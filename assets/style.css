@@ -1,0 +1,653 @@
+:root {
+  --bg: #101010;
+  --surface: #171717;
+  --panel: #292929;
+  --panel-2: #1b1b1b;
+  --field: #111;
+  --line: #3a3a3a;
+  --text: #f4f4f4;
+  --muted: #b9b9b9;
+  --soft: #858585;
+  --accent: #ffffff;
+  --danger: #c91818;
+  --ok: #8fcf9a;
+  --warn: #f1c66b;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background: #f2f2f2;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  border-radius: var(--radius);
+  padding: 9px 14px;
+  background: #050505;
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button:hover { background: #000; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+
+input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 9px 10px;
+  background: var(--field);
+  color: var(--text);
+}
+
+textarea {
+  min-height: 118px;
+  resize: vertical;
+}
+
+label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+label.inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+label.inline input {
+  width: auto;
+}
+
+h1, h2, h3, p { margin: 0; }
+
+pre {
+  margin: 0;
+  min-height: 92px;
+  overflow: auto;
+  white-space: pre-wrap;
+  border-radius: var(--radius);
+  padding: 10px;
+  background: #101010;
+  color: var(--text);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--line);
+  padding: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  grid-template-columns: max-content max-content minmax(220px, 1fr) max-content;
+  gap: 18px;
+  align-items: center;
+  padding: 16px 24px;
+  background: #282828;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  background: transparent;
+  font-size: 21px;
+}
+
+.brand:hover { background: transparent; }
+
+.brand-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: #f5f5f5;
+  color: #111;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.topnav {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.nav-pill {
+  padding: 8px 13px;
+  background: #333;
+}
+
+.nav-pill.active,
+.primary-action {
+  background: #000;
+}
+
+.nav-pill.muted {
+  color: var(--muted);
+}
+
+.global-search {
+  position: relative;
+  max-width: 620px;
+}
+
+.global-search span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.status,
+.autosave-state {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.autosave-state.dirty { color: var(--warn); }
+.autosave-state.saving { color: #9dc3ff; }
+.autosave-state.saved { color: var(--ok); }
+.autosave-state.error { color: #ff9b9b; }
+
+.app-shell {
+  padding: 24px;
+}
+
+.view.is-hidden,
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+.panel {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.panel-head h2,
+.panel-head h3 {
+  font-size: 22px;
+}
+
+.panel-head span,
+.panel-head p {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.divider {
+  height: 1px;
+  background: var(--line);
+  margin: 10px 0;
+}
+
+.roster-view {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.roster-tools {
+  display: grid;
+  gap: 14px;
+}
+
+.roster-main {
+  min-height: calc(100vh - 150px);
+}
+
+.roster-heading {
+  align-items: center;
+}
+
+.roster-count {
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.character-roster {
+  display: grid;
+  gap: 12px;
+}
+
+.character-row {
+  display: grid;
+  grid-template-columns: 58px minmax(190px, 1.3fr) minmax(260px, 1fr) max-content;
+  gap: 16px;
+  align-items: center;
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--panel-2);
+}
+
+.character-token,
+.avatar-token {
+  display: grid;
+  place-items: center;
+  width: 58px;
+  height: 58px;
+  border: 2px solid #525252;
+  border-radius: var(--radius);
+  background: #111;
+  color: var(--text);
+  font-weight: 900;
+}
+
+.character-main h3 {
+  font-size: 18px;
+}
+
+.character-main p,
+.character-row-stats span {
+  color: var(--muted);
+}
+
+.character-row-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(72px, 1fr));
+  gap: 10px;
+  font-size: 13px;
+}
+
+.character-row-stats strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--text);
+}
+
+.character-actions,
+.version-actions,
+.equipment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.empty-state,
+.muted-note {
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.sheet-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.character-name-field {
+  min-width: 260px;
+  flex: 1;
+}
+
+.sheet-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(420px, 1fr) 360px;
+  gap: 16px;
+  align-items: start;
+}
+
+.sheet-left,
+.sheet-center,
+.sheet-right {
+  display: grid;
+  gap: 16px;
+}
+
+.identity-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.identity-grid,
+.identity-card,
+.class-list,
+.panel-block,
+.roll-panel,
+.advanced-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.identity-card {
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--panel-2);
+}
+
+.identity-card h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.class-entry,
+.picker-row {
+  display: grid;
+  grid-template-columns: 1fr 74px max-content;
+  gap: 8px;
+}
+
+.picker-row {
+  grid-template-columns: 1fr max-content;
+}
+
+.primary-stats {
+  display: grid;
+  gap: 12px;
+}
+
+.ability-column {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ability-card,
+.stat-card.compact,
+.hp-mini,
+.inventory-pill {
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--panel-2);
+}
+
+.ability-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px;
+}
+
+.ability-name {
+  font-weight: 900;
+}
+
+.ability-full {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ability-total {
+  grid-row: span 2;
+  align-self: center;
+  font-size: 28px;
+  font-weight: 900;
+}
+
+.ability-score,
+.ability-bonus {
+  grid-column: span 2;
+}
+
+.ability-mod {
+  grid-column: span 2;
+  border-radius: 999px;
+  padding: 5px 8px;
+  background: #333;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.primary-core-row,
+.hp-mini-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stat-card.compact {
+  color: var(--muted);
+}
+
+.tabbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+}
+
+.tab-btn {
+  background: #333;
+}
+
+.tab-btn.active {
+  background: #000;
+}
+
+.feature-grid,
+.roleplay-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, .8fr);
+  gap: 16px;
+}
+
+.roleplay-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.hp-area {
+  display: grid;
+  gap: 14px;
+}
+
+.hp-adjust-row {
+  display: grid;
+  grid-template-columns: 80px 1fr 1fr;
+  gap: 8px;
+}
+
+.death-saves {
+  display: grid;
+  gap: 8px;
+}
+
+.death-track {
+  display: grid;
+  grid-template-columns: 1fr repeat(3, 24px);
+  gap: 8px;
+  align-items: center;
+  color: var(--muted);
+}
+
+.death-track input {
+  width: 18px;
+  height: 18px;
+}
+
+.equipment-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.equipment-actions select {
+  min-width: 180px;
+}
+
+.equipment-table-wrap,
+.table-scroll {
+  overflow: auto;
+}
+
+.equipment-table {
+  min-width: 1120px;
+}
+
+.equipment-table input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+}
+
+.version-list,
+.version-history-full,
+#inventorySummary {
+  display: grid;
+  gap: 10px;
+}
+
+.version-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 10px;
+  align-items: center;
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--panel-2);
+}
+
+.version-item span,
+.inventory-pill span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quick-inventory {
+  display: grid;
+  gap: 10px;
+}
+
+.block {
+  display: grid;
+  gap: 8px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+}
+
+@media (max-width: 1320px) {
+  .sheet-layout {
+    grid-template-columns: 300px minmax(0, 1fr);
+  }
+
+  .sheet-right {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 980px) {
+  .topbar {
+    grid-template-columns: 1fr;
+  }
+
+  .topnav,
+  .sheet-toolbar {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+
+  .roster-view,
+  .sheet-layout,
+  .sheet-right,
+  .feature-grid,
+  .roleplay-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .character-row {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+
+  .character-row-stats,
+  .character-actions {
+    grid-column: 1 / -1;
+  }
+
+  .character-row-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 12px;
+  }
+
+  .topbar {
+    padding: 14px;
+  }
+
+  .panel {
+    padding: 12px;
+  }
+
+  .ability-column,
+  .primary-core-row,
+  .hp-mini-grid,
+  .hp-adjust-row,
+  .class-entry,
+  .picker-row {
+    grid-template-columns: 1fr;
+  }
+
+  .version-item {
+    grid-template-columns: 1fr;
+  }
+
+  .version-actions,
+  .character-actions,
+  .equipment-actions {
+    justify-content: flex-start;
+  }
+}
