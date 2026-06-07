@@ -49,6 +49,13 @@ type CharacterSnapshot = {
     wis_bonus?: number;
     cha_bonus?: number;
     notes?: string;
+    location?: string;
+    is_equipment?: boolean;
+    to_hit_bonus?: number;
+    damage_bonus?: number;
+    attack_ability?: AbilityKey;
+    damage_rolls?: string;
+    effects?: string;
   }>;
   attacks?: Array<{ name?: string; attack_ability?: AbilityKey; proficient?: boolean; damage_dice?: string; notes?: string }>;
   notes?: Array<{ note_key?: string; title?: string; content?: string }>;
@@ -398,9 +405,16 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
     (snapshot.inventory ?? []).map((row) => ({
       name: row.name || '',
       category: row.category || 'gear',
+      location: normalizeInventoryLocation(row.location, Boolean(row.equipped)),
       quantity: Number(row.quantity) || 1,
       equipped: Boolean(row.equipped),
+      isEquipment: Boolean(row.is_equipment),
       acBonus: Number(row.ac_bonus) || 0,
+      toHitBonus: Number(row.to_hit_bonus) || 0,
+      damageBonus: Number(row.damage_bonus) || 0,
+      attackAbility: abilityKeys.includes(row.attack_ability as AbilityKey) ? (row.attack_ability as AbilityKey) : 'str',
+      damageRolls: row.damage_rolls || '',
+      effects: row.effects || '',
       abilityBonuses: {
         str: Number(row.str_bonus) || 0,
         dex: Number(row.dex_bonus) || 0,
@@ -478,14 +492,28 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     wis_bonus: number;
     cha_bonus: number;
     notes: string;
+    location: 'equipped' | 'backpack' | 'misc';
+    is_equipment: boolean;
+    to_hit_bonus: number;
+    damage_bonus: number;
+    attack_ability: AbilityKey;
+    damage_rolls: string;
+    effects: string;
   }>('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order ASC', [characterId]);
   return result.rows.map((row) => ({
     id: row.id,
     name: row.name,
     category: row.category,
+    location: row.location || (row.equipped ? 'equipped' : 'backpack'),
     quantity: row.quantity,
     equipped: row.equipped,
+    isEquipment: row.is_equipment,
     acBonus: row.ac_bonus,
+    toHitBonus: row.to_hit_bonus,
+    damageBonus: row.damage_bonus,
+    attackAbility: row.attack_ability || 'str',
+    damageRolls: row.damage_rolls,
+    effects: row.effects,
     abilityBonuses: {
       str: row.str_bonus,
       dex: row.dex_bonus,
@@ -566,16 +594,23 @@ async function replaceInventory(client: pg.PoolClient, characterId: string, inve
     await client.query(
       `
         INSERT INTO character_inventory_items
-          (character_id, name, category, quantity, equipped, ac_bonus, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          (character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
       `,
       [
         characterId,
         row.name,
         row.category || 'gear',
+        row.location || (row.equipped ? 'equipped' : 'backpack'),
         Math.max(0, Number(row.quantity) || 1),
-        row.equipped,
+        row.location === 'equipped' || row.equipped,
+        row.isEquipment,
         Number(row.acBonus) || 0,
+        Number(row.toHitBonus) || 0,
+        Number(row.damageBonus) || 0,
+        abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str',
+        row.damageRolls || '',
+        row.effects || '',
         Number(row.abilityBonuses.str) || 0,
         Number(row.abilityBonuses.dex) || 0,
         Number(row.abilityBonuses.con) || 0,
@@ -644,17 +679,46 @@ function parseResources(form: FormData): CharacterResource[] {
 }
 
 function parseInventory(form: FormData): InventoryItem[] {
-  return [
-    {
-      name: String(form.get('inventoryName') || '').trim(),
-      category: String(form.get('inventoryCategory') || 'gear'),
-      quantity: Number(form.get('inventoryQuantity')) || 1,
-      equipped: !!form.get('inventoryEquipped'),
-      acBonus: Number(form.get('inventoryAcBonus')) || 0,
-      abilityBonuses: {},
-      notes: String(form.get('inventoryNotes') || '')
-    }
-  ];
+  const names = form.getAll('inventoryName').map((value) => String(value).trim());
+  const categories = form.getAll('inventoryCategory').map(String);
+  const locations = form.getAll('inventoryLocation').map(String);
+  const quantities = form.getAll('inventoryQuantity').map(Number);
+  const equipped = form.getAll('inventoryEquipped').map((value) => String(value) === 'true');
+  const isEquipment = form.getAll('inventoryIsEquipment').map((value) => String(value) === 'true');
+  const acBonuses = form.getAll('inventoryAcBonus').map(Number);
+  const toHitBonuses = form.getAll('inventoryToHitBonus').map(Number);
+  const damageBonuses = form.getAll('inventoryDamageBonus').map(Number);
+  const attackAbilities = form.getAll('inventoryAttackAbility').map(String);
+  const damageRolls = form.getAll('inventoryDamageRolls').map(String);
+  const effects = form.getAll('inventoryEffects').map(String);
+  const notes = form.getAll('inventoryNotes').map(String);
+
+  return names
+    .map((name, index) => {
+      const location = normalizeInventoryLocation(locations[index], equipped[index]);
+      return {
+        name,
+        category: categories[index] || 'gear',
+        location,
+        quantity: Math.max(0, quantities[index] || 1),
+        equipped: location === 'equipped',
+        isEquipment: Boolean(isEquipment[index]),
+        acBonus: acBonuses[index] || 0,
+        toHitBonus: toHitBonuses[index] || 0,
+        damageBonus: damageBonuses[index] || 0,
+        attackAbility: abilityKeys.includes(attackAbilities[index] as AbilityKey) ? (attackAbilities[index] as AbilityKey) : 'str',
+        damageRolls: damageRolls[index] || '',
+        effects: effects[index] || '',
+        abilityBonuses: {},
+        notes: notes[index] || ''
+      };
+    })
+    .filter((item) => item.name.trim());
+}
+
+function normalizeInventoryLocation(value: string | undefined, equipped: boolean): 'equipped' | 'backpack' | 'misc' {
+  if (value === 'equipped' || value === 'backpack' || value === 'misc') return value;
+  return equipped ? 'equipped' : 'backpack';
 }
 
 function parseAttacks(form: FormData): CharacterAttack[] {
