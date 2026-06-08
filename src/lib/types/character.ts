@@ -40,6 +40,44 @@ export type ItemCategory = {
   label: string;
 };
 
+export type EffectModifier = {
+  target: string;
+  modifierType: string;
+  valueExpression: string;
+  conditionExpression: string;
+  priority: number;
+};
+
+export type EffectDefinition = {
+  id: string;
+  key: string;
+  name: string;
+  sourceType: string;
+  sourceRef: string;
+  description: string;
+  durationType: string;
+  durationRounds: number | null;
+  requiresConcentration: boolean;
+  isCondition: boolean;
+  isSelectable: boolean;
+  modifiers: EffectModifier[];
+};
+
+export type ActiveCharacterEffect = {
+  id: string;
+  effectId: string;
+  effectKey: string;
+  name: string;
+  sourceType: string;
+  description: string;
+  durationType: string;
+  requiresConcentration: boolean;
+  isCondition: boolean;
+  isSelectable: boolean;
+  remainingRounds: number | null;
+  modifiers: EffectModifier[];
+};
+
 export type CharacterAttack = {
   id?: string;
   name: string;
@@ -69,6 +107,9 @@ export type CharacterDetail = {
   inventory: InventoryItem[];
   attacks: CharacterAttack[];
   notes: CharacterNote[];
+  activeEffects: ActiveCharacterEffect[];
+  availableEffects: EffectDefinition[];
+  exhaustionLevel: number;
   updatedAt: string;
 };
 

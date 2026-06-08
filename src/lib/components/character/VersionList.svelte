@@ -13,8 +13,8 @@
 </script>
 
 {#if open}
-  <div class="modal-backdrop" role="presentation">
-    <div class="panel version-modal" role="dialog" aria-modal="true" aria-labelledby="version-history-title">
+  <div class="modal-backdrop" role="presentation" onpointerdown={onClose}>
+    <div class="panel version-modal" role="dialog" aria-modal="true" aria-labelledby="version-history-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
       <div class="panel-head">
         <div>
           <h2 id="version-history-title">Version History</h2>

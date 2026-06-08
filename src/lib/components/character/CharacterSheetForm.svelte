@@ -1,6 +1,6 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
-  import { abilityMap, abilityModifier, proficiencyBonus, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, proficiencyBonus, resolvedFlatBonuses, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
 
   let {
@@ -81,6 +81,11 @@
   let deathSaveFailures = $state(0);
   let savingThrowsOpen = $state(false);
   let skillChecksOpen = $state(false);
+  let playerModificationsOpen = $state(false);
+  let selectedEffectKeys = $state<string[]>([]);
+  let selectedExhaustionLevel = $state(0);
+  let modifierSearch = $state('');
+  let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all' | 'catalogue'>('active');
   let newItemOpen = $state(false);
   let newItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
   let rollResult = $state<{
@@ -91,6 +96,18 @@
   } | null>(null);
   let inventoryMessage = $state<string | null>(null);
   const autosaveIntervalMs = 30_000;
+  const modifierFilters = [
+    { key: 'active', label: 'Active' },
+    { key: 'automated', label: 'Automated' },
+    { key: 'potential', label: 'Potential' },
+    { key: 'condition', label: 'Conditions' },
+    { key: 'spell', label: 'Spells' },
+    { key: 'combat', label: 'Combat' },
+    { key: 'class_feature', label: 'Class' },
+    { key: 'environment', label: 'Environment' },
+    { key: 'all', label: 'All' },
+    { key: 'catalogue', label: 'Catalogue' }
+  ] as const;
   const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
   const skillChecks: Array<{ name: string; ability: AbilityKey }> = [
     { name: 'Acrobatics', ability: 'dex' },
@@ -115,6 +132,46 @@
 
   function meta(field: string, fallback = '') {
     return String(metadata[field] ?? fallback);
+  }
+
+  const activeEffectDetails = $derived(
+    character.availableEffects.filter((effect) => selectedEffectKeys.includes(effect.key))
+  );
+  const filteredModifierEffects = $derived(
+    character.availableEffects.filter((effect) => {
+      const query = modifierSearch.trim().toLowerCase();
+      const matchesSearch = !query || [effect.name, effect.description, effect.sourceRef, effect.sourceType]
+        .join(' ')
+        .toLowerCase()
+        .includes(query);
+      const matchesFilter =
+        (modifierFilter === 'all' && effect.isSelectable) ||
+        modifierFilter === 'catalogue' ||
+        (modifierFilter === 'active' && selectedEffectKeys.includes(effect.key)) ||
+        (modifierFilter === 'automated' && effect.modifiers.length > 0) ||
+        (modifierFilter === 'potential' && effect.modifiers.length === 0 && !effect.isSelectable) ||
+        (modifierFilter === 'condition' && effect.isCondition && effect.isSelectable) ||
+        (modifierFilter === 'spell' && effect.sourceType === 'spell' && effect.isSelectable) ||
+        (modifierFilter === 'combat' && effect.sourceType === 'combat_state' && effect.isSelectable) ||
+        (modifierFilter === 'class_feature' && effect.sourceType === 'class_feature' && effect.isSelectable) ||
+        (modifierFilter === 'environment' && effect.sourceType === 'environment' && effect.isSelectable);
+
+      return matchesSearch && matchesFilter;
+    })
+  );
+  const visibleModifierEffects = $derived(filteredModifierEffects.slice(0, 50));
+  const activeModifierFilterLabel = $derived(
+    modifierFilters.find((filter) => filter.key === modifierFilter)?.label ?? 'Modifiers'
+  );
+
+  function isEffectSelected(key: string) {
+    return selectedEffectKeys.includes(key);
+  }
+
+  function toggleEffect(key: string) {
+    selectedEffectKeys = isEffectSelected(key)
+      ? selectedEffectKeys.filter((selected) => selected !== key)
+      : [...selectedEffectKeys, key];
   }
 
   function categoryOptionsFor(category: string) {
@@ -145,6 +202,11 @@
     deathSaveFailures = clampDeathSave(metadata.deathSaveFailures);
   });
 
+  $effect(() => {
+    selectedEffectKeys = character.activeEffects.map((effect) => effect.effectKey);
+    selectedExhaustionLevel = character.exhaustionLevel ?? 0;
+  });
+
   function signed(value: number) {
     return value >= 0 ? `+${value}` : String(value);
   }
@@ -155,7 +217,8 @@
       .map((roll) => roll.trim())
       .filter(Boolean);
     const ability = abilityModifier(abilityScores[item.attackAbility]);
-    const flatBonus = Number(item.damageBonus || 0) + ability;
+    const modifierBonuses = battleDamageBonuses(item).reduce((sum, bonus) => sum + bonus.value, 0);
+    const flatBonus = Number(item.damageBonus || 0) + ability + modifierBonuses;
     let summary = rolls.join(' + ');
     if (flatBonus) {
       summary = summary ? `${summary} ${flatBonus > 0 ? '+' : '-'} ${Math.abs(flatBonus)}` : String(flatBonus);
@@ -167,7 +230,7 @@
     return Math.floor(Math.random() * sides) + 1;
   }
 
-  function rollDamageExpression(expression: string, bonus: number, abilityBonus = 0, abilityLabel = '') {
+  function rollDamageExpression(expression: string, bonus: number, abilityBonus = 0, abilityLabel = '', modifierBonuses: Array<{ label: string; value: number }> = []) {
     const parts = expression
       .split('+')
       .map((part) => part.trim())
@@ -204,6 +267,11 @@
       lines.push(`${abilityLabel} Modifier: ${signed(abilityBonus)} = ${total}`);
     }
 
+    for (const modifierBonus of modifierBonuses) {
+      total += modifierBonus.value;
+      lines.push(`${modifierBonus.label}: ${signed(modifierBonus.value)} = ${total}`);
+    }
+
     lines.push(`Total: ${total}`);
 
     return {
@@ -212,12 +280,29 @@
     };
   }
 
+  function battleDamageBonuses(item: InventoryItem) {
+    const canBeMeleeWeaponAttack = ['weapon', 'shield'].includes(item.category) && item.attackAbility === 'str';
+    const candidates = [
+      'damage_roll.all',
+      'damage_roll.weapon',
+      item.attackAbility ? `damage_roll.weapon.${item.attackAbility}` : '',
+      canBeMeleeWeaponAttack ? 'damage_roll.melee_weapon' : '',
+      canBeMeleeWeaponAttack ? `damage_roll.melee_weapon.${item.attackAbility}` : ''
+    ].filter(Boolean);
+
+    return resolvedFlatBonuses(character.activeEffects, candidates, {
+      classes: character.classes,
+      attackType: 'melee_weapon',
+      ability: item.attackAbility
+    });
+  }
+
   function rollBattleAction(item: InventoryItem) {
     const d20 = rollDie(20);
     const ability = abilityModifier(abilityScores[item.attackAbility]);
     const attackBonus = ability + prof + Number(item.toHitBonus || 0);
     const attackTotal = d20 + attackBonus;
-    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase());
+    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item));
 
     rollResult = {
       title: item.name || 'Battle Action',
@@ -423,6 +508,42 @@
             <div class="ability-popup-links">
               <button type="button" class="text-button" onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
               <button type="button" class="text-button" onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel stack compact-panel modifications-panel">
+          <div class="panel-head compact-head">
+            <h2>Player Modifications</h2>
+            <button type="button" class="compact-button" onclick={() => (playerModificationsOpen = true)}>Manage</button>
+          </div>
+          <div class="mod-summary">
+            <label>Exhaustion
+              <input
+                type="number"
+                min="0"
+                max="6"
+                value={selectedExhaustionLevel}
+                oninput={(event) => (selectedExhaustionLevel = Math.min(6, Math.max(0, Number(event.currentTarget.value) || 0)))}
+              />
+            </label>
+            <div class="active-mods">
+              {#each activeEffectDetails.slice(0, 5) as effect}
+                <button
+                  type="button"
+                  class:condition-chip={effect.isCondition}
+                  class="tooltip-chip"
+                  data-tooltip={effect.description || effect.name}
+                  aria-label={`${effect.name}: ${effect.description || 'No description available'}`}
+                >
+                  {effect.name}
+                </button>
+              {:else}
+                <span class="muted">No active effects</span>
+              {/each}
+              {#if activeEffectDetails.length > 5}
+                <span>+{activeEffectDetails.length - 5}</span>
+              {/if}
             </div>
           </div>
         </section>
@@ -688,6 +809,11 @@
   {/if}
 
   <div class="hidden-save-fields" aria-hidden="true">
+    <input name="exhaustionLevel" type="hidden" value={selectedExhaustionLevel} />
+    {#each selectedEffectKeys as effectKey}
+      <input name="activeEffectKey" type="hidden" value={effectKey} />
+    {/each}
+
     {#if activeTab !== 'battle'}
       <input name="hpCurrent" type="hidden" value={hp.currentValue} />
       <input name="hpMax" type="hidden" value={hp.maxValue} />
@@ -783,8 +909,8 @@
   </div>
 
   {#if savingThrowsOpen}
-    <div class="modal-backdrop" role="presentation">
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title">
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (savingThrowsOpen = false)}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="saving-throws-title">Saving Throws</h2>
           <button type="button" class="text-button" onclick={() => (savingThrowsOpen = false)}>Close</button>
@@ -802,8 +928,8 @@
   {/if}
 
   {#if skillChecksOpen}
-    <div class="modal-backdrop" role="presentation">
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title">
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (skillChecksOpen = false)}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="skill-checks-title">Skill Checks</h2>
           <button type="button" class="text-button" onclick={() => (skillChecksOpen = false)}>Close</button>
@@ -815,6 +941,109 @@
               <span>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}</span>
             </div>
           {/each}
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if playerModificationsOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (playerModificationsOpen = false)}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <div>
+            <h2 id="player-modifications-title">Player Modifications</h2>
+            <p class="muted">Conditions, spells, combat states, and environment effects applied to this character.</p>
+          </div>
+          <button type="button" class="text-button" onclick={() => (playerModificationsOpen = false)}>Close</button>
+        </div>
+
+        <label class="exhaustion-control">Exhaustion Level
+          <input
+            type="number"
+            min="0"
+            max="6"
+            value={selectedExhaustionLevel}
+            oninput={(event) => (selectedExhaustionLevel = Math.min(6, Math.max(0, Number(event.currentTarget.value) || 0)))}
+          />
+        </label>
+
+        <div class="modifier-picker">
+          <div class="modifier-toolbar">
+            <label class="modifier-search">Search
+              <input
+                value={modifierSearch}
+                placeholder="Search conditions, spells, features, states..."
+                oninput={(event) => (modifierSearch = event.currentTarget.value)}
+              />
+            </label>
+
+            <div class="modifier-tabs" role="tablist" aria-label="Modifier filters">
+              {#each modifierFilters as filter}
+                <button
+                  type="button"
+                  class:active={modifierFilter === filter.key}
+                  onclick={() => (modifierFilter = filter.key)}
+                >
+                  {filter.label}
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <section class="selected-modifier-summary">
+            <h3>Selected</h3>
+            <div class="selected-mods">
+              {#each activeEffectDetails as effect}
+                <button
+                  type="button"
+                  class:condition-chip={effect.isCondition}
+                  title={effect.description}
+                  onclick={() => toggleEffect(effect.key)}
+                >
+                  {effect.name}
+                </button>
+              {:else}
+                <span class="muted">No active effects selected.</span>
+              {/each}
+            </div>
+          </section>
+
+          <section class="modifier-results">
+            <div class="modifier-results-head">
+              <h3>{activeModifierFilterLabel}</h3>
+              <span class="muted">Showing {visibleModifierEffects.length} of {filteredModifierEffects.length}</span>
+            </div>
+
+            <div class="modifier-list compact">
+              {#each visibleModifierEffects as effect}
+                <label class="modifier-toggle">
+                  <input type="checkbox" checked={isEffectSelected(effect.key)} onchange={() => toggleEffect(effect.key)} />
+                  <span>
+                    <strong>{effect.name}</strong>
+                    <small>{effect.description}</small>
+                    <b>
+                      {effect.isCondition ? 'Condition' : effect.sourceType.replace('_', ' ')}
+                      {effect.requiresConcentration ? ' - Concentration' : ''}
+                      {effect.modifiers.length ? ' - Automated' : effect.isSelectable ? ' - Trackable' : ' - Catalogue'}
+                    </b>
+                    {#if effect.modifiers.length}
+                      <em>{effect.modifiers.map((modifier) => `${modifier.target}: ${modifier.modifierType}${modifier.valueExpression ? ` ${modifier.valueExpression}` : ''}`).join(', ')}</em>
+                    {/if}
+                  </span>
+                </label>
+              {:else}
+                <p class="muted">No modifiers match this filter.</p>
+              {/each}
+            </div>
+
+            {#if filteredModifierEffects.length > visibleModifierEffects.length}
+              <p class="muted">Showing the first 50 results. Search or filter to narrow the list.</p>
+            {/if}
+          </section>
+        </div>
+
+        <div class="modal-actions">
+          <button type="submit">Save Modifications</button>
         </div>
       </div>
     </div>

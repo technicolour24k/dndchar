@@ -362,7 +362,7 @@ label.inline input {
 
 .battle-top-row {
   display: grid;
-  grid-template-columns: max-content max-content max-content;
+  grid-template-columns: max-content max-content max-content max-content;
   gap: 20px;
   align-items: start;
   justify-content: center;
@@ -784,6 +784,99 @@ button.death-save-icon.failure.active {
   min-width: 96px;
 }
 
+.modifications-panel {
+  width: 280px;
+}
+
+.panel-head.compact-head {
+  margin-bottom: 0;
+}
+
+.mod-summary {
+  display: grid;
+  gap: 10px;
+}
+
+.mod-summary label {
+  grid-template-columns: max-content 64px;
+  align-items: center;
+}
+
+.mod-summary input,
+.exhaustion-control input {
+  min-height: 34px;
+  padding: 5px 8px;
+}
+
+.active-mods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 30px;
+  align-items: start;
+}
+
+.active-mods span,
+.active-mods button {
+  border-radius: 999px;
+  padding: 5px 8px;
+  background: var(--panel-dark);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.active-mods span.condition-chip,
+.active-mods button.condition-chip {
+  color: var(--danger);
+}
+
+.active-mods button {
+  min-height: auto;
+  border: 0;
+  cursor: help;
+}
+
+.active-mods button:hover,
+.active-mods button:focus-visible {
+  background: #050505;
+}
+
+.tooltip-chip {
+  position: relative;
+  outline: none;
+}
+
+.tooltip-chip::after {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 40;
+  width: max-content;
+  max-width: 260px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #080808;
+  color: var(--text);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 35%);
+  content: attr(data-tooltip);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(2px);
+  transition: opacity 70ms ease, transform 70ms ease;
+  white-space: normal;
+}
+
+.tooltip-chip:hover::after,
+.tooltip-chip:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 .save-state {
   color: var(--muted);
   font-weight: 700;
@@ -837,11 +930,146 @@ button.death-save-icon.failure.active {
   box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
 }
 
+.modifier-modal {
+  width: min(980px, 100%);
+  max-height: min(780px, calc(100vh - 48px));
+  overflow: auto;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+}
+
 .item-modal {
   width: min(780px, 100%);
   max-height: min(760px, calc(100vh - 48px));
   overflow: auto;
   box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+}
+
+.modifier-picker {
+  display: grid;
+  gap: 16px;
+}
+
+.modifier-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) max-content;
+  gap: 12px;
+  align-items: end;
+}
+
+.modifier-search input {
+  min-height: 36px;
+  padding: 7px 10px;
+}
+
+.modifier-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: end;
+}
+
+.modifier-tabs button {
+  min-height: 34px;
+  padding: 7px 10px;
+  background: var(--panel-dark);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.modifier-tabs button.active {
+  background: #000;
+  color: var(--text);
+}
+
+.selected-modifier-summary,
+.modifier-results {
+  display: grid;
+  gap: 8px;
+}
+
+.selected-mods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 32px;
+  align-items: center;
+}
+
+.selected-mods span,
+.selected-mods button {
+  border-radius: 999px;
+  padding: 6px 9px;
+  background: var(--panel-dark);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.selected-mods button {
+  min-height: auto;
+}
+
+.selected-mods button.condition-chip {
+  color: var(--danger);
+}
+
+.modifier-results-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.modifier-list {
+  display: grid;
+  gap: 8px;
+}
+
+.modifier-list.compact {
+  max-height: 420px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.modifier-toggle {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-dark);
+}
+
+.modifier-toggle input {
+  width: 16px;
+  margin-top: 3px;
+}
+
+.modifier-toggle span {
+  display: grid;
+  gap: 4px;
+}
+
+.modifier-toggle strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.modifier-toggle small,
+.modifier-toggle em,
+.modifier-toggle b {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.modifier-toggle b {
+  color: var(--ok);
+}
+
+.exhaustion-control {
+  max-width: 220px;
+  margin-bottom: 16px;
 }
 
 .new-item-grid {
@@ -858,7 +1086,7 @@ button.death-save-icon.failure.active {
 .modal-actions {
   display: flex;
   justify-content: end;
-  margin-top: 14px;
+  margin-top: 16px;
 }
 
 .check-list {
@@ -938,6 +1166,10 @@ button.death-save-icon.failure.active {
     grid-template-columns: 1fr;
   }
 
+  .modifications-panel {
+    width: auto;
+  }
+
   .inventory-row-main,
   .inventory-row-combat,
   .new-item-grid,
@@ -973,6 +1205,14 @@ button.death-save-icon.failure.active {
 
   .skill-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .modifier-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .modifier-tabs {
+    justify-content: start;
   }
 }
 
