@@ -1,6 +1,6 @@
 import { error, fail } from '@sveltejs/kit';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { getCharacter, listVersions, restoreCharacterVersion, updateCharacter } from '$lib/server/services/characters';
+import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, updateCharacter } from '$lib/server/services/characters';
 
 export async function load({ params, locals }) {
   const character = await getCharacter(locals.user!.id, params.id);
@@ -8,6 +8,7 @@ export async function load({ params, locals }) {
 
   return {
     character,
+    itemCategories: await listItemCategories(),
     versions: await listVersions(locals.user!.id, params.id)
   };
 }
