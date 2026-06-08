@@ -11,6 +11,9 @@ import type {
   CharacterNote,
   CharacterResource,
   CharacterVersion,
+  EffectDefinition,
+  EffectModifier,
+  ItemCategory,
   InventoryItem
 } from '$lib/types/character';
 
@@ -59,6 +62,8 @@ type CharacterSnapshot = {
   }>;
   attacks?: Array<{ name?: string; attack_ability?: AbilityKey; proficient?: boolean; damage_dice?: string; notes?: string }>;
   notes?: Array<{ note_key?: string; title?: string; content?: string }>;
+  active_effects?: Array<{ effect_key?: string; remaining_rounds?: number | null; metadata_json?: Record<string, unknown> }>;
+  exhaustion?: { exhaustion_level?: number };
 };
 
 const defaultClasses: CharacterClass[] = [{ className: 'Fighter', level: 1 }];
@@ -212,8 +217,33 @@ export async function getCharacter(userId: string, characterId: string): Promise
     resources: await getResources(characterId),
     inventory: await getInventory(characterId),
     attacks: await getAttacks(characterId),
-    notes: await getNotes(characterId)
+    notes: await getNotes(characterId),
+    activeEffects: await getActiveEffects(characterId),
+    availableEffects: await listEffectDefinitions(),
+    exhaustionLevel: await getExhaustionLevel(characterId)
   });
+}
+
+export async function listItemCategories(): Promise<ItemCategory[]> {
+  try {
+    const result = await query<{ key: string; label: string }>(
+      'SELECT key, label FROM item_categories ORDER BY sort_order ASC, label ASC'
+    );
+    return result.rows;
+  } catch {
+    return [
+      { key: 'weapon', label: 'Weapon' },
+      { key: 'armor', label: 'Armor' },
+      { key: 'shield', label: 'Shield' },
+      { key: 'focus', label: 'Spell Focus' },
+      { key: 'consumable', label: 'Consumable' },
+      { key: 'tool', label: 'Tool' },
+      { key: 'gear', label: 'Adventuring Gear' },
+      { key: 'treasure', label: 'Treasure' },
+      { key: 'junk', label: 'Junk' },
+      { key: 'misc', label: 'Misc' }
+    ];
+  }
 }
 
 export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<void> {
@@ -246,6 +276,8 @@ export async function updateCharacter(userId: string, characterId: string, form:
     await replaceInventory(client, characterId, parseInventory(form));
     await replaceAttacks(client, characterId, parseAttacks(form));
     await replaceNotes(client, characterId, parseNotes(form));
+    await replaceActiveEffects(client, characterId, parseActiveEffectKeys(form));
+    await setExhaustionLevel(client, characterId, Number(form.get('exhaustionLevel')) || 0);
     await createVersionWithClient(client, characterId, userId, summary);
   });
 }
@@ -320,6 +352,17 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const inventory = await client.query('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order', [characterId]);
   const attacks = await client.query('SELECT * FROM character_attacks WHERE character_id = $1 ORDER BY sort_order', [characterId]);
   const notes = await client.query('SELECT note_key, title, content, sort_order FROM character_notes WHERE character_id = $1 ORDER BY sort_order', [characterId]);
+  const activeEffects = await client.query(
+    `
+      SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json
+      FROM active_character_effects
+      JOIN effect_definitions ON effect_definitions.id = active_character_effects.effect_id
+      WHERE active_character_effects.character_id = $1
+      ORDER BY effect_definitions.sort_order, effect_definitions.name
+    `,
+    [characterId]
+  );
+  const exhaustion = await client.query('SELECT exhaustion_level FROM character_exhaustion WHERE character_id = $1', [characterId]);
 
   return {
     character: character.rows[0],
@@ -328,7 +371,9 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
     resources: resources.rows,
     inventory: inventory.rows,
     attacks: attacks.rows,
-    notes: notes.rows
+    notes: notes.rows,
+    active_effects: activeEffects.rows,
+    exhaustion: exhaustion.rows[0] ?? { exhaustion_level: 0 }
   };
 }
 
@@ -446,6 +491,12 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       content: row.content || ''
     }))
   );
+  await replaceActiveEffects(
+    client,
+    characterId,
+    (snapshot.active_effects ?? []).map((row) => row.effect_key || '').filter(Boolean)
+  );
+  await setExhaustionLevel(client, characterId, Number(snapshot.exhaustion?.exhaustion_level) || 0);
 }
 
 async function getClasses(characterId: string): Promise<CharacterClass[]> {
@@ -553,6 +604,119 @@ async function getNotes(characterId: string): Promise<CharacterNote[]> {
   return result.rows.map((row) => ({ key: row.note_key, title: row.title, content: row.content }));
 }
 
+async function listEffectDefinitions(): Promise<EffectDefinition[]> {
+  try {
+    const effects = await query<{
+      id: string;
+      effect_key: string;
+      name: string;
+      source_type: string;
+      source_ref: string;
+      description: string;
+      duration_type: string;
+      duration_rounds: number | null;
+      requires_concentration: boolean;
+      is_condition: boolean;
+    }>(
+      `
+        SELECT id, effect_key, name, source_type, source_ref, description, duration_type, duration_rounds, requires_concentration, is_condition
+        FROM effect_definitions
+        ORDER BY is_condition DESC, sort_order ASC, name ASC
+      `
+    );
+
+    const modifiers = await query<{
+      effect_id: string;
+      target: string;
+      modifier_type: string;
+      value_expression: string;
+      condition_expression: string;
+      priority: number;
+    }>('SELECT effect_id, target, modifier_type, value_expression, condition_expression, priority FROM effect_modifiers ORDER BY priority ASC, target ASC');
+    const modifiersByEffect = new Map<string, EffectModifier[]>();
+    for (const row of modifiers.rows) {
+      const list = modifiersByEffect.get(row.effect_id) ?? [];
+      list.push({
+        target: row.target,
+        modifierType: row.modifier_type,
+        valueExpression: row.value_expression || '',
+        conditionExpression: row.condition_expression || '',
+        priority: row.priority
+      });
+      modifiersByEffect.set(row.effect_id, list);
+    }
+
+    return effects.rows.map((row) => ({
+      id: row.id,
+      key: row.effect_key,
+      name: row.name,
+      sourceType: row.source_type,
+      sourceRef: row.source_ref || '',
+      description: row.description || '',
+      durationType: row.duration_type || '',
+      durationRounds: row.duration_rounds,
+      requiresConcentration: row.requires_concentration,
+      isCondition: row.is_condition,
+      modifiers: modifiersByEffect.get(row.id) ?? []
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function getActiveEffects(characterId: string): Promise<CharacterDetail['activeEffects']> {
+  const definitions = await listEffectDefinitions();
+  const byId = new Map(definitions.map((definition) => [definition.id, definition]));
+  try {
+    const active = await query<{
+      id: string;
+      effect_id: string;
+      remaining_rounds: number | null;
+    }>(
+      `
+        SELECT id, effect_id, remaining_rounds
+        FROM active_character_effects
+        WHERE character_id = $1
+      `,
+      [characterId]
+    );
+
+    return active.rows
+      .map((row) => {
+        const definition = byId.get(row.effect_id);
+        if (!definition) return null;
+        return {
+          id: row.id,
+          effectId: row.effect_id,
+          effectKey: definition.key,
+          name: definition.name,
+          sourceType: definition.sourceType,
+          description: definition.description,
+          durationType: definition.durationType,
+          requiresConcentration: definition.requiresConcentration,
+          isCondition: definition.isCondition,
+          remainingRounds: row.remaining_rounds,
+          modifiers: definition.modifiers
+        };
+      })
+      .filter((effect): effect is CharacterDetail['activeEffects'][number] => Boolean(effect));
+  } catch {
+    return [];
+  }
+}
+
+async function getExhaustionLevel(characterId: string): Promise<number> {
+  try {
+    const result = await query<{ exhaustion_level: number }>(
+      'SELECT exhaustion_level FROM character_exhaustion WHERE character_id = $1',
+      [characterId]
+    );
+    return result.rows[0]?.exhaustion_level ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function replaceClasses(client: pg.PoolClient, characterId: string, classes: CharacterClass[]): Promise<void> {
   await client.query('DELETE FROM character_classes WHERE character_id = $1', [characterId]);
   for (const [index, row] of classes.entries()) {
@@ -645,6 +809,37 @@ async function replaceNotes(client: pg.PoolClient, characterId: string, notes: C
   }
 }
 
+async function replaceActiveEffects(client: pg.PoolClient, characterId: string, effectKeys: string[]): Promise<void> {
+  await client.query('DELETE FROM active_character_effects WHERE character_id = $1', [characterId]);
+  const uniqueKeys = [...new Set(effectKeys.map((key) => key.trim()).filter(Boolean))];
+  for (const key of uniqueKeys) {
+    await client.query(
+      `
+        INSERT INTO active_character_effects (character_id, effect_id)
+        SELECT $1, id
+        FROM effect_definitions
+        WHERE effect_key = $2
+        ON CONFLICT (character_id, effect_id) DO NOTHING
+      `,
+      [characterId, key]
+    );
+  }
+}
+
+async function setExhaustionLevel(client: pg.PoolClient, characterId: string, level: number): Promise<void> {
+  const exhaustionLevel = Math.min(6, Math.max(0, Number(level) || 0));
+  await client.query(
+    `
+      INSERT INTO character_exhaustion (character_id, exhaustion_level, updated_at)
+      VALUES ($1, $2, now())
+      ON CONFLICT (character_id) DO UPDATE
+      SET exhaustion_level = EXCLUDED.exhaustion_level,
+          updated_at = now()
+    `,
+    [characterId, exhaustionLevel]
+  );
+}
+
 function parseClasses(form: FormData): CharacterClass[] {
   const className = String(form.get('className') || 'Fighter').trim() || 'Fighter';
   const level = Math.max(1, Number(form.get('level')) || 1);
@@ -735,6 +930,10 @@ function parseAttacks(form: FormData): CharacterAttack[] {
 
 function parseMetadata(form: FormData): Record<string, string> {
   return Object.fromEntries(metadataFields.map((field) => [field, String(form.get(field) || '').trim()]));
+}
+
+function parseActiveEffectKeys(form: FormData): string[] {
+  return form.getAll('activeEffectKey').map((value) => String(value).trim()).filter(Boolean);
 }
 
 function parseNotes(form: FormData): CharacterNote[] {
