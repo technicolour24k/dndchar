@@ -621,6 +621,7 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
       `
         SELECT id, effect_key, name, source_type, source_ref, description, duration_type, duration_rounds, requires_concentration, is_condition
         FROM effect_definitions
+        WHERE is_selectable = true
         ORDER BY is_condition DESC, sort_order ASC, name ASC
       `
     );

@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { abilityModifier, clampResource, proficiencyBonus, skillModifier, totalLevel } from './dnd5e';
+import {
+  abilityModifier,
+  barbarianRageDamageBonus,
+  clampResource,
+  proficiencyBonus,
+  resolvedFlatBonuses,
+  skillModifier,
+  totalLevel
+} from './dnd5e';
+import type { ActiveCharacterEffect } from '$lib/types/character';
 
 describe('D&D 5e helpers', () => {
   it('calculates ability modifiers', () => {
@@ -25,5 +34,44 @@ describe('D&D 5e helpers', () => {
   it('clamps resource values', () => {
     expect(clampResource(12, 10)).toBe(10);
     expect(clampResource(-3, 10)).toBe(0);
+  });
+
+  it('calculates barbarian rage damage bonus by barbarian level', () => {
+    expect(barbarianRageDamageBonus([{ className: 'Barbarian', level: 1 }])).toBe(2);
+    expect(barbarianRageDamageBonus([{ className: 'Barbarian', level: 9 }])).toBe(3);
+    expect(barbarianRageDamageBonus([{ className: 'Barbarian', level: 16 }])).toBe(4);
+    expect(barbarianRageDamageBonus([{ className: 'Fighter', level: 16 }])).toBe(0);
+  });
+
+  it('resolves active effect flat bonuses from modifier targets', () => {
+    const rage: ActiveCharacterEffect = {
+      id: 'active-rage',
+      effectId: 'rage',
+      effectKey: 'rage',
+      name: 'Rage',
+      sourceType: 'class_feature',
+      description: '',
+      durationType: 'timed',
+      requiresConcentration: false,
+      isCondition: false,
+      remainingRounds: null,
+      modifiers: [
+        {
+          target: 'damage_roll.melee_weapon.str',
+          modifierType: 'bonus',
+          valueExpression: 'rage_damage_bonus',
+          conditionExpression: '',
+          priority: 0
+        }
+      ]
+    };
+
+    expect(
+      resolvedFlatBonuses([rage], ['damage_roll.melee_weapon.str'], {
+        classes: [{ className: 'Barbarian', level: 9 }],
+        attackType: 'melee_weapon',
+        ability: 'str'
+      })
+    ).toEqual([{ label: 'Rage', value: 3 }]);
   });
 });

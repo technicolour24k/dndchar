@@ -1,6 +1,6 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
-  import { abilityMap, abilityModifier, proficiencyBonus, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, proficiencyBonus, resolvedFlatBonuses, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
 
   let {
@@ -211,7 +211,8 @@
       .map((roll) => roll.trim())
       .filter(Boolean);
     const ability = abilityModifier(abilityScores[item.attackAbility]);
-    const flatBonus = Number(item.damageBonus || 0) + ability;
+    const modifierBonuses = battleDamageBonuses(item).reduce((sum, bonus) => sum + bonus.value, 0);
+    const flatBonus = Number(item.damageBonus || 0) + ability + modifierBonuses;
     let summary = rolls.join(' + ');
     if (flatBonus) {
       summary = summary ? `${summary} ${flatBonus > 0 ? '+' : '-'} ${Math.abs(flatBonus)}` : String(flatBonus);
@@ -223,7 +224,7 @@
     return Math.floor(Math.random() * sides) + 1;
   }
 
-  function rollDamageExpression(expression: string, bonus: number, abilityBonus = 0, abilityLabel = '') {
+  function rollDamageExpression(expression: string, bonus: number, abilityBonus = 0, abilityLabel = '', modifierBonuses: Array<{ label: string; value: number }> = []) {
     const parts = expression
       .split('+')
       .map((part) => part.trim())
@@ -260,6 +261,11 @@
       lines.push(`${abilityLabel} Modifier: ${signed(abilityBonus)} = ${total}`);
     }
 
+    for (const modifierBonus of modifierBonuses) {
+      total += modifierBonus.value;
+      lines.push(`${modifierBonus.label}: ${signed(modifierBonus.value)} = ${total}`);
+    }
+
     lines.push(`Total: ${total}`);
 
     return {
@@ -268,12 +274,29 @@
     };
   }
 
+  function battleDamageBonuses(item: InventoryItem) {
+    const canBeMeleeWeaponAttack = ['weapon', 'shield'].includes(item.category) && item.attackAbility === 'str';
+    const candidates = [
+      'damage_roll.all',
+      'damage_roll.weapon',
+      item.attackAbility ? `damage_roll.weapon.${item.attackAbility}` : '',
+      canBeMeleeWeaponAttack ? 'damage_roll.melee_weapon' : '',
+      canBeMeleeWeaponAttack ? `damage_roll.melee_weapon.${item.attackAbility}` : ''
+    ].filter(Boolean);
+
+    return resolvedFlatBonuses(character.activeEffects, candidates, {
+      classes: character.classes,
+      attackType: 'melee_weapon',
+      ability: item.attackAbility
+    });
+  }
+
   function rollBattleAction(item: InventoryItem) {
     const d20 = rollDie(20);
     const ability = abilityModifier(abilityScores[item.attackAbility]);
     const attackBonus = ability + prof + Number(item.toHitBonus || 0);
     const attackTotal = d20 + attackBonus;
-    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase());
+    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item));
 
     rollResult = {
       title: item.name || 'Battle Action',

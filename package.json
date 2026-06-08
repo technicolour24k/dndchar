@@ -11,7 +11,9 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "db:migrate": "tsx scripts/migrate.ts",
-    "db:seed:user": "tsx scripts/seed-user.ts"
+    "db:seed:user": "tsx scripts/seed-user.ts",
+    "db:import:srd-effects": "tsx scripts/import-srd-effects.ts",
+    "db:trim:effects": "tsx scripts/trim-effect-catalog.ts"
   },
   "dependencies": {
     "@sveltejs/adapter-node": "^5.2.12",
