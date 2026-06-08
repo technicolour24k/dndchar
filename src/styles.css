@@ -65,6 +65,23 @@ button.text-button:hover {
   color: var(--text);
 }
 
+button.compact-button,
+button.qty-button {
+  min-height: 34px;
+  border-radius: 7px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+button.compact-button.danger {
+  color: var(--danger);
+}
+
+button.qty-button {
+  width: 34px;
+  padding: 0;
+}
+
 button:hover,
 .button-link:hover {
   background: #000;
@@ -201,6 +218,10 @@ label.inline input {
   gap: 16px;
   align-items: center;
   margin-bottom: 16px;
+}
+
+.panel-head.compact-head {
+  margin-bottom: 0;
 }
 
 .page-head {
@@ -366,7 +387,7 @@ label.inline input {
 
 .action-row {
   display: grid;
-  grid-template-columns: minmax(150px, 1.2fr) 70px 80px minmax(140px, 1fr) minmax(120px, 1fr);
+  grid-template-columns: minmax(140px, 1.2fr) 70px 80px minmax(150px, 1fr) minmax(120px, 1fr) max-content;
   gap: 10px;
   align-items: center;
   border-radius: 8px;
@@ -396,7 +417,7 @@ label.inline input {
 
 .inventory-layout {
   display: grid;
-  grid-template-columns: minmax(360px, 2fr) minmax(360px, 2fr) minmax(240px, 1fr);
+  grid-template-columns: minmax(0, 1.65fr) minmax(0, 1.45fr) minmax(220px, .8fr);
   gap: 20px;
   align-items: start;
 }
@@ -412,16 +433,30 @@ label.inline input {
 
 .inventory-row {
   display: grid;
-  grid-template-columns: repeat(auto-fill, 100px);
-  gap: 10px;
+  gap: 8px;
   align-items: end;
   border-radius: 8px;
-  padding: 12px;
+  padding: 10px;
   background: var(--panel-dark);
 }
 
+.inventory-row-main,
+.inventory-row-combat {
+  display: grid;
+  gap: 10px;
+  align-items: end;
+}
+
+.inventory-row-main {
+  grid-template-columns: minmax(140px, 1fr) minmax(120px, .85fr) 160px;
+}
+
+.inventory-row-combat {
+  grid-template-columns: 56px 64px 84px 76px minmax(120px, 1fr) minmax(110px, 1fr) minmax(110px, 1fr);
+}
+
 .inventory-row.simple {
-  grid-template-columns: repeat(auto-fill, 100px);
+  grid-template-columns: minmax(130px, 1.2fr) minmax(112px, .8fr) 148px minmax(110px, 1fr);
 }
 
 .inventory-row.misc-row {
@@ -440,6 +475,78 @@ label.inline input {
   padding: 6px 8px;
 }
 
+.tiny-field input {
+  max-width: 64px;
+}
+
+.equipment-state {
+  display: grid;
+  place-items: center;
+  min-height: 34px;
+}
+
+.qty-control {
+  display: grid;
+  grid-template-columns: 28px minmax(52px, 1fr) 28px;
+  gap: 4px;
+  align-items: center;
+}
+
+.qty-control input {
+  text-align: center;
+}
+
+.qty-equipment-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+  align-items: end;
+}
+
+button.equipment-toggle {
+  width: 34px;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px;
+  background: var(--field);
+}
+
+button.equipment-toggle:hover {
+  background: #000;
+}
+
+button.equipment-toggle.active {
+  border-color: #6d5728;
+  background: #1e1a10;
+}
+
+button.equipment-toggle .item-kind-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+  grid-column: 1 / -1;
+  justify-content: end;
+}
+
+.inline-notice {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: #181818;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .inventory-flag {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 24px;
@@ -452,11 +559,11 @@ label.inline input {
   width: 22px;
   height: 22px;
   background: #656565;
-  mask-image: url("../assets/images/equipment.svg");
+  mask-image: url("/images/equipment.svg");
   mask-position: center;
   mask-repeat: no-repeat;
   mask-size: contain;
-  -webkit-mask-image: url("../assets/images/equipment.svg");
+  -webkit-mask-image: url("/images/equipment.svg");
   -webkit-mask-position: center;
   -webkit-mask-repeat: no-repeat;
   -webkit-mask-size: contain;
@@ -464,6 +571,17 @@ label.inline input {
 
 .item-kind-icon.active {
   background: #d7ad4a;
+}
+
+.coin-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 78px);
+  gap: 10px 14px;
+}
+
+.coin-grid input {
+  min-height: 34px;
+  padding: 6px 8px;
 }
 
 .hidden-save-fields {
@@ -588,13 +706,13 @@ button.death-save-icon:hover {
 }
 
 button.death-save-icon.success {
-  mask-image: url("../assets/images/death-save-success.svg");
-  -webkit-mask-image: url("../assets/images/death-save-success.svg");
+  mask-image: url("/images/death-save-success.svg");
+  -webkit-mask-image: url("/images/death-save-success.svg");
 }
 
 button.death-save-icon.failure {
-  mask-image: url("../assets/images/death-save-fail.svg");
-  -webkit-mask-image: url("../assets/images/death-save-fail.svg");
+  mask-image: url("/images/death-save-fail.svg");
+  -webkit-mask-image: url("/images/death-save-fail.svg");
 }
 
 button.death-save-icon.success.active {
@@ -719,6 +837,30 @@ button.death-save-icon.failure.active {
   box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
 }
 
+.item-modal {
+  width: min(780px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  overflow: auto;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+}
+
+.new-item-grid {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(130px, .8fr) 104px minmax(120px, .8fr) 110px;
+  gap: 10px;
+  align-items: end;
+}
+
+.new-item-grid label:nth-last-child(-n + 3) {
+  grid-column: span 2;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: end;
+  margin-top: 14px;
+}
+
 .check-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -749,6 +891,34 @@ button.death-save-icon.failure.active {
   font-weight: 900;
 }
 
+.roll-result {
+  display: grid;
+  gap: 10px;
+}
+
+.roll-result > div {
+  display: grid;
+  gap: 4px;
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel-dark);
+}
+
+.roll-result span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.roll-result strong {
+  font-size: 15px;
+}
+
+.damage-lines {
+  display: grid;
+  gap: 3px;
+}
+
 .version-list {
   max-height: 560px;
   overflow: auto;
@@ -766,6 +936,18 @@ button.death-save-icon.failure.active {
   .battle-main-row,
   .inventory-layout {
     grid-template-columns: 1fr;
+  }
+
+  .inventory-row-main,
+  .inventory-row-combat,
+  .new-item-grid,
+  .inventory-row.simple,
+  .action-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .action-row.header {
+    display: none;
   }
 
   .battle-top-row {
@@ -817,7 +999,20 @@ button.death-save-icon.failure.active {
 
   .compact-ability-grid,
   .check-list,
-  .skill-list {
+  .skill-list,
+  .inventory-row-main,
+  .inventory-row-combat,
+  .new-item-grid,
+  .inventory-row.simple,
+  .action-row {
     grid-template-columns: 1fr;
+  }
+
+  .row-actions {
+    justify-content: stretch;
+  }
+
+  .row-actions button {
+    flex: 1;
   }
 }

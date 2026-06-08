@@ -11,6 +11,7 @@ import type {
   CharacterNote,
   CharacterResource,
   CharacterVersion,
+  ItemCategory,
   InventoryItem
 } from '$lib/types/character';
 
@@ -214,6 +215,28 @@ export async function getCharacter(userId: string, characterId: string): Promise
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId)
   });
+}
+
+export async function listItemCategories(): Promise<ItemCategory[]> {
+  try {
+    const result = await query<{ key: string; label: string }>(
+      'SELECT key, label FROM item_categories ORDER BY sort_order ASC, label ASC'
+    );
+    return result.rows;
+  } catch {
+    return [
+      { key: 'weapon', label: 'Weapon' },
+      { key: 'armor', label: 'Armor' },
+      { key: 'shield', label: 'Shield' },
+      { key: 'focus', label: 'Spell Focus' },
+      { key: 'consumable', label: 'Consumable' },
+      { key: 'tool', label: 'Tool' },
+      { key: 'gear', label: 'Adventuring Gear' },
+      { key: 'treasure', label: 'Treasure' },
+      { key: 'junk', label: 'Junk' },
+      { key: 'misc', label: 'Misc' }
+    ];
+  }
 }
 
 export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<void> {
@@ -590,7 +613,7 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
 async function replaceInventory(client: pg.PoolClient, characterId: string, inventory: InventoryItem[]): Promise<void> {
   await client.query('DELETE FROM character_inventory_items WHERE character_id = $1', [characterId]);
   for (const [index, row] of inventory.entries()) {
-    if (!row.name.trim()) continue;
+    if (!row.name.trim() || Number(row.quantity) <= 0) continue;
     await client.query(
       `
         INSERT INTO character_inventory_items
@@ -713,7 +736,7 @@ function parseInventory(form: FormData): InventoryItem[] {
         notes: notes[index] || ''
       };
     })
-    .filter((item) => item.name.trim());
+    .filter((item) => item.name.trim() && item.quantity > 0);
 }
 
 function normalizeInventoryLocation(value: string | undefined, equipped: boolean): 'equipped' | 'backpack' | 'misc' {

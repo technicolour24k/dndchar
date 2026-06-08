@@ -35,6 +35,11 @@ export type InventoryItem = {
   notes: string;
 };
 
+export type ItemCategory = {
+  key: string;
+  label: string;
+};
+
 export type CharacterAttack = {
   id?: string;
   name: string;
