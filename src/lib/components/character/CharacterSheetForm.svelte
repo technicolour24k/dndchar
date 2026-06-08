@@ -85,7 +85,7 @@
   let selectedEffectKeys = $state<string[]>([]);
   let selectedExhaustionLevel = $state(0);
   let modifierSearch = $state('');
-  let modifierFilter = $state<'active' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
+  let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all' | 'catalogue'>('active');
   let newItemOpen = $state(false);
   let newItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
   let rollResult = $state<{
@@ -98,12 +98,15 @@
   const autosaveIntervalMs = 30_000;
   const modifierFilters = [
     { key: 'active', label: 'Active' },
+    { key: 'automated', label: 'Automated' },
+    { key: 'potential', label: 'Potential' },
     { key: 'condition', label: 'Conditions' },
     { key: 'spell', label: 'Spells' },
     { key: 'combat', label: 'Combat' },
     { key: 'class_feature', label: 'Class' },
     { key: 'environment', label: 'Environment' },
-    { key: 'all', label: 'All' }
+    { key: 'all', label: 'All' },
+    { key: 'catalogue', label: 'Catalogue' }
   ] as const;
   const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
   const skillChecks: Array<{ name: string; ability: AbilityKey }> = [
@@ -142,13 +145,16 @@
         .toLowerCase()
         .includes(query);
       const matchesFilter =
-        modifierFilter === 'all' ||
+        (modifierFilter === 'all' && effect.isSelectable) ||
+        modifierFilter === 'catalogue' ||
         (modifierFilter === 'active' && selectedEffectKeys.includes(effect.key)) ||
-        (modifierFilter === 'condition' && effect.isCondition) ||
-        (modifierFilter === 'spell' && effect.sourceType === 'spell') ||
-        (modifierFilter === 'combat' && effect.sourceType === 'combat_state') ||
-        (modifierFilter === 'class_feature' && effect.sourceType === 'class_feature') ||
-        (modifierFilter === 'environment' && effect.sourceType === 'environment');
+        (modifierFilter === 'automated' && effect.modifiers.length > 0) ||
+        (modifierFilter === 'potential' && effect.modifiers.length === 0 && !effect.isSelectable) ||
+        (modifierFilter === 'condition' && effect.isCondition && effect.isSelectable) ||
+        (modifierFilter === 'spell' && effect.sourceType === 'spell' && effect.isSelectable) ||
+        (modifierFilter === 'combat' && effect.sourceType === 'combat_state' && effect.isSelectable) ||
+        (modifierFilter === 'class_feature' && effect.sourceType === 'class_feature' && effect.isSelectable) ||
+        (modifierFilter === 'environment' && effect.sourceType === 'environment' && effect.isSelectable);
 
       return matchesSearch && matchesFilter;
     })
@@ -1018,6 +1024,7 @@
                     <b>
                       {effect.isCondition ? 'Condition' : effect.sourceType.replace('_', ' ')}
                       {effect.requiresConcentration ? ' - Concentration' : ''}
+                      {effect.modifiers.length ? ' - Automated' : effect.isSelectable ? ' - Trackable' : ' - Catalogue'}
                     </b>
                     {#if effect.modifiers.length}
                       <em>{effect.modifiers.map((modifier) => `${modifier.target}: ${modifier.modifierType}${modifier.valueExpression ? ` ${modifier.valueExpression}` : ''}`).join(', ')}</em>

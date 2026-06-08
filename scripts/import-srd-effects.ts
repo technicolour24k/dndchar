@@ -46,11 +46,16 @@ const pool = new pg.Pool({
 
 function effectKey(endpoint: (typeof endpoints)[number], index: string) {
   if (endpoint === 'conditions') return `condition_${index.replaceAll('-', '_')}`;
+  if (endpoint === 'features' && index.includes('ability-score-improvement')) return 'feature_ability_score_improvement';
   if (endpoint === 'features' && index === 'rage') return 'rage';
   if (endpoint === 'spells' && index === 'bless') return 'bless';
   if (endpoint === 'spells' && index === 'haste') return 'haste';
   if (endpoint === 'spells' && index === 'shield') return 'shield_spell';
   return `${endpoint.slice(0, -1)}_${index.replaceAll('-', '_')}`;
+}
+
+function sourceRef(endpoint: (typeof endpoints)[number], index: string) {
+  return `${endpoint}.${index}`;
 }
 
 function sourceType(endpoint: (typeof endpoints)[number]) {
@@ -130,7 +135,7 @@ function isSelectableModifier(endpoint: (typeof endpoints)[number], detail: ApiD
   const key = effectKey(endpoint, detail.index);
   if (alwaysSelectableKeys.has(key)) return true;
   if (endpoint === 'conditions') return true;
-  if (neverSelectableIndexes.has(detail.index)) return false;
+  if (neverSelectableIndexes.has(detail.index) || detail.index.includes('ability-score-improvement')) return false;
 
   const description = detail.desc?.join('\n').toLowerCase() || '';
   if (endpoint === 'spells') {
@@ -191,6 +196,7 @@ async function importEndpoint(endpoint: (typeof endpoints)[number]) {
   for (const item of list.results) {
     if (requestDelayMs) await sleep(requestDelayMs);
     const detail = await fetchJson<ApiDetail>(`${apiBase}/${endpoint}/${item.index}`);
+    const key = effectKey(endpoint, detail.index);
     await pool.query(
       `
         INSERT INTO effect_definitions (
@@ -217,10 +223,10 @@ async function importEndpoint(endpoint: (typeof endpoints)[number]) {
             is_selectable = EXCLUDED.is_selectable
       `,
       [
-        effectKey(endpoint, detail.index),
+        key,
         detail.name,
         sourceType(endpoint),
-        `${endpoint}.${detail.index}`,
+        sourceRef(endpoint, detail.index),
         detail.desc?.join('\n\n') || '',
         durationType(detail),
         Boolean(detail.concentration),
@@ -240,7 +246,18 @@ async function importEndpoint(endpoint: (typeof endpoints)[number]) {
             WHERE effect_modifiers.effect_id = effect_definitions.id
           )
       `,
-      [effectKey(endpoint, detail.index)]
+      [key]
+    );
+    await pool.query(
+      `
+        INSERT INTO effect_sources (effect_id, source_type, source_ref, source_name)
+        SELECT id, $2, $3, $4
+        FROM effect_definitions
+        WHERE effect_key = $1
+        ON CONFLICT (effect_id, source_ref) DO UPDATE
+        SET source_name = EXCLUDED.source_name
+      `,
+      [key, sourceType(endpoint), sourceRef(endpoint, detail.index), detail.name]
     );
     imported += 1;
   }

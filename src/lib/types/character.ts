@@ -59,6 +59,7 @@ export type EffectDefinition = {
   durationRounds: number | null;
   requiresConcentration: boolean;
   isCondition: boolean;
+  isSelectable: boolean;
   modifiers: EffectModifier[];
 };
 
@@ -72,6 +73,7 @@ export type ActiveCharacterEffect = {
   durationType: string;
   requiresConcentration: boolean;
   isCondition: boolean;
+  isSelectable: boolean;
   remainingRounds: number | null;
   modifiers: EffectModifier[];
 };

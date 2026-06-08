@@ -18,6 +18,72 @@ async function main() {
       ADD COLUMN IF NOT EXISTS is_selectable boolean NOT NULL DEFAULT true
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS effect_sources (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      effect_id uuid NOT NULL REFERENCES effect_definitions(id) ON DELETE CASCADE,
+      source_type text NOT NULL,
+      source_ref text NOT NULL,
+      source_name text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(effect_id, source_ref)
+    )
+  `);
+
+  await pool.query(`
+    INSERT INTO effect_definitions (
+      effect_key,
+      name,
+      source_type,
+      source_ref,
+      description,
+      duration_type,
+      requires_concentration,
+      is_condition,
+      is_selectable,
+      sort_order
+    )
+    VALUES (
+      'feature_ability_score_improvement',
+      'Ability Score Improvement',
+      'class_feature',
+      'feature.ability-score-improvement',
+      'When eligible, increase one ability score by 2 or two ability scores by 1, subject to the normal maximum.',
+      'permanent',
+      false,
+      false,
+      false,
+      900
+    )
+    ON CONFLICT (effect_key) DO UPDATE
+    SET name = EXCLUDED.name,
+        description = EXCLUDED.description,
+        is_selectable = false
+  `);
+
+  await pool.query(`
+    INSERT INTO effect_sources (effect_id, source_type, source_ref, source_name)
+    SELECT canonical.id, duplicates.source_type, duplicates.source_ref, duplicates.name
+    FROM effect_definitions duplicates
+    CROSS JOIN effect_definitions canonical
+    WHERE canonical.effect_key = 'feature_ability_score_improvement'
+      AND duplicates.source_ref LIKE 'features.%ability-score-improvement%'
+    ON CONFLICT (effect_id, source_ref) DO UPDATE
+    SET source_name = EXCLUDED.source_name
+  `);
+
+  await pool.query(`
+    UPDATE effect_definitions
+    SET is_selectable = false
+    WHERE source_ref LIKE 'features.%ability-score-improvement%'
+      AND effect_key <> 'feature_ability_score_improvement'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM effect_modifiers
+        WHERE effect_modifiers.effect_id = effect_definitions.id
+      )
+  `);
+
   const result = await pool.query(`
     WITH classified AS (
       SELECT

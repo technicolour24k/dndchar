@@ -617,25 +617,18 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
       duration_rounds: number | null;
       requires_concentration: boolean;
       is_condition: boolean;
+      is_selectable: boolean;
     }>(
       `
-        SELECT id, effect_key, name, source_type, source_ref, description, duration_type, duration_rounds, requires_concentration, is_condition
+        SELECT id, effect_key, name, source_type, source_ref, description, duration_type, duration_rounds, requires_concentration, is_condition, COALESCE(is_selectable, true) AS is_selectable
         FROM effect_definitions
-        WHERE is_selectable = true
         ORDER BY is_condition DESC, sort_order ASC, name ASC
       `
     );
 
-    const modifiers = await query<{
-      effect_id: string;
-      target: string;
-      modifier_type: string;
-      value_expression: string;
-      condition_expression: string;
-      priority: number;
-    }>('SELECT effect_id, target, modifier_type, value_expression, condition_expression, priority FROM effect_modifiers ORDER BY priority ASC, target ASC');
+    const modifiers = await listEffectModifiers();
     const modifiersByEffect = new Map<string, EffectModifier[]>();
-    for (const row of modifiers.rows) {
+    for (const row of modifiers) {
       const list = modifiersByEffect.get(row.effect_id) ?? [];
       list.push({
         target: row.target,
@@ -658,10 +651,55 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
       durationRounds: row.duration_rounds,
       requiresConcentration: row.requires_concentration,
       isCondition: row.is_condition,
+      isSelectable: row.is_selectable,
       modifiers: modifiersByEffect.get(row.id) ?? []
     }));
   } catch {
     return [];
+  }
+}
+
+async function listEffectModifiers(): Promise<Array<{
+  effect_id: string;
+  target: string;
+  modifier_type: string;
+  value_expression: string;
+  condition_expression: string;
+  priority: number;
+}>> {
+  try {
+    const result = await query<{
+      effect_id: string;
+      target: string;
+      modifier_type: string;
+      value_expression: string;
+      condition_expression: string;
+      priority: number;
+    }>(
+      `
+        SELECT
+          effect_modifier_links.effect_id,
+          modifier_definitions.target,
+          modifier_definitions.modifier_type,
+          modifier_definitions.value_expression,
+          effect_modifier_links.condition_expression,
+          effect_modifier_links.priority
+        FROM effect_modifier_links
+        JOIN modifier_definitions ON modifier_definitions.id = effect_modifier_links.modifier_id
+        ORDER BY effect_modifier_links.priority ASC, modifier_definitions.target ASC
+      `
+    );
+    return result.rows;
+  } catch {
+    const result = await query<{
+      effect_id: string;
+      target: string;
+      modifier_type: string;
+      value_expression: string;
+      condition_expression: string;
+      priority: number;
+    }>('SELECT effect_id, target, modifier_type, value_expression, condition_expression, priority FROM effect_modifiers ORDER BY priority ASC, target ASC');
+    return result.rows;
   }
 }
 
@@ -696,6 +734,7 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
           durationType: definition.durationType,
           requiresConcentration: definition.requiresConcentration,
           isCondition: definition.isCondition,
+          isSelectable: definition.isSelectable,
           remainingRounds: row.remaining_rounds,
           modifiers: definition.modifiers
         };

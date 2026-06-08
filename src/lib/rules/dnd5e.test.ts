@@ -54,6 +54,7 @@ describe('D&D 5e helpers', () => {
       durationType: 'timed',
       requiresConcentration: false,
       isCondition: false,
+      isSelectable: true,
       remainingRounds: null,
       modifiers: [
         {
