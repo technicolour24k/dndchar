@@ -754,7 +754,7 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
 async function replaceInventory(client: pg.PoolClient, characterId: string, inventory: InventoryItem[]): Promise<void> {
   await client.query('DELETE FROM character_inventory_items WHERE character_id = $1', [characterId]);
   for (const [index, row] of inventory.entries()) {
-    if (!row.name.trim()) continue;
+    if (!row.name.trim() || Number(row.quantity) <= 0) continue;
     await client.query(
       `
         INSERT INTO character_inventory_items
@@ -908,7 +908,7 @@ function parseInventory(form: FormData): InventoryItem[] {
         notes: notes[index] || ''
       };
     })
-    .filter((item) => item.name.trim());
+    .filter((item) => item.name.trim() && item.quantity > 0);
 }
 
 function normalizeInventoryLocation(value: string | undefined, equipped: boolean): 'equipped' | 'backpack' | 'misc' {

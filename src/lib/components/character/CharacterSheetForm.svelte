@@ -1,14 +1,16 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
   import { abilityMap, abilityModifier, proficiencyBonus, totalLevel } from '$lib/rules/dnd5e';
-  import type { AbilityKey, CharacterDetail, InventoryItem } from '$lib/types/character';
+  import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
 
   let {
     character,
+    itemCategories = [],
     result,
     onVersionHistory
   }: {
     character: CharacterDetail;
+    itemCategories?: ItemCategory[];
     result?: Record<string, unknown>;
     onVersionHistory?: () => void;
   } = $props();
@@ -39,22 +41,26 @@
     abilityBonuses: {},
     notes: ''
   };
-  const inventoryRows = $derived(character.inventory.length ? character.inventory : [emptyInventoryItem]);
-  const equippedInventoryRows = $derived([
-    ...inventoryRows.filter((item) => item.location === 'equipped' || item.equipped),
-    { ...emptyInventoryItem, location: 'equipped' as const, equipped: true },
-    { ...emptyInventoryItem, location: 'equipped' as const, equipped: true }
+  const categoryOptions = $derived(itemCategories.length ? itemCategories : [
+    { key: 'weapon', label: 'Weapon' },
+    { key: 'armor', label: 'Armor' },
+    { key: 'shield', label: 'Shield' },
+    { key: 'focus', label: 'Spell Focus' },
+    { key: 'consumable', label: 'Consumable' },
+    { key: 'tool', label: 'Tool' },
+    { key: 'gear', label: 'Adventuring Gear' },
+    { key: 'treasure', label: 'Treasure' },
+    { key: 'junk', label: 'Junk' },
+    { key: 'misc', label: 'Misc' }
   ]);
-  const backpackInventoryRows = $derived([
-    ...inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped),
-    { ...emptyInventoryItem, location: 'backpack' as const },
-    { ...emptyInventoryItem, location: 'backpack' as const },
-    { ...emptyInventoryItem, location: 'backpack' as const }
-  ]);
-  const miscInventoryRows = $derived([
-    ...inventoryRows.filter((item) => item.location === 'misc'),
-    { ...emptyInventoryItem, category: 'misc', location: 'misc' as const }
-  ]);
+  const inventoryRows = $derived(character.inventory);
+  const equippedInventoryRows = $derived(
+    inventoryRows.filter((item) => item.location === 'equipped' || item.equipped)
+  );
+  const backpackInventoryRows = $derived(
+    inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
+  );
+  const miscInventoryRows = $derived(inventoryRows.filter((item) => item.location === 'misc'));
   const battleActionItems = $derived(
     inventoryRows.filter((item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus))
   );
@@ -80,6 +86,15 @@
   let selectedExhaustionLevel = $state(0);
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
+  let newItemOpen = $state(false);
+  let newItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
+  let rollResult = $state<{
+    title: string;
+    attack: string;
+    damage: string[];
+    effects: string;
+  } | null>(null);
+  let inventoryMessage = $state<string | null>(null);
   const autosaveIntervalMs = 30_000;
   const modifierFilters = [
     { key: 'active', label: 'Active' },
@@ -153,6 +168,16 @@
       : [...selectedEffectKeys, key];
   }
 
+  function categoryOptionsFor(category: string) {
+    if (!category || categoryOptions.some((option) => option.key === category)) return categoryOptions;
+    return [...categoryOptions, { key: category, label: category }];
+  }
+
+  function openNewItem(location: 'equipped' | 'backpack' | 'misc') {
+    newItemLocation = location;
+    newItemOpen = true;
+  }
+
   function clampDeathSave(value: unknown) {
     return Math.min(3, Math.max(0, Number(value) || 0));
   }
@@ -185,10 +210,131 @@
       .split('+')
       .map((roll) => roll.trim())
       .filter(Boolean);
-    const parts = [...rolls];
-    if (item.damageBonus) parts.push(signed(item.damageBonus));
-    if (item.effects) parts.push(item.effects);
-    return parts.join(' + ') || 'No damage';
+    const ability = abilityModifier(abilityScores[item.attackAbility]);
+    const flatBonus = Number(item.damageBonus || 0) + ability;
+    let summary = rolls.join(' + ');
+    if (flatBonus) {
+      summary = summary ? `${summary} ${flatBonus > 0 ? '+' : '-'} ${Math.abs(flatBonus)}` : String(flatBonus);
+    }
+    return summary || 'No damage';
+  }
+
+  function rollDie(sides: number) {
+    return Math.floor(Math.random() * sides) + 1;
+  }
+
+  function rollDamageExpression(expression: string, bonus: number, abilityBonus = 0, abilityLabel = '') {
+    const parts = expression
+      .split('+')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const lines: string[] = [];
+    let total = 0;
+
+    for (const part of parts) {
+      const dice = part.match(/^(\d*)d(\d+)$/i);
+      if (dice) {
+        const count = Math.max(1, Number(dice[1]) || 1);
+        const sides = Math.max(1, Number(dice[2]) || 1);
+        const rolls = Array.from({ length: count }, () => rollDie(sides));
+        const subtotal = rolls.reduce((sum, roll) => sum + roll, 0);
+        total += subtotal;
+        lines.push(`${part}: ${rolls.join(', ')} = ${total}`);
+        continue;
+      }
+
+      const flat = Number(part);
+      if (Number.isFinite(flat)) {
+        total += flat;
+        lines.push(`${flat >= 0 ? '+' : '-'}${Math.abs(flat)} = ${total}`);
+      }
+    }
+
+    if (bonus) {
+      total += bonus;
+      lines.push(`Weapon: ${signed(bonus)} = ${total}`);
+    }
+
+    if (abilityBonus) {
+      total += abilityBonus;
+      lines.push(`${abilityLabel} Modifier: ${signed(abilityBonus)} = ${total}`);
+    }
+
+    lines.push(`Total: ${total}`);
+
+    return {
+      total,
+      lines: lines.length ? lines : ['No damage dice', 'Total: 0']
+    };
+  }
+
+  function rollBattleAction(item: InventoryItem) {
+    const d20 = rollDie(20);
+    const ability = abilityModifier(abilityScores[item.attackAbility]);
+    const attackBonus = ability + prof + Number(item.toHitBonus || 0);
+    const attackTotal = d20 + attackBonus;
+    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase());
+
+    rollResult = {
+      title: item.name || 'Battle Action',
+      attack: `d20 ${d20} ${attackBonus >= 0 ? '+' : '-'} ${Math.abs(attackBonus)} = ${attackTotal} (beats AC ${attackTotal} or below)`,
+      damage: damage.lines,
+      effects: item.effects || item.notes || '-'
+    };
+  }
+
+  function findInventoryRow(event: MouseEvent) {
+    return (event.currentTarget as HTMLElement).closest<HTMLElement>('.inventory-row, .new-item-grid');
+  }
+
+  function setInventoryQuantity(event: MouseEvent, quantity: number) {
+    const input = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryQuantity"]');
+    if (!input) return;
+    input.value = String(Math.max(0, quantity));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function adjustInventoryQuantity(event: MouseEvent, delta: number) {
+    const input = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryQuantity"]');
+    if (!input) return;
+    const next = Math.max(0, (Number(input.value) || 0) + delta);
+    input.value = String(next);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function useInventoryItem(event: MouseEvent) {
+    const row = findInventoryRow(event);
+    const name = row?.querySelector<HTMLInputElement>('input[name="inventoryName"]')?.value || 'Item';
+    const damageRolls = row?.querySelector<HTMLInputElement>('input[name="inventoryDamageRolls"]')?.value || '';
+    const damageBonus = Number(row?.querySelector<HTMLInputElement>('input[name="inventoryDamageBonus"]')?.value) || 0;
+    const attackAbility = (row?.querySelector<HTMLInputElement | HTMLSelectElement>('input[name="inventoryAttackAbility"], select[name="inventoryAttackAbility"]')?.value || 'str') as AbilityKey;
+    const ability = abilityModifier(abilityScores[attackAbility]);
+    const effects = row?.querySelector<HTMLInputElement>('input[name="inventoryEffects"]')?.value || '';
+    const roll = damageRolls ? rollDamageExpression(damageRolls, damageBonus, ability, attackAbility.toUpperCase()) : null;
+    adjustInventoryQuantity(event, -1);
+    inventoryMessage = roll
+      ? `${name} used. Quantity reduced by 1. Roll: ${roll.lines.join('; ')}${effects ? ` (${effects})` : ''}.`
+      : `${name} used. Quantity reduced by 1.`;
+  }
+
+  function removeInventoryItem(event: MouseEvent) {
+    const row = findInventoryRow(event);
+    const name = row?.querySelector<HTMLInputElement>('input[name="inventoryName"]')?.value || 'Item';
+    setInventoryQuantity(event, 0);
+    inventoryMessage = `${name} set to 0. Save to remove it from the backpack.`;
+  }
+
+  function toggleEquipped(event: MouseEvent, equipped: boolean) {
+    const row = findInventoryRow(event);
+    const form = (event.currentTarget as HTMLElement).closest('form');
+    const location = row?.querySelector<HTMLInputElement>('input[name="inventoryLocation"]');
+    const equippedInput = row?.querySelector<HTMLInputElement>('input[name="inventoryEquipped"]');
+    const equipmentInput = row?.querySelector<HTMLInputElement>('input[name="inventoryIsEquipment"]');
+
+    if (location) location.value = equipped ? 'equipped' : 'backpack';
+    if (equippedInput) equippedInput.value = equipped ? 'true' : 'false';
+    if (equipmentInput) equipmentInput.value = 'true';
+    form?.requestSubmit();
   }
 
   async function runAutosave(form: HTMLFormElement) {
@@ -385,6 +531,7 @@
               <span>To Hit</span>
               <span>Damage</span>
               <span>Effects</span>
+              <span></span>
             </div>
             {#each battleActionItems as item}
               <div class="action-row">
@@ -398,6 +545,7 @@
                 <span>{signed(item.toHitBonus)}</span>
                 <span>{damageSummary(item)}</span>
                 <span>{item.notes || '-'}</span>
+                <button type="button" class="compact-button" onclick={() => rollBattleAction(item)}>Roll</button>
               </div>
             {:else}
               <p class="muted">No equipped combat items yet. Add one on the Inventory tab.</p>
@@ -445,63 +593,95 @@
   {#if activeTab === 'inventory'}
     <section class="inventory-layout">
       <section class="panel stack inventory-section">
-        <h2>Equipped</h2>
+        <div class="panel-head compact-head">
+          <h2>Equipment</h2>
+          <button type="button" class="compact-button" onclick={() => openNewItem('equipped')}>Add Item</button>
+        </div>
         <p class="muted">Items here can become read-only Battle Actions when marked as equipment or given attack values.</p>
         <div class="inventory-table equipped-table">
-          {#each equippedInventoryRows as item}
-            <div class="inventory-row">
-              <label>Item <input name="inventoryName" value={item.name} placeholder="Longsword" /></label>
-              <label>Category <input name="inventoryCategory" value={item.category} placeholder="weapon, armor" /></label>
-              <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
-              <label>AC <input name="inventoryAcBonus" type="number" value={item.acBonus} /></label>
-              <label>To Hit <input name="inventoryToHitBonus" type="number" value={item.toHitBonus} /></label>
-              <label>Damage Bonus <input name="inventoryDamageBonus" type="number" value={item.damageBonus} /></label>
-              <label>Ability
-                <select name="inventoryAttackAbility">
-                  {#each abilityOrder as ability}
-                    <option value={ability} selected={item.attackAbility === ability}>{ability.toUpperCase()}</option>
-                  {/each}
-                </select>
-              </label>
-              <label>Damage Rolls <input name="inventoryDamageRolls" value={item.damageRolls} placeholder="1d8 + 1d4 + 1d6" /></label>
-              <label>Effects <input name="inventoryEffects" value={item.effects} placeholder="fire, poison, prone" /></label>
-              <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
-              <label>Slot
-                <select name="inventoryLocation">
-                  <option value="equipped" selected>Equipped</option>
-                  <option value="backpack">Backpack</option>
-                  <option value="misc">Misc</option>
-                </select>
-              </label>
-              <label class="inline inventory-flag">
-                <select name="inventoryIsEquipment">
-                  <option value="false" selected={!item.isEquipment}>Item</option>
-                  <option value="true" selected={item.isEquipment}>Equipment</option>
-                </select>
-                <span class="item-kind-icon" class:active={item.isEquipment} aria-hidden="true"></span>
-              </label>
+          {#each equippedInventoryRows as item, index (item.id ?? `equipment-${item.name}-${index}`)}
+            <div class="inventory-row equipped-row">
+              <div class="inventory-row-main">
+                <label>Item <input name="inventoryName" value={item.name} placeholder="Longsword" /></label>
+                <label>Category
+                  <select name="inventoryCategory">
+                    {#each categoryOptionsFor(item.category) as category}
+                      <option value={category.key} selected={item.category === category.key}>{category.label}</option>
+                    {/each}
+                  </select>
+                </label>
+                <div class="qty-equipment-control">
+                  <label class="qty-label">Quantity
+                    <span class="qty-control">
+                      <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, -1)}>-</button>
+                      <input name="inventoryQuantity" type="number" min="0" value={item.quantity} />
+                      <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, 1)}>+</button>
+                    </span>
+                  </label>
+                  <button type="button" class="equipment-toggle active" aria-label="Move to backpack" title="Move to backpack" onclick={(event) => toggleEquipped(event, false)}>
+                    <span class="item-kind-icon active" aria-hidden="true"></span>
+                  </button>
+                </div>
+              </div>
+              <div class="inventory-row-combat">
+                <label class="tiny-field">AC <input name="inventoryAcBonus" type="number" value={item.acBonus} /></label>
+                <label class="tiny-field">To Hit <input name="inventoryToHitBonus" type="number" value={item.toHitBonus} /></label>
+                <label class="tiny-field">Damage Bonus <input name="inventoryDamageBonus" type="number" value={item.damageBonus} /></label>
+                <label>Ability
+                  <select name="inventoryAttackAbility">
+                    {#each abilityOrder as ability}
+                      <option value={ability} selected={item.attackAbility === ability}>{ability.toUpperCase()}</option>
+                    {/each}
+                  </select>
+                </label>
+                <label>Damage Rolls <input name="inventoryDamageRolls" value={item.damageRolls} placeholder="1d8 + 1d4 + 1d6" /></label>
+                <label>Effects <input name="inventoryEffects" value={item.effects} placeholder="fire, poison, prone" /></label>
+                <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+              </div>
+              <input name="inventoryLocation" type="hidden" value="equipped" />
+              <input name="inventoryIsEquipment" type="hidden" value="true" />
               <input name="inventoryEquipped" type="hidden" value="true" />
             </div>
+          {:else}
+            <p class="muted">No equipment yet.</p>
           {/each}
         </div>
       </section>
 
       <section class="panel stack inventory-section">
-        <h2>Backpack</h2>
+        <div class="panel-head compact-head">
+          <h2>Backpack</h2>
+          <button type="button" class="compact-button" onclick={() => openNewItem('backpack')}>Add Item</button>
+        </div>
         <div class="inventory-table backpack-table">
-          {#each backpackInventoryRows as item}
+          {#each backpackInventoryRows as item, index (item.id ?? `backpack-${item.name}-${index}`)}
             <div class="inventory-row simple">
               <label>Item <input name="inventoryName" value={item.name} placeholder="Potion, rope, gold ring" /></label>
-              <label>Category <input name="inventoryCategory" value={item.category} placeholder="gear, potion, junk" /></label>
-              <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
-              <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
-              <label>Slot
-                <select name="inventoryLocation">
-                  <option value="equipped">Equipped</option>
-                  <option value="backpack" selected>Backpack</option>
-                  <option value="misc">Misc</option>
+              <label>Category
+                <select name="inventoryCategory">
+                  {#each categoryOptionsFor(item.category) as category}
+                    <option value={category.key} selected={item.category === category.key}>{category.label}</option>
+                  {/each}
                 </select>
               </label>
+              <label class="qty-label">Qty
+                <span class="qty-equipment-control">
+                  <span class="qty-control">
+                    <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, -1)}>-</button>
+                    <input name="inventoryQuantity" type="number" min="0" value={item.quantity} />
+                    <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, 1)}>+</button>
+                  </span>
+                  <button type="button" class="equipment-toggle" aria-label="Equip item" title="Equip item" onclick={(event) => toggleEquipped(event, true)}>
+                    <span class="item-kind-icon" aria-hidden="true"></span>
+                  </button>
+                </span>
+              </label>
+              <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+              <div class="row-actions">
+                <button type="button" class="compact-button" onclick={useInventoryItem}>Use</button>
+                <button type="button" class="compact-button danger" onclick={removeInventoryItem}>Remove</button>
+              </div>
+              <input name="inventoryLocation" type="hidden" value="backpack" />
               <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
               <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
               <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
@@ -511,13 +691,18 @@
               <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
               <input name="inventoryEquipped" type="hidden" value="false" />
             </div>
+          {:else}
+            <p class="muted">No backpack items yet.</p>
           {/each}
         </div>
       </section>
 
       <section class="panel stack inventory-section misc-section">
-        <h2>Misc</h2>
-        <div class="mini-grid">
+        <div class="panel-head compact-head">
+          <h2>Misc</h2>
+          <button type="button" class="compact-button" onclick={() => openNewItem('misc')}>Add Item</button>
+        </div>
+        <div class="coin-grid">
           <label>CP <input name="currencyCp" type="number" min="0" value={meta('currencyCp')} /></label>
           <label>SP <input name="currencySp" type="number" min="0" value={meta('currencySp')} /></label>
           <label>EP <input name="currencyEp" type="number" min="0" value={meta('currencyEp')} /></label>
@@ -526,7 +711,7 @@
         </div>
         <label>Treasure & Valuables <textarea name="treasureNote">{notes.treasure ?? ''}</textarea></label>
         <label>General Inventory / Junk <textarea name="generalInventoryNote">{notes.general_inventory ?? ''}</textarea></label>
-        {#each miscInventoryRows as item}
+        {#each miscInventoryRows as item, index (item.id ?? `misc-${item.name}-${index}`)}
           <div class="inventory-row misc-row">
             <label>Misc Item <input name="inventoryName" value={item.name} placeholder="Letter, gem, trinket" /></label>
             <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
@@ -542,6 +727,8 @@
             <input name="inventoryIsEquipment" type="hidden" value="false" />
             <input name="inventoryEquipped" type="hidden" value="false" />
           </div>
+        {:else}
+          <p class="muted">No misc items yet.</p>
         {/each}
       </section>
     </section>
@@ -641,7 +828,7 @@
     {/if}
 
     {#if activeTab !== 'inventory'}
-      {#each inventoryRows as item}
+      {#each inventoryRows as item, index (item.id ?? `hidden-inventory-${item.name}-${index}`)}
         <input name="inventoryName" type="hidden" value={item.name} />
         <input name="inventoryCategory" type="hidden" value={item.category} />
         <input name="inventoryLocation" type="hidden" value={item.location} />
@@ -827,6 +1014,105 @@
 
         <div class="modal-actions">
           <button type="submit">Save Modifications</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if rollResult}
+    <div class="modal-backdrop" role="presentation">
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title">
+        <div class="panel-head">
+          <h2 id="roll-result-title">{rollResult.title}</h2>
+          <button type="button" class="text-button" onclick={() => (rollResult = null)}>Close</button>
+        </div>
+        <div class="roll-result">
+          <div>
+            <span>To Hit</span>
+            <strong>{rollResult.attack}</strong>
+          </div>
+          <div>
+            <span>Damage</span>
+            <div class="damage-lines">
+              {#each rollResult.damage as line}
+                <strong>{line}</strong>
+              {/each}
+            </div>
+          </div>
+          <div>
+            <span>Effects</span>
+            <strong>{rollResult.effects}</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if inventoryMessage}
+    <div class="modal-backdrop" role="presentation">
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-action-title">
+        <div class="panel-head">
+          <h2 id="inventory-action-title">Inventory Action</h2>
+          <button type="button" class="text-button" onclick={() => (inventoryMessage = null)}>Close</button>
+        </div>
+        <p class="muted">{inventoryMessage}</p>
+      </div>
+    </div>
+  {/if}
+
+  {#if newItemOpen}
+    <div class="modal-backdrop" role="presentation">
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title">
+        <div class="panel-head">
+          <h2 id="new-item-title">Add Item</h2>
+          <button type="button" class="text-button" onclick={() => (newItemOpen = false)}>Close</button>
+        </div>
+        <div class="new-item-grid">
+          <label>Item <input name="inventoryName" placeholder="Longsword, potion, gold ring" /></label>
+          <label>Category
+            <select name="inventoryCategory">
+              {#each categoryOptions as category}
+                <option value={category.key} selected={category.key === (newItemLocation === 'misc' ? 'misc' : 'gear')}>{category.label}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="qty-label">Quantity
+            <span class="qty-control">
+              <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, -1)}>-</button>
+              <input name="inventoryQuantity" type="number" min="0" value="1" />
+              <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, 1)}>+</button>
+            </span>
+          </label>
+          <label>Section
+            <select name="inventoryLocation">
+              <option value="equipped" selected={newItemLocation === 'equipped'}>Equipment</option>
+              <option value="backpack" selected={newItemLocation === 'backpack'}>Backpack</option>
+              <option value="misc" selected={newItemLocation === 'misc'}>Misc</option>
+            </select>
+          </label>
+          <label class="equipment-select-label">Equipment
+            <select name="inventoryIsEquipment">
+              <option value="false" selected={newItemLocation !== 'equipped'}>No</option>
+              <option value="true" selected={newItemLocation === 'equipped'}>Yes</option>
+            </select>
+          </label>
+          <label class="tiny-field">AC <input name="inventoryAcBonus" type="number" value="0" /></label>
+          <label class="tiny-field">To Hit <input name="inventoryToHitBonus" type="number" value="0" /></label>
+          <label class="tiny-field">Damage Bonus <input name="inventoryDamageBonus" type="number" value="0" /></label>
+          <label>Ability
+            <select name="inventoryAttackAbility">
+              {#each abilityOrder as ability}
+                <option value={ability} selected={ability === 'str'}>{ability.toUpperCase()}</option>
+              {/each}
+            </select>
+          </label>
+          <label>Damage Rolls <input name="inventoryDamageRolls" placeholder="1d8 + 1d4" /></label>
+          <label>Effects <input name="inventoryEffects" placeholder="fire, poison, prone" /></label>
+          <label>Notes <input name="inventoryNotes" /></label>
+        </div>
+        <input name="inventoryEquipped" type="hidden" value={newItemLocation === 'equipped' ? 'true' : 'false'} />
+        <div class="modal-actions">
+          <button type="submit">Save Item</button>
         </div>
       </div>
     </div>

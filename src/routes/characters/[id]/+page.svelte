@@ -13,7 +13,7 @@
 </script>
 
 <section class="sheet-grid single">
-  <CharacterSheetForm character={data.character} result={form ?? undefined} onVersionHistory={() => (versionHistoryOpen = true)} />
+  <CharacterSheetForm character={data.character} itemCategories={data.itemCategories} result={form ?? undefined} onVersionHistory={() => (versionHistoryOpen = true)} />
 </section>
 
 <VersionList versions={data.versions} open={versionHistoryOpen} onClose={() => (versionHistoryOpen = false)} />
