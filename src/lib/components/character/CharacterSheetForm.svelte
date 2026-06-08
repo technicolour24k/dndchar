@@ -1,7 +1,7 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
   import { abilityMap, abilityModifier, proficiencyBonus, totalLevel } from '$lib/rules/dnd5e';
-  import type { AbilityKey, CharacterDetail } from '$lib/types/character';
+  import type { AbilityKey, CharacterDetail, InventoryItem } from '$lib/types/character';
 
   let {
     character,
@@ -23,15 +23,41 @@
   const prof = $derived(proficiencyBonus(level));
   const metadata = $derived(character.metadata ?? {});
   const race = $derived(String(character.metadata?.race ?? ''));
-  const inventory = $derived(character.inventory[0] ?? {
+  const emptyInventoryItem = {
     name: '',
     category: 'gear',
+    location: 'backpack' as const,
     quantity: 1,
     equipped: false,
+    isEquipment: false,
     acBonus: 0,
+    toHitBonus: 0,
+    damageBonus: 0,
+    attackAbility: 'str' as AbilityKey,
+    damageRolls: '',
+    effects: '',
     abilityBonuses: {},
     notes: ''
-  });
+  };
+  const inventoryRows = $derived(character.inventory.length ? character.inventory : [emptyInventoryItem]);
+  const equippedInventoryRows = $derived([
+    ...inventoryRows.filter((item) => item.location === 'equipped' || item.equipped),
+    { ...emptyInventoryItem, location: 'equipped' as const, equipped: true },
+    { ...emptyInventoryItem, location: 'equipped' as const, equipped: true }
+  ]);
+  const backpackInventoryRows = $derived([
+    ...inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped),
+    { ...emptyInventoryItem, location: 'backpack' as const },
+    { ...emptyInventoryItem, location: 'backpack' as const },
+    { ...emptyInventoryItem, location: 'backpack' as const }
+  ]);
+  const miscInventoryRows = $derived([
+    ...inventoryRows.filter((item) => item.location === 'misc'),
+    { ...emptyInventoryItem, category: 'misc', location: 'misc' as const }
+  ]);
+  const battleActionItems = $derived(
+    inventoryRows.filter((item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus))
+  );
   const attack = $derived(character.attacks[0] ?? {
     name: '',
     attackAbility: 'str' as AbilityKey,
@@ -96,6 +122,17 @@
 
   function signed(value: number) {
     return value >= 0 ? `+${value}` : String(value);
+  }
+
+  function damageSummary(item: InventoryItem) {
+    const rolls = item.damageRolls
+      .split('+')
+      .map((roll) => roll.trim())
+      .filter(Boolean);
+    const parts = [...rolls];
+    if (item.damageBonus) parts.push(signed(item.damageBonus));
+    if (item.effects) parts.push(item.effects);
+    return parts.join(' + ') || 'No damage';
   }
 
   async function runAutosave(form: HTMLFormElement) {
@@ -248,18 +285,32 @@
       <div class="battle-main-row">
         <section class="panel stack">
           <h2>Battle Actions</h2>
-          <p class="muted">Weapons, shield bashes, spell attacks, maneuvers, and anything flagged as available in battle.</p>
-          <label>Action Name <input name="attackName" value={attack.name} placeholder="Longsword, Shield Bash, Fire Bolt" /></label>
-          <label>Ability
-            <select name="attackAbility">
-              {#each ['str', 'dex', 'con', 'int', 'wis', 'cha'] as ability}
-                <option value={ability} selected={attack.attackAbility === ability}>{ability.toUpperCase()}</option>
-              {/each}
-            </select>
-          </label>
-          <label>Damage / Effect Dice <input name="attackDamageDice" value={attack.damageDice} placeholder="1d8, 2d6, 1d10+3" /></label>
-          <label class="inline"><input name="attackProficient" type="checkbox" checked={attack.proficient} /> Add proficiency</label>
-          <label>Action Notes <textarea name="attackNotes">{attack.notes}</textarea></label>
+          <p class="muted">Read-only actions from equipped inventory rows flagged as equipment or given combat values.</p>
+          <div class="action-table">
+            <div class="action-row header">
+              <span>Item</span>
+              <span>Ability</span>
+              <span>To Hit</span>
+              <span>Damage</span>
+              <span>Effects</span>
+            </div>
+            {#each battleActionItems as item}
+              <div class="action-row">
+                <span class="item-name">
+                  {#if item.isEquipment}
+                    <span class="item-kind-icon active" aria-hidden="true"></span>
+                  {/if}
+                  {item.name}
+                </span>
+                <span>{item.attackAbility.toUpperCase()}</span>
+                <span>{signed(item.toHitBonus)}</span>
+                <span>{damageSummary(item)}</span>
+                <span>{item.notes || '-'}</span>
+              </div>
+            {:else}
+              <p class="muted">No equipped combat items yet. Add one on the Inventory tab.</p>
+            {/each}
+          </div>
         </section>
 
         <section class="panel stack">
@@ -300,20 +351,80 @@
   {/if}
 
   {#if activeTab === 'inventory'}
-    <section class="sheet-columns">
-      <section class="panel stack">
-        <h2>Equipment</h2>
-        <label>Item <input name="inventoryName" value={inventory.name} placeholder="Longsword, Potion of Healing, Gold Ring" /></label>
-        <label>Category <input name="inventoryCategory" value={inventory.category} placeholder="weapon, armor, potion, treasure, junk" /></label>
-        <label>Quantity <input name="inventoryQuantity" type="number" min="0" value={inventory.quantity} /></label>
-        <label>AC Bonus <input name="inventoryAcBonus" type="number" value={inventory.acBonus} /></label>
-        <label class="inline"><input name="inventoryEquipped" type="checkbox" checked={inventory.equipped} /> Equipped</label>
-        <label>Notes <textarea name="inventoryNotes">{inventory.notes}</textarea></label>
+    <section class="inventory-layout">
+      <section class="panel stack inventory-section">
+        <h2>Equipped</h2>
+        <p class="muted">Items here can become read-only Battle Actions when marked as equipment or given attack values.</p>
+        <div class="inventory-table equipped-table">
+          {#each equippedInventoryRows as item}
+            <div class="inventory-row">
+              <label>Item <input name="inventoryName" value={item.name} placeholder="Longsword" /></label>
+              <label>Category <input name="inventoryCategory" value={item.category} placeholder="weapon, armor" /></label>
+              <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
+              <label>AC <input name="inventoryAcBonus" type="number" value={item.acBonus} /></label>
+              <label>To Hit <input name="inventoryToHitBonus" type="number" value={item.toHitBonus} /></label>
+              <label>Damage Bonus <input name="inventoryDamageBonus" type="number" value={item.damageBonus} /></label>
+              <label>Ability
+                <select name="inventoryAttackAbility">
+                  {#each abilityOrder as ability}
+                    <option value={ability} selected={item.attackAbility === ability}>{ability.toUpperCase()}</option>
+                  {/each}
+                </select>
+              </label>
+              <label>Damage Rolls <input name="inventoryDamageRolls" value={item.damageRolls} placeholder="1d8 + 1d4 + 1d6" /></label>
+              <label>Effects <input name="inventoryEffects" value={item.effects} placeholder="fire, poison, prone" /></label>
+              <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+              <label>Slot
+                <select name="inventoryLocation">
+                  <option value="equipped" selected>Equipped</option>
+                  <option value="backpack">Backpack</option>
+                  <option value="misc">Misc</option>
+                </select>
+              </label>
+              <label class="inline inventory-flag">
+                <select name="inventoryIsEquipment">
+                  <option value="false" selected={!item.isEquipment}>Item</option>
+                  <option value="true" selected={item.isEquipment}>Equipment</option>
+                </select>
+                <span class="item-kind-icon" class:active={item.isEquipment} aria-hidden="true"></span>
+              </label>
+              <input name="inventoryEquipped" type="hidden" value="true" />
+            </div>
+          {/each}
+        </div>
       </section>
 
-      <section class="panel stack">
-        <h2>Inventory Intent</h2>
-        <p class="muted">Track gear, usable items, potions, treasure, and general junk separately here as the model expands.</p>
+      <section class="panel stack inventory-section">
+        <h2>Backpack</h2>
+        <div class="inventory-table backpack-table">
+          {#each backpackInventoryRows as item}
+            <div class="inventory-row simple">
+              <label>Item <input name="inventoryName" value={item.name} placeholder="Potion, rope, gold ring" /></label>
+              <label>Category <input name="inventoryCategory" value={item.category} placeholder="gear, potion, junk" /></label>
+              <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
+              <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+              <label>Slot
+                <select name="inventoryLocation">
+                  <option value="equipped">Equipped</option>
+                  <option value="backpack" selected>Backpack</option>
+                  <option value="misc">Misc</option>
+                </select>
+              </label>
+              <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
+              <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
+              <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
+              <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+              <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
+              <input name="inventoryEffects" type="hidden" value={item.effects} />
+              <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
+              <input name="inventoryEquipped" type="hidden" value="false" />
+            </div>
+          {/each}
+        </div>
+      </section>
+
+      <section class="panel stack inventory-section misc-section">
+        <h2>Misc</h2>
         <div class="mini-grid">
           <label>CP <input name="currencyCp" type="number" min="0" value={meta('currencyCp')} /></label>
           <label>SP <input name="currencySp" type="number" min="0" value={meta('currencySp')} /></label>
@@ -323,6 +434,23 @@
         </div>
         <label>Treasure & Valuables <textarea name="treasureNote">{notes.treasure ?? ''}</textarea></label>
         <label>General Inventory / Junk <textarea name="generalInventoryNote">{notes.general_inventory ?? ''}</textarea></label>
+        {#each miscInventoryRows as item}
+          <div class="inventory-row misc-row">
+            <label>Misc Item <input name="inventoryName" value={item.name} placeholder="Letter, gem, trinket" /></label>
+            <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
+            <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+            <input name="inventoryCategory" type="hidden" value={item.category || 'misc'} />
+            <input name="inventoryLocation" type="hidden" value="misc" />
+            <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
+            <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
+            <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
+            <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+            <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
+            <input name="inventoryEffects" type="hidden" value={item.effects} />
+            <input name="inventoryIsEquipment" type="hidden" value="false" />
+            <input name="inventoryEquipped" type="hidden" value="false" />
+          </div>
+        {/each}
       </section>
     </section>
   {/if}
@@ -416,12 +544,21 @@
     {/if}
 
     {#if activeTab !== 'inventory'}
-      <input name="inventoryName" type="hidden" value={inventory.name} />
-      <input name="inventoryCategory" type="hidden" value={inventory.category} />
-      <input name="inventoryQuantity" type="hidden" value={inventory.quantity} />
-      <input name="inventoryAcBonus" type="hidden" value={inventory.acBonus} />
-      {#if inventory.equipped}<input name="inventoryEquipped" type="hidden" value="on" />{/if}
-      <input name="inventoryNotes" type="hidden" value={inventory.notes} />
+      {#each inventoryRows as item}
+        <input name="inventoryName" type="hidden" value={item.name} />
+        <input name="inventoryCategory" type="hidden" value={item.category} />
+        <input name="inventoryLocation" type="hidden" value={item.location} />
+        <input name="inventoryQuantity" type="hidden" value={item.quantity} />
+        <input name="inventoryEquipped" type="hidden" value={item.equipped ? 'true' : 'false'} />
+        <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
+        <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
+        <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
+        <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
+        <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+        <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
+        <input name="inventoryEffects" type="hidden" value={item.effects} />
+        <input name="inventoryNotes" type="hidden" value={item.notes} />
+      {/each}
       <input name="currencyCp" type="hidden" value={meta('currencyCp')} />
       <input name="currencySp" type="hidden" value={meta('currencySp')} />
       <input name="currencyEp" type="hidden" value={meta('currencyEp')} />

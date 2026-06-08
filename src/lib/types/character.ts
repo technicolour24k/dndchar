@@ -21,9 +21,16 @@ export type InventoryItem = {
   id?: string;
   name: string;
   category: string;
+  location: 'equipped' | 'backpack' | 'misc';
   quantity: number;
   equipped: boolean;
+  isEquipment: boolean;
   acBonus: number;
+  toHitBonus: number;
+  damageBonus: number;
+  attackAbility: AbilityKey;
+  damageRolls: string;
+  effects: string;
   abilityBonuses: Partial<Record<AbilityKey, number>>;
   notes: string;
 };

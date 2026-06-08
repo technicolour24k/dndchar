@@ -359,8 +359,111 @@ label.inline input {
   align-items: start;
 }
 
+.action-table {
+  display: grid;
+  gap: 8px;
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.2fr) 70px 80px minmax(140px, 1fr) minmax(120px, 1fr);
+  gap: 10px;
+  align-items: center;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel-dark);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.action-row.header {
+  background: transparent;
+  padding-block: 0;
+  color: var(--text);
+}
+
+.item-name {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--text);
+}
+
 .character-layout {
   grid-template-columns: 320px minmax(0, 1fr) minmax(280px, .8fr);
+}
+
+.inventory-layout {
+  display: grid;
+  grid-template-columns: minmax(360px, 2fr) minmax(360px, 2fr) minmax(240px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.inventory-section {
+  min-width: 0;
+}
+
+.inventory-table {
+  display: grid;
+  gap: 12px;
+}
+
+.inventory-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 100px);
+  gap: 10px;
+  align-items: end;
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel-dark);
+}
+
+.inventory-row.simple {
+  grid-template-columns: repeat(auto-fill, 100px);
+}
+
+.inventory-row.misc-row {
+  grid-template-columns: minmax(120px, 1fr) 70px minmax(120px, 1fr);
+  padding: 0;
+  background: transparent;
+}
+
+.inventory-row label {
+  font-size: 12px;
+}
+
+.inventory-row input,
+.inventory-row select {
+  min-height: 34px;
+  padding: 6px 8px;
+}
+
+.inventory-flag {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  gap: 8px;
+  align-items: end;
+}
+
+.item-kind-icon {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  background: #656565;
+  mask-image: url("../assets/images/equipment.svg");
+  mask-position: center;
+  mask-repeat: no-repeat;
+  mask-size: contain;
+  -webkit-mask-image: url("../assets/images/equipment.svg");
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+}
+
+.item-kind-icon.active {
+  background: #d7ad4a;
 }
 
 .hidden-save-fields {
@@ -660,7 +763,8 @@ button.death-save-icon.failure.active {
   }
 
   .battle-top-row,
-  .battle-main-row {
+  .battle-main-row,
+  .inventory-layout {
     grid-template-columns: 1fr;
   }
 
