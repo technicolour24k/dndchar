@@ -421,7 +421,7 @@ label.inline input {
 }
 
 .inventory-row.simple {
-  grid-template-columns: minmax(170px, 1.3fr) minmax(120px, .8fr) 70px minmax(170px, 1fr) 110px;
+  grid-template-columns: repeat(auto-fill, 100px);
 }
 
 .inventory-row.misc-row {
