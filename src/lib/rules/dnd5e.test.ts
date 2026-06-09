@@ -3,8 +3,10 @@ import {
   abilityModifier,
   barbarianRageDamageBonus,
   clampResource,
+  hitDiceSummary,
   proficiencyBonus,
   resolvedFlatBonuses,
+  resolvedNumericModifiers,
   skillModifier,
   totalLevel
 } from './dnd5e';
@@ -25,6 +27,11 @@ describe('D&D 5e helpers', () => {
 
   it('calculates total class level', () => {
     expect(totalLevel([{ className: 'Fighter', level: 3 }, { className: 'Wizard', level: 2 }])).toBe(5);
+  });
+
+  it('summarises hit dice by class hit die', () => {
+    expect(hitDiceSummary([{ className: 'Fighter', level: 3 }, { className: 'Wizard', level: 2 }])).toBe('3d10, 2d6');
+    expect(hitDiceSummary([{ className: 'Ranger', level: 4 }, { className: 'Paladin', level: 2 }])).toBe('6d10');
   });
 
   it('calculates skill modifiers with proficiency', () => {
@@ -50,6 +57,7 @@ describe('D&D 5e helpers', () => {
       effectKey: 'rage',
       name: 'Rage',
       sourceType: 'class_feature',
+      sourceName: 'Rage',
       description: '',
       durationType: 'timed',
       requiresConcentration: false,
@@ -61,6 +69,8 @@ describe('D&D 5e helpers', () => {
           target: 'damage_roll.melee_weapon.str',
           modifierType: 'bonus',
           valueExpression: 'rage_damage_bonus',
+          defaultValueExpression: 'rage_damage_bonus',
+          valueOverrideExpression: '',
           conditionExpression: '',
           priority: 0
         }
@@ -74,5 +84,35 @@ describe('D&D 5e helpers', () => {
         ability: 'str'
       })
     ).toEqual([{ label: 'Rage', value: 3 }]);
+  });
+
+  it('resolves non-bonus numeric modifiers by type', () => {
+    const haste: ActiveCharacterEffect = {
+      id: 'active-haste',
+      effectId: 'haste',
+      effectKey: 'haste',
+      name: 'Haste',
+      sourceType: 'spell',
+      sourceName: 'Haste',
+      description: '',
+      durationType: 'concentration',
+      requiresConcentration: true,
+      isCondition: false,
+      isSelectable: true,
+      remainingRounds: null,
+      modifiers: [
+        {
+          target: 'speed.all',
+          modifierType: 'multiplier',
+          valueExpression: '2',
+          defaultValueExpression: '2',
+          valueOverrideExpression: '',
+          conditionExpression: '',
+          priority: 0
+        }
+      ]
+    };
+
+    expect(resolvedNumericModifiers([haste], ['speed.walk'], ['multiplier'])).toEqual([{ label: 'Haste', value: 2 }]);
   });
 });

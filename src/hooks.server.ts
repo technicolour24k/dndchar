@@ -1,7 +1,7 @@
 import { redirect, type Handle } from '@sveltejs/kit';
 import { getUserForToken, readSessionCookie } from '$lib/server/auth/session';
 
-const publicRoutes = new Set(['/login']);
+const publicRoutes = new Set(['/login', '/register']);
 
 export const handle: Handle = async ({ event, resolve }) => {
   const session = await getUserForToken(readSessionCookie(event.cookies));

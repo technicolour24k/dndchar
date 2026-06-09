@@ -9,6 +9,7 @@ import type {
   CharacterDetail,
   CharacterListItem,
   CharacterNote,
+  CharacterProficiencies,
   CharacterResource,
   CharacterVersion,
   EffectDefinition,
@@ -57,11 +58,13 @@ type CharacterSnapshot = {
     to_hit_bonus?: number;
     damage_bonus?: number;
     attack_ability?: AbilityKey;
+    proficient?: boolean;
     damage_rolls?: string;
     effects?: string;
   }>;
   attacks?: Array<{ name?: string; attack_ability?: AbilityKey; proficient?: boolean; damage_dice?: string; notes?: string }>;
   notes?: Array<{ note_key?: string; title?: string; content?: string }>;
+  proficiencies?: Array<{ proficiency_type?: string; proficiency_key?: string }>;
   active_effects?: Array<{ effect_key?: string; remaining_rounds?: number | null; metadata_json?: Record<string, unknown> }>;
   exhaustion?: { exhaustion_level?: number };
 };
@@ -218,6 +221,7 @@ export async function getCharacter(userId: string, characterId: string): Promise
     inventory: await getInventory(characterId),
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId),
+    proficiencies: await getProficiencies(characterId),
     activeEffects: await getActiveEffects(characterId),
     availableEffects: await listEffectDefinitions(),
     exhaustionLevel: await getExhaustionLevel(characterId)
@@ -276,6 +280,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
     await replaceInventory(client, characterId, parseInventory(form));
     await replaceAttacks(client, characterId, parseAttacks(form));
     await replaceNotes(client, characterId, parseNotes(form));
+    await replaceProficiencies(client, characterId, parseProficiencies(form));
     await replaceActiveEffects(client, characterId, parseActiveEffectKeys(form));
     await setExhaustionLevel(client, characterId, Number(form.get('exhaustionLevel')) || 0);
     await createVersionWithClient(client, characterId, userId, summary);
@@ -352,6 +357,7 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const inventory = await client.query('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order', [characterId]);
   const attacks = await client.query('SELECT * FROM character_attacks WHERE character_id = $1 ORDER BY sort_order', [characterId]);
   const notes = await client.query('SELECT note_key, title, content, sort_order FROM character_notes WHERE character_id = $1 ORDER BY sort_order', [characterId]);
+  const proficiencies = await client.query('SELECT proficiency_type, proficiency_key FROM character_proficiencies WHERE character_id = $1 ORDER BY proficiency_type, proficiency_key', [characterId]);
   const activeEffects = await client.query(
     `
       SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json
@@ -372,6 +378,7 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
     inventory: inventory.rows,
     attacks: attacks.rows,
     notes: notes.rows,
+    proficiencies: proficiencies.rows,
     active_effects: activeEffects.rows,
     exhaustion: exhaustion.rows[0] ?? { exhaustion_level: 0 }
   };
@@ -458,6 +465,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       toHitBonus: Number(row.to_hit_bonus) || 0,
       damageBonus: Number(row.damage_bonus) || 0,
       attackAbility: abilityKeys.includes(row.attack_ability as AbilityKey) ? (row.attack_ability as AbilityKey) : 'str',
+      proficient: row.proficient ?? true,
       damageRolls: row.damage_rolls || '',
       effects: row.effects || '',
       abilityBonuses: {
@@ -489,6 +497,14 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       key: row.note_key || 'note',
       title: row.title || row.note_key || 'Note',
       content: row.content || ''
+    }))
+  );
+  await replaceProficiencies(
+    client,
+    characterId,
+    (snapshot.proficiencies ?? []).map((row) => ({
+      type: row.proficiency_type || '',
+      key: row.proficiency_key || ''
     }))
   );
   await replaceActiveEffects(
@@ -548,6 +564,7 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     to_hit_bonus: number;
     damage_bonus: number;
     attack_ability: AbilityKey;
+    proficient: boolean;
     damage_rolls: string;
     effects: string;
   }>('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order ASC', [characterId]);
@@ -563,6 +580,7 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     toHitBonus: row.to_hit_bonus,
     damageBonus: row.damage_bonus,
     attackAbility: row.attack_ability || 'str',
+    proficient: row.proficient ?? true,
     damageRolls: row.damage_rolls,
     effects: row.effects,
     abilityBonuses: {
@@ -604,6 +622,24 @@ async function getNotes(characterId: string): Promise<CharacterNote[]> {
   return result.rows.map((row) => ({ key: row.note_key, title: row.title, content: row.content }));
 }
 
+async function getProficiencies(characterId: string): Promise<CharacterProficiencies> {
+  try {
+    const result = await query<{ proficiency_type: string; proficiency_key: string }>(
+      'SELECT proficiency_type, proficiency_key FROM character_proficiencies WHERE character_id = $1 ORDER BY proficiency_type, proficiency_key',
+      [characterId]
+    );
+    return {
+      savingThrows: result.rows
+        .filter((row) => row.proficiency_type === 'saving_throw' && abilityKeys.includes(row.proficiency_key as AbilityKey))
+        .map((row) => row.proficiency_key as AbilityKey),
+      skills: result.rows.filter((row) => row.proficiency_type === 'skill').map((row) => row.proficiency_key),
+      weapons: result.rows.filter((row) => row.proficiency_type === 'weapon').map((row) => row.proficiency_key)
+    };
+  } catch {
+    return { savingThrows: [], skills: [], weapons: [] };
+  }
+}
+
 async function listEffectDefinitions(): Promise<EffectDefinition[]> {
   try {
     const effects = await query<{
@@ -612,6 +648,7 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
       name: string;
       source_type: string;
       source_ref: string;
+      source_name: string;
       description: string;
       duration_type: string;
       duration_rounds: number | null;
@@ -620,9 +657,28 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
       is_selectable: boolean;
     }>(
       `
-        SELECT id, effect_key, name, source_type, source_ref, description, duration_type, duration_rounds, requires_concentration, is_condition, COALESCE(is_selectable, true) AS is_selectable
+        SELECT
+          effect_definitions.id,
+          effect_definitions.effect_key,
+          effect_definitions.name,
+          effect_definitions.source_type,
+          effect_definitions.source_ref,
+          COALESCE(source_label.source_name, effect_definitions.name) AS source_name,
+          effect_definitions.description,
+          effect_definitions.duration_type,
+          effect_definitions.duration_rounds,
+          effect_definitions.requires_concentration,
+          effect_definitions.is_condition,
+          COALESCE(effect_definitions.is_selectable, true) AS is_selectable
         FROM effect_definitions
-        ORDER BY is_condition DESC, sort_order ASC, name ASC
+        LEFT JOIN LATERAL (
+          SELECT effect_sources.source_name
+          FROM effect_sources
+          WHERE effect_sources.effect_id = effect_definitions.id
+          ORDER BY effect_sources.created_at ASC
+          LIMIT 1
+        ) source_label ON true
+        ORDER BY effect_definitions.is_condition DESC, effect_definitions.sort_order ASC, effect_definitions.name ASC
       `
     );
 
@@ -634,6 +690,8 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
         target: row.target,
         modifierType: row.modifier_type,
         valueExpression: row.value_expression || '',
+        defaultValueExpression: row.default_value_expression || '',
+        valueOverrideExpression: row.value_override_expression || '',
         conditionExpression: row.condition_expression || '',
         priority: row.priority
       });
@@ -646,6 +704,7 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
       name: row.name,
       sourceType: row.source_type,
       sourceRef: row.source_ref || '',
+      sourceName: row.source_name || row.name,
       description: row.description || '',
       durationType: row.duration_type || '',
       durationRounds: row.duration_rounds,
@@ -663,44 +722,38 @@ async function listEffectModifiers(): Promise<Array<{
   effect_id: string;
   target: string;
   modifier_type: string;
+  default_value_expression: string;
+  value_override_expression: string;
   value_expression: string;
   condition_expression: string;
   priority: number;
 }>> {
-  try {
-    const result = await query<{
-      effect_id: string;
-      target: string;
-      modifier_type: string;
-      value_expression: string;
-      condition_expression: string;
-      priority: number;
-    }>(
-      `
-        SELECT
-          effect_modifier_links.effect_id,
-          modifier_definitions.target,
-          modifier_definitions.modifier_type,
-          modifier_definitions.value_expression,
-          effect_modifier_links.condition_expression,
-          effect_modifier_links.priority
-        FROM effect_modifier_links
-        JOIN modifier_definitions ON modifier_definitions.id = effect_modifier_links.modifier_id
-        ORDER BY effect_modifier_links.priority ASC, modifier_definitions.target ASC
-      `
-    );
-    return result.rows;
-  } catch {
-    const result = await query<{
-      effect_id: string;
-      target: string;
-      modifier_type: string;
-      value_expression: string;
-      condition_expression: string;
-      priority: number;
-    }>('SELECT effect_id, target, modifier_type, value_expression, condition_expression, priority FROM effect_modifiers ORDER BY priority ASC, target ASC');
-    return result.rows;
-  }
+  const result = await query<{
+    effect_id: string;
+    target: string;
+    modifier_type: string;
+    default_value_expression: string;
+    value_override_expression: string;
+    value_expression: string;
+    condition_expression: string;
+    priority: number;
+  }>(
+    `
+      SELECT
+        effect_modifier_links.effect_id,
+        modifier_definitions.target,
+        modifier_definitions.modifier_type,
+        modifier_definitions.default_value_expression,
+        effect_modifier_links.value_override_expression,
+        COALESCE(effect_modifier_links.value_override_expression, modifier_definitions.default_value_expression) AS value_expression,
+        effect_modifier_links.condition_expression,
+        effect_modifier_links.priority
+      FROM effect_modifier_links
+      JOIN modifier_definitions ON modifier_definitions.id = effect_modifier_links.modifier_id
+      ORDER BY effect_modifier_links.priority ASC, modifier_definitions.target ASC
+    `
+  );
+  return result.rows;
 }
 
 async function getActiveEffects(characterId: string): Promise<CharacterDetail['activeEffects']> {
@@ -730,6 +783,7 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
           effectKey: definition.key,
           name: definition.name,
           sourceType: definition.sourceType,
+          sourceName: definition.sourceName,
           description: definition.description,
           durationType: definition.durationType,
           requiresConcentration: definition.requiresConcentration,
@@ -798,8 +852,8 @@ async function replaceInventory(client: pg.PoolClient, characterId: string, inve
     await client.query(
       `
         INSERT INTO character_inventory_items
-          (character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+          (character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
       `,
       [
         characterId,
@@ -813,6 +867,7 @@ async function replaceInventory(client: pg.PoolClient, characterId: string, inve
         Number(row.toHitBonus) || 0,
         Number(row.damageBonus) || 0,
         abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str',
+        row.proficient ?? true,
         row.damageRolls || '',
         row.effects || '',
         Number(row.abilityBonuses.str) || 0,
@@ -845,6 +900,27 @@ async function replaceNotes(client: pg.PoolClient, characterId: string, notes: C
     await client.query(
       'INSERT INTO character_notes (character_id, note_key, title, content, sort_order) VALUES ($1, $2, $3, $4, $5)',
       [characterId, row.key, row.title, row.content, index]
+    );
+  }
+}
+
+async function replaceProficiencies(
+  client: pg.PoolClient,
+  characterId: string,
+  proficiencies: Array<{ type: string; key: string }>
+): Promise<void> {
+  await client.query('DELETE FROM character_proficiencies WHERE character_id = $1', [characterId]);
+  const validTypes = new Set(['saving_throw', 'skill', 'weapon']);
+  const seen = new Set<string>();
+  for (const row of proficiencies) {
+    const type = row.type.trim();
+    const key = row.key.trim();
+    const identity = `${type}:${key}`;
+    if (!validTypes.has(type) || !key || seen.has(identity)) continue;
+    seen.add(identity);
+    await client.query(
+      'INSERT INTO character_proficiencies (character_id, proficiency_type, proficiency_key) VALUES ($1, $2, $3)',
+      [characterId, type, key]
     );
   }
 }
@@ -924,6 +1000,7 @@ function parseInventory(form: FormData): InventoryItem[] {
   const toHitBonuses = form.getAll('inventoryToHitBonus').map(Number);
   const damageBonuses = form.getAll('inventoryDamageBonus').map(Number);
   const attackAbilities = form.getAll('inventoryAttackAbility').map(String);
+  const proficientValues = form.getAll('inventoryProficient').map((value) => String(value) === 'true');
   const damageRolls = form.getAll('inventoryDamageRolls').map(String);
   const effects = form.getAll('inventoryEffects').map(String);
   const notes = form.getAll('inventoryNotes').map(String);
@@ -942,6 +1019,7 @@ function parseInventory(form: FormData): InventoryItem[] {
         toHitBonus: toHitBonuses[index] || 0,
         damageBonus: damageBonuses[index] || 0,
         attackAbility: abilityKeys.includes(attackAbilities[index] as AbilityKey) ? (attackAbilities[index] as AbilityKey) : 'str',
+        proficient: proficientValues[index] ?? true,
         damageRolls: damageRolls[index] || '',
         effects: effects[index] || '',
         abilityBonuses: {},
@@ -949,6 +1027,14 @@ function parseInventory(form: FormData): InventoryItem[] {
       };
     })
     .filter((item) => item.name.trim() && item.quantity > 0);
+}
+
+function parseProficiencies(form: FormData): Array<{ type: string; key: string }> {
+  return [
+    ...form.getAll('savingThrowProficiency').map((value) => ({ type: 'saving_throw', key: String(value) })),
+    ...form.getAll('skillProficiency').map((value) => ({ type: 'skill', key: String(value) })),
+    ...form.getAll('weaponProficiency').map((value) => ({ type: 'weapon', key: String(value) }))
+  ];
 }
 
 function normalizeInventoryLocation(value: string | undefined, equipped: boolean): 'equipped' | 'backpack' | 'misc' {

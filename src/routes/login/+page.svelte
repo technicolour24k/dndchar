@@ -1,5 +1,5 @@
 <script lang="ts">
-  let { form } = $props();
+  let { data, form } = $props();
 </script>
 
 <section class="auth-card">
@@ -22,5 +22,8 @@
       <input name="password" type="password" autocomplete="current-password" required />
     </label>
     <button type="submit">Log in</button>
+    {#if data.registrationEnabled}
+      <a class="text-button" href="/register">Create an account</a>
+    {/if}
   </form>
 </section>

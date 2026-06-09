@@ -1,6 +1,6 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
-  import { abilityMap, abilityModifier, proficiencyBonus, resolvedFlatBonuses, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, hitDiceSummary, proficiencyBonus, resolvedFlatBonuses, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
 
   let {
@@ -25,6 +25,7 @@
   const prof = $derived(proficiencyBonus(level));
   const metadata = $derived(character.metadata ?? {});
   const race = $derived(String(character.metadata?.race ?? ''));
+  const d20Icon = '/images/dice-twenty-faces-one-svgrepo-com.svg';
   const emptyInventoryItem = {
     name: '',
     category: 'gear',
@@ -36,6 +37,7 @@
     toHitBonus: 0,
     damageBonus: 0,
     attackAbility: 'str' as AbilityKey,
+    proficient: true,
     damageRolls: '',
     effects: '',
     abilityBonuses: {},
@@ -72,6 +74,7 @@
     notes: ''
   });
   const notes = $derived(Object.fromEntries(character.notes.map((note) => [note.key, note.content])));
+  const proficiencies = $derived(character.proficiencies ?? { savingThrows: [], skills: [], weapons: [] });
 
   let activeTab = $state<'battle' | 'traits' | 'inventory' | 'character'>('battle');
   let autosaveTimer: ReturnType<typeof setTimeout>;
@@ -84,6 +87,11 @@
   let playerModificationsOpen = $state(false);
   let selectedEffectKeys = $state<string[]>([]);
   let selectedExhaustionLevel = $state(0);
+  let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
+  let selectedSkillProficiencies = $state<string[]>([]);
+  let savingThrowRolls = $state<Record<string, { text: string; natural: number }>>({});
+  let skillRolls = $state<Record<string, { text: string; natural: number }>>({});
+  let abilityRolls = $state<Partial<Record<AbilityKey, { text: string; natural: number }>>>({});
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all' | 'catalogue'>('active');
   let newItemOpen = $state(false);
@@ -93,6 +101,10 @@
     attack: string;
     damage: string[];
     effects: string;
+  } | null>(null);
+  let formulaHelp = $state<{
+    title: string;
+    lines: string[];
   } | null>(null);
   let inventoryMessage = $state<string | null>(null);
   const autosaveIntervalMs = 30_000;
@@ -109,25 +121,25 @@
     { key: 'catalogue', label: 'Catalogue' }
   ] as const;
   const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
-  const skillChecks: Array<{ name: string; ability: AbilityKey }> = [
-    { name: 'Acrobatics', ability: 'dex' },
-    { name: 'Animal Handling', ability: 'wis' },
-    { name: 'Arcana', ability: 'int' },
-    { name: 'Athletics', ability: 'str' },
-    { name: 'Deception', ability: 'cha' },
-    { name: 'History', ability: 'int' },
-    { name: 'Insight', ability: 'wis' },
-    { name: 'Intimidation', ability: 'cha' },
-    { name: 'Investigation', ability: 'int' },
-    { name: 'Medicine', ability: 'wis' },
-    { name: 'Nature', ability: 'int' },
-    { name: 'Perception', ability: 'wis' },
-    { name: 'Performance', ability: 'cha' },
-    { name: 'Persuasion', ability: 'cha' },
-    { name: 'Religion', ability: 'int' },
-    { name: 'Sleight of Hand', ability: 'dex' },
-    { name: 'Stealth', ability: 'dex' },
-    { name: 'Survival', ability: 'wis' }
+  const skillChecks: Array<{ key: string; name: string; ability: AbilityKey }> = [
+    { key: 'acrobatics', name: 'Acrobatics', ability: 'dex' },
+    { key: 'animal_handling', name: 'Animal Handling', ability: 'wis' },
+    { key: 'arcana', name: 'Arcana', ability: 'int' },
+    { key: 'athletics', name: 'Athletics', ability: 'str' },
+    { key: 'deception', name: 'Deception', ability: 'cha' },
+    { key: 'history', name: 'History', ability: 'int' },
+    { key: 'insight', name: 'Insight', ability: 'wis' },
+    { key: 'intimidation', name: 'Intimidation', ability: 'cha' },
+    { key: 'investigation', name: 'Investigation', ability: 'int' },
+    { key: 'medicine', name: 'Medicine', ability: 'wis' },
+    { key: 'nature', name: 'Nature', ability: 'int' },
+    { key: 'perception', name: 'Perception', ability: 'wis' },
+    { key: 'performance', name: 'Performance', ability: 'cha' },
+    { key: 'persuasion', name: 'Persuasion', ability: 'cha' },
+    { key: 'religion', name: 'Religion', ability: 'int' },
+    { key: 'sleight_of_hand', name: 'Sleight of Hand', ability: 'dex' },
+    { key: 'stealth', name: 'Stealth', ability: 'dex' },
+    { key: 'survival', name: 'Survival', ability: 'wis' }
   ];
 
   function meta(field: string, fallback = '') {
@@ -162,6 +174,107 @@
   const visibleModifierEffects = $derived(filteredModifierEffects.slice(0, 50));
   const activeModifierFilterLabel = $derived(
     modifierFilters.find((filter) => filter.key === modifierFilter)?.label ?? 'Modifiers'
+  );
+  const equippedAcBonus = $derived(
+    equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
+  );
+  const acModifierBonuses = $derived(resolvedFlatBonuses(character.activeEffects, ['ac'], { classes: character.classes }));
+  const computedArmorClass = $derived(
+    10 +
+      abilityModifier(abilityScores.dex) +
+      equippedAcBonus +
+      acModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+  );
+  const initiativeModifierBonuses = $derived(resolvedFlatBonuses(character.activeEffects, ['initiative'], { classes: character.classes }));
+  const computedInitiative = $derived(
+    abilityModifier(abilityScores.dex) +
+      initiativeModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+  );
+  const computedSpeedValue = $derived.by(() => {
+    const setValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: character.classes });
+    const bonuses = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['bonus'], { classes: character.classes });
+    const multipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: character.classes });
+    const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
+    const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
+    const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
+    return Math.max(0, Math.floor(multiplied));
+  });
+  const computedSpeed = $derived(`${computedSpeedValue} ft.`);
+  const computedHitDice = $derived(hitDiceSummary(character.classes));
+  const passivePerceptionBonuses = $derived(resolvedFlatBonuses(character.activeEffects, ['skill.perception', 'passive.perception'], { classes: character.classes }));
+  const computedPassivePerception = $derived(
+    10 +
+      abilityModifier(abilityScores.wis) +
+      (isSkillProficient('perception') ? prof : 0) +
+      passivePerceptionBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+  );
+  const combatFormulaHelp = $derived.by(() => {
+    const dexMod = abilityModifier(abilityScores.dex);
+    const wisMod = abilityModifier(abilityScores.wis);
+    const speedSetValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: character.classes });
+    const speedBonuses = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['bonus'], { classes: character.classes });
+    const speedMultipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: character.classes });
+    const speedBase = speedSetValues.length ? speedSetValues.at(-1)?.value ?? 30 : 30;
+
+    return {
+      proficiency: [`Total level: ${level}`, `Formula: 2 + floor((level - 1) / 4)`, `Result: ${signed(prof)}`],
+      armorClass: [
+        'Base: 10',
+        `DEX modifier: ${signed(dexMod)}`,
+        `Equipped item AC bonuses: ${signed(equippedAcBonus)}`,
+        ...acModifierBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${computedArmorClass}`
+      ],
+      hitDice: [
+        ...character.classes.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${row.className ? hitDiceSummary([row]).split('d')[1] || '8' : '8'}`),
+        `Total: ${computedHitDice || 'None'}`
+      ],
+      passivePerception: [
+        'Base: 10',
+        `WIS modifier: ${signed(wisMod)}`,
+        `Perception proficiency: ${isSkillProficient('perception') ? signed(prof) : '+0'}`,
+        ...passivePerceptionBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${computedPassivePerception}`
+      ],
+      initiative: [
+        `DEX modifier: ${signed(dexMod)}`,
+        ...initiativeModifierBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${signed(computedInitiative)}`
+      ],
+      speed: [
+        speedSetValues.length ? `Base set by effect: ${speedBase} ft.` : 'Base walking speed: 30 ft.',
+        ...speedBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)} ft.`),
+        ...speedMultipliers.map((bonus) => `${bonus.label}: x${bonus.value}`),
+        `Total: ${computedSpeed}`
+      ]
+    };
+  });
+
+  function openFormulaHelp(title: string, lines: string[]) {
+    formulaHelp = { title, lines };
+  }
+
+  function helpTitle(lines: string[]) {
+    return lines.join('\n');
+  }
+
+  function formulaHelpButton(title: string, lines: string[]) {
+    return {
+      title: helpTitle(lines),
+      ariaLabel: `${title} formula breakdown`
+    };
+  }
+
+  function hitDieForRow(row: { className: string; level: number }) {
+    const summary = hitDiceSummary([row]);
+    return summary.includes('d') ? summary.split('d')[1] : '8';
+  }
+
+  const hitDiceFormulaLines = $derived(
+    [
+      ...character.classes.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${hitDieForRow(row)}`),
+      `Total: ${computedHitDice || 'None'}`
+    ]
   );
 
   function isEffectSelected(key: string) {
@@ -205,10 +318,79 @@
   $effect(() => {
     selectedEffectKeys = character.activeEffects.map((effect) => effect.effectKey);
     selectedExhaustionLevel = character.exhaustionLevel ?? 0;
+    selectedSavingThrowProficiencies = [...proficiencies.savingThrows];
+    selectedSkillProficiencies = [...proficiencies.skills];
   });
 
   function signed(value: number) {
     return value >= 0 ? `+${value}` : String(value);
+  }
+
+  function setSiblingHiddenBoolean(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const hidden = input.closest('label')?.querySelector<HTMLInputElement>('input[type="hidden"]');
+    if (hidden) hidden.value = input.checked ? 'true' : 'false';
+  }
+
+  function isSavingThrowProficient(key: AbilityKey) {
+    return selectedSavingThrowProficiencies.includes(key);
+  }
+
+  function isSkillProficient(key: string) {
+    return selectedSkillProficiencies.includes(key);
+  }
+
+  function toggleSavingThrowProficiency(key: AbilityKey) {
+    selectedSavingThrowProficiencies = isSavingThrowProficient(key)
+      ? selectedSavingThrowProficiencies.filter((value) => value !== key)
+      : [...selectedSavingThrowProficiencies, key];
+  }
+
+  function toggleSkillProficiency(key: string) {
+    selectedSkillProficiencies = isSkillProficient(key)
+      ? selectedSkillProficiencies.filter((value) => value !== key)
+      : [...selectedSkillProficiencies, key];
+  }
+
+  function savingThrowTotal(key: AbilityKey) {
+    return abilityModifier(abilityScores[key]) + (isSavingThrowProficient(key) ? prof : 0);
+  }
+
+  function skillCheckTotal(skill: { key: string; ability: AbilityKey }) {
+    return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0);
+  }
+
+  function rollText(modifier: number) {
+    const d20 = rollDie(20);
+    const total = d20 + modifier;
+    return {
+      text: `d20 ${d20} ${modifier >= 0 ? '+' : '-'} ${Math.abs(modifier)} = ${total}`,
+      natural: d20
+    };
+  }
+
+  function rollAllSavingThrows() {
+    savingThrowRolls = Object.fromEntries(
+      abilityOrder.map((key) => [key, rollText(savingThrowTotal(key))])
+    );
+  }
+
+  function rollAllSkillChecks() {
+    skillRolls = Object.fromEntries(
+      skillChecks.map((skill) => [skill.key, rollText(skillCheckTotal(skill))])
+    );
+  }
+
+  function rollSingleSavingThrow(key: AbilityKey) {
+    savingThrowRolls = { ...savingThrowRolls, [key]: rollText(savingThrowTotal(key)) };
+  }
+
+  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey }) {
+    skillRolls = { ...skillRolls, [skill.key]: rollText(skillCheckTotal(skill)) };
+  }
+
+  function rollAbilityCheck(key: AbilityKey) {
+    abilityRolls = { ...abilityRolls, [key]: rollText(abilityModifier(abilityScores[key])) };
   }
 
   function damageSummary(item: InventoryItem) {
@@ -300,7 +482,7 @@
   function rollBattleAction(item: InventoryItem) {
     const d20 = rollDie(20);
     const ability = abilityModifier(abilityScores[item.attackAbility]);
-    const attackBonus = ability + prof + Number(item.toHitBonus || 0);
+    const attackBonus = ability + (item.proficient ? prof : 0) + Number(item.toHitBonus || 0);
     const attackTotal = d20 + attackBonus;
     const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item));
 
@@ -448,12 +630,48 @@
         <section class="panel stack compact-panel">
           <h2>Combat Summary</h2>
           <div class="combat-summary-grid">
-            <label>Proficiency <input type="text" value={`+${prof}`} readonly /></label>
-            <label>Armor Class <input name="armorClass" type="number" value={meta('armorClass')} /></label>
-            <label>Hit Dice <input name="hitDice" value={meta('hitDice')} placeholder="1d10, 4d8" /></label>
-            <label>Passive Perception <input name="passivePerception" type="number" value={meta('passivePerception')} /></label>
-            <label>Initiative <input name="initiative" value={meta('initiative')} placeholder="+2" /></label>
-            <label>Speed <input name="speed" value={meta('speed')} placeholder="30 ft." /></label>
+            <label>
+              <span class="field-label-with-help">
+                Proficiency
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.proficiency)} aria-label="Proficiency formula breakdown" onclick={() => openFormulaHelp('Proficiency', combatFormulaHelp.proficiency)}>?</button>
+              </span>
+              <input type="text" value={`+${prof}`} readonly />
+            </label>
+            <label>
+              <span class="field-label-with-help">
+                Armor Class
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.armorClass)} aria-label="Armor Class formula breakdown" onclick={() => openFormulaHelp('Armor Class', combatFormulaHelp.armorClass)}>?</button>
+              </span>
+              <input name="armorClass" type="number" value={computedArmorClass} readonly />
+            </label>
+            <label>
+              <span class="field-label-with-help">
+                Hit Dice
+                <button type="button" class="formula-help-button" title={helpTitle(hitDiceFormulaLines)} aria-label="Hit Dice formula breakdown" onclick={() => openFormulaHelp('Hit Dice', hitDiceFormulaLines)}>?</button>
+              </span>
+              <input name="hitDice" value={computedHitDice} readonly />
+            </label>
+            <label>
+              <span class="field-label-with-help">
+                Passive Perception
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passivePerception)} aria-label="Passive Perception formula breakdown" onclick={() => openFormulaHelp('Passive Perception', combatFormulaHelp.passivePerception)}>?</button>
+              </span>
+              <input name="passivePerception" type="number" value={computedPassivePerception} readonly />
+            </label>
+            <label>
+              <span class="field-label-with-help">
+                Initiative
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.initiative)} aria-label="Initiative formula breakdown" onclick={() => openFormulaHelp('Initiative', combatFormulaHelp.initiative)}>?</button>
+              </span>
+              <input name="initiative" value={signed(computedInitiative)} readonly />
+            </label>
+            <label>
+              <span class="field-label-with-help">
+                Speed
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.speed)} aria-label="Speed formula breakdown" onclick={() => openFormulaHelp('Speed', combatFormulaHelp.speed)}>?</button>
+              </span>
+              <input name="speed" value={computedSpeed} readonly />
+            </label>
             <div class="death-save-grid" aria-label="Death saves">
               <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
               <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
@@ -501,7 +719,15 @@
                     <strong>{key.toUpperCase()}:</strong>
                     <input name={`ability_${key}`} type="number" min="1" value={abilityScores[key]} />
                   </span>
-                  <span class="modifier-line">Mod: {abilityModifier(abilityScores[key])}</span>
+                  <span class="modifier-line">
+                    Mod: {abilityModifier(abilityScores[key])}
+                    <button type="button" class="dice-icon-button small" aria-label={`Roll ${key.toUpperCase()} ability check`} title={`Roll ${key.toUpperCase()} ability check`} onclick={() => rollAbilityCheck(key)}>
+                      <img src={d20Icon} alt="" />
+                    </button>
+                  </span>
+                  {#if abilityRolls[key]}
+                    <span class="ability-roll-result" class:nat-one={abilityRolls[key]?.natural === 1} class:nat-twenty={abilityRolls[key]?.natural === 20}>{abilityRolls[key]?.text}</span>
+                  {/if}
                 </label>
               {/each}
             </div>
@@ -574,7 +800,10 @@
                 <span>{signed(item.toHitBonus)}</span>
                 <span>{damageSummary(item)}</span>
                 <span>{item.notes || '-'}</span>
-                <button type="button" class="compact-button" onclick={() => rollBattleAction(item)}>Roll</button>
+                <button type="button" class="compact-button dice-button" onclick={() => rollBattleAction(item)}>
+                  <img src={d20Icon} alt="" />
+                  Roll
+                </button>
               </div>
             {:else}
               <p class="muted">No equipped combat items yet. Add one on the Inventory tab.</p>
@@ -663,6 +892,11 @@
                     {/each}
                   </select>
                 </label>
+                <label class="inline compact-check">
+                  <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
+                  <input type="checkbox" checked={item.proficient} onchange={setSiblingHiddenBoolean} />
+                  Proficient
+                </label>
                 <label>Damage Rolls <input name="inventoryDamageRolls" value={item.damageRolls} placeholder="1d8 + 1d4 + 1d6" /></label>
                 <label>Effects <input name="inventoryEffects" value={item.effects} placeholder="fire, poison, prone" /></label>
                 <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
@@ -715,6 +949,7 @@
               <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
               <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
               <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+              <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
               <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
               <input name="inventoryEffects" type="hidden" value={item.effects} />
               <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
@@ -751,6 +986,7 @@
             <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
             <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
             <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+            <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
             <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
             <input name="inventoryEffects" type="hidden" value={item.effects} />
             <input name="inventoryIsEquipment" type="hidden" value="false" />
@@ -813,19 +1049,32 @@
     {#each selectedEffectKeys as effectKey}
       <input name="activeEffectKey" type="hidden" value={effectKey} />
     {/each}
+    {#if !savingThrowsOpen}
+      {#each selectedSavingThrowProficiencies as key}
+        <input name="savingThrowProficiency" type="hidden" value={key} />
+      {/each}
+    {/if}
+    {#if !skillChecksOpen}
+      {#each selectedSkillProficiencies as key}
+        <input name="skillProficiency" type="hidden" value={key} />
+      {/each}
+    {/if}
+    {#each proficiencies.weapons as key}
+      <input name="weaponProficiency" type="hidden" value={key} />
+    {/each}
 
     {#if activeTab !== 'battle'}
       <input name="hpCurrent" type="hidden" value={hp.currentValue} />
       <input name="hpMax" type="hidden" value={hp.maxValue} />
       <input name="tempHp" type="hidden" value={tempHp.currentValue} />
       <input name="inspiration" type="hidden" value={inspiration} />
-      <input name="armorClass" type="hidden" value={meta('armorClass')} />
-      <input name="initiative" type="hidden" value={meta('initiative')} />
-      <input name="speed" type="hidden" value={meta('speed')} />
-      <input name="hitDice" type="hidden" value={meta('hitDice')} />
+      <input name="armorClass" type="hidden" value={computedArmorClass} />
+      <input name="initiative" type="hidden" value={signed(computedInitiative)} />
+      <input name="speed" type="hidden" value={computedSpeed} />
+      <input name="hitDice" type="hidden" value={computedHitDice} />
       <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
       <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
-      <input name="passivePerception" type="hidden" value={meta('passivePerception')} />
+      <input name="passivePerception" type="hidden" value={computedPassivePerception} />
       {#each Object.entries(abilityScores) as [key, score]}
         <input name={`ability_${key}`} type="hidden" value={score} />
       {/each}
@@ -868,6 +1117,7 @@
         <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
         <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
         <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+        <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
         <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
         <input name="inventoryEffects" type="hidden" value={item.effects} />
         <input name="inventoryNotes" type="hidden" value={item.notes} />
@@ -913,15 +1163,36 @@
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="saving-throws-title">Saving Throws</h2>
-          <button type="button" class="text-button" onclick={() => (savingThrowsOpen = false)}>Close</button>
+          <div class="actions">
+            <button type="button" class="compact-button dice-button" onclick={rollAllSavingThrows}>
+              <img src={d20Icon} alt="" />
+              Roll All Saves
+            </button>
+            <button type="button" class="text-button" onclick={() => (savingThrowsOpen = false)}>Close</button>
+          </div>
         </div>
         <div class="check-list">
           {#each abilityOrder as key}
-            <div class="check-row">
-              <strong>{key.toUpperCase()}</strong>
-              <span>{signed(abilityModifier(abilityScores[key]))}</span>
+            <div class="check-row proficiency-row" class:proficient={isSavingThrowProficient(key)}>
+              <label class="proficiency-toggle">
+                <input name="savingThrowProficiency" type="checkbox" value={key} checked={isSavingThrowProficient(key)} onchange={() => toggleSavingThrowProficiency(key)} />
+                <span>
+                  <strong>{key.toUpperCase()}</strong>
+                  <small>{signed(abilityModifier(abilityScores[key]))}{isSavingThrowProficient(key) ? ` + ${prof} proficiency` : ''}</small>
+                </span>
+                <b>{signed(savingThrowTotal(key))}</b>
+                {#if savingThrowRolls[key]}
+                  <em class:nat-one={savingThrowRolls[key].natural === 1} class:nat-twenty={savingThrowRolls[key].natural === 20}>{savingThrowRolls[key].text}</em>
+                {/if}
+              </label>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => rollSingleSavingThrow(key)}>
+                <img src={d20Icon} alt="" />
+              </button>
             </div>
           {/each}
+        </div>
+        <div class="modal-actions">
+          <button type="submit">Save Proficiencies</button>
         </div>
       </div>
     </div>
@@ -929,18 +1200,39 @@
 
   {#if skillChecksOpen}
     <div class="modal-backdrop" role="presentation" onpointerdown={() => (skillChecksOpen = false)}>
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="skill-checks-title">Skill Checks</h2>
-          <button type="button" class="text-button" onclick={() => (skillChecksOpen = false)}>Close</button>
+          <div class="actions">
+            <button type="button" class="compact-button dice-button" onclick={rollAllSkillChecks}>
+              <img src={d20Icon} alt="" />
+              Roll All Skills
+            </button>
+            <button type="button" class="text-button" onclick={() => (skillChecksOpen = false)}>Close</button>
+          </div>
         </div>
         <div class="check-list skill-list">
           {#each skillChecks as skill}
-            <div class="check-row">
-              <strong>{skill.name}</strong>
-              <span>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}</span>
+            <div class="check-row proficiency-row" class:proficient={isSkillProficient(skill.key)}>
+              <label class="proficiency-toggle">
+                <input name="skillProficiency" type="checkbox" value={skill.key} checked={isSkillProficient(skill.key)} onchange={() => toggleSkillProficiency(skill.key)} />
+                <span>
+                  <strong>{skill.name}</strong>
+                  <small>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}{isSkillProficient(skill.key) ? ` + ${prof} proficiency` : ''}</small>
+                </span>
+                <b>{signed(skillCheckTotal(skill))}</b>
+                {#if skillRolls[skill.key]}
+                  <em class:nat-one={skillRolls[skill.key].natural === 1} class:nat-twenty={skillRolls[skill.key].natural === 20}>{skillRolls[skill.key].text}</em>
+                {/if}
+              </label>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => rollSingleSkillCheck(skill)}>
+                <img src={d20Icon} alt="" />
+              </button>
             </div>
           {/each}
+        </div>
+        <div class="modal-actions">
+          <button type="submit">Save Proficiencies</button>
         </div>
       </div>
     </div>
@@ -1049,6 +1341,22 @@
     </div>
   {/if}
 
+  {#if formulaHelp}
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (formulaHelp = null)}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="formula-help-title">{formulaHelp.title}</h2>
+          <button type="button" class="text-button" onclick={() => (formulaHelp = null)}>Close</button>
+        </div>
+        <div class="formula-breakdown">
+          {#each formulaHelp.lines as line}
+            <p>{line}</p>
+          {/each}
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if rollResult}
     <div class="modal-backdrop" role="presentation">
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title">
@@ -1135,6 +1443,11 @@
                 <option value={ability} selected={ability === 'str'}>{ability.toUpperCase()}</option>
               {/each}
             </select>
+          </label>
+          <label class="inline compact-check">
+            <input name="inventoryProficient" type="hidden" value="true" />
+            <input type="checkbox" checked onchange={setSiblingHiddenBoolean} />
+            Proficient
           </label>
           <label>Damage Rolls <input name="inventoryDamageRolls" placeholder="1d8 + 1d4" /></label>
           <label>Effects <input name="inventoryEffects" placeholder="fire, poison, prone" /></label>

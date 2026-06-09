@@ -12,6 +12,7 @@
     "test": "vitest run",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:seed:user": "tsx scripts/seed-user.ts",
+    "db:seed:core-effects": "tsx scripts/seed-core-effects.ts",
     "db:import:srd-effects": "tsx scripts/import-srd-effects.ts",
     "db:trim:effects": "tsx scripts/trim-effect-catalog.ts"
   },
