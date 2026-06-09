@@ -15,7 +15,10 @@ const pool = new pg.Pool({
 async function main() {
   await pool.query(`
     ALTER TABLE effect_definitions
-      ADD COLUMN IF NOT EXISTS is_selectable boolean NOT NULL DEFAULT true
+      ADD COLUMN IF NOT EXISTS is_selectable boolean NOT NULL DEFAULT true,
+      ADD COLUMN IF NOT EXISTS is_homebrew boolean NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS owner_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb
   `);
 
   await pool.query(`
@@ -25,9 +28,19 @@ async function main() {
       source_type text NOT NULL,
       source_ref text NOT NULL,
       source_name text,
+      is_homebrew boolean NOT NULL DEFAULT false,
+      owner_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+      metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
       created_at timestamptz NOT NULL DEFAULT now(),
       UNIQUE(effect_id, source_ref)
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE effect_sources
+      ADD COLUMN IF NOT EXISTS is_homebrew boolean NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS owner_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb
   `);
 
   await pool.query(`
@@ -79,8 +92,8 @@ async function main() {
       AND effect_key <> 'feature_ability_score_improvement'
       AND NOT EXISTS (
         SELECT 1
-        FROM effect_modifiers
-        WHERE effect_modifiers.effect_id = effect_definitions.id
+        FROM effect_modifier_links
+        WHERE effect_modifier_links.effect_id = effect_definitions.id
       )
   `);
 
@@ -90,8 +103,8 @@ async function main() {
         effect_definitions.id,
         EXISTS (
           SELECT 1
-          FROM effect_modifiers
-          WHERE effect_modifiers.effect_id = effect_definitions.id
+          FROM effect_modifier_links
+          WHERE effect_modifier_links.effect_id = effect_definitions.id
         ) AS has_modifiers,
         source_type,
         source_ref,

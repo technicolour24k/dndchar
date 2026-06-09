@@ -242,8 +242,8 @@ async function importEndpoint(endpoint: (typeof endpoints)[number]) {
         WHERE effect_key = $1
           AND EXISTS (
             SELECT 1
-            FROM effect_modifiers
-            WHERE effect_modifiers.effect_id = effect_definitions.id
+            FROM effect_modifier_links
+            WHERE effect_modifier_links.effect_id = effect_definitions.id
           )
       `,
       [key]

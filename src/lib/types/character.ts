@@ -29,6 +29,7 @@ export type InventoryItem = {
   toHitBonus: number;
   damageBonus: number;
   attackAbility: AbilityKey;
+  proficient: boolean;
   damageRolls: string;
   effects: string;
   abilityBonuses: Partial<Record<AbilityKey, number>>;
@@ -44,6 +45,8 @@ export type EffectModifier = {
   target: string;
   modifierType: string;
   valueExpression: string;
+  defaultValueExpression: string;
+  valueOverrideExpression: string;
   conditionExpression: string;
   priority: number;
 };
@@ -54,6 +57,7 @@ export type EffectDefinition = {
   name: string;
   sourceType: string;
   sourceRef: string;
+  sourceName: string;
   description: string;
   durationType: string;
   durationRounds: number | null;
@@ -69,6 +73,7 @@ export type ActiveCharacterEffect = {
   effectKey: string;
   name: string;
   sourceType: string;
+  sourceName: string;
   description: string;
   durationType: string;
   requiresConcentration: boolean;
@@ -93,6 +98,12 @@ export type CharacterNote = {
   content: string;
 };
 
+export type CharacterProficiencies = {
+  savingThrows: AbilityKey[];
+  skills: string[];
+  weapons: string[];
+};
+
 export type CharacterDetail = {
   id: string;
   ownerUserId: string;
@@ -107,6 +118,7 @@ export type CharacterDetail = {
   inventory: InventoryItem[];
   attacks: CharacterAttack[];
   notes: CharacterNote[];
+  proficiencies: CharacterProficiencies;
   activeEffects: ActiveCharacterEffect[];
   availableEffects: EffectDefinition[];
   exhaustionLevel: number;

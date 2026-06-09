@@ -1,5 +1,12 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { loginWithPassword, setSessionCookie } from '$lib/server/auth/session';
+import { isRegistrationEnabled } from '$lib/server/services/app-settings';
+
+export async function load() {
+  return {
+    registrationEnabled: await isRegistrationEnabled()
+  };
+}
 
 export const actions = {
   default: async ({ request, cookies }) => {
