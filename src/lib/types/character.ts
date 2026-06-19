@@ -8,6 +8,8 @@ export type CharacterAbility = {
 export type CharacterClass = {
   className: string;
   level: number;
+  subclassName?: string;
+  spellcastingAbility?: AbilityKey | null;
 };
 
 export type CharacterResource = {
@@ -30,6 +32,8 @@ export type InventoryItem = {
   damageBonus: number;
   attackAbility: AbilityKey;
   proficient: boolean;
+  sourceContentId?: string | null;
+  attuned?: boolean;
   damageRolls: string;
   effects: string;
   abilityBonuses: Partial<Record<AbilityKey, number>>;
@@ -122,6 +126,9 @@ export type CharacterDetail = {
   activeEffects: ActiveCharacterEffect[];
   availableEffects: EffectDefinition[];
   exhaustionLevel: number;
+  content: import('$lib/types/content').CharacterContentInstance[];
+  spellSlots: import('$lib/types/content').SpellSlot[];
+  combatClock: { roundNumber: number; turnNumber: number };
   updatedAt: string;
 };
 

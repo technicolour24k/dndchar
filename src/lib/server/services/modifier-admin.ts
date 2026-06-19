@@ -88,6 +88,68 @@ export function typeLabel(type: string): string {
   return modifierTypes.find(([key]) => key === type)?.[1] ?? type;
 }
 
+function safeExpression(value: FormDataEntryValue | null): string {
+  const expression = String(value || '').trim();
+  if (expression && !/^[a-zA-Z0-9_.,+\- ]+$/.test(expression)) throw new Error('Expressions may contain only numbers, dice, named variables, commas, spaces, +, and -.');
+  return expression;
+}
+
+export async function listModifierTargets(): Promise<Array<[string, string, boolean]>> {
+  const result = await query<{ target_key: string; label: string; runtime_supported: boolean }>(
+    'SELECT target_key, label, runtime_supported FROM modifier_targets ORDER BY category, label'
+  );
+  return result.rows.map((row) => [row.target_key, row.label, row.runtime_supported]);
+}
+
+export async function createModifierTarget(form: FormData): Promise<void> {
+  const key = String(form.get('targetKey') || '').trim().toLowerCase();
+  const label = String(form.get('targetLabel') || '').trim();
+  if (!/^[a-z][a-z0-9_.-]*$/.test(key) || !label) throw new Error('A valid target key and label are required.');
+  await query(`INSERT INTO modifier_targets
+    (target_key, label, category, value_kind, runtime_supported, description)
+    VALUES ($1,$2,$3,$4,false,$5)
+    ON CONFLICT (target_key) DO UPDATE SET label=EXCLUDED.label, category=EXCLUDED.category,
+      value_kind=EXCLUDED.value_kind, description=EXCLUDED.description`,
+    [key, label, String(form.get('targetCategory') || 'custom'), String(form.get('valueKind') || 'number'),
+      String(form.get('targetDescription') || '')]);
+}
+
+export async function loadModifierCatalogue() {
+  const targets=await query<{target_key:string;label:string;category:string;value_kind:string;runtime_supported:boolean;description:string}>(
+    'SELECT target_key,label,category,value_kind,runtime_supported,description FROM modifier_targets ORDER BY category,label');
+  const modifiers=await query<{id:string;target:string;modifier_type:string;default_value_expression:string;label:string;description:string;target_label:string}>(`
+    SELECT m.id,m.target,m.modifier_type,COALESCE(m.default_value_expression,'') AS default_value_expression,
+      COALESCE(m.label,'') AS label,COALESCE(m.description,'') AS description,COALESCE(t.label,m.target) AS target_label
+    FROM modifier_definitions m LEFT JOIN modifier_targets t ON t.target_key=m.target
+    ORDER BY target_label,m.modifier_type,m.default_value_expression`);
+  return {targets:targets.rows.map(row=>({key:row.target_key,label:row.label,category:row.category,valueKind:row.value_kind,
+    runtimeSupported:row.runtime_supported,description:row.description})),modifiers:modifiers.rows.map(row=>({id:row.id,target:row.target,
+      targetLabel:row.target_label,modifierType:row.modifier_type,defaultValueExpression:row.default_value_expression,
+      label:row.label,description:row.description}))};
+}
+
+export async function loadGenericEffectAdmin(selectedId=''){
+  const effects=await query<any>(`SELECT e.id,e.effect_key,e.name,e.source_type,COALESCE(e.description,'') AS description,
+    COALESCE(e.is_selectable,true) AS is_selectable,COUNT(l.id)::int AS modifier_count
+    FROM effect_definitions e LEFT JOIN effect_modifier_links l ON l.effect_id=e.id
+    WHERE e.source_type NOT IN('spell','feat','class_feature','item')
+      AND COALESCE((e.metadata_json->>'managedByContentAdmin')::boolean,false)=false
+    GROUP BY e.id ORDER BY e.source_type,e.name`);
+  const effectId=effects.rows.some((row:any)=>row.id===selectedId)?selectedId:effects.rows[0]?.id||'';
+  const links=effectId?await query<any>(`SELECT l.id,l.effect_id,m.id AS modifier_id,m.target,
+    COALESCE(t.label,m.target) AS target_label,m.modifier_type,
+    COALESCE(l.value_override_expression,m.default_value_expression,'') AS value_expression,
+    COALESCE(l.condition_expression,'') AS condition_expression,l.priority
+    FROM effect_modifier_links l JOIN modifier_definitions m ON m.id=l.modifier_id
+    LEFT JOIN modifier_targets t ON t.target_key=m.target WHERE l.effect_id=$1
+    ORDER BY l.priority,target_label`,[effectId]):{rows:[]};
+  return{effects:effects.rows.map((row:any)=>({id:row.id,key:row.effect_key,name:row.name,sourceType:row.source_type,
+    description:row.description,isSelectable:row.is_selectable,modifierCount:row.modifier_count})),selectedEffectId:effectId,
+    effectLinks:links.rows.map((row:any)=>({id:row.id,effectId:row.effect_id,modifierId:row.modifier_id,target:row.target,
+      targetLabel:row.target_label,modifierType:row.modifier_type,valueExpression:row.value_expression,
+      conditionExpression:row.condition_expression,priority:row.priority}))};
+}
+
 export async function loadModifierAdmin(selectedEffectId = '') {
   const effects = await query<{
     id: string;
@@ -301,7 +363,7 @@ export async function createModifier(form: FormData): Promise<string> {
     [
       target,
       modifierType,
-      String(form.get('defaultValueExpression') || '').trim(),
+      safeExpression(form.get('defaultValueExpression')),
       String(form.get('label') || '').trim(),
       String(form.get('description') || '').trim()
     ]
@@ -330,7 +392,7 @@ export async function attachModifierToEffect(form: FormData): Promise<string> {
     [
       effectId,
       modifierId,
-      String(form.get('valueOverrideExpression') || '').trim(),
+      safeExpression(form.get('valueOverrideExpression')),
       String(form.get('conditionExpression') || '').trim(),
       Number(form.get('priority')) || 0
     ]

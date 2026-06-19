@@ -287,6 +287,7 @@ label.compact-check {
 }
 
 .form-error {
+  margin-bottom: 18px;
   border-radius: 8px;
   padding: 12px;
   background: #431f1f;
@@ -301,6 +302,7 @@ label.compact-check {
 }
 
 .form-success {
+  margin-bottom: 18px;
   border-radius: 8px;
   padding: 12px;
   background: #18351f;
@@ -323,6 +325,74 @@ label.compact-check {
 .admin-grid {
   display: grid;
   grid-template-columns: minmax(300px, 1fr) minmax(360px, 1.15fr) minmax(320px, .95fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.admin-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel);
+}
+
+.admin-nav a {
+  border-radius: 7px;
+  padding: 9px 12px;
+  background: var(--panel-dark);
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.admin-nav a:hover {
+  background: var(--field);
+  color: var(--text);
+}
+
+.admin-nav a.active {
+  background: #000;
+  color: var(--text);
+}
+
+.content-admin-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, .65fr) minmax(360px, 1fr) minmax(380px, 1.1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.content-admin-layout > * {
+  min-width: 0;
+}
+
+.content-selector-panel,
+.content-editor-panel,
+.modifier-attachment-panel {
+  max-height: calc(100vh - 190px);
+  overflow-y: auto;
+}
+
+.content-admin-layout select,
+.content-admin-layout input,
+.content-admin-layout textarea {
+  min-width: 0;
+  width: 100%;
+}
+
+.modifier-summary-row {
+  align-items: start;
+}
+
+.system-effects-panel {
+  margin-top: 18px;
+}
+
+.system-effect-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, .8fr) minmax(380px, 1.2fr);
   gap: 18px;
   align-items: start;
 }
@@ -793,13 +863,196 @@ button.equipment-toggle .item-kind-icon {
   display: grid;
   grid-template-columns: repeat(4, max-content);
   gap: 8px 16px;
+  padding-bottom: 18px;
   justify-content: start;
   align-items: end;
+}
+
+.inventory-action-result {
+  white-space: pre-line;
 }
 
 .combat-summary-grid label {
   gap: 4px;
   font-size: 12px;
+}
+
+.catalogue-add-panel,
+.catalogue-add-row,
+.catalogue-filter,
+.participant-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.catalogue-add-panel {
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.catalogue-toolbar {
+  margin-bottom: 18px;
+}
+
+.catalogue-layout > * {
+  min-width: 0;
+}
+
+.catalogue-layout aside > h2:not(:first-child) {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 18px;
+}
+
+.catalogue-add-row select,
+.catalogue-filter label,
+.participant-form select {
+  min-width: min(280px, 100%);
+  flex: 1;
+}
+
+.structured-section,
+.content-instance-card {
+  display: grid;
+  gap: 10px;
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel-dark);
+}
+
+.slot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+  gap: 8px;
+}
+
+.slot-counter,
+.resource-counter {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 9px;
+}
+
+.slot-counter > div,
+.resource-counter > div {
+  display: flex;
+  gap: 5px;
+}
+
+.slot-counter button,
+.resource-counter button {
+  min-width: 32px;
+  min-height: 30px;
+  padding: 4px 8px;
+}
+
+.content-instance-list,
+.catalogue-list,
+.initiative-list {
+  display: grid;
+  gap: 9px;
+}
+
+.content-instance-row,
+.catalogue-card,
+.initiative-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border-radius: 8px;
+  padding: 11px;
+  background: var(--panel-dark);
+}
+
+.catalogue-card {
+  padding: 14px;
+}
+
+.content-instance-row > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.traits-layout,
+.encounter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.summary-input-roll {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.combat-summary-grid .summary-input-roll input {
+  width: 62px;
+}
+
+.initiative-control {
+  grid-column: 1;
+  grid-row: 2;
+  width: 91px;
+  min-width: 91px;
+  position: relative;
+  contain: layout;
+}
+
+.speed-control {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.initiative-control .inline-roll-result {
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 0;
+  z-index: 1;
+  max-width: none;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.inline-roll-result {
+  display: block;
+  max-width: 130px;
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.status-chip,
+.initiative-list .active-turn {
+  border: 1px solid #d7ad4a;
+  color: #f0ca68;
+}
+
+.catalogue-admin-grid {
+  grid-template-columns: minmax(420px, 1.3fr) repeat(2, minmax(280px, .8fr));
+}
+
+.class-list,
+.class-row {
+  display: grid;
+  gap: 9px;
+}
+
+.class-row {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-dark);
+}
+
+.class-row button {
+  justify-self: start;
 }
 
 .field-label-with-help {
@@ -918,6 +1171,7 @@ button.formula-help-button:focus-visible {
 
 .death-save-grid {
   grid-column: 3 / 5;
+  grid-row: 2;
   display: grid;
   gap: 7px;
   align-self: end;
@@ -1155,6 +1409,27 @@ button.death-save-icon.failure.active {
 
 .save-state.good {
   color: var(--ok);
+}
+
+.sheet-header-actions {
+  justify-content: end;
+}
+
+.save-cluster {
+  display: grid;
+  gap: 4px;
+}
+
+.save-command-row,
+.save-status-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.save-status-row {
+  min-height: 18px;
+  font-size: 12px;
 }
 
 .version-row {
@@ -1437,8 +1712,25 @@ button.death-save-icon.failure.active {
 
   .battle-top-row,
   .battle-main-row,
-  .inventory-layout {
+  .inventory-layout,
+  .traits-layout,
+  .encounter-grid,
+  .catalogue-admin-grid {
     grid-template-columns: 1fr;
+  }
+
+  .content-admin-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .system-effect-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .content-selector-panel,
+  .content-editor-panel,
+  .modifier-attachment-panel {
+    max-height: none;
   }
 
   .modifications-panel {
@@ -1504,6 +1796,7 @@ button.death-save-icon.failure.active {
 
   .page-shell {
     padding: 12px;
+    overflow-x: clip;
   }
 
   .mini-grid,
@@ -1529,5 +1822,39 @@ button.death-save-icon.failure.active {
 
   .row-actions button {
     flex: 1;
+  }
+
+  .catalogue-add-row,
+  .catalogue-add-panel,
+  .catalogue-filter,
+  .participant-form,
+  .content-instance-row,
+  .catalogue-card,
+  .class-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .catalogue-add-row select,
+  .catalogue-filter label,
+  .participant-form select {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .content-instance-row .actions,
+  .catalogue-add-row button,
+  .catalogue-add-row a {
+    width: 100%;
+  }
+
+  .modal-backdrop {
+    padding: 10px;
+  }
+
+  .modal-backdrop > .panel {
+    width: min(100%, 100vw - 20px);
+    max-height: calc(100vh - 20px);
+    overflow-y: auto;
   }
 }
