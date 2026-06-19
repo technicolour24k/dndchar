@@ -28,6 +28,7 @@ export async function loginWithPassword(email: string, password: string): Promis
     id: string;
     email: string;
     display_name: string;
+    role: 'user' | 'admin';
     password_hash: string;
   }>('SELECT id, email, display_name, password_hash FROM users WHERE email = lower($1)', [email]);
 
@@ -63,6 +64,7 @@ export async function getUserForToken(token: string | undefined): Promise<{ user
     id: string;
     email: string;
     display_name: string;
+    role: 'user' | 'admin';
     theme_background_color: string;
     theme_panel_color: string;
     theme_text_color: string;
@@ -73,6 +75,7 @@ export async function getUserForToken(token: string | undefined): Promise<{ user
         users.id,
         users.email,
         users.display_name,
+        users.role,
         COALESCE(users.theme_background_color, '#f1f1f1') AS theme_background_color,
         COALESCE(users.theme_panel_color, '#292929') AS theme_panel_color,
         COALESCE(users.theme_text_color, '#f4f4f4') AS theme_text_color
@@ -92,6 +95,7 @@ export async function getUserForToken(token: string | undefined): Promise<{ user
       id: row.id,
       email: row.email,
       displayName: row.display_name,
+      role: row.role,
       themeBackgroundColor: row.theme_background_color,
       themePanelColor: row.theme_panel_color,
       themeTextColor: row.theme_text_color

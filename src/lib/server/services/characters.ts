@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { abilityKeys, clampResource } from '$lib/rules/dnd5e';
+import { getCombatClock, listCharacterContent, listSpellSlots, syncCharacterSpellSlots } from '$lib/server/services/catalogue';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -41,6 +42,7 @@ type CharacterSnapshot = {
   abilities?: Array<{ ability_key?: AbilityKey; score?: number }>;
   resources?: Array<{ resource_key?: string; label?: string; current_value?: number; max_value?: number }>;
   inventory?: Array<{
+    id?: string;
     name?: string;
     category?: string;
     quantity?: number;
@@ -61,12 +63,18 @@ type CharacterSnapshot = {
     proficient?: boolean;
     damage_rolls?: string;
     effects?: string;
+    source_content_id?: string | null;
+    attuned?: boolean;
   }>;
   attacks?: Array<{ name?: string; attack_ability?: AbilityKey; proficient?: boolean; damage_dice?: string; notes?: string }>;
   notes?: Array<{ note_key?: string; title?: string; content?: string }>;
   proficiencies?: Array<{ proficiency_type?: string; proficiency_key?: string }>;
-  active_effects?: Array<{ effect_key?: string; remaining_rounds?: number | null; metadata_json?: Record<string, unknown> }>;
+  active_effects?: Array<{ effect_key?: string; remaining_rounds?: number | null; metadata_json?: Record<string, unknown>; source_content_instance_id?: string | null; expiry_boundary?: string }>;
   exhaustion?: { exhaustion_level?: number };
+  content_instances?: any[];
+  content_resources?: any[];
+  spell_slots?: any[];
+  combat_clock?: any;
 };
 
 const defaultClasses: CharacterClass[] = [{ className: 'Fighter', level: 1 }];
@@ -224,7 +232,10 @@ export async function getCharacter(userId: string, characterId: string): Promise
     proficiencies: await getProficiencies(characterId),
     activeEffects: await getActiveEffects(characterId),
     availableEffects: await listEffectDefinitions(),
-    exhaustionLevel: await getExhaustionLevel(characterId)
+    exhaustionLevel: await getExhaustionLevel(characterId),
+    content: await listCharacterContent(characterId),
+    spellSlots: await listSpellSlots(characterId),
+    combatClock: await getCombatClock(characterId)
   });
 }
 
@@ -285,6 +296,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
     await setExhaustionLevel(client, characterId, Number(form.get('exhaustionLevel')) || 0);
     await createVersionWithClient(client, characterId, userId, summary);
   });
+  await syncCharacterSpellSlots(userId, characterId);
 }
 
 export async function listVersions(userId: string, characterId: string): Promise<CharacterVersion[]> {
@@ -360,7 +372,8 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const proficiencies = await client.query('SELECT proficiency_type, proficiency_key FROM character_proficiencies WHERE character_id = $1 ORDER BY proficiency_type, proficiency_key', [characterId]);
   const activeEffects = await client.query(
     `
-      SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json
+      SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json,
+        active_character_effects.source_content_instance_id, active_character_effects.expiry_boundary
       FROM active_character_effects
       JOIN effect_definitions ON effect_definitions.id = active_character_effects.effect_id
       WHERE active_character_effects.character_id = $1
@@ -369,6 +382,11 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
     [characterId]
   );
   const exhaustion = await client.query('SELECT exhaustion_level FROM character_exhaustion WHERE character_id = $1', [characterId]);
+  const contentInstances = await client.query('SELECT * FROM character_content_instances WHERE character_id = $1 ORDER BY created_at', [characterId]);
+  const contentResources = await client.query(`SELECT r.* FROM character_content_resources r
+    JOIN character_content_instances i ON i.id = r.character_content_id WHERE i.character_id = $1`, [characterId]);
+  const spellSlots = await client.query('SELECT * FROM character_spell_slots WHERE character_id = $1 ORDER BY slot_type, slot_level', [characterId]);
+  const combatClock = await client.query('SELECT * FROM character_combat_clocks WHERE character_id = $1', [characterId]);
 
   return {
     character: character.rows[0],
@@ -380,7 +398,11 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
     notes: notes.rows,
     proficiencies: proficiencies.rows,
     active_effects: activeEffects.rows,
-    exhaustion: exhaustion.rows[0] ?? { exhaustion_level: 0 }
+    exhaustion: exhaustion.rows[0] ?? { exhaustion_level: 0 },
+    content_instances: contentInstances.rows,
+    content_resources: contentResources.rows,
+    spell_slots: spellSlots.rows,
+    combat_clock: combatClock.rows[0] ?? null
   };
 }
 
@@ -455,6 +477,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
     client,
     characterId,
     (snapshot.inventory ?? []).map((row) => ({
+      id: row.id,
       name: row.name || '',
       category: row.category || 'gear',
       location: normalizeInventoryLocation(row.location, Boolean(row.equipped)),
@@ -466,6 +489,8 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       damageBonus: Number(row.damage_bonus) || 0,
       attackAbility: abilityKeys.includes(row.attack_ability as AbilityKey) ? (row.attack_ability as AbilityKey) : 'str',
       proficient: row.proficient ?? true,
+      sourceContentId: row.source_content_id || null,
+      attuned: row.attuned || false,
       damageRolls: row.damage_rolls || '',
       effects: row.effects || '',
       abilityBonuses: {
@@ -507,20 +532,60 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       key: row.proficiency_key || ''
     }))
   );
+  await restoreStructuredContent(client, characterId, snapshot);
   await replaceActiveEffects(
     client,
     characterId,
     (snapshot.active_effects ?? []).map((row) => row.effect_key || '').filter(Boolean)
   );
+  for (const row of snapshot.active_effects ?? []) {
+    await client.query(`UPDATE active_character_effects active SET remaining_rounds=$1, metadata_json=$2,
+      source_content_instance_id=$3, expiry_boundary=COALESCE($4,'round_end')
+      FROM effect_definitions effect WHERE active.character_id=$5 AND active.effect_id=effect.id AND effect.effect_key=$6`,
+      [row.remaining_rounds ?? null, JSON.stringify(row.metadata_json || {}), row.source_content_instance_id || null,
+        row.expiry_boundary || 'round_end', characterId, row.effect_key]);
+  }
   await setExhaustionLevel(client, characterId, Number(snapshot.exhaustion?.exhaustion_level) || 0);
 }
 
+async function restoreStructuredContent(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot): Promise<void> {
+  await client.query('DELETE FROM character_content_instances WHERE character_id = $1', [characterId]);
+  for (const row of snapshot.content_instances ?? []) {
+    const contentExists = await client.query('SELECT id FROM content_definitions WHERE id = $1', [row.content_id]);
+    if (!contentExists.rowCount) continue;
+    await client.query(`INSERT INTO character_content_instances
+      (id, character_id, content_id, source_class_id, is_known, is_prepared, is_active, custom_name, notes, metadata_json, created_at)
+      VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,COALESCE($10,now()))`,
+      [row.id, characterId, row.content_id, row.is_known, row.is_prepared, row.is_active, row.custom_name,
+        row.notes || '', JSON.stringify(row.metadata_json || {}), row.created_at]);
+  }
+  for (const row of snapshot.content_resources ?? []) {
+    await client.query(`INSERT INTO character_content_resources
+      (id, character_content_id, resource_definition_id, current_value, max_value)
+      SELECT $1,$2,$3,$4,$5 WHERE EXISTS (SELECT 1 FROM character_content_instances WHERE id=$2)
+        AND EXISTS (SELECT 1 FROM content_resource_definitions WHERE id=$3)`,
+      [row.id, row.character_content_id, row.resource_definition_id, row.current_value, row.max_value]);
+  }
+  await client.query('DELETE FROM character_spell_slots WHERE character_id = $1', [characterId]);
+  for (const row of snapshot.spell_slots ?? []) {
+    await client.query(`INSERT INTO character_spell_slots
+      (character_id, slot_type, slot_level, current_slots, max_slots) VALUES ($1,$2,$3,$4,$5)`,
+      [characterId, row.slot_type, row.slot_level, row.current_slots, row.max_slots]);
+  }
+  if (snapshot.combat_clock) {
+    await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number, updated_at)
+      VALUES ($1,$2,$3,now()) ON CONFLICT (character_id) DO UPDATE
+      SET round_number=EXCLUDED.round_number, turn_number=EXCLUDED.turn_number, updated_at=now()`,
+      [characterId, snapshot.combat_clock.round_number, snapshot.combat_clock.turn_number]);
+  }
+}
+
 async function getClasses(characterId: string): Promise<CharacterClass[]> {
-  const result = await query<{ class_name: string; level: number }>(
-    'SELECT class_name, level FROM character_classes WHERE character_id = $1 ORDER BY sort_order ASC',
+  const result = await query<{ class_name: string; level: number; subclass_name: string; spellcasting_ability: AbilityKey | null }>(
+    'SELECT class_name, level, subclass_name, spellcasting_ability FROM character_classes WHERE character_id = $1 ORDER BY sort_order ASC',
     [characterId]
   );
-  return result.rows.map((row) => ({ className: row.class_name, level: row.level }));
+  return result.rows.map((row) => ({ className: row.class_name, level: row.level, subclassName: row.subclass_name, spellcastingAbility: row.spellcasting_ability }));
 }
 
 async function getAbilities(characterId: string): Promise<CharacterAbility[]> {
@@ -567,6 +632,8 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     proficient: boolean;
     damage_rolls: string;
     effects: string;
+    source_content_id: string | null;
+    attuned: boolean;
   }>('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order ASC', [characterId]);
   return result.rows.map((row) => ({
     id: row.id,
@@ -581,6 +648,8 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     damageBonus: row.damage_bonus,
     attackAbility: row.attack_ability || 'str',
     proficient: row.proficient ?? true,
+    sourceContentId: row.source_content_id,
+    attuned: row.attuned,
     damageRolls: row.damage_rolls,
     effects: row.effects,
     abilityBonuses: {
@@ -766,9 +835,33 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
       remaining_rounds: number | null;
     }>(
       `
-        SELECT id, effect_id, remaining_rounds
-        FROM active_character_effects
-        WHERE character_id = $1
+        SELECT id::text, effect_id, remaining_rounds FROM active_character_effects WHERE character_id = $1
+        UNION ALL
+        SELECT ('content:' || i.id::text || ':' || l.id::text), l.effect_id, NULL
+        FROM character_content_instances i
+        JOIN content_definitions c ON c.id = i.content_id
+        JOIN content_effect_links l ON l.content_id = i.content_id
+        WHERE i.character_id = $1 AND i.is_active = true AND c.content_type <> 'item'
+          AND l.activation_type IN ('carried', 'equipped', 'attuned', 'manual')
+        UNION ALL
+        SELECT ('item:' || inventory.id::text || ':' || l.id::text), l.effect_id, NULL
+        FROM character_inventory_items inventory
+        JOIN content_effect_links l ON l.content_id = inventory.source_content_id
+        WHERE inventory.character_id = $1 AND (
+          l.activation_type = 'carried'
+          OR (l.activation_type = 'equipped' AND inventory.equipped)
+          OR (l.activation_type = 'attuned' AND inventory.attuned)
+        )
+        UNION ALL
+        SELECT ('grant:' || inventory.id::text || ':' || granted_link.id::text), granted_link.effect_id, NULL
+        FROM character_inventory_items inventory
+        JOIN content_grants grant_link ON grant_link.source_content_id = inventory.source_content_id
+        JOIN content_effect_links granted_link ON granted_link.content_id = grant_link.granted_content_id
+        WHERE inventory.character_id = $1 AND (
+          grant_link.activation_type = 'carried'
+          OR (grant_link.activation_type = 'equipped' AND inventory.equipped)
+          OR (grant_link.activation_type = 'attuned' AND inventory.attuned)
+        )
       `,
       [characterId]
     );
@@ -815,8 +908,8 @@ async function replaceClasses(client: pg.PoolClient, characterId: string, classe
   await client.query('DELETE FROM character_classes WHERE character_id = $1', [characterId]);
   for (const [index, row] of classes.entries()) {
     await client.query(
-      'INSERT INTO character_classes (character_id, class_name, level, sort_order) VALUES ($1, $2, $3, $4)',
-      [characterId, row.className || 'Fighter', Math.max(1, Number(row.level) || 1), index]
+      'INSERT INTO character_classes (character_id, class_name, level, subclass_name, spellcasting_ability, sort_order) VALUES ($1, $2, $3, $4, $5, $6)',
+      [characterId, row.className || 'Fighter', Math.max(1, Number(row.level) || 1), row.subclassName || '', row.spellcastingAbility || null, index]
     );
   }
 }
@@ -846,16 +939,25 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
 }
 
 async function replaceInventory(client: pg.PoolClient, characterId: string, inventory: InventoryItem[]): Promise<void> {
-  await client.query('DELETE FROM character_inventory_items WHERE character_id = $1', [characterId]);
+  const retainedIds = inventory.map((row) => row.id).filter(Boolean);
+  await client.query('DELETE FROM character_inventory_items WHERE character_id = $1 AND NOT (id = ANY($2::uuid[]))', [characterId, retainedIds]);
   for (const [index, row] of inventory.entries()) {
     if (!row.name.trim() || Number(row.quantity) <= 0) continue;
     await client.query(
       `
         INSERT INTO character_inventory_items
-          (character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+          (id, character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order, source_content_id, attuned)
+        VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+        ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, location=EXCLUDED.location,
+          quantity=EXCLUDED.quantity, equipped=EXCLUDED.equipped, is_equipment=EXCLUDED.is_equipment,
+          ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
+          attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
+          effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
+          source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
+        WHERE character_inventory_items.character_id = EXCLUDED.character_id
       `,
       [
+        row.id || null,
         characterId,
         row.name,
         row.category || 'gear',
@@ -877,7 +979,9 @@ async function replaceInventory(client: pg.PoolClient, characterId: string, inve
         Number(row.abilityBonuses.wis) || 0,
         Number(row.abilityBonuses.cha) || 0,
         row.notes || '',
-        index
+        index,
+        row.sourceContentId || null,
+        row.attuned || false
       ]
     );
   }
@@ -926,8 +1030,10 @@ async function replaceProficiencies(
 }
 
 async function replaceActiveEffects(client: pg.PoolClient, characterId: string, effectKeys: string[]): Promise<void> {
-  await client.query('DELETE FROM active_character_effects WHERE character_id = $1', [characterId]);
   const uniqueKeys = [...new Set(effectKeys.map((key) => key.trim()).filter(Boolean))];
+  await client.query(`DELETE FROM active_character_effects active WHERE character_id=$1
+    AND NOT EXISTS (SELECT 1 FROM effect_definitions effect WHERE effect.id=active.effect_id AND effect.effect_key=ANY($2::text[]))`,
+    [characterId, uniqueKeys]);
   for (const key of uniqueKeys) {
     await client.query(
       `
@@ -957,9 +1063,15 @@ async function setExhaustionLevel(client: pg.PoolClient, characterId: string, le
 }
 
 function parseClasses(form: FormData): CharacterClass[] {
-  const className = String(form.get('className') || 'Fighter').trim() || 'Fighter';
-  const level = Math.max(1, Number(form.get('level')) || 1);
-  return [{ className, level }];
+  const names = form.getAll('className').map((value) => String(value).trim());
+  const levels = form.getAll('classLevel').map(Number);
+  const subclasses = form.getAll('subclassName').map(String);
+  const abilities = form.getAll('classSpellcastingAbility').map(String);
+  if (!names.length) return [{ className: 'Fighter', level: Math.max(1, Number(form.get('level')) || 1) }];
+  return names.map((className, index) => ({
+    className: className || 'Fighter', level: Math.max(1, levels[index] || 1), subclassName: subclasses[index] || '',
+    spellcastingAbility: (abilities[index] || null) as AbilityKey | null
+  }));
 }
 
 function parseAbilities(form: FormData): CharacterAbility[] {
@@ -990,6 +1102,7 @@ function parseResources(form: FormData): CharacterResource[] {
 }
 
 function parseInventory(form: FormData): InventoryItem[] {
+  const ids = form.getAll('inventoryId').map(String);
   const names = form.getAll('inventoryName').map((value) => String(value).trim());
   const categories = form.getAll('inventoryCategory').map(String);
   const locations = form.getAll('inventoryLocation').map(String);
@@ -1004,11 +1117,14 @@ function parseInventory(form: FormData): InventoryItem[] {
   const damageRolls = form.getAll('inventoryDamageRolls').map(String);
   const effects = form.getAll('inventoryEffects').map(String);
   const notes = form.getAll('inventoryNotes').map(String);
+  const sourceContentIds = form.getAll('inventorySourceContentId').map(String);
+  const attunedValues = form.getAll('inventoryAttuned').map((value) => String(value) === 'true');
 
   return names
     .map((name, index) => {
       const location = normalizeInventoryLocation(locations[index], equipped[index]);
       return {
+        id: ids[index] || undefined,
         name,
         category: categories[index] || 'gear',
         location,
@@ -1020,6 +1136,8 @@ function parseInventory(form: FormData): InventoryItem[] {
         damageBonus: damageBonuses[index] || 0,
         attackAbility: abilityKeys.includes(attackAbilities[index] as AbilityKey) ? (attackAbilities[index] as AbilityKey) : 'str',
         proficient: proficientValues[index] ?? true,
+        sourceContentId: sourceContentIds[index] || null,
+        attuned: attunedValues[index] || false,
         damageRolls: damageRolls[index] || '',
         effects: effects[index] || '',
         abilityBonuses: {},

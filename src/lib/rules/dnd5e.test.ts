@@ -4,10 +4,16 @@ import {
   barbarianRageDamageBonus,
   clampResource,
   hitDiceSummary,
+  effectiveCasterLevel,
+  pactMagicSlots,
   proficiencyBonus,
+  resolveResourceMaximum,
+  rollDiceExpression,
   resolvedFlatBonuses,
   resolvedNumericModifiers,
   skillModifier,
+  spellSaveDc,
+  standardSpellSlotMaximums,
   totalLevel
 } from './dnd5e';
 import type { ActiveCharacterEffect } from '$lib/types/character';
@@ -114,5 +120,32 @@ describe('D&D 5e helpers', () => {
     };
 
     expect(resolvedNumericModifiers([haste], ['speed.walk'], ['multiplier'])).toEqual([{ label: 'Haste', value: 2 }]);
+  });
+
+  it('calculates full 2014 multiclass spell slots', () => {
+    const classes = [{ className: 'Wizard', level: 3 }, { className: 'Paladin', level: 4 }];
+    expect(effectiveCasterLevel(classes)).toBe(5);
+    expect(standardSpellSlotMaximums(classes).slice(0, 4)).toEqual([4, 3, 2, 0]);
+    expect(effectiveCasterLevel([{ className: 'Fighter', subclassName: 'Eldritch Knight', level: 9 }])).toBe(3);
+  });
+
+  it('keeps Pact Magic separate from standard slots', () => {
+    expect(pactMagicSlots([{ className: 'Warlock', level: 1 }])).toEqual({ level: 1, slots: 1 });
+    expect(pactMagicSlots([{ className: 'Warlock', level: 11 }])).toEqual({ level: 5, slots: 3 });
+  });
+
+  it('calculates spell save DC with modifier bonuses', () => {
+    expect(spellSaveDc(16, 5, [2])).toBe(16);
+  });
+
+  it('resolves safe resource maximum expressions', () => {
+    expect(resolveResourceMaximum('3')).toBe(3);
+    expect(resolveResourceMaximum('proficiency_bonus', { proficiencyBonus: 4 })).toBe(4);
+    expect(resolveResourceMaximum('process.exit()', { level: 20 })).toBe(0);
+  });
+
+  it('rolls additive and subtractive resource expressions safely',()=>{
+    expect(rollDiceExpression('2d4+3-1d6',()=>2)).toBe(5);
+    expect(rollDiceExpression('process.exit()',()=>20)).toBe(0);
   });
 });

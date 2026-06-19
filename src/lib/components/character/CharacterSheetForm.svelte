@@ -1,27 +1,32 @@
 <script lang="ts">
-  import { enhance } from '$app/forms';
-  import { abilityMap, abilityModifier, hitDiceSummary, proficiencyBonus, resolvedFlatBonuses, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
+  import { deserialize, enhance } from '$app/forms';
+  import { untrack } from 'svelte';
+  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolvedAdditiveModifiers, resolvedNumericModifiers, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
+  import type { ContentDefinition, ContentType } from '$lib/types/content';
 
   let {
     character,
+    catalogue = [],
     itemCategories = [],
     result,
     onVersionHistory
   }: {
     character: CharacterDetail;
+    catalogue?: ContentDefinition[];
     itemCategories?: ItemCategory[];
     result?: Record<string, unknown>;
     onVersionHistory?: () => void;
   } = $props();
 
-  const classes = $derived(character.classes[0] ?? { className: 'Fighter', level: 1 });
+  let classRows = $state(untrack(() => character.classes.map((row) => ({ ...row }))));
+  const classes = $derived(classRows[0] ?? { className: 'Fighter', level: 1 });
   const resources = $derived(Object.fromEntries(character.resources.map((resource) => [resource.key, resource])));
   const hp = $derived(resources.hp ?? { currentValue: 10, maxValue: 10 });
   const tempHp = $derived(resources.temp_hp ?? { currentValue: 0, maxValue: 0 });
   const inspiration = $derived(resources.inspiration?.currentValue ?? 0);
   const abilityScores = $derived(abilityMap(character.abilities));
-  const level = $derived(totalLevel(character.classes));
+  const level = $derived(totalLevel(classRows));
   const prof = $derived(proficiencyBonus(level));
   const metadata = $derived(character.metadata ?? {});
   const race = $derived(String(character.metadata?.race ?? ''));
@@ -92,6 +97,9 @@
   let savingThrowRolls = $state<Record<string, { text: string; natural: number }>>({});
   let skillRolls = $state<Record<string, { text: string; natural: number }>>({});
   let abilityRolls = $state<Partial<Record<AbilityKey, { text: string; natural: number }>>>({});
+  let initiativeRoll = $state<{ text: string; natural: number } | null>(null);
+  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '' });
+  let contentBusy = $state(false);
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all' | 'catalogue'>('active');
   let newItemOpen = $state(false);
@@ -149,6 +157,7 @@
   const activeEffectDetails = $derived(
     character.availableEffects.filter((effect) => selectedEffectKeys.includes(effect.key))
   );
+  const allActiveEffectDetails = $derived(character.activeEffects);
   const filteredModifierEffects = $derived(
     character.availableEffects.filter((effect) => {
       const query = modifierSearch.trim().toLowerCase();
@@ -178,30 +187,42 @@
   const equippedAcBonus = $derived(
     equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
   );
-  const acModifierBonuses = $derived(resolvedFlatBonuses(character.activeEffects, ['ac'], { classes: character.classes }));
+  const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['ac'], { classes: classRows }));
   const computedArmorClass = $derived(
     10 +
       abilityModifier(abilityScores.dex) +
       equippedAcBonus +
       acModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
   );
-  const initiativeModifierBonuses = $derived(resolvedFlatBonuses(character.activeEffects, ['initiative'], { classes: character.classes }));
+  const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['initiative'], { classes: classRows }));
   const computedInitiative = $derived(
     abilityModifier(abilityScores.dex) +
       initiativeModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
   );
+  const spellcastingAbility = $derived((classes.spellcastingAbility || meta('spellcastingAbility', 'int').toLowerCase()) as AbilityKey);
+  const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['spell_save_dc'], { classes: classRows }));
+  const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
+  const computedSpellSaveDc = $derived(spellSaveDc(abilityScores[spellcastingAbility] ?? 10, level, spellDcBonuses.map((bonus) => bonus.value)));
+  const computedSpellAttackBonus = $derived(spellAttackBonus(abilityScores[spellcastingAbility] ?? 10, level, spellAttackBonuses.map((bonus) => bonus.value)));
+  const spellDcFormula = $derived([
+    'Base: 8', `Proficiency: ${signed(prof)}`, `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`,
+    ...spellDcBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`), `Total: ${computedSpellSaveDc}`
+  ]);
+  const characterSpells = $derived(character.content.filter((entry) => entry.type === 'spell'));
+  const characterFeats = $derived(character.content.filter((entry) => entry.type === 'feat'));
+  const characterFeatures = $derived(character.content.filter((entry) => entry.type === 'class_feature'));
   const computedSpeedValue = $derived.by(() => {
-    const setValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: character.classes });
-    const bonuses = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['bonus'], { classes: character.classes });
-    const multipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: character.classes });
+    const setValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
+    const bonuses = resolvedAdditiveModifiers(character.activeEffects, ['speed.all', 'speed.walk'], { classes: classRows });
+    const multipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
     const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
     const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
     const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
     return Math.max(0, Math.floor(multiplied));
   });
   const computedSpeed = $derived(`${computedSpeedValue} ft.`);
-  const computedHitDice = $derived(hitDiceSummary(character.classes));
-  const passivePerceptionBonuses = $derived(resolvedFlatBonuses(character.activeEffects, ['skill.perception', 'passive.perception'], { classes: character.classes }));
+  const computedHitDice = $derived(hitDiceSummary(classRows));
+  const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
   const computedPassivePerception = $derived(
     10 +
       abilityModifier(abilityScores.wis) +
@@ -211,9 +232,9 @@
   const combatFormulaHelp = $derived.by(() => {
     const dexMod = abilityModifier(abilityScores.dex);
     const wisMod = abilityModifier(abilityScores.wis);
-    const speedSetValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: character.classes });
-    const speedBonuses = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['bonus'], { classes: character.classes });
-    const speedMultipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: character.classes });
+    const speedSetValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
+    const speedBonuses = resolvedAdditiveModifiers(character.activeEffects, ['speed.all', 'speed.walk'], { classes: classRows });
+    const speedMultipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
     const speedBase = speedSetValues.length ? speedSetValues.at(-1)?.value ?? 30 : 30;
 
     return {
@@ -226,7 +247,7 @@
         `Total: ${computedArmorClass}`
       ],
       hitDice: [
-        ...character.classes.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${row.className ? hitDiceSummary([row]).split('d')[1] || '8' : '8'}`),
+        ...classRows.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${row.className ? hitDiceSummary([row]).split('d')[1] || '8' : '8'}`),
         `Total: ${computedHitDice || 'None'}`
       ],
       passivePerception: [
@@ -272,7 +293,7 @@
 
   const hitDiceFormulaLines = $derived(
     [
-      ...character.classes.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${hitDieForRow(row)}`),
+      ...classRows.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${hitDieForRow(row)}`),
       `Total: ${computedHitDice || 'None'}`
     ]
   );
@@ -316,7 +337,7 @@
   });
 
   $effect(() => {
-    selectedEffectKeys = character.activeEffects.map((effect) => effect.effectKey);
+    selectedEffectKeys = character.activeEffects.filter((effect) => !effect.id.startsWith('content:') && !effect.id.startsWith('item:')).map((effect) => effect.effectKey);
     selectedExhaustionLevel = character.exhaustionLevel ?? 0;
     selectedSavingThrowProficiencies = [...proficiencies.savingThrows];
     selectedSkillProficiencies = [...proficiencies.skills];
@@ -360,37 +381,85 @@
     return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0);
   }
 
-  function rollText(modifier: number) {
-    const d20 = rollDie(20);
-    const total = d20 + modifier;
+  function rollText(modifier: number, candidates: string[] = []) {
+    const relevant = character.activeEffects.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
+      .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
+    const advantage = relevant.some(({ entry }) => entry.modifierType === 'advantage');
+    const disadvantage = relevant.some(({ entry }) => entry.modifierType === 'disadvantage');
+    const first = rollDie(20);
+    const second = advantage !== disadvantage ? rollDie(20) : null;
+    const d20 = second === null ? first : advantage ? Math.max(first, second) : Math.min(first, second);
+    const flat = relevant.reduce((sum, { entry }) => {
+      const value = Number(entry.valueExpression) || 0;
+      return sum + (entry.modifierType === 'bonus' ? value : entry.modifierType === 'penalty' ? -value : 0);
+    }, 0);
+    const extraDice = relevant.filter(({ entry }) => entry.modifierType === 'extra_die').map(({ effect, entry }) => {
+      const match = entry.valueExpression.match(/^(\d*)d(\d+)$/i);
+      if (!match) return { effect, value: 0, label: entry.valueExpression };
+      const count = Math.max(1, Number(match[1]) || 1);
+      const rolls = Array.from({ length: count }, () => rollDie(Number(match[2])));
+      return { effect, value: rolls.reduce((sum, roll) => sum + roll, 0), label: `${entry.valueExpression} (${rolls.join(', ')})` };
+    });
+    const extraTotal = extraDice.reduce((sum, die) => sum + die.value, 0);
+    const total = d20 + modifier + flat + extraTotal;
+    const mode = second === null ? `d20 ${d20}` : `${advantage ? 'advantage' : 'disadvantage'} d20 [${first}, ${second}] -> ${d20}`;
+    const extras = extraDice.map((die) => `${die.effect} ${die.label}`).join(' + ');
     return {
-      text: `d20 ${d20} ${modifier >= 0 ? '+' : '-'} ${Math.abs(modifier)} = ${total}`,
-      natural: d20
+      text: `${mode} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${extras ? ` + ${extras}` : ''} = ${total}`,
+      natural: d20,
+      total
     };
   }
 
   function rollAllSavingThrows() {
     savingThrowRolls = Object.fromEntries(
-      abilityOrder.map((key) => [key, rollText(savingThrowTotal(key))])
+      abilityOrder.map((key) => [key, rollText(savingThrowTotal(key), [`saving_throw.${key}`])])
     );
   }
 
   function rollAllSkillChecks() {
     skillRolls = Object.fromEntries(
-      skillChecks.map((skill) => [skill.key, rollText(skillCheckTotal(skill))])
+      skillChecks.map((skill) => [skill.key, rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`])])
     );
   }
 
   function rollSingleSavingThrow(key: AbilityKey) {
-    savingThrowRolls = { ...savingThrowRolls, [key]: rollText(savingThrowTotal(key)) };
+    savingThrowRolls = { ...savingThrowRolls, [key]: rollText(savingThrowTotal(key), [`saving_throw.${key}`]) };
   }
 
   function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey }) {
-    skillRolls = { ...skillRolls, [skill.key]: rollText(skillCheckTotal(skill)) };
+    skillRolls = { ...skillRolls, [skill.key]: rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) };
   }
 
   function rollAbilityCheck(key: AbilityKey) {
-    abilityRolls = { ...abilityRolls, [key]: rollText(abilityModifier(abilityScores[key])) };
+    abilityRolls = { ...abilityRolls, [key]: rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]) };
+  }
+
+  function rollInitiative() {
+    initiativeRoll = rollText(computedInitiative, ['initiative']);
+  }
+
+  async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
+    contentBusy = true;
+    const body = new FormData();
+    for (const [key, value] of Object.entries(values)) body.set(key, String(value));
+    const response = await fetch(`?/${action}`, { method: 'POST', body });
+    contentBusy = false;
+    if (response.ok) location.reload();
+    else inventoryMessage = `Could not update character content (${response.status}).`;
+  }
+
+  function addSelectedContent(type: ContentType) {
+    const contentId = selectedCatalogue[type];
+    if (contentId) void runContentAction('addContent', { contentId });
+  }
+
+  function addClassRow() {
+    classRows = [...classRows, { className: '', level: 1, subclassName: '', spellcastingAbility: null }];
+  }
+
+  function removeClassRow(index: number) {
+    if (classRows.length > 1) classRows = classRows.filter((_, rowIndex) => rowIndex !== index);
   }
 
   function damageSummary(item: InventoryItem) {
@@ -472,23 +541,29 @@
       canBeMeleeWeaponAttack ? `damage_roll.melee_weapon.${item.attackAbility}` : ''
     ].filter(Boolean);
 
-    return resolvedFlatBonuses(character.activeEffects, candidates, {
-      classes: character.classes,
+    const context = {
+      classes: classRows,
       attackType: 'melee_weapon',
       ability: item.attackAbility
-    });
+    } as const;
+    return [
+      ...resolvedNumericModifiers(character.activeEffects, candidates, ['bonus'], context),
+      ...resolvedNumericModifiers(character.activeEffects, candidates, ['penalty'], context).map((penalty) => ({ ...penalty, value: -penalty.value }))
+    ];
   }
 
   function rollBattleAction(item: InventoryItem) {
-    const d20 = rollDie(20);
     const ability = abilityModifier(abilityScores[item.attackAbility]);
     const attackBonus = ability + (item.proficient ? prof : 0) + Number(item.toHitBonus || 0);
-    const attackTotal = d20 + attackBonus;
+    const attackCandidates = ['attack_roll.weapon', `attack_roll.weapon.${item.attackAbility}`,
+      item.category === 'weapon' ? 'attack_roll.melee_weapon' : '',
+      item.category === 'weapon' ? `attack_roll.melee_weapon.${item.attackAbility}` : ''].filter(Boolean);
+    const attackRoll = rollText(attackBonus, attackCandidates);
     const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item));
 
     rollResult = {
       title: item.name || 'Battle Action',
-      attack: `d20 ${d20} ${attackBonus >= 0 ? '+' : '-'} ${Math.abs(attackBonus)} = ${attackTotal} (beats AC ${attackTotal} or below)`,
+      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)`,
       damage: damage.lines,
       effects: item.effects || item.notes || '-'
     };
@@ -521,12 +596,47 @@
     const attackAbility = (row?.querySelector<HTMLInputElement | HTMLSelectElement>('input[name="inventoryAttackAbility"], select[name="inventoryAttackAbility"]')?.value || 'str') as AbilityKey;
     const ability = abilityModifier(abilityScores[attackAbility]);
     const effects = row?.querySelector<HTMLInputElement>('input[name="inventoryEffects"]')?.value || '';
+    const inventoryId = row?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    const sourceContentId = row?.querySelector<HTMLInputElement>('input[name="inventorySourceContentId"]')?.value || '';
     const roll = damageRolls ? rollDamageExpression(damageRolls, damageBonus, ability, attackAbility.toUpperCase()) : null;
+    if (inventoryId && sourceContentId) {
+      void useCatalogueInventoryItem(inventoryId, name);
+      return;
+    }
     adjustInventoryQuantity(event, -1);
     inventoryMessage = roll
       ? `${name} used. Quantity reduced by 1. Roll: ${roll.lines.join('; ')}${effects ? ` (${effects})` : ''}.`
       : `${name} used. Quantity reduced by 1.`;
   }
+
+  async function useCatalogueInventoryItem(inventoryId:string,name:string){
+    const body=new FormData();body.set('inventoryId',inventoryId);
+    await runResourceAction('useItem',body,`${name} used. Quantity reduced by 1.`);
+  }
+
+  async function triggerContentResourceAction(instanceId:string,name:string){
+    const body=new FormData();body.set('instanceId',instanceId);
+    await runResourceAction('triggerContent',body,`${name} used.`);
+  }
+
+  async function runResourceAction(action:string,body:FormData,heading:string){
+    const response=await fetch(`?/${action}`,{method:'POST',body});
+    const actionResult=deserialize(await response.text());
+    if(actionResult.type!=='success'){
+      inventoryMessage='Could not apply the resource action.';
+      return;
+    }
+    const results=((actionResult.data as {itemResult?:Array<{label:string;target:string;expression:string;rolled:number;before:number;after:number}>})?.itemResult)||[];
+    const lines=[heading,...results.map(result=>
+      `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
+    sessionStorage.setItem('inventory-use-result',lines.join('\n'));
+    location.reload();
+  }
+
+  $effect(()=>{
+    const message=sessionStorage.getItem('inventory-use-result');
+    if(message){sessionStorage.removeItem('inventory-use-result');inventoryMessage=message;}
+  });
 
   function removeInventoryItem(event: MouseEvent) {
     const row = findInventoryRow(event);
@@ -602,15 +712,24 @@
       <button type="button" class:active={activeTab === 'inventory'} onclick={() => (activeTab = 'inventory')}>Inventory</button>
       <button type="button" class:active={activeTab === 'character'} onclick={() => (activeTab = 'character')}>Character</button>
     </nav>
-    <div class="actions">
-      <span class="save-state">{autosaveStatus}</span>
-      {#if result?.saved}
-        <span class="save-state good">Saved</span>
-      {/if}
-      <button type="submit">Save</button>
-      {#if onVersionHistory}
-        <button type="button" class="text-button" onclick={onVersionHistory}>Version History</button>
-      {/if}
+    <div class="actions sheet-header-actions">
+      <span class="save-state">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
+      <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
+      <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceRound')}>Next Round</button>
+      <div class="save-cluster">
+        <div class="save-command-row">
+          <button type="submit">Save</button>
+          {#if onVersionHistory}
+            <button type="button" class="text-button" onclick={onVersionHistory}>Version History</button>
+          {/if}
+        </div>
+        <div class="save-status-row">
+          <span class="save-state">{autosaveStatus}</span>
+          {#if result?.saved}
+            <span class="save-state good">Saved</span>
+          {/if}
+        </div>
+      </div>
     </div>
   </section>
 
@@ -658,14 +777,20 @@
               </span>
               <input name="passivePerception" type="number" value={computedPassivePerception} readonly />
             </label>
-            <label>
+            <label class="initiative-control">
               <span class="field-label-with-help">
                 Initiative
                 <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.initiative)} aria-label="Initiative formula breakdown" onclick={() => openFormulaHelp('Initiative', combatFormulaHelp.initiative)}>?</button>
               </span>
-              <input name="initiative" value={signed(computedInitiative)} readonly />
+              <span class="summary-input-roll">
+                <input name="initiative" value={signed(computedInitiative)} readonly />
+                <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={rollInitiative}>
+                  <img src={d20Icon} alt="" />
+                </button>
+              </span>
+              {#if initiativeRoll}<span class="inline-roll-result" class:nat-one={initiativeRoll.natural === 1} class:nat-twenty={initiativeRoll.natural === 20}>{initiativeRoll.text}</span>{/if}
             </label>
-            <label>
+            <label class="speed-control">
               <span class="field-label-with-help">
                 Speed
                 <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.speed)} aria-label="Speed formula breakdown" onclick={() => openFormulaHelp('Speed', combatFormulaHelp.speed)}>?</button>
@@ -754,7 +879,7 @@
               />
             </label>
             <div class="active-mods">
-              {#each activeEffectDetails.slice(0, 5) as effect}
+              {#each allActiveEffectDetails.slice(0, 5) as effect}
                 <button
                   type="button"
                   class:condition-chip={effect.isCondition}
@@ -767,8 +892,8 @@
               {:else}
                 <span class="muted">No active effects</span>
               {/each}
-              {#if activeEffectDetails.length > 5}
-                <span>+{activeEffectDetails.length - 5}</span>
+              {#if allActiveEffectDetails.length > 5}
+                <span>+{allActiveEffectDetails.length - 5}</span>
               {/if}
             </div>
           </div>
@@ -814,9 +939,25 @@
         <section class="panel stack">
           <h2>Magic & Battle Notes</h2>
           <div class="mini-grid">
-            <label>Spellcasting Ability <input name="spellcastingAbility" value={meta('spellcastingAbility')} placeholder="INT, WIS, CHA" /></label>
-            <label>Spell Save DC <input name="spellSaveDc" type="number" value={meta('spellSaveDc')} /></label>
-            <label>Spell Attack Bonus <input name="spellAttackBonus" value={meta('spellAttackBonus')} placeholder="+5" /></label>
+            <label>Spellcasting Ability <select name="spellcastingAbility" value={spellcastingAbility}>{#each abilityOrder as key}<option value={key}>{key.toUpperCase()}</option>{/each}</select></label>
+            <label><span class="field-label-with-help">Spell Save DC<button type="button" class="formula-help-button" onclick={() => openFormulaHelp('Spell Save DC', spellDcFormula)}>?</button></span><input name="spellSaveDc" type="number" value={computedSpellSaveDc} readonly /></label>
+            <label><span class="field-label-with-help">Spell Attack Bonus<button type="button" class="formula-help-button" onclick={() => openFormulaHelp('Spell Attack Bonus', [`Proficiency: ${signed(prof)}`, `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`, ...spellAttackBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`), `Total: ${signed(computedSpellAttackBonus)}`])}>?</button></span><input name="spellAttackBonus" value={signed(computedSpellAttackBonus)} readonly /></label>
+          </div>
+          <div class="structured-section">
+            <div class="panel-head compact-head"><h3>Spell Slots</h3><div class="actions"><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button></div></div>
+            <div class="slot-grid">
+              {#each character.spellSlots as slot}
+                <div class="slot-counter"><strong>{slot.type === 'pact' ? 'Pact' : `Level ${slot.level}`}</strong><span>{slot.current} / {slot.max}</span><div><button type="button" onclick={() => runContentAction('spellSlot', { slotType: slot.type, slotLevel: slot.level, delta: -1 })}>-</button><button type="button" onclick={() => runContentAction('spellSlot', { slotType: slot.type, slotLevel: slot.level, delta: 1 })}>+</button></div></div>
+              {:else}<span class="muted">No spell slots for the current classes.</span>{/each}
+            </div>
+          </div>
+          <div class="structured-section">
+            <div class="catalogue-add-row"><select bind:value={selectedCatalogue.spell}><option value="">Add a spell...</option>{#each catalogue.filter((entry) => entry.type === 'spell') as entry}<option value={entry.id}>{entry.name} (level {entry.spell?.level ?? 0})</option>{/each}</select><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button><a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a></div>
+            <div class="content-instance-list">
+              {#each characterSpells as spell}
+                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}</span></div><div class="actions">{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button></div></article>
+              {/each}
+            </div>
           </div>
           <label>Spellcasting <textarea name="spellcastingNote">{notes.spellcasting ?? ''}</textarea></label>
           <label>Spell Slots <textarea name="spellSlotsNote">{notes.spell_slots ?? ''}</textarea></label>
@@ -832,6 +973,7 @@
   {/if}
 
   {#if activeTab === 'traits'}
+    <section class="traits-layout">
     <section class="panel stack">
       <div class="panel-head">
         <h2>Traits & Features</h2>
@@ -846,9 +988,38 @@
         <label>Limited Uses <textarea name="limitedUsesNote">{notes.limited_uses ?? ''}</textarea></label>
       </div>
     </section>
+    <section class="panel stack">
+      <div class="panel-head"><h2>Structured Features</h2><a href="/catalogue">Create Homebrew</a></div>
+      {#each [['class_feature', 'Class Feature'], ['feat', 'Feat']] as option}
+        <div class="catalogue-add-row">
+          <select value={selectedCatalogue[option[0] as ContentType]} onchange={(event) => (selectedCatalogue[option[0] as ContentType] = event.currentTarget.value)}>
+            <option value="">Add {option[1]}...</option>
+            {#each catalogue.filter((entry) => entry.type === option[0]) as entry}<option value={entry.id}>{entry.name}</option>{/each}
+          </select>
+          <button type="button" disabled={!selectedCatalogue[option[0] as ContentType] || contentBusy} onclick={() => addSelectedContent(option[0] as ContentType)}>Add</button>
+        </div>
+      {/each}
+      <div class="content-instance-list">
+        {#each [...characterFeatures, ...characterFeats] as entry}
+          <article class="content-instance-card">
+            <div class="panel-head compact-head"><div><span class="eyebrow">{entry.type.replace('_', ' ')}{entry.grantedBy ? ` / granted by ${entry.grantedBy}` : ''}</span><h3>{entry.name}</h3></div>{#if !entry.grantedBy}<button type="button" class="danger compact-button" onclick={() => runContentAction('removeContent', { instanceId: entry.id })}>Remove</button>{/if}</div>
+            <p>{entry.description}</p>
+            {#if entry.hasResourceActions}<button type="button" class="compact-button" onclick={() => triggerContentResourceAction(entry.id,entry.name)}>Use Actions</button>{/if}
+            {#each entry.resources as resource}
+              <div class="resource-counter"><span>{resource.label}</span><strong>{resource.currentValue} / {resource.maxValue}</strong><div><button type="button" onclick={() => runContentAction('contentResource', { resourceId: resource.id, delta: -1 })}>-</button><button type="button" onclick={() => runContentAction('contentResource', { resourceId: resource.id, delta: 1 })}>+</button></div><small>{resource.rechargePeriod.replace('_', ' ')}</small></div>
+            {/each}
+          </article>
+        {:else}<p class="muted">No structured feats or class features added yet.</p>{/each}
+      </div>
+    </section>
+    </section>
   {/if}
 
   {#if activeTab === 'inventory'}
+    <section class="panel catalogue-add-panel">
+      <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
+      <div class="catalogue-add-row"><select bind:value={selectedCatalogue.item}><option value="">Choose an item...</option>{#each catalogue.filter((entry) => entry.type === 'item') as entry}<option value={entry.id}>{entry.name}</option>{/each}</select><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button><a class="compact-button" href="/catalogue?type=item">Create Homebrew</a></div>
+    </section>
     <section class="inventory-layout">
       <section class="panel stack inventory-section">
         <div class="panel-head compact-head">
@@ -859,6 +1030,8 @@
         <div class="inventory-table equipped-table">
           {#each equippedInventoryRows as item, index (item.id ?? `equipment-${item.name}-${index}`)}
             <div class="inventory-row equipped-row">
+              <input name="inventoryId" type="hidden" value={item.id || ''} />
+              <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
               <div class="inventory-row-main">
                 <label>Item <input name="inventoryName" value={item.name} placeholder="Longsword" /></label>
                 <label>Category
@@ -897,6 +1070,10 @@
                   <input type="checkbox" checked={item.proficient} onchange={setSiblingHiddenBoolean} />
                   Proficient
                 </label>
+                <label class="inline compact-check">
+                  <input name="inventoryAttuned" type="hidden" value={item.attuned ? 'true' : 'false'} />
+                  <input type="checkbox" checked={item.attuned} onchange={setSiblingHiddenBoolean} /> Attuned
+                </label>
                 <label>Damage Rolls <input name="inventoryDamageRolls" value={item.damageRolls} placeholder="1d8 + 1d4 + 1d6" /></label>
                 <label>Effects <input name="inventoryEffects" value={item.effects} placeholder="fire, poison, prone" /></label>
                 <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
@@ -919,6 +1096,9 @@
         <div class="inventory-table backpack-table">
           {#each backpackInventoryRows as item, index (item.id ?? `backpack-${item.name}-${index}`)}
             <div class="inventory-row simple">
+              <input name="inventoryId" type="hidden" value={item.id || ''} />
+              <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+              <input name="inventoryAttuned" type="hidden" value={item.attuned ? 'true' : 'false'} />
               <label>Item <input name="inventoryName" value={item.name} placeholder="Potion, rope, gold ring" /></label>
               <label>Category
                 <select name="inventoryCategory">
@@ -977,6 +1157,9 @@
         <label>General Inventory / Junk <textarea name="generalInventoryNote">{notes.general_inventory ?? ''}</textarea></label>
         {#each miscInventoryRows as item, index (item.id ?? `misc-${item.name}-${index}`)}
           <div class="inventory-row misc-row">
+            <input name="inventoryId" type="hidden" value={item.id || ''} />
+            <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+            <input name="inventoryAttuned" type="hidden" value="false" />
             <label>Misc Item <input name="inventoryName" value={item.name} placeholder="Letter, gem, trinket" /></label>
             <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
             <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
@@ -1004,8 +1187,18 @@
       <section class="panel stack">
         <h2>Identity</h2>
         <label>Character Name <input name="name" value={character.name} required /></label>
-        <label>Class <input name="className" value={classes.className} /></label>
-        <label>Level <input name="level" type="number" min="1" max="20" value={classes.level} /></label>
+        <div class="class-list">
+          {#each classRows as classRow, index}
+            <div class="class-row">
+              <label>Class <input name="className" bind:value={classRow.className} /></label>
+              <label>Subclass <input name="subclassName" bind:value={classRow.subclassName} placeholder="Eldritch Knight" /></label>
+              <label>Level <input name="classLevel" type="number" min="1" max="20" bind:value={classRow.level} /></label>
+              <label>Spellcasting Ability<select name="classSpellcastingAbility" bind:value={classRow.spellcastingAbility}><option value={null}>None</option>{#each abilityOrder as key}<option value={key}>{key.toUpperCase()}</option>{/each}</select></label>
+              <button type="button" class="compact-button danger" disabled={classRows.length === 1} onclick={() => removeClassRow(index)}>Remove</button>
+            </div>
+          {/each}
+          <button type="button" class="compact-button" onclick={addClassRow}>Add Class</button>
+        </div>
         <label>Ancestry <input name="ancestry" value={character.ancestry} /></label>
         <label>Race <input name="race" value={race} /></label>
         <label>Background <input name="background" value={character.background} /></label>
@@ -1083,9 +1276,9 @@
       {#if attack.proficient}<input name="attackProficient" type="hidden" value="on" />{/if}
       <input name="attackDamageDice" type="hidden" value={attack.damageDice} />
       <input name="attackNotes" type="hidden" value={attack.notes} />
-      <input name="spellcastingAbility" type="hidden" value={meta('spellcastingAbility')} />
-      <input name="spellSaveDc" type="hidden" value={meta('spellSaveDc')} />
-      <input name="spellAttackBonus" type="hidden" value={meta('spellAttackBonus')} />
+      <input name="spellcastingAbility" type="hidden" value={spellcastingAbility} />
+      <input name="spellSaveDc" type="hidden" value={computedSpellSaveDc} />
+      <input name="spellAttackBonus" type="hidden" value={signed(computedSpellAttackBonus)} />
       <input name="spellcastingNote" type="hidden" value={notes.spellcasting ?? ''} />
       <input name="spellSlotsNote" type="hidden" value={notes.spell_slots ?? ''} />
       <input name="preparedSpellsNote" type="hidden" value={notes.prepared_spells ?? ''} />
@@ -1107,6 +1300,9 @@
 
     {#if activeTab !== 'inventory'}
       {#each inventoryRows as item, index (item.id ?? `hidden-inventory-${item.name}-${index}`)}
+        <input name="inventoryId" type="hidden" value={item.id || ''} />
+        <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+        <input name="inventoryAttuned" type="hidden" value={item.attuned ? 'true' : 'false'} />
         <input name="inventoryName" type="hidden" value={item.name} />
         <input name="inventoryCategory" type="hidden" value={item.category} />
         <input name="inventoryLocation" type="hidden" value={item.location} />
@@ -1133,8 +1329,12 @@
 
     {#if activeTab !== 'character'}
       <input name="name" type="hidden" value={character.name} />
-      <input name="className" type="hidden" value={classes.className} />
-      <input name="level" type="hidden" value={classes.level} />
+      {#each classRows as classRow}
+        <input name="className" type="hidden" value={classRow.className} />
+        <input name="subclassName" type="hidden" value={classRow.subclassName || ''} />
+        <input name="classSpellcastingAbility" type="hidden" value={classRow.spellcastingAbility || ''} />
+        <input name="classLevel" type="hidden" value={classRow.level} />
+      {/each}
       <input name="ancestry" type="hidden" value={character.ancestry} />
       <input name="race" type="hidden" value={race} />
       <input name="background" type="hidden" value={character.background} />
@@ -1393,7 +1593,7 @@
           <h2 id="inventory-action-title">Inventory Action</h2>
           <button type="button" class="text-button" onclick={() => (inventoryMessage = null)}>Close</button>
         </div>
-        <p class="muted">{inventoryMessage}</p>
+        <p class="muted inventory-action-result">{inventoryMessage}</p>
       </div>
     </div>
   {/if}
@@ -1406,6 +1606,9 @@
           <button type="button" class="text-button" onclick={() => (newItemOpen = false)}>Close</button>
         </div>
         <div class="new-item-grid">
+          <input name="inventoryId" type="hidden" value="" />
+          <input name="inventorySourceContentId" type="hidden" value="" />
+          <input name="inventoryAttuned" type="hidden" value="false" />
           <label>Item <input name="inventoryName" placeholder="Longsword, potion, gold ring" /></label>
           <label>Category
             <select name="inventoryCategory">

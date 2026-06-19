@@ -6,7 +6,7 @@
 <section class="page-head">
   <div>
     <p class="eyebrow">Administration</p>
-    <h1>Settings</h1>
+    <h1>Site Settings</h1>
   </div>
 </section>
 

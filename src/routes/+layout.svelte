@@ -23,10 +23,12 @@
       <nav class="topnav" aria-label="Primary">
         <a href="/dashboard">Dashboard</a>
         <a href="/characters">Characters</a>
+        <a href="/catalogue">Catalogue</a>
         <a href="/campaigns">Campaigns</a>
         <a href="/encounters">Encounters</a>
-        <a href="/admin/modifiers">Admin</a>
-        <a href="/admin/settings">Settings</a>
+        {#if data.user.role === 'admin'}
+          <a href="/admin/settings">Admin</a>
+        {/if}
       </nav>
       <div class="user-menu">
         <a class="profile-link" href="/profile">{data.user.displayName}</a>

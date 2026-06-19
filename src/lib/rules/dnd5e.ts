@@ -80,6 +80,16 @@ export type ResolvedBonus = {
   value: number;
 };
 
+export type ModifierAuditEntry = ResolvedBonus & {
+  effectName: string;
+  sourceName: string;
+  target: string;
+  modifierType: string;
+  valueExpression: string;
+  conditionExpression: string;
+  priority: number;
+};
+
 export function modifierTargetMatches(target: string, candidates: string[]) {
   return candidates.some((candidate) => {
     if (target === candidate) return true;
@@ -129,4 +139,107 @@ export function resolvedFlatBonuses(
   context: ModifierContext = {}
 ): ResolvedBonus[] {
   return resolvedNumericModifiers(effects, candidates, ['bonus'], context);
+}
+
+export function resolvedAdditiveModifiers(
+  effects: ActiveCharacterEffect[], candidates: string[], context: ModifierContext = {}
+): ResolvedBonus[] {
+  return [
+    ...resolvedNumericModifiers(effects, candidates, ['bonus'], context),
+    ...resolvedNumericModifiers(effects, candidates, ['penalty'], context).map((entry) => ({ ...entry, value: -entry.value }))
+  ];
+}
+
+export function modifierAudit(
+  effects: ActiveCharacterEffect[],
+  candidates: string[],
+  modifierTypes: string[],
+  context: ModifierContext = {}
+): ModifierAuditEntry[] {
+  return effects.flatMap((effect) =>
+    effect.modifiers
+      .filter((modifier) => modifierTypes.includes(modifier.modifierType) && modifierTargetMatches(modifier.target, candidates))
+      .map((modifier) => ({
+        label: effect.name,
+        value: resolveModifierNumericValue(modifier.valueExpression, context),
+        effectName: effect.name,
+        sourceName: effect.sourceName,
+        target: modifier.target,
+        modifierType: modifier.modifierType,
+        valueExpression: modifier.valueExpression,
+        conditionExpression: modifier.conditionExpression,
+        priority: modifier.priority
+      }))
+  );
+}
+
+const multiclassSpellSlots: number[][] = [
+  [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  [2, 0, 0, 0, 0, 0, 0, 0, 0], [3, 0, 0, 0, 0, 0, 0, 0, 0], [4, 2, 0, 0, 0, 0, 0, 0, 0],
+  [4, 3, 0, 0, 0, 0, 0, 0, 0], [4, 3, 2, 0, 0, 0, 0, 0, 0], [4, 3, 3, 0, 0, 0, 0, 0, 0],
+  [4, 3, 3, 1, 0, 0, 0, 0, 0], [4, 3, 3, 2, 0, 0, 0, 0, 0], [4, 3, 3, 3, 1, 0, 0, 0, 0],
+  [4, 3, 3, 3, 2, 0, 0, 0, 0], [4, 3, 3, 3, 2, 1, 0, 0, 0], [4, 3, 3, 3, 2, 1, 0, 0, 0],
+  [4, 3, 3, 3, 2, 1, 1, 0, 0], [4, 3, 3, 3, 2, 1, 1, 0, 0], [4, 3, 3, 3, 2, 1, 1, 1, 0],
+  [4, 3, 3, 3, 2, 1, 1, 1, 0], [4, 3, 3, 3, 2, 1, 1, 1, 1], [4, 3, 3, 3, 3, 1, 1, 1, 1],
+  [4, 3, 3, 3, 3, 2, 1, 1, 1], [4, 3, 3, 3, 3, 2, 2, 1, 1]
+];
+
+const fullCasters = new Set(['bard', 'cleric', 'druid', 'sorcerer', 'wizard']);
+const halfCasters = new Set(['paladin', 'ranger']);
+
+export function effectiveCasterLevel(classes: CharacterClass[]): number {
+  return Math.min(20, classes.reduce((sum, row) => {
+    const name = row.className.trim().toLowerCase();
+    const subclass = (row.subclassName || '').trim().toLowerCase();
+    const classLevel = Math.max(0, Number(row.level) || 0);
+    if (fullCasters.has(name)) return sum + classLevel;
+    if (name === 'artificer') return sum + Math.ceil(classLevel / 2);
+    if (halfCasters.has(name)) return sum + Math.floor(classLevel / 2);
+    if ((name === 'fighter' && subclass === 'eldritch knight') || (name === 'rogue' && subclass === 'arcane trickster')) {
+      return sum + Math.floor(classLevel / 3);
+    }
+    return sum;
+  }, 0));
+}
+
+export function standardSpellSlotMaximums(classes: CharacterClass[]): number[] {
+  return [...multiclassSpellSlots[effectiveCasterLevel(classes)]];
+}
+
+export function pactMagicSlots(classes: CharacterClass[]): { level: number; slots: number } {
+  const level = Math.min(20, classes.filter((row) => row.className.trim().toLowerCase() === 'warlock')
+    .reduce((sum, row) => sum + Math.max(0, Number(row.level) || 0), 0));
+  if (!level) return { level: 0, slots: 0 };
+  return {
+    level: level >= 9 ? 5 : level >= 7 ? 4 : level >= 5 ? 3 : level >= 3 ? 2 : 1,
+    slots: level >= 17 ? 4 : level >= 11 ? 3 : level >= 2 ? 2 : 1
+  };
+}
+
+export function spellSaveDc(score: number, level: number, bonuses: number[] = []): number {
+  return 8 + abilityModifier(score) + proficiencyBonus(level) + bonuses.reduce((sum, value) => sum + value, 0);
+}
+
+export function spellAttackBonus(score: number, level: number, bonuses: number[] = []): number {
+  return abilityModifier(score) + proficiencyBonus(level) + bonuses.reduce((sum, value) => sum + value, 0);
+}
+
+export function resolveResourceMaximum(expression: string, context: { level?: number; proficiencyBonus?: number; abilityModifier?: number } = {}): number {
+  const normalized = expression.trim().toLowerCase();
+  if (/^\d+$/.test(normalized)) return Number(normalized);
+  if (normalized === 'level') return Math.max(0, context.level || 0);
+  if (normalized === 'proficiency_bonus') return Math.max(0, context.proficiencyBonus || 0);
+  if (normalized === 'ability_modifier') return Math.max(0, context.abilityModifier || 0);
+  return 0;
+}
+
+export function rollDiceExpression(expression:string,rollDie:(sides:number)=>number=(sides)=>Math.floor(Math.random()*sides)+1):number{
+  return (expression.replace(/\s+/g,'').match(/[+-]?[^+-]+/g)||[]).reduce((total,raw)=>{
+    const sign=raw.startsWith('-')?-1:1;
+    const term=raw.replace(/^[+-]/,'');
+    const dice=term.match(/^(\d*)d(\d+)$/i);
+    if(dice){const count=Math.max(1,Number(dice[1])||1);const sides=Math.max(1,Number(dice[2])||1);
+      return total+sign*Array.from({length:count},()=>rollDie(sides)).reduce((sum,value)=>sum+value,0);}
+    return total+sign*(Number(term)||0);
+  },0);
 }
