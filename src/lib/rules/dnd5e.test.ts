@@ -9,6 +9,8 @@ import {
   proficiencyBonus,
   resolveResourceMaximum,
   rollDiceExpression,
+  modifierConditionMatches,
+  resolveAdvantageState,
   resolvedFlatBonuses,
   resolvedNumericModifiers,
   skillModifier,
@@ -147,5 +149,21 @@ describe('D&D 5e helpers', () => {
   it('rolls additive and subtractive resource expressions safely',()=>{
     expect(rollDiceExpression('2d4+3-1d6',()=>2)).toBe(5);
     expect(rollDiceExpression('process.exit()',()=>20)).toBe(0);
+  });
+
+  it('evaluates supported modifier conditions and rejects unknown predicates',()=>{
+    const context={classes:[{className:'Barbarian',level:5}],ability:'str' as const,attackType:'melee_weapon' as const};
+    expect(modifierConditionMatches('class:barbarian && ability:str',context)).toBe(true);
+    expect(modifierConditionMatches('attack:ranged_weapon',context)).toBe(false);
+    expect(modifierConditionMatches('user_supplied_javascript()',context)).toBe(false);
+  });
+
+  it('cancels advantage and disadvantage regardless of source count',()=>{
+    const source=(name:string,modifierType:string):ActiveCharacterEffect=>({id:name,effectId:name,effectKey:name,name,
+      sourceType:'effect',sourceName:name,description:'',durationType:'',requiresConcentration:false,isCondition:false,
+      isSelectable:true,remainingRounds:null,modifiers:[{target:'attack_roll.all',modifierType,valueExpression:'',
+        defaultValueExpression:'',valueOverrideExpression:'',conditionExpression:'',priority:0}]});
+    expect(resolveAdvantageState([source('Blessing','advantage')],['attack_roll.weapon'])).toBe('advantage');
+    expect(resolveAdvantageState([source('Blessing','advantage'),source('Poisoned','disadvantage')],['attack_roll.weapon'])).toBe('normal');
   });
 });

@@ -73,6 +73,7 @@ export type ModifierContext = {
   classes?: CharacterClass[];
   attackType?: 'melee_weapon' | 'ranged_weapon' | 'spell' | 'weapon';
   ability?: AbilityKey;
+  flags?: string[];
 };
 
 export type ResolvedBonus = {
@@ -124,13 +125,36 @@ export function resolvedNumericModifiers(
 ): ResolvedBonus[] {
   return effects.flatMap((effect) =>
     effect.modifiers
-      .filter((modifier) => modifierTypes.includes(modifier.modifierType) && modifierTargetMatches(modifier.target, candidates))
+      .filter((modifier) => modifierTypes.includes(modifier.modifierType) && modifierTargetMatches(modifier.target, candidates)
+        && modifierConditionMatches(modifier.conditionExpression,context))
       .map((modifier) => ({
         label: effect.name,
-        value: resolveModifierNumericValue(modifier.valueExpression, context)
+        value: resolveModifierNumericValue(modifier.valueExpression, context),
+        priority:modifier.priority
       }))
       .filter((bonus) => bonus.value !== 0 || modifierTypes.includes('set'))
-  );
+  ).sort((left,right)=>left.priority-right.priority).map(({label,value})=>({label,value}));
+}
+
+export function modifierConditionMatches(expression:string,context:ModifierContext={}):boolean{
+  const condition=expression.trim().toLowerCase();if(!condition)return true;
+  return condition.split(/\s*&&\s*/).every((part)=>{
+    if(part==='always')return true;
+    if(part.startsWith('class:'))return (context.classes||[]).some((row)=>row.className.toLowerCase()===part.slice(6));
+    if(part.startsWith('ability:'))return context.ability===part.slice(8);
+    if(part.startsWith('attack:'))return context.attackType===part.slice(7);
+    if(part.startsWith('flag:'))return (context.flags||[]).includes(part.slice(5));
+    return false;
+  });
+}
+
+export function resolveAdvantageState(effects:ActiveCharacterEffect[],candidates:string[],context:ModifierContext={}):'advantage'|'disadvantage'|'normal'{
+  let advantage=false,disadvantage=false;
+  for(const effect of effects)for(const modifier of effect.modifiers){
+    if(!modifierTargetMatches(modifier.target,candidates)||!modifierConditionMatches(modifier.conditionExpression,context))continue;
+    if(modifier.modifierType==='advantage')advantage=true;if(modifier.modifierType==='disadvantage')disadvantage=true;
+  }
+  return advantage===disadvantage?'normal':advantage?'advantage':'disadvantage';
 }
 
 export function resolvedFlatBonuses(

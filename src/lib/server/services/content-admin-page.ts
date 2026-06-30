@@ -2,11 +2,18 @@ import { fail, isRedirect, redirect } from '@sveltejs/kit';
 import { addContentResourceDefinition, grantContentFromContent } from '$lib/server/services/catalogue';
 import {
   attachModifierToContent,
+  attachEffectToAdminContent,
+  detachEffectFromAdminContent,
+  addSpellAccess,
+  removeSpellAccess,
+  attachActionToContent,
+  detachActionFromContent,
   addContentResourceAction,
   createAdminContent,
   detachContentModifier,
   loadContentAdmin,
   removeContentResourceAction,
+  toggleAdminContentArchive,
   updateAdminContent
 } from '$lib/server/services/content-admin';
 import type { ContentType } from '$lib/types/content';
@@ -38,6 +45,10 @@ export function createContentAdminPage(types: ContentType[], fallbackType: Conte
           return fail(400, { error: error instanceof Error ? error.message : 'Could not update entry.' });
         }
       },
+      archive: async ({ request }: ActionEvent) => {
+        try { const id=await toggleAdminContentArchive(await request.formData());throw redirect(303,`?content=${id}`); }
+        catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not archive entry.'});}
+      },
       attachModifier: async ({ request }: ActionEvent) => {
         try {
           const id = await attachModifierToContent(await request.formData());
@@ -56,6 +67,8 @@ export function createContentAdminPage(types: ContentType[], fallbackType: Conte
           return fail(400, { error: error instanceof Error ? error.message : 'Could not remove modifier.' });
         }
       },
+      attachEffect: async ({request}:ActionEvent)=>{try{const id=await attachEffectToAdminContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not attach Effect.'})}},
+      detachEffect: async ({request}:ActionEvent)=>{try{const id=await detachEffectFromAdminContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Effect.'})}},
       addResource: async ({ request }: ActionEvent) => {
         try {
           const form = await request.formData();
@@ -95,6 +108,11 @@ export function createContentAdminPage(types: ContentType[], fallbackType: Conte
           return fail(400, { error: error instanceof Error ? error.message : 'Could not remove action.' });
         }
       }
+      ,
+      attachAction:async({request}:ActionEvent)=>{try{const id=await attachActionToContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not attach Action.'})}},
+      detachAction:async({request}:ActionEvent)=>{try{const id=await detachActionFromContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Action.'})}},
+      addSpellAccess:async({request}:ActionEvent)=>{try{const id=await addSpellAccess(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not grant Spell.'})}},
+      removeSpellAccess:async({request}:ActionEvent)=>{try{const id=await removeSpellAccess(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Spell access.'})}}
     }
   };
 }

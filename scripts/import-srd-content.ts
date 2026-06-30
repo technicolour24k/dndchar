@@ -20,8 +20,8 @@ async function upsertContent(type: string, entry: any): Promise<string> {
   const sourceRef = `${type}.${entry.index}`;
   const description = Array.isArray(entry.desc) ? entry.desc.join('\n\n') : String(entry.desc || entry.description || '');
   const result = await pool.query<{ id: string }>(`INSERT INTO content_definitions
-    (content_key, content_type, name, description, source_kind, source_ref, publication_status, metadata_json)
-    VALUES ($1,$2,$3,$4,'srd',$5,'published',$6)
+    (content_key, content_type, name, description, source_kind, source_ref, metadata_json)
+    VALUES ($1,$2,$3,$4,'srd',$5,$6)
     ON CONFLICT (content_key) WHERE owner_user_id IS NULL DO UPDATE SET name=EXCLUDED.name,
       description=EXCLUDED.description, source_ref=EXCLUDED.source_ref, updated_at=now() RETURNING id`,
     [`srd:${type}:${entry.index}`, type, entry.name, description, sourceRef, JSON.stringify({ apiIndex: entry.index })]);

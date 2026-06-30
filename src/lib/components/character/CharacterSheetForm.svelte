@@ -187,21 +187,21 @@
   const equippedAcBonus = $derived(
     equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
   );
-  const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['ac'], { classes: classRows }));
+  const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ac'], { classes: classRows }));
   const computedArmorClass = $derived(
     10 +
       abilityModifier(abilityScores.dex) +
       equippedAcBonus +
       acModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
   );
-  const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['initiative'], { classes: classRows }));
+  const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['initiative'], { classes: classRows }));
   const computedInitiative = $derived(
     abilityModifier(abilityScores.dex) +
       initiativeModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
   );
   const spellcastingAbility = $derived((classes.spellcastingAbility || meta('spellcastingAbility', 'int').toLowerCase()) as AbilityKey);
-  const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['spell_save_dc'], { classes: classRows }));
-  const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
+  const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_save_dc'], { classes: classRows }));
+  const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
   const computedSpellSaveDc = $derived(spellSaveDc(abilityScores[spellcastingAbility] ?? 10, level, spellDcBonuses.map((bonus) => bonus.value)));
   const computedSpellAttackBonus = $derived(spellAttackBonus(abilityScores[spellcastingAbility] ?? 10, level, spellAttackBonuses.map((bonus) => bonus.value)));
   const spellDcFormula = $derived([
@@ -212,9 +212,9 @@
   const characterFeats = $derived(character.content.filter((entry) => entry.type === 'feat'));
   const characterFeatures = $derived(character.content.filter((entry) => entry.type === 'class_feature'));
   const computedSpeedValue = $derived.by(() => {
-    const setValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
-    const bonuses = resolvedAdditiveModifiers(character.activeEffects, ['speed.all', 'speed.walk'], { classes: classRows });
-    const multipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
+    const setValues = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
+    const bonuses = resolvedAdditiveModifiers(character.modifierSources, ['speed.all', 'speed.walk'], { classes: classRows });
+    const multipliers = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
     const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
     const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
     const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
@@ -222,7 +222,7 @@
   });
   const computedSpeed = $derived(`${computedSpeedValue} ft.`);
   const computedHitDice = $derived(hitDiceSummary(classRows));
-  const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.activeEffects, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
+  const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
   const computedPassivePerception = $derived(
     10 +
       abilityModifier(abilityScores.wis) +
@@ -232,9 +232,9 @@
   const combatFormulaHelp = $derived.by(() => {
     const dexMod = abilityModifier(abilityScores.dex);
     const wisMod = abilityModifier(abilityScores.wis);
-    const speedSetValues = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
-    const speedBonuses = resolvedAdditiveModifiers(character.activeEffects, ['speed.all', 'speed.walk'], { classes: classRows });
-    const speedMultipliers = resolvedNumericModifiers(character.activeEffects, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
+    const speedSetValues = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
+    const speedBonuses = resolvedAdditiveModifiers(character.modifierSources, ['speed.all', 'speed.walk'], { classes: classRows });
+    const speedMultipliers = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
     const speedBase = speedSetValues.length ? speedSetValues.at(-1)?.value ?? 30 : 30;
 
     return {
@@ -382,7 +382,7 @@
   }
 
   function rollText(modifier: number, candidates: string[] = []) {
-    const relevant = character.activeEffects.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
+    const relevant = character.modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
       .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
     const advantage = relevant.some(({ entry }) => entry.modifierType === 'advantage');
     const disadvantage = relevant.some(({ entry }) => entry.modifierType === 'disadvantage');
@@ -547,8 +547,8 @@
       ability: item.attackAbility
     } as const;
     return [
-      ...resolvedNumericModifiers(character.activeEffects, candidates, ['bonus'], context),
-      ...resolvedNumericModifiers(character.activeEffects, candidates, ['penalty'], context).map((penalty) => ({ ...penalty, value: -penalty.value }))
+      ...resolvedNumericModifiers(character.modifierSources, candidates, ['bonus'], context),
+      ...resolvedNumericModifiers(character.modifierSources, candidates, ['penalty'], context).map((penalty) => ({ ...penalty, value: -penalty.value }))
     ];
   }
 
@@ -619,6 +619,13 @@
     await runResourceAction('triggerContent',body,`${name} used.`);
   }
 
+  async function castSpell(spell:any){
+    const body=new FormData();
+    if(spell.spellAccessId){body.set('spellAccessId',spell.spellAccessId);body.set('inventoryItemId',spell.inventoryItemId||'');}
+    else body.set('instanceId',spell.id);
+    await runResourceAction('castSpell',body,`${spell.name} cast.`);
+  }
+
   async function runResourceAction(action:string,body:FormData,heading:string){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
@@ -626,8 +633,9 @@
       inventoryMessage='Could not apply the resource action.';
       return;
     }
-    const results=((actionResult.data as {itemResult?:Array<{label:string;target:string;expression:string;rolled:number;before:number;after:number}>})?.itemResult)||[];
+    const results=((actionResult.data as {itemResult?:Array<{label:string;target:string;expression:string;rolled:number;before:number|null;after:number|null;detail?:string}>})?.itemResult)||[];
     const lines=[heading,...results.map(result=>
+      result.before===null?`${result.label}: ${result.detail||`${result.expression} rolled ${result.rolled}`} (${result.target})`:
       `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
     sessionStorage.setItem('inventory-use-result',lines.join('\n'));
     location.reload();
@@ -955,7 +963,7 @@
             <div class="catalogue-add-row"><select bind:value={selectedCatalogue.spell}><option value="">Add a spell...</option>{#each catalogue.filter((entry) => entry.type === 'spell') as entry}<option value={entry.id}>{entry.name} (level {entry.spell?.level ?? 0})</option>{/each}</select><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button><a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a></div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
-                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}</span></div><div class="actions">{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button></div></article>
+                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}</span></div><div class="actions"><button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
               {/each}
             </div>
           </div>
@@ -1081,6 +1089,7 @@
               <input name="inventoryLocation" type="hidden" value="equipped" />
               <input name="inventoryIsEquipment" type="hidden" value="true" />
               <input name="inventoryEquipped" type="hidden" value="true" />
+              {#if item.resources?.length}<div class="inventory-item-resources">{#each item.resources as resource}<div class="resource-counter"><span>{resource.label}</span><strong>{resource.currentValue} / {resource.maxValue}</strong><div><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:-1})}>-</button><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:1})}>+</button></div></div>{/each}</div>{/if}
             </div>
           {:else}
             <p class="muted">No equipment yet.</p>
@@ -1134,6 +1143,7 @@
               <input name="inventoryEffects" type="hidden" value={item.effects} />
               <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
               <input name="inventoryEquipped" type="hidden" value="false" />
+              {#if item.resources?.length}<div class="inventory-item-resources">{#each item.resources as resource}<div class="resource-counter"><span>{resource.label}</span><strong>{resource.currentValue} / {resource.maxValue}</strong><div><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:-1})}>-</button><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:1})}>+</button></div></div>{/each}</div>{/if}
             </div>
           {:else}
             <p class="muted">No backpack items yet.</p>
