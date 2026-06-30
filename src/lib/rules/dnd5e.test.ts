@@ -7,7 +7,11 @@ import {
   effectiveCasterLevel,
   pactMagicSlots,
   proficiencyBonus,
+  resolveCritThreshold,
+  resolveD20Outcomes,
   resolveDicePool,
+  resolveExtraDiceRolls,
+  resolveModifierNumericValue,
   resolveResourceMaximum,
   rollD20Pool,
   rollDiceExpression,
@@ -20,7 +24,7 @@ import {
   standardSpellSlotMaximums,
   totalLevel
 } from './dnd5e';
-import type { ActiveCharacterEffect } from '$lib/types/character';
+import type { ActiveCharacterEffect, EffectModifier } from '$lib/types/character';
 
 describe('D&D 5e helpers', () => {
   it('calculates ability modifiers', () => {
@@ -78,6 +82,7 @@ describe('D&D 5e helpers', () => {
         {
           target: 'damage_roll.melee_weapon.str',
           modifierType: 'bonus',
+          label: '',
           valueExpression: 'rage_damage_bonus',
           defaultValueExpression: 'rage_damage_bonus',
           valueOverrideExpression: '',
@@ -114,6 +119,7 @@ describe('D&D 5e helpers', () => {
         {
           target: 'speed.all',
           modifierType: 'multiplier',
+          label: '',
           valueExpression: '2',
           defaultValueExpression: '2',
           valueOverrideExpression: '',
@@ -163,7 +169,7 @@ describe('D&D 5e helpers', () => {
   it('derives the advantage/disadvantage label from the net of a dice-pool resolution',()=>{
     const source=(name:string,modifierType:string):ActiveCharacterEffect=>({id:name,effectId:name,effectKey:name,name,
       sourceType:'effect',sourceName:name,description:'',durationType:'',requiresConcentration:false,isCondition:false,
-      isSelectable:true,remainingRounds:null,modifiers:[{target:'attack_roll.all',modifierType,valueExpression:'',
+      isSelectable:true,remainingRounds:null,modifiers:[{target:'attack_roll.all',modifierType,label:'',valueExpression:'',
         defaultValueExpression:'',valueOverrideExpression:'',conditionExpression:'',priority:0}]});
     expect(resolveAdvantageState([source('Blessing','advantage')],['attack_roll.weapon'])).toBe('advantage');
     expect(resolveAdvantageState([source('Blessing','advantage'),source('Poisoned','disadvantage')],['attack_roll.weapon'])).toBe('normal');
@@ -187,5 +193,149 @@ describe('D&D 5e helpers', () => {
     expect(rollD20Pool(4,'lowest',rollDie)).toEqual({rolls:[14,7,19,2],chosen:2});
     index=0;
     expect(rollD20Pool(1,'flat',rollDie)).toEqual({rolls:[14],chosen:14});
+  });
+
+  it('derives named, open-ended roll outcomes from a natural d20, per modifier-primacy.md §6.4',()=>{
+    expect(resolveD20Outcomes(1)).toEqual(['critical_miss']);
+    expect(resolveD20Outcomes(20)).toEqual(['critical_hit']);
+    expect(resolveD20Outcomes(10)).toEqual([]);
+    // A lowered crit threshold (e.g. a Champion Fighter's 19-20 range) widens which naturals
+    // produce 'critical_hit', without the function itself knowing anything crit-specific.
+    expect(resolveD20Outcomes(19,19)).toEqual(['critical_hit']);
+    expect(resolveD20Outcomes(18,19)).toEqual([]);
+  });
+
+  it('resolves crit threshold as 20 by default, lowered by a crit_threshold.all penalty modifier',()=>{
+    expect(resolveCritThreshold([])).toBe(20);
+    const championFighter: ActiveCharacterEffect = {
+      id: 'active-improved-crit', effectId: 'improved-crit', effectKey: 'improved-crit', name: 'Improved Critical',
+      sourceType: 'class_feature', sourceName: 'Improved Critical', description: '', durationType: '',
+      requiresConcentration: false, isCondition: false, isSelectable: true, remainingRounds: null,
+      modifiers: [{ target: 'crit_threshold.all', modifierType: 'penalty', label: '', valueExpression: '1',
+        defaultValueExpression: '1', valueOverrideExpression: '', conditionExpression: '', priority: 0 }]
+    };
+    expect(resolveCritThreshold([championFighter])).toBe(19);
+  });
+
+  it('matches "on:<outcome>" conditions against context.outcomes, per modifier-primacy.md §6.4',()=>{
+    expect(modifierConditionMatches('on:critical_hit',{outcomes:['critical_hit']})).toBe(true);
+    expect(modifierConditionMatches('on:critical_hit',{outcomes:['critical_miss']})).toBe(false);
+    expect(modifierConditionMatches('on:critical_hit',{})).toBe(false);
+    expect(modifierConditionMatches('class:barbarian && on:critical_hit',{classes:[{className:'Barbarian',level:5}],outcomes:['critical_hit']})).toBe(true);
+  });
+
+  it('resolves a sibling-derived value to the max of another Modifier on the same Container, per modifier-primacy.md §2.1',()=>{
+    const baseDie: EffectModifier = { target:'damage_roll.melee_weapon.str', modifierType:'extra_die', label:'', valueExpression:'1d10',
+      defaultValueExpression:'1d10', valueOverrideExpression:'', conditionExpression:'', priority:0 };
+    const critBonus: EffectModifier = { target:'damage_roll.melee_weapon.str', modifierType:'bonus', label:'',
+      valueExpression:'sibling:max:damage_roll.melee_weapon.str', defaultValueExpression:'sibling:max:damage_roll.melee_weapon.str',
+      valueOverrideExpression:'', conditionExpression:'on:critical_hit', priority:1 };
+    const siblings = [baseDie, critBonus];
+    expect(resolveModifierNumericValue(critBonus.valueExpression,{},siblings,critBonus)).toBe(10);
+    // A flat-value sibling resolves to itself, not just dice expressions.
+    const flatSibling: EffectModifier = { ...baseDie, modifierType:'bonus', valueExpression:'4', defaultValueExpression:'4' };
+    expect(resolveModifierNumericValue('sibling:max:damage_roll.melee_weapon.str',{},[flatSibling,critBonus],critBonus)).toBe(4);
+    // No matching sibling on the container -> 0, not a thrown error.
+    expect(resolveModifierNumericValue('sibling:max:nonexistent.target',{},siblings,critBonus)).toBe(0);
+  });
+
+  it('labels a resolved value with the modifier\'s own label when set, falling back to the Container name otherwise',()=>{
+    const weapon: ActiveCharacterEffect = {
+      id:'active-weapon', effectId:'weapon', effectKey:'weapon', name:'Flameheart Greatsword', sourceType:'item',
+      sourceName:'Flameheart Greatsword', description:'', durationType:'while_applicable', requiresConcentration:false,
+      isCondition:false, isSelectable:false, remainingRounds:null,
+      modifiers:[
+        { target:'damage_roll.melee_weapon.str', modifierType:'extra_die', label:'Flameheart Greatsword Attack',
+          valueExpression:'1d10', defaultValueExpression:'1d10', valueOverrideExpression:'', conditionExpression:'', priority:0 },
+        { target:'damage_roll.melee_weapon.str', modifierType:'bonus', label:'Critical Hit (max dice)',
+          valueExpression:'sibling:max:damage_roll.melee_weapon.str', defaultValueExpression:'sibling:max:damage_roll.melee_weapon.str',
+          valueOverrideExpression:'', conditionExpression:'on:critical_hit', priority:1 },
+        { target:'damage_roll.melee_weapon.str', modifierType:'bonus', label:'', valueExpression:'1',
+          defaultValueExpression:'1', valueOverrideExpression:'', conditionExpression:'', priority:2 }
+      ]
+    };
+    const candidates=['damage_roll.melee_weapon.str'];
+    expect(resolveExtraDiceRolls([weapon],candidates,{},()=>7)).toEqual([
+      { label:'Flameheart Greatsword Attack', expression:'1d10', rolls:[7], value:7 }
+    ]);
+    expect(resolvedNumericModifiers([weapon],candidates,['bonus'],{outcomes:['critical_hit']})).toEqual([
+      { label:'Critical Hit (max dice)', value:10 },
+      { label:'Flameheart Greatsword', value:1 }
+    ]);
+  });
+
+  it('resolves extra_die Modifiers with condition-awareness, including outcome-gated dice, per modifier-primacy.md §6.4',()=>{
+    const bless: ActiveCharacterEffect = {
+      id:'active-bless', effectId:'bless', effectKey:'bless', name:'Bless', sourceType:'spell', sourceName:'Bless',
+      description:'', durationType:'concentration', requiresConcentration:true, isCondition:false, isSelectable:true,
+      remainingRounds:null,
+      modifiers:[{ target:'attack_roll.all', modifierType:'extra_die', label:'', valueExpression:'1d4', defaultValueExpression:'1d4',
+        valueOverrideExpression:'', conditionExpression:'', priority:0 }]
+    };
+    const scripted=[3];let index=0;const rollDie=()=>scripted[index++];
+    expect(resolveExtraDiceRolls([bless],['attack_roll.weapon'],{},rollDie)).toEqual([
+      { label:'Bless', expression:'1d4', rolls:[3], value:3 }
+    ]);
+
+    const gatedWeapon: ActiveCharacterEffect = {
+      id:'active-weapon', effectId:'weapon', effectKey:'weapon', name:'Flameheart Greatsword', sourceType:'item',
+      sourceName:'Flameheart Greatsword', description:'', durationType:'while_applicable', requiresConcentration:false,
+      isCondition:false, isSelectable:false, remainingRounds:null,
+      modifiers:[
+        { target:'damage_roll.melee_weapon.str', modifierType:'extra_die', label:'', valueExpression:'1d10',
+          defaultValueExpression:'1d10', valueOverrideExpression:'', conditionExpression:'', priority:0 },
+        { target:'damage_roll.melee_weapon.str', modifierType:'extra_die', label:'', valueExpression:'1d6',
+          defaultValueExpression:'1d6', valueOverrideExpression:'', conditionExpression:'on:critical_hit', priority:1 }
+      ]
+    };
+    const candidates=['damage_roll.melee_weapon.str'];
+    // Normal hit: only the unconditioned base die rolls.
+    let rolls=[7];index=0;
+    const normalRollDie=()=>rolls[index++];
+    expect(resolveExtraDiceRolls([gatedWeapon],candidates,{outcomes:[]},normalRollDie)).toEqual([
+      { label:'Flameheart Greatsword', expression:'1d10', rolls:[7], value:7 }
+    ]);
+    // Critical hit: both the base die and the outcome-gated companion die roll.
+    rolls=[7,5];index=0;
+    const critRollDie=()=>rolls[index++];
+    expect(resolveExtraDiceRolls([gatedWeapon],candidates,{outcomes:['critical_hit']},critRollDie)).toEqual([
+      { label:'Flameheart Greatsword', expression:'1d10', rolls:[7], value:7 },
+      { label:'Flameheart Greatsword', expression:'1d6', rolls:[5], value:5 }
+    ]);
+  });
+
+  it('end to end: a single Container with a base damage Modifier and a sibling-derived, outcome-gated crit bonus resolves correctly on both a normal and a critical hit',()=>{
+    const weapon: ActiveCharacterEffect = {
+      id:'active-weapon', effectId:'weapon', effectKey:'weapon', name:'Flameheart Greatsword', sourceType:'item',
+      sourceName:'Flameheart Greatsword', description:'', durationType:'while_applicable', requiresConcentration:false,
+      isCondition:false, isSelectable:false, remainingRounds:null,
+      modifiers:[
+        { target:'damage_roll.melee_weapon.str', modifierType:'extra_die', label:'', valueExpression:'1d10',
+          defaultValueExpression:'1d10', valueOverrideExpression:'', conditionExpression:'', priority:0 },
+        { target:'damage_roll.melee_weapon.str', modifierType:'bonus', label:'', valueExpression:'sibling:max:damage_roll.melee_weapon.str',
+          defaultValueExpression:'sibling:max:damage_roll.melee_weapon.str', valueOverrideExpression:'',
+          conditionExpression:'on:critical_hit', priority:1 }
+      ]
+    };
+    const candidates=['damage_roll.melee_weapon.str'];
+
+    // Natural 12 -> no outcomes -> base die only, crit bonus does not apply.
+    const normalOutcomes=resolveD20Outcomes(12,resolveCritThreshold([weapon]));
+    expect(normalOutcomes).toEqual([]);
+    let rolls=[7];let index=0;
+    const normalExtraDice=resolveExtraDiceRolls([weapon],candidates,{outcomes:normalOutcomes},()=>rolls[index++]);
+    expect(normalExtraDice).toEqual([{ label:'Flameheart Greatsword', expression:'1d10', rolls:[7], value:7 }]);
+    const normalBonuses=resolvedNumericModifiers([weapon],candidates,['bonus'],{outcomes:normalOutcomes});
+    expect(normalBonuses).toEqual([]);
+
+    // Natural 20 -> critical_hit -> base die rolls AND the sibling-derived crit bonus (+10, the
+    // base die's max) applies, each attributed separately.
+    const critOutcomes=resolveD20Outcomes(20,resolveCritThreshold([weapon]));
+    expect(critOutcomes).toEqual(['critical_hit']);
+    rolls=[7];index=0;
+    const critExtraDice=resolveExtraDiceRolls([weapon],candidates,{outcomes:critOutcomes},()=>rolls[index++]);
+    expect(critExtraDice).toEqual([{ label:'Flameheart Greatsword', expression:'1d10', rolls:[7], value:7 }]);
+    const critBonuses=resolvedNumericModifiers([weapon],candidates,['bonus'],{outcomes:critOutcomes});
+    expect(critBonuses).toEqual([{ label:'Flameheart Greatsword', value:10 }]);
   });
 });

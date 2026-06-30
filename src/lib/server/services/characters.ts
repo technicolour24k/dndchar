@@ -776,6 +776,7 @@ async function listEffectDefinitions(includeArchived=false): Promise<EffectDefin
       list.push({
         target: row.target,
         modifierType: row.modifier_type,
+        label: '',
         valueExpression: row.value_expression || '',
         defaultValueExpression: row.default_value_expression || '',
         valueOverrideExpression: row.value_override_expression || '',

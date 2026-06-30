@@ -1,7 +1,7 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolveDicePool, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -381,7 +381,7 @@
     return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0);
   }
 
-  function rollText(modifier: number, candidates: string[] = []) {
+  function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = []) {
     const relevant = character.modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
       .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
 
@@ -396,21 +396,18 @@
       const value = Number(entry.valueExpression) || 0;
       return sum + (entry.modifierType === 'bonus' ? value : entry.modifierType === 'penalty' ? -value : 0);
     }, 0);
-    const extraDice = relevant.filter(({ entry }) => entry.modifierType === 'extra_die').map(({ effect, entry }) => {
-      const match = entry.valueExpression.match(/^(\d*)d(\d+)$/i);
-      if (!match) return { effect, value: 0, label: entry.valueExpression };
-      const count = Math.max(1, Number(match[1]) || 1);
-      const rolls = Array.from({ length: count }, () => rollDie(Number(match[2])));
-      return { effect, value: rolls.reduce((sum, roll) => sum + roll, 0), label: `${entry.valueExpression} (${rolls.join(', ')})` };
-    });
+    const extraDice = resolveExtraDiceRolls(character.modifierSources, candidates, {}, rollDie);
     const extraTotal = extraDice.reduce((sum, die) => sum + die.value, 0);
     const total = d20 + modifier + flat + extraTotal;
 
     // Source-attributed audit trail per modifier-primacy.md §2.6: name which effects granted
     // advantage/disadvantage, show the net and pool size, and show every die actually rolled —
     // even when sources fully cancel, since "nothing changed" is itself worth showing why.
-    const extras = extraDice.map((die) => `${die.effect} ${die.label}`).join(' + ');
-    const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${extras ? ` + ${extras}` : ''} = ${total}`;
+    const extras = extraDice.map((die) => `${die.label} ${die.expression} (${die.rolls.join(', ')})`).join(' + ');
+    // §2.6 audit trail — when the caller supplies a labeled breakdown of the flat modifier (e.g.
+    // Proficiency + ability mod), show its components instead of just the summed total.
+    const breakdownText = modifierBreakdown.length ? ` (${modifierBreakdown.map((entry) => `${entry.label} ${entry.value}`).join(' + ')})` : '';
+    const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${breakdownText}${extras ? ` + ${extras}` : ''} = ${total}`;
 
     let text: string;
     if (pool.advantageCount === 0 && pool.disadvantageCount === 0) {
@@ -501,7 +498,14 @@
     return Math.floor(Math.random() * sides) + 1;
   }
 
-  function rollDamageExpression(expression: string, bonus: number, abilityBonus = 0, abilityLabel = '', modifierBonuses: Array<{ label: string; value: number }> = []) {
+  function rollDamageExpression(
+    expression: string,
+    bonus: number,
+    abilityBonus = 0,
+    abilityLabel = '',
+    modifierBonuses: Array<{ label: string; value: number }> = [],
+    extraDice: ReturnType<typeof resolveExtraDiceRolls> = []
+  ) {
     const parts = expression
       .split('+')
       .map((part) => part.trim())
@@ -528,6 +532,14 @@
       }
     }
 
+    // modifier-primacy.md §2.1/§6.3 — a Container's own attached 'extra_die' Modifiers (e.g. its
+    // base weapon damage die, sourced from the Modifier system rather than the legacy flat
+    // expression above) get their own attributed line, same as any other modifier-granted die.
+    for (const die of extraDice) {
+      total += die.value;
+      lines.push(`${die.label}: ${die.expression} (${die.rolls.join(', ')}) = ${total}`);
+    }
+
     if (bonus) {
       total += bonus;
       lines.push(`Weapon: ${signed(bonus)} = ${total}`);
@@ -551,20 +563,24 @@
     };
   }
 
-  function battleDamageBonuses(item: InventoryItem) {
+  function damageCandidatesFor(item: InventoryItem) {
     const canBeMeleeWeaponAttack = ['weapon', 'shield'].includes(item.category) && item.attackAbility === 'str';
-    const candidates = [
+    return [
       'damage_roll.all',
       'damage_roll.weapon',
       item.attackAbility ? `damage_roll.weapon.${item.attackAbility}` : '',
       canBeMeleeWeaponAttack ? 'damage_roll.melee_weapon' : '',
       canBeMeleeWeaponAttack ? `damage_roll.melee_weapon.${item.attackAbility}` : ''
     ].filter(Boolean);
+  }
 
+  function battleDamageBonuses(item: InventoryItem, outcomes: string[] = []) {
+    const candidates = damageCandidatesFor(item);
     const context = {
       classes: classRows,
       attackType: 'melee_weapon',
-      ability: item.attackAbility
+      ability: item.attackAbility,
+      outcomes
     } as const;
     return [
       ...resolvedNumericModifiers(character.modifierSources, candidates, ['bonus'], context),
@@ -574,16 +590,33 @@
 
   function rollBattleAction(item: InventoryItem) {
     const ability = abilityModifier(abilityScores[item.attackAbility]);
-    const attackBonus = ability + (item.proficient ? prof : 0) + Number(item.toHitBonus || 0);
+    const attackBreakdown = [
+      ...(item.proficient ? [{ label: 'Proficiency', value: prof }] : []),
+      { label: `${item.attackAbility.toUpperCase()} Mod`, value: ability },
+      ...(Number(item.toHitBonus) ? [{ label: 'Weapon', value: Number(item.toHitBonus) }] : [])
+    ];
+    const attackBonus = attackBreakdown.reduce((sum, entry) => sum + entry.value, 0);
     const attackCandidates = ['attack_roll.weapon', `attack_roll.weapon.${item.attackAbility}`,
       item.category === 'weapon' ? 'attack_roll.melee_weapon' : '',
       item.category === 'weapon' ? `attack_roll.melee_weapon.${item.attackAbility}` : ''].filter(Boolean);
-    const attackRoll = rollText(attackBonus, attackCandidates);
-    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item));
+
+    // Phase 1 (modifier-primacy.md §6.4) — resolve the triggering (to-hit) roll first.
+    const attackRoll = rollText(attackBonus, attackCandidates, attackBreakdown);
+
+    // Phase 1 -> 2 handoff: turn the to-hit result into the named outcomes it satisfied, before
+    // deciding which damage Modifiers (e.g. a crit-only bonus) are active for this roll.
+    const critThreshold = resolveCritThreshold(character.modifierSources, { ability: item.attackAbility, attackType: 'melee_weapon' });
+    const outcomes = resolveD20Outcomes(attackRoll.natural, critThreshold);
+
+    // Phase 2 — resolve the dependent (damage) roll using the now-known outcome set.
+    const damageCandidates = damageCandidatesFor(item);
+    const damageContext = { classes: classRows, attackType: 'melee_weapon', ability: item.attackAbility, outcomes } as const;
+    const extraDice = resolveExtraDiceRolls(character.modifierSources, damageCandidates, damageContext, rollDie);
+    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item, outcomes), extraDice);
 
     rollResult = {
       title: item.name || 'Battle Action',
-      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)`,
+      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` — ${outcomes.join(', ')}` : ''}`,
       damage: damage.lines,
       effects: item.effects || item.notes || '-'
     };
@@ -712,7 +745,25 @@
       void runAutosave(form);
     }, wait);
   }
+
+  // Modals never stack in this UI, so closing whichever one is open is unambiguous.
+  function closeOpenModal() {
+    if (rollResult) { rollResult = null; return; }
+    if (simpleRollResult) { simpleRollResult = null; return; }
+    if (inventoryMessage) { inventoryMessage = null; return; }
+    if (newItemOpen) { newItemOpen = false; return; }
+    if (formulaHelp) { formulaHelp = null; return; }
+    if (playerModificationsOpen) { playerModificationsOpen = false; return; }
+    if (skillChecksOpen) { skillChecksOpen = false; return; }
+    if (savingThrowsOpen) { savingThrowsOpen = false; return; }
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape') closeOpenModal();
+  }
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <form
   method="POST"
@@ -1578,8 +1629,8 @@
   {/if}
 
   {#if rollResult}
-    <div class="modal-backdrop" role="presentation">
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title">
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (rollResult = null)}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="roll-result-title">{rollResult.title}</h2>
           <button type="button" class="text-button" onclick={() => (rollResult = null)}>Close</button>
@@ -1607,8 +1658,8 @@
   {/if}
 
   {#if simpleRollResult}
-    <div class="modal-backdrop" role="presentation">
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title">
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleRollResult = null)}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="simple-roll-result-title">{simpleRollResult.title}</h2>
           <button type="button" class="text-button" onclick={() => (simpleRollResult = null)}>Close</button>
@@ -1626,8 +1677,8 @@
   {/if}
 
   {#if inventoryMessage}
-    <div class="modal-backdrop" role="presentation">
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-action-title">
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (inventoryMessage = null)}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-action-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="inventory-action-title">Inventory Action</h2>
           <button type="button" class="text-button" onclick={() => (inventoryMessage = null)}>Close</button>
@@ -1638,8 +1689,8 @@
   {/if}
 
   {#if newItemOpen}
-    <div class="modal-backdrop" role="presentation">
-      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title">
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (newItemOpen = false)}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="new-item-title">Add Item</h2>
           <button type="button" class="text-button" onclick={() => (newItemOpen = false)}>Close</button>
