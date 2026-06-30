@@ -10,7 +10,13 @@
     open: boolean;
     onClose: () => void;
   } = $props();
+
+  function handleKeydown(event: KeyboardEvent) {
+    if (open && event.key === 'Escape') onClose();
+  }
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 {#if open}
   <div class="modal-backdrop" role="presentation" onpointerdown={onClose}>

@@ -49,6 +49,7 @@ export type ItemCategory = {
 export type EffectModifier = {
   target: string;
   modifierType: string;
+  label: string;
   valueExpression: string;
   defaultValueExpression: string;
   valueOverrideExpression: string;

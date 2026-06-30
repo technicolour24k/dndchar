@@ -11,6 +11,7 @@ type ModifierRow = {
   modifier_id: string;
   target: string;
   modifier_type: string;
+  modifier_label: string;
   value_expression: string;
   default_value_expression: string;
   value_override_expression: string;
@@ -28,6 +29,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
       SELECT active.id::text AS source_id, 'effect'::text AS source_type, effect.name AS source_name,
         COALESCE(effect.description, '') AS source_description, link.id::text AS attachment_id,
         modifier.id::text AS modifier_id, modifier.target, modifier.modifier_type,
+        COALESCE(modifier.label, '') AS modifier_label,
         COALESCE(link.value_override_expression, modifier.default_value_expression, '') AS value_expression,
         COALESCE(modifier.default_value_expression, '') AS default_value_expression,
         COALESCE(link.value_override_expression, '') AS value_override_expression,
@@ -43,7 +45,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
       UNION ALL
 
       SELECT instance.id::text, 'content', COALESCE(instance.custom_name, content.name), content.description,
-        link.id::text, modifier.id::text, modifier.target, modifier.modifier_type,
+        link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
         COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
@@ -60,7 +62,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
       UNION ALL
 
       SELECT inventory.id::text, 'item', inventory.name, inventory.notes, link.id::text,
-        modifier.id::text, modifier.target, modifier.modifier_type,
+        modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
         COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
@@ -77,7 +79,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
       UNION ALL
 
       SELECT inventory.id::text || ':' || granted.id::text, 'grant', granted.name, granted.description,
-        link.id::text, modifier.id::text, modifier.target, modifier.modifier_type,
+        link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
         COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
@@ -123,7 +125,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
 
 function mapModifier(row: ModifierRow): EffectModifier {
   return {
-    target: row.target, modifierType: row.modifier_type, valueExpression: row.value_expression,
+    target: row.target, modifierType: row.modifier_type, label: row.modifier_label, valueExpression: row.value_expression,
     defaultValueExpression: row.default_value_expression, valueOverrideExpression: row.value_override_expression,
     conditionExpression: row.condition_expression, priority: row.priority
   };
