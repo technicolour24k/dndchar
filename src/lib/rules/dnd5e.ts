@@ -148,13 +148,51 @@ export function modifierConditionMatches(expression:string,context:ModifierConte
   });
 }
 
-export function resolveAdvantageState(effects:ActiveCharacterEffect[],candidates:string[],context:ModifierContext={}):'advantage'|'disadvantage'|'normal'{
-  let advantage=false,disadvantage=false;
-  for(const effect of effects)for(const modifier of effect.modifiers){
-    if(!modifierTargetMatches(modifier.target,candidates)||!modifierConditionMatches(modifier.conditionExpression,context))continue;
-    if(modifier.modifierType==='advantage')advantage=true;if(modifier.modifierType==='disadvantage')disadvantage=true;
+// modifier-primacy.md §3.3 — advantage/disadvantage is a dice pool, not a binary state.
+// Net = advantage sources - disadvantage sources (within one bucket). Pool size = 1 + |net|;
+// canceled sources contribute nothing to the pool. Sign of net picks the take-highest /
+// take-lowest direction; net 0 is a true flat 1-die roll, not "normal" because nothing happened.
+export type DicePoolResolution = {
+  advantageCount: number;
+  disadvantageCount: number;
+  net: number;
+  poolSize: number;
+  direction: 'highest' | 'lowest' | 'flat';
+};
+
+export function resolveDicePool(advantageCount: number, disadvantageCount: number): DicePoolResolution {
+  const net = advantageCount - disadvantageCount;
+  const poolSize = 1 + Math.abs(net);
+  const direction = net > 0 ? 'highest' : net < 0 ? 'lowest' : 'flat';
+  return { advantageCount, disadvantageCount, net, poolSize, direction };
+}
+
+export function rollD20Pool(
+  poolSize: number,
+  direction: 'highest' | 'lowest' | 'flat',
+  rollDie: (sides: number) => number = (sides) => Math.floor(Math.random() * sides) + 1
+): { rolls: number[]; chosen: number } {
+  const rolls = Array.from({ length: Math.max(1, poolSize) }, () => rollDie(20));
+  const chosen = direction === 'lowest' ? Math.min(...rolls) : Math.max(...rolls);
+  return { rolls, chosen };
+}
+
+function countAdvantageSources(effects: ActiveCharacterEffect[], candidates: string[], context: ModifierContext = {}) {
+  let advantageCount = 0, disadvantageCount = 0;
+  for (const effect of effects) for (const modifier of effect.modifiers) {
+    if (!modifierTargetMatches(modifier.target, candidates) || !modifierConditionMatches(modifier.conditionExpression, context)) continue;
+    if (modifier.modifierType === 'advantage') advantageCount += 1;
+    if (modifier.modifierType === 'disadvantage') disadvantageCount += 1;
   }
-  return advantage===disadvantage?'normal':advantage?'advantage':'disadvantage';
+  return { advantageCount, disadvantageCount };
+}
+
+// Convenience label derived from the dice pool's net sign, for callers that only need a
+// three-state summary (e.g. a small UI badge) rather than the full pool breakdown.
+export function resolveAdvantageState(effects:ActiveCharacterEffect[],candidates:string[],context:ModifierContext={}):'advantage'|'disadvantage'|'normal'{
+  const {advantageCount,disadvantageCount}=countAdvantageSources(effects,candidates,context);
+  const {net}=resolveDicePool(advantageCount,disadvantageCount);
+  return net>0?'advantage':net<0?'disadvantage':'normal';
 }
 
 export function resolvedFlatBonuses(

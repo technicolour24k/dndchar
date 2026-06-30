@@ -1,7 +1,7 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolvedAdditiveModifiers, resolvedNumericModifiers, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolveDicePool, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -384,11 +384,14 @@
   function rollText(modifier: number, candidates: string[] = []) {
     const relevant = character.modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
       .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
-    const advantage = relevant.some(({ entry }) => entry.modifierType === 'advantage');
-    const disadvantage = relevant.some(({ entry }) => entry.modifierType === 'disadvantage');
-    const first = rollDie(20);
-    const second = advantage !== disadvantage ? rollDie(20) : null;
-    const d20 = second === null ? first : advantage ? Math.max(first, second) : Math.min(first, second);
+
+    // modifier-primacy.md §3.3 — count advantage/disadvantage sources per bucket (don't just
+    // detect presence), net them, and roll a 1+|net|-size d20 pool in the net's direction.
+    const advantageSources = relevant.filter(({ entry }) => entry.modifierType === 'advantage').map(({ effect }) => effect);
+    const disadvantageSources = relevant.filter(({ entry }) => entry.modifierType === 'disadvantage').map(({ effect }) => effect);
+    const pool = resolveDicePool(advantageSources.length, disadvantageSources.length);
+    const { rolls, chosen: d20 } = rollD20Pool(pool.poolSize, pool.direction, rollDie);
+
     const flat = relevant.reduce((sum, { entry }) => {
       const value = Number(entry.valueExpression) || 0;
       return sum + (entry.modifierType === 'bonus' ? value : entry.modifierType === 'penalty' ? -value : 0);
@@ -402,7 +405,24 @@
     });
     const extraTotal = extraDice.reduce((sum, die) => sum + die.value, 0);
     const total = d20 + modifier + flat + extraTotal;
-    const mode = second === null ? `d20 ${d20}` : `${advantage ? 'advantage' : 'disadvantage'} d20 [${first}, ${second}] -> ${d20}`;
+
+    // Source-attributed audit trail per modifier-primacy.md §2.6: name which effects granted
+    // advantage/disadvantage, show the net and pool size, and show every die actually rolled —
+    // even when sources fully cancel, since "nothing changed" is itself worth showing why.
+    let mode: string;
+    if (pool.advantageCount === 0 && pool.disadvantageCount === 0) {
+      mode = `d20 ${d20}`;
+    } else {
+      const sideText = [
+        advantageSources.length ? `Advantage (${advantageSources.join(', ')})` : '',
+        disadvantageSources.length ? `Disadvantage (${disadvantageSources.join(', ')})` : ''
+      ].filter(Boolean).join(' vs ');
+      const netText = pool.net === 0
+        ? 'net 0, flat 1 die'
+        : `net ${pool.net > 0 ? '+' : ''}${pool.net}, pool of ${pool.poolSize}, take ${pool.direction}`;
+      mode = `${sideText} — ${netText} [${rolls.join(', ')}] -> ${d20}`;
+    }
+
     const extras = extraDice.map((die) => `${die.effect} ${die.label}`).join(' + ');
     return {
       text: `${mode} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${extras ? ` + ${extras}` : ''} = ${total}`,
