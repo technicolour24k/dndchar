@@ -94,10 +94,6 @@
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
   let selectedSkillProficiencies = $state<string[]>([]);
-  let savingThrowRolls = $state<Record<string, { text: string; natural: number }>>({});
-  let skillRolls = $state<Record<string, { text: string; natural: number }>>({});
-  let abilityRolls = $state<Partial<Record<AbilityKey, { text: string; natural: number }>>>({});
-  let initiativeRoll = $state<{ text: string; natural: number } | null>(null);
   let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '' });
   let contentBusy = $state(false);
   let modifierSearch = $state('');
@@ -109,6 +105,10 @@
     attack: string;
     damage: string[];
     effects: string;
+  } | null>(null);
+  let simpleRollResult = $state<{
+    title: string;
+    lines: Array<{ label: string; text: string; natural: number }>;
   } | null>(null);
   let formulaHelp = $state<{
     title: string;
@@ -409,54 +409,54 @@
     // Source-attributed audit trail per modifier-primacy.md §2.6: name which effects granted
     // advantage/disadvantage, show the net and pool size, and show every die actually rolled —
     // even when sources fully cancel, since "nothing changed" is itself worth showing why.
-    let mode: string;
+    const extras = extraDice.map((die) => `${die.effect} ${die.label}`).join(' + ');
+    const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${extras ? ` + ${extras}` : ''} = ${total}`;
+
+    let text: string;
     if (pool.advantageCount === 0 && pool.disadvantageCount === 0) {
-      mode = `d20 ${d20}`;
+      text = `d20 ${d20}\n${finalLine}`;
     } else {
-      const sideText = [
-        advantageSources.length ? `Advantage (${advantageSources.join(', ')})` : '',
-        disadvantageSources.length ? `Disadvantage (${disadvantageSources.join(', ')})` : ''
-      ].filter(Boolean).join(' vs ');
-      const netText = pool.net === 0
-        ? 'net 0, flat 1 die'
-        : `net ${pool.net > 0 ? '+' : ''}${pool.net}, pool of ${pool.poolSize}, take ${pool.direction}`;
-      mode = `${sideText} — ${netText} [${rolls.join(', ')}] -> ${d20}`;
+      const directionLabel = pool.direction === 'highest' ? 'Advantage' : pool.direction === 'lowest' ? 'Disadvantage' : 'Normal';
+      const sourceLines = [
+        ...disadvantageSources.map((name) => `Disadvantage (${name})`),
+        ...advantageSources.map((name) => `Advantage (${name})`)
+      ];
+      const rollLine = `Roll 1+${Math.abs(pool.net)} (${pool.advantageCount} Advantage - ${pool.disadvantageCount} Disadvantage) dice = ${pool.poolSize} dice at ${directionLabel}`;
+      const rolledLine = `Rolled: ${rolls.join(', ')} - ${d20} wins`;
+      text = [...sourceLines, '', rollLine, rolledLine, finalLine].join('\n');
     }
 
-    const extras = extraDice.map((die) => `${die.effect} ${die.label}`).join(' + ');
-    return {
-      text: `${mode} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${extras ? ` + ${extras}` : ''} = ${total}`,
-      natural: d20,
-      total
-    };
+    return { text, natural: d20, total };
   }
 
   function rollAllSavingThrows() {
-    savingThrowRolls = Object.fromEntries(
-      abilityOrder.map((key) => [key, rollText(savingThrowTotal(key), [`saving_throw.${key}`])])
-    );
+    simpleRollResult = {
+      title: 'Saving Throws',
+      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`]) }))
+    };
   }
 
   function rollAllSkillChecks() {
-    skillRolls = Object.fromEntries(
-      skillChecks.map((skill) => [skill.key, rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`])])
-    );
+    simpleRollResult = {
+      title: 'Skill Checks',
+      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }))
+    };
   }
 
   function rollSingleSavingThrow(key: AbilityKey) {
-    savingThrowRolls = { ...savingThrowRolls, [key]: rollText(savingThrowTotal(key), [`saving_throw.${key}`]) };
+    simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`]) }] };
   }
 
-  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey }) {
-    skillRolls = { ...skillRolls, [skill.key]: rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) };
+  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
+    simpleRollResult = { title: skill.name, lines: [{ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }] };
   }
 
   function rollAbilityCheck(key: AbilityKey) {
-    abilityRolls = { ...abilityRolls, [key]: rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]) };
+    simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label: `${key.toUpperCase()} Check`, ...rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]) }] };
   }
 
   function rollInitiative() {
-    initiativeRoll = rollText(computedInitiative, ['initiative']);
+    simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...rollText(computedInitiative, ['initiative']) }] };
   }
 
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
@@ -816,7 +816,6 @@
                   <img src={d20Icon} alt="" />
                 </button>
               </span>
-              {#if initiativeRoll}<span class="inline-roll-result" class:nat-one={initiativeRoll.natural === 1} class:nat-twenty={initiativeRoll.natural === 20}>{initiativeRoll.text}</span>{/if}
             </label>
             <label class="speed-control">
               <span class="field-label-with-help">
@@ -878,9 +877,6 @@
                       <img src={d20Icon} alt="" />
                     </button>
                   </span>
-                  {#if abilityRolls[key]}
-                    <span class="ability-roll-result" class:nat-one={abilityRolls[key]?.natural === 1} class:nat-twenty={abilityRolls[key]?.natural === 20}>{abilityRolls[key]?.text}</span>
-                  {/if}
                 </label>
               {/each}
             </div>
@@ -1411,9 +1407,6 @@
                   <small>{signed(abilityModifier(abilityScores[key]))}{isSavingThrowProficient(key) ? ` + ${prof} proficiency` : ''}</small>
                 </span>
                 <b>{signed(savingThrowTotal(key))}</b>
-                {#if savingThrowRolls[key]}
-                  <em class:nat-one={savingThrowRolls[key].natural === 1} class:nat-twenty={savingThrowRolls[key].natural === 20}>{savingThrowRolls[key].text}</em>
-                {/if}
               </label>
               <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => rollSingleSavingThrow(key)}>
                 <img src={d20Icon} alt="" />
@@ -1451,9 +1444,6 @@
                   <small>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}{isSkillProficient(skill.key) ? ` + ${prof} proficiency` : ''}</small>
                 </span>
                 <b>{signed(skillCheckTotal(skill))}</b>
-                {#if skillRolls[skill.key]}
-                  <em class:nat-one={skillRolls[skill.key].natural === 1} class:nat-twenty={skillRolls[skill.key].natural === 20}>{skillRolls[skill.key].text}</em>
-                {/if}
               </label>
               <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => rollSingleSkillCheck(skill)}>
                 <img src={d20Icon} alt="" />
@@ -1611,6 +1601,25 @@
             <span>Effects</span>
             <strong>{rollResult.effects}</strong>
           </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if simpleRollResult}
+    <div class="modal-backdrop" role="presentation">
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title">
+        <div class="panel-head">
+          <h2 id="simple-roll-result-title">{simpleRollResult.title}</h2>
+          <button type="button" class="text-button" onclick={() => (simpleRollResult = null)}>Close</button>
+        </div>
+        <div class="roll-result">
+          {#each simpleRollResult.lines as line}
+            <div>
+              <span>{line.label}</span>
+              <strong class:nat-one={line.natural === 1} class:nat-twenty={line.natural === 20}>{line.text}</strong>
+            </div>
+          {/each}
         </div>
       </div>
     </div>

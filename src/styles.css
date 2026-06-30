@@ -1109,24 +1109,6 @@ button.equipment-toggle .item-kind-icon {
   grid-row: 2;
 }
 
-.initiative-control .inline-roll-result {
-  position: absolute;
-  top: calc(100% + 3px);
-  left: 0;
-  z-index: 1;
-  max-width: none;
-  margin: 0;
-  white-space: nowrap;
-}
-
-.inline-roll-result {
-  display: block;
-  max-width: 130px;
-  margin-top: 4px;
-  font-size: 11px;
-  font-weight: 900;
-}
-
 .status-chip,
 .initiative-list .active-turn {
   border: 1px solid #d7ad4a;
@@ -1239,22 +1221,6 @@ button.formula-help-button:focus-visible {
   display: block;
   color: var(--muted);
   font-size: 12px;
-}
-
-.proficiency-row em {
-  grid-column: 1 / -1;
-  color: #ffd36a;
-  font-size: 12px;
-  font-style: normal;
-  font-weight: 800;
-}
-
-.proficiency-row em.nat-one {
-  color: #ff9a9a;
-}
-
-.proficiency-row em.nat-twenty {
-  color: #9dd7a5;
 }
 
 .proficiency-row button {
@@ -1384,20 +1350,6 @@ button.death-save-icon.failure.active {
   gap: 8px;
   color: var(--text);
   font-weight: 900;
-}
-
-.ability-roll-result {
-  color: #ffd36a;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.ability-roll-result.nat-one {
-  color: #ff9a9a;
-}
-
-.ability-roll-result.nat-twenty {
-  color: #9dd7a5;
 }
 
 .ability-popup-links {
@@ -1789,6 +1741,15 @@ button.death-save-icon.failure.active {
 
 .roll-result strong {
   font-size: 15px;
+  white-space: pre-line;
+}
+
+.roll-result strong.nat-one {
+  color: #ff9a9a;
+}
+
+.roll-result strong.nat-twenty {
+  color: #9dd7a5;
 }
 
 .damage-lines {
