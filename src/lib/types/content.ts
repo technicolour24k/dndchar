@@ -1,7 +1,6 @@
 import type { AbilityKey } from '$lib/types/character';
 
 export type ContentType = 'item' | 'spell' | 'feat' | 'class_feature';
-export type PublicationStatus = 'private' | 'pending' | 'published';
 export type ActivationType = 'carried' | 'equipped' | 'attuned' | 'on_use' | 'manual';
 export type RechargePeriod = 'short_rest' | 'long_rest' | 'dawn' | 'round' | 'encounter' | 'manual';
 
@@ -28,7 +27,7 @@ export type ContentDefinition = {
   sourceKind: 'srd' | 'homebrew';
   sourceRef: string;
   ownerUserId: string | null;
-  publicationStatus: PublicationStatus;
+  isArchived: boolean;
   metadata: Record<string, unknown>;
   spell?: {
     level: number;
@@ -68,6 +67,8 @@ export type CharacterContentInstance = {
   notes: string;
   spellLevel: number | null;
   grantedBy?: string;
+  spellAccessId?: string;
+  inventoryItemId?: string;
   hasResourceActions?: boolean;
   resources: Array<ContentResourceDefinition & { currentValue: number; maxValue: number }>;
 };

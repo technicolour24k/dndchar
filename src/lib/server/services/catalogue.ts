@@ -1,11 +1,11 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
-import { abilityModifier, abilityMap, proficiencyBonus, resolveResourceMaximum, rollDiceExpression, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
+import { abilityModifier, abilityMap, proficiencyBonus, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
+import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
-import type { CharacterContentInstance, ContentDefinition, ContentType, PublicationStatus, RechargePeriod, SpellSlot } from '$lib/types/content';
+import type { CharacterContentInstance, ContentDefinition, ContentType, RechargePeriod, SpellSlot } from '$lib/types/content';
 
 const contentTypes = new Set<ContentType>(['item', 'spell', 'feat', 'class_feature']);
-const publicationStatuses = new Set<PublicationStatus>(['private', 'pending', 'published']);
 const rechargePeriods = new Set<RechargePeriod>(['short_rest', 'long_rest', 'dawn', 'round', 'encounter', 'manual']);
 
 function slug(value: string): string {
@@ -22,13 +22,12 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
       FROM content_definitions c
       LEFT JOIN spell_definitions s ON s.content_id = c.id
       LEFT JOIN item_definitions i ON i.content_id = c.id
-      WHERE (c.publication_status = 'published' OR c.owner_user_id = $1)
-        AND ($2::text IS NULL OR c.content_type = $2)
-        AND ($3 = '' OR c.name ILIKE '%' || $3 || '%')
+      WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1)
+        AND ($2 = '' OR c.name ILIKE '%' || $2 || '%')
       ORDER BY c.source_kind = 'srd' DESC, c.name ASC
       LIMIT 300
     `,
-    [userId, type || null, search.trim()]
+    [type || null, search.trim()]
   );
 
   const ids = result.rows.map((row: any) => row.id);
@@ -51,7 +50,7 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
     sourceKind: row.source_kind,
     sourceRef: row.source_ref || '',
     ownerUserId: row.owner_user_id,
-    publicationStatus: row.publication_status,
+    isArchived: row.is_archived,
     metadata: row.metadata_json || {},
     spell: row.content_type === 'spell' ? {
       level: row.spell_level, school: row.school, castingTime: row.casting_time, range: row.spell_range,
@@ -82,8 +81,8 @@ export async function createHomebrewContent(userId: string, form: FormData): Pro
     const key = `custom:${userId}:${type}:${slug(name)}:${Date.now()}`;
     const created = await client.query<{ id: string }>(
       `INSERT INTO content_definitions
-       (content_key, content_type, name, description, source_kind, owner_user_id, publication_status, metadata_json)
-       VALUES ($1, $2, $3, $4, 'homebrew', $5, 'private', $6) RETURNING id`,
+       (content_key, content_type, name, description, source_kind, owner_user_id, metadata_json)
+       VALUES ($1, $2, $3, $4, 'homebrew', $5, $6) RETURNING id`,
       [key, type, name, String(form.get('description') || ''), userId, JSON.stringify({})]
     );
     const id = created.rows[0].id;
@@ -112,22 +111,17 @@ export async function createHomebrewContent(userId: string, form: FormData): Pro
   });
 }
 
-export async function requestPublication(userId: string, contentId: string): Promise<void> {
-  await query(`UPDATE content_definitions SET publication_status = 'pending', updated_at = now()
-    WHERE id = $1 AND owner_user_id = $2 AND source_kind = 'homebrew'`, [contentId, userId]);
+export async function setContentArchived(userId:string,contentId:string,isAdmin=false):Promise<void>{
+  const result=await query(`UPDATE content_definitions SET is_archived=NOT is_archived,updated_at=now()
+    WHERE id=$1 AND ($2::boolean OR owner_user_id=$3) RETURNING id`,[contentId,isAdmin,userId]);
+  if(!result.rowCount)throw new Error('Catalogue entry not found or not editable.');
 }
 
-export async function publishContent(contentId: string, status: PublicationStatus): Promise<void> {
-  if (!publicationStatuses.has(status)) throw new Error('Invalid publication status.');
-  await query('UPDATE content_definitions SET publication_status = $2, updated_at = now() WHERE id = $1', [contentId, status]);
-}
-
-export async function listAdminCatalogue(): Promise<Array<{ id: string; name: string; type: ContentType; sourceKind: string; status: PublicationStatus; ownerName: string }>> {
-  const result = await query<any>(`SELECT c.id, c.name, c.content_type, c.source_kind, c.publication_status,
-    COALESCE(u.display_name, 'Global') AS owner_name FROM content_definitions c
-    LEFT JOIN users u ON u.id = c.owner_user_id ORDER BY c.publication_status, c.content_type, c.name`);
-  return result.rows.map((row: any) => ({ id: row.id, name: row.name, type: row.content_type,
-    sourceKind: row.source_kind, status: row.publication_status, ownerName: row.owner_name }));
+export async function updateOwnedContent(userId:string,form:FormData):Promise<void>{
+  const result=await query(`UPDATE content_definitions SET name=$3,description=$4,updated_at=now()
+    WHERE id=$1 AND owner_user_id=$2 AND source_kind='homebrew'`,[String(form.get('contentId')||''),userId,
+    String(form.get('name')||'').trim(),String(form.get('description')||'').trim()]);
+  if(!result.rowCount)throw new Error('Homebrew entry not found or not editable.');
 }
 
 export async function attachEffectToContent(form: FormData): Promise<void> {
@@ -143,6 +137,15 @@ export async function attachEffectToOwnedContent(userId: string, form: FormData)
   const contentId = String(form.get('contentId') || '');
   const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
   if (!owned.rowCount) throw new Error('Private homebrew content not found.');
+  if(String(form.get('activationType')||'manual')==='on_use'){
+    await withTransaction(async client=>{const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[contentId]);
+      const action=await client.query<{id:string}>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id)
+        VALUES($1,$2,$3,$4) ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,[`content:${contentId}:on_use`,`Use ${content.rows[0].name}`,`Actions for ${content.rows[0].name}`,content.rows[0].owner_user_id]);
+      await client.query("INSERT INTO content_action_links(content_id,action_id,trigger_type) VALUES($1,$2,'on_use') ON CONFLICT DO NOTHING",[contentId,action.rows[0].id]);
+      await client.query(`INSERT INTO action_steps(action_id,step_type,operation,effect_id,label,sort_order)
+        SELECT $1,'apply_effect','apply',$2,effect.name,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
+        FROM effect_definitions effect WHERE effect.id=$2 AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,[action.rows[0].id,String(form.get('effectId')||'')]);});return;
+  }
   await attachEffectToContent(form);
 }
 
@@ -161,6 +164,8 @@ export async function addContentResourceDefinition(form: FormData): Promise<void
     const instances = await client.query<{ id: string; character_id: string }>(
       'SELECT id, character_id FROM character_content_instances WHERE content_id=$1', [contentId]);
     for (const instance of instances.rows) await initializeContentResources(client, instance.id, instance.character_id);
+    const inventory=await client.query<{id:string;character_id:string}>('SELECT id,character_id FROM character_inventory_items WHERE source_content_id=$1',[contentId]);
+    for(const item of inventory.rows)await initializeInventoryResources(client,item.id,item.character_id,contentId);
   });
 }
 
@@ -179,27 +184,27 @@ export async function addOwnedContentResourceDefinition(userId: string, form: Fo
 
 export async function listEffectsForLinking(userId?: string): Promise<Array<{ id: string; name: string }>> {
   const result = await query<{ id: string; name: string }>(`SELECT id, name FROM effect_definitions
-    WHERE $1::uuid IS NULL OR is_homebrew=false OR owner_user_id=$1 ORDER BY name`, [userId || null]);
+    WHERE is_archived=false ORDER BY name`);
   return result.rows;
 }
 
 export async function addContentToCharacter(userId: string, characterId: string, contentId: string): Promise<void> {
   await withTransaction(async (client) => {
     await assertCharacterOwner(client, userId, characterId);
-    const visible = await client.query(`SELECT id FROM content_definitions WHERE id = $1
-      AND (publication_status = 'published' OR owner_user_id = $2)`, [contentId, userId]);
+    const visible = await client.query('SELECT id FROM content_definitions WHERE id=$1 AND is_archived=false', [contentId]);
     if (!visible.rowCount) throw new Error('Catalogue entry not found.');
     const definition = await client.query<any>(`SELECT c.content_type, c.name, i.* FROM content_definitions c
       LEFT JOIN item_definitions i ON i.content_id = c.id WHERE c.id = $1`, [contentId]);
     if (definition.rows[0]?.content_type === 'item') {
       const item = definition.rows[0];
-      await client.query(`INSERT INTO character_inventory_items
+      const inventory=await client.query<{id:string}>(`INSERT INTO character_inventory_items
         (character_id, name, category, quantity, equipped, location, is_equipment, ac_bonus, to_hit_bonus,
          damage_bonus, attack_ability, damage_rolls, source_content_id, attuned, notes, sort_order)
         VALUES ($1,$2,$3,1,false,'backpack',($3 IN ('weapon','armor','shield','focus')),$4,$5,$6,$7,$8,$9,false,'',
-          COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1),0))`,
+          COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1),0)) RETURNING id`,
         [characterId, item.name, item.category || 'gear', item.ac_bonus || 0, item.to_hit_bonus || 0,
           item.damage_bonus || 0, item.attack_ability || 'str', item.damage_rolls || '', contentId]);
+      await initializeInventoryResources(client,inventory.rows[0].id,characterId,contentId);
       return;
     }
     const instance = await client.query<{ id: string }>(
@@ -238,18 +243,20 @@ export async function useContentResource(userId: string, characterId: string, re
         AND c.id = i.character_id AND c.owner_user_id = $4
       RETURNING r.character_content_id, i.content_id`, [delta, resourceId, characterId, userId]);
     if (!result.rowCount) throw new Error('Resource not found.');
-    if (delta < 0) {
-      await client.query(`INSERT INTO active_character_effects (character_id,effect_id,source_content_instance_id)
-        SELECT $1,l.effect_id,$2 FROM content_effect_links l WHERE l.content_id=$3 AND l.activation_type='on_use'
-        ON CONFLICT (character_id,effect_id) DO NOTHING`,
-        [characterId, result.rows[0].character_content_id, result.rows[0].content_id]);
-    }
+    if(delta<0)await executeContentActions(client,characterId,result.rows[0].content_id,['on_use'],{instanceId:result.rows[0].character_content_id});
   });
+}
+
+export async function useInventoryResource(userId:string,characterId:string,resourceId:string,delta:number):Promise<void>{
+  const result=await query(`UPDATE character_inventory_resources resource SET current_value=GREATEST(0,LEAST(max_value,current_value+$1))
+    FROM character_inventory_items inventory,characters character WHERE resource.id=$2 AND inventory.id=resource.inventory_item_id
+      AND inventory.character_id=$3 AND character.id=inventory.character_id AND character.owner_user_id=$4`,[delta,resourceId,characterId,userId]);
+  if(!result.rowCount)throw new Error('Item resource not found.');
 }
 
 export async function listCharacterContent(characterId: string): Promise<CharacterContentInstance[]> {
   const result = await query<any>(`SELECT i.*, c.content_type, c.name, c.description, s.spell_level,
-    EXISTS(SELECT 1 FROM content_resource_actions action WHERE action.content_id=c.id AND action.activation_type IN('manual','on_use')) AS has_resource_actions
+    EXISTS(SELECT 1 FROM content_action_links action WHERE action.content_id=c.id) AS has_resource_actions
     FROM character_content_instances i JOIN content_definitions c ON c.id = i.content_id
     LEFT JOIN spell_definitions s ON s.content_id = c.id WHERE i.character_id = $1
     ORDER BY c.content_type, c.name`, [characterId]);
@@ -274,11 +281,58 @@ export async function listCharacterContent(characterId: string): Promise<Charact
     WHERE inventory.character_id = $1 AND (g.activation_type='carried'
       OR (g.activation_type='equipped' AND inventory.equipped)
       OR (g.activation_type='attuned' AND inventory.attuned))`, [characterId]);
+  const spellAccess=await query<any>(`SELECT access.id,access.spell_content_id,spell.name,spell.description,spell_detail.spell_level,
+      inventory.id AS inventory_id,inventory.name AS source_name FROM character_inventory_items inventory
+    JOIN content_spell_access access ON access.owner_content_id=inventory.source_content_id
+    JOIN content_definitions spell ON spell.id=access.spell_content_id
+    JOIN spell_definitions spell_detail ON spell_detail.content_id=spell.id
+    WHERE inventory.character_id=$1 AND (access.availability_type='carried'
+      OR (access.availability_type='equipped' AND inventory.equipped)
+      OR (access.availability_type='attuned' AND inventory.attuned))`,[characterId]);
   return [...instances, ...grants.rows.map((row: any): CharacterContentInstance => ({
     id: `grant:${row.id}`, contentId: row.content_id, type: row.content_type, name: row.name,
     description: row.description, isKnown: true, isPrepared: true, isActive: true, notes: '',
     spellLevel: null, grantedBy: row.source_name, resources: []
-  }))];
+  })),...spellAccess.rows.map((row:any):CharacterContentInstance=>({id:`spell-access:${row.id}:${row.inventory_id}`,
+    contentId:row.spell_content_id,type:'spell',name:row.name,description:row.description,isKnown:true,isPrepared:true,isActive:true,
+    notes:'',spellLevel:row.spell_level,grantedBy:row.source_name,spellAccessId:row.id,inventoryItemId:row.inventory_id,resources:[]}))];
+}
+
+export async function castCharacterSpell(userId:string,characterId:string,form:FormData):Promise<ActionResult[]>{
+  return withTransaction(async(client)=>{await assertCharacterOwner(client,userId,characterId);
+    const accessId=String(form.get('spellAccessId')||'');let spellId='';let instanceId:string|undefined;
+    if(accessId){
+      const inventoryId=String(form.get('inventoryItemId')||'');
+      const access=await client.query<any>(`SELECT access.*,spell.spell_level FROM content_spell_access access
+        JOIN spell_definitions spell ON spell.content_id=access.spell_content_id
+        JOIN character_inventory_items inventory ON inventory.source_content_id=access.owner_content_id
+        WHERE access.id=$1 AND inventory.id=$2 AND inventory.character_id=$3 AND (access.availability_type='carried'
+          OR (access.availability_type='equipped' AND inventory.equipped) OR (access.availability_type='attuned' AND inventory.attuned)) FOR UPDATE`,[accessId,inventoryId,characterId]);
+      if(!access.rowCount)throw new Error('Granted Spell is unavailable.');const row=access.rows[0];spellId=row.spell_content_id;
+      const cost=Math.max(1,Number(row.resource_cost_expression)||1);
+      if(row.access_type==='charges'||row.access_type==='limited_free'){
+        if(!row.resource_definition_id)throw new Error('This Spell access has no charge resource.');
+        const spent=await client.query(`UPDATE character_inventory_resources SET current_value=current_value-$3
+          WHERE inventory_item_id=$1 AND resource_definition_id=$2 AND current_value>=$3`,[inventoryId,row.resource_definition_id,cost]);
+        if(!spent.rowCount)throw new Error('Not enough charges to cast this Spell.');
+      }else if(row.access_type==='character_slots'&&row.spell_level>0)await spendAvailableSlot(client,characterId,row.spell_level,form);
+      return executeContentActions(client,characterId,spellId,['on_cast','on_use'],{inventoryId});
+    }
+    instanceId=String(form.get('instanceId')||'');const spell=await client.query<any>(`SELECT instance.content_id,instance.is_known,instance.is_prepared,definition.spell_level
+      FROM character_content_instances instance JOIN spell_definitions definition ON definition.content_id=instance.content_id
+      WHERE instance.id=$1 AND instance.character_id=$2 FOR UPDATE`,[instanceId,characterId]);
+    if(!spell.rowCount||!spell.rows[0].is_known||!spell.rows[0].is_prepared)throw new Error('Spell must be known and prepared before casting.');
+    spellId=spell.rows[0].content_id;if(spell.rows[0].spell_level>0)await spendAvailableSlot(client,characterId,spell.rows[0].spell_level,form);
+    return executeContentActions(client,characterId,spellId,['on_cast','on_use'],{instanceId});
+  });
+}
+
+async function spendAvailableSlot(client:pg.PoolClient,characterId:string,minimumLevel:number,form:FormData){
+  const requestedType=String(form.get('slotType')||''),requestedLevel=Number(form.get('slotLevel'))||0;
+  const slot=await client.query<any>(`SELECT slot_type,slot_level FROM character_spell_slots WHERE character_id=$1 AND current_slots>0
+    AND slot_level>=$2 AND ($3='' OR slot_type=$3) AND ($4=0 OR slot_level=$4) ORDER BY slot_level,slot_type='pact' LIMIT 1 FOR UPDATE`,[characterId,minimumLevel,requestedType,requestedLevel]);
+  if(!slot.rowCount)throw new Error('No suitable Spell slot is available.');await client.query(`UPDATE character_spell_slots SET current_slots=current_slots-1
+    WHERE character_id=$1 AND slot_type=$2 AND slot_level=$3`,[characterId,slot.rows[0].slot_type,slot.rows[0].slot_level]);
 }
 
 export async function listSpellSlots(characterId: string): Promise<SpellSlot[]> {
@@ -300,19 +354,19 @@ export async function spendSpellSlot(userId: string, characterId: string, type: 
   if (!result.rowCount) throw new Error('Spell slot not found.');
 }
 
-export type ResourceActionResult={label:string;target:string;expression:string;rolled:number;before:number;after:number};
+export type ResourceActionResult=ActionResult;
 
 export async function useInventoryCatalogueItem(userId: string, characterId: string, inventoryId: string): Promise<ResourceActionResult[]> {
   return withTransaction(async (client) => {
     await assertCharacterOwner(client, userId, characterId);
-    const item = await client.query<any>(`UPDATE character_inventory_items SET quantity=GREATEST(0,quantity-1)
-      WHERE id=$1 AND character_id=$2 AND quantity>0 RETURNING source_content_id`, [inventoryId, characterId]);
+    const item = await client.query<any>(`SELECT source_content_id,quantity FROM character_inventory_items
+      WHERE id=$1 AND character_id=$2 AND quantity>0 FOR UPDATE`, [inventoryId, characterId]);
     if (!item.rowCount) throw new Error('Inventory item is unavailable.');
     if (!item.rows[0].source_content_id) return [];
-    const results=await executeResourceActions(client,characterId,item.rows[0].source_content_id,['on_use']);
-    await client.query(`INSERT INTO active_character_effects (character_id,effect_id,source_content_instance_id)
-      SELECT $1,l.effect_id,NULL FROM content_effect_links l WHERE l.content_id=$2 AND l.activation_type='on_use'
-      ON CONFLICT (character_id,effect_id) DO NOTHING`, [characterId, item.rows[0].source_content_id]);
+    const hasSpendStep=await client.query(`SELECT 1 FROM content_action_links link JOIN action_steps step ON step.action_id=link.action_id
+      WHERE link.content_id=$1 AND link.trigger_type='on_use' AND step.step_type='spend_item' LIMIT 1`,[item.rows[0].source_content_id]);
+    if(!hasSpendStep.rowCount)await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1',[inventoryId]);
+    const results=await executeContentActions(client,characterId,item.rows[0].source_content_id,['on_use'],{inventoryId});
     return results;
   });
 }
@@ -323,71 +377,8 @@ export async function triggerCharacterContentActions(userId:string,characterId:s
     const instance=await client.query<{content_id:string}>(`SELECT content_id FROM character_content_instances
       WHERE id=$1 AND character_id=$2`,[instanceId,characterId]);
     if(!instance.rowCount)throw new Error('Character content not found.');
-    return executeResourceActions(client,characterId,instance.rows[0].content_id,['manual','on_use']);
+    return executeContentActions(client,characterId,instance.rows[0].content_id,['manual','on_use'],{instanceId});
   });
-}
-
-async function executeResourceActions(client:pg.PoolClient,characterId:string,contentId:string,activations:string[]):Promise<ResourceActionResult[]>{
-  const actions=await client.query<any>(`SELECT action_operation,target_type,target_key,value_expression,label
-    FROM content_resource_actions WHERE content_id=$1 AND activation_type=ANY($2::text[]) ORDER BY sort_order,created_at`,
-    [contentId,activations]);
-  const results:ResourceActionResult[]=[];
-  for(const action of actions.rows){
-    const rolled=rollDiceExpression(action.value_expression);
-    const result=await applyResourceAction(client,characterId,action,rolled);
-    if(result)results.push({...result,label:action.label||resourceActionDefaultLabel(action),expression:action.value_expression,rolled});
-  }
-  return results;
-}
-
-function adjustedValue(before:number,amount:number,operation:string,max:number|null):number{
-  const raw=operation==='set'?amount:operation==='subtract'?before-amount:before+amount;
-  return Math.max(0,max===null?raw:Math.min(max,raw));
-}
-
-async function applyResourceAction(client:pg.PoolClient,characterId:string,action:any,amount:number):Promise<Omit<ResourceActionResult,'label'|'expression'|'rolled'>|null>{
-  if(action.target_type==='hp'||action.target_type==='temp_hp'){
-    const key=action.target_type==='hp'?'hp':'temp_hp';
-    const current=await client.query<{current_value:number;max_value:number}>('SELECT current_value,max_value FROM character_resources WHERE character_id=$1 AND resource_key=$2 FOR UPDATE',[characterId,key]);
-    if(!current.rowCount)return null;
-    const before=current.rows[0].current_value;
-    const max=key==='hp'?current.rows[0].max_value:null;
-    const after=adjustedValue(before,amount,action.action_operation,max);
-    await client.query(`UPDATE character_resources SET current_value=$3,
-      max_value=CASE WHEN resource_key='temp_hp' THEN GREATEST(max_value,$3) ELSE max_value END
-      WHERE character_id=$1 AND resource_key=$2`,[characterId,key,after]);
-    return{target:key==='hp'?'Hit Points':'Temporary HP',before,after};
-  }
-  if(action.target_type==='spell_slot'){
-    const order=action.target_key==='lowest_expended'?'ASC':'DESC';
-    const conditions=action.target_key==='pact'?`slot_type='pact'`:
-      /^\d$/.test(action.target_key)?`slot_type='standard' AND slot_level=${Number(action.target_key)}`:
-      `slot_type='standard' AND current_slots<max_slots`;
-    const slot=await client.query<any>(`SELECT slot_type,slot_level,current_slots,max_slots FROM character_spell_slots
-      WHERE character_id=$1 AND ${conditions} ORDER BY slot_level ${order} LIMIT 1 FOR UPDATE`,[characterId]);
-    if(!slot.rowCount)return null;
-    const before=slot.rows[0].current_slots;
-    const after=adjustedValue(before,amount,action.action_operation,slot.rows[0].max_slots);
-    await client.query(`UPDATE character_spell_slots SET current_slots=$4 WHERE character_id=$1 AND slot_type=$2 AND slot_level=$3`,
-      [characterId,slot.rows[0].slot_type,slot.rows[0].slot_level,after]);
-    return{target:`${slot.rows[0].slot_type==='pact'?'Pact':'Level '+slot.rows[0].slot_level} Spell Slots`,before,after};
-  }
-  if(action.target_type==='coin'){
-    const metadataKey:{[key:string]:string}={cp:'currencyCp',sp:'currencySp',ep:'currencyEp',gp:'currencyGp',pp:'currencyPp'};
-    const key=metadataKey[action.target_key];if(!key)return null;
-    const current=await client.query<any>('SELECT metadata_json FROM characters WHERE id=$1 FOR UPDATE',[characterId]);
-    const before=Number(current.rows[0]?.metadata_json?.[key])||0;
-    const after=adjustedValue(before,amount,action.action_operation,null);
-    await client.query(`UPDATE characters SET metadata_json=jsonb_set(metadata_json,$2::text[],to_jsonb($3::text),true),updated_at=now() WHERE id=$1`,
-      [characterId,[key],after]);
-    return{target:action.target_key.toUpperCase(),before,after};
-  }
-  return null;
-}
-
-function resourceActionDefaultLabel(action:any):string{
-  const verb=action.action_operation==='add'?'Recover':action.action_operation==='subtract'?'Spend / Damage':'Set';
-  return `${verb} ${action.target_type.replace('_',' ')}`;
 }
 
 export async function restCharacter(userId: string, characterId: string, rest: 'short_rest' | 'long_rest'): Promise<void> {
@@ -400,6 +391,10 @@ export async function restCharacter(userId: string, characterId: string, rest: '
         AND i.character_id = $1 AND d.recharge_period = ANY($2::text[])`, [characterId, periods]);
     await client.query(`UPDATE character_spell_slots SET current_slots = max_slots
       WHERE character_id = $1 AND (slot_type = 'pact' OR $2 = 'long_rest')`, [characterId, rest]);
+    await client.query(`UPDATE character_inventory_resources resource SET current_value=resource.max_value
+      FROM content_resource_definitions definition,character_inventory_items inventory
+      WHERE resource.resource_definition_id=definition.id AND resource.inventory_item_id=inventory.id
+        AND inventory.character_id=$1 AND definition.recharge_period=ANY($2::text[])`,[characterId,periods]);
   });
 }
 
@@ -459,6 +454,16 @@ async function initializeContentResources(client: pg.PoolClient, instanceId: str
   }
 }
 
+async function initializeInventoryResources(client:pg.PoolClient,inventoryId:string,characterId:string,contentId:string):Promise<void>{
+  const classes=await getClasses(client,characterId);const abilities=await getAbilities(client,characterId);const level=totalLevel(classes);
+  const maxAbility=Math.max(...Object.values(abilityMap(abilities)).map(abilityModifier));
+  const definitions=await client.query<any>('SELECT * FROM content_resource_definitions WHERE content_id=$1',[contentId]);
+  for(const definition of definitions.rows){const maximum=resolveResourceMaximum(definition.max_value_expression,{level,proficiencyBonus:proficiencyBonus(level),abilityModifier:maxAbility});
+    await client.query(`INSERT INTO character_inventory_resources(inventory_item_id,resource_definition_id,current_value,max_value)
+      VALUES($1,$2,$3,$3) ON CONFLICT(inventory_item_id,resource_definition_id) DO UPDATE SET max_value=EXCLUDED.max_value,
+      current_value=LEAST(character_inventory_resources.current_value,EXCLUDED.max_value)`,[inventoryId,definition.id,maximum]);}
+}
+
 async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: string): Promise<void> {
   const classes = await getClasses(client, characterId);
   const standard = standardSpellSlotMaximums(classes);
@@ -472,12 +477,24 @@ async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: stri
         WHERE inventory.character_id=$1 AND (l.activation_type='carried'
           OR (l.activation_type='equipped' AND inventory.equipped)
           OR (l.activation_type='attuned' AND inventory.attuned))
-    ) SELECT COALESCE(sum(
-      CASE WHEN COALESCE(l.value_override_expression, m.default_value_expression, '') ~ '^-?[0-9]+$'
-        THEN COALESCE(l.value_override_expression, m.default_value_expression)::integer ELSE 0 END), 0)::text AS bonus
-    FROM effect_ids a JOIN effect_modifier_links l ON l.effect_id = a.effect_id
-    JOIN modifier_definitions m ON m.id = l.modifier_id
-    WHERE m.target = 'spell_slots.highest.max' AND m.modifier_type = 'bonus'`, [characterId]);
+    ), modifier_values AS (
+      SELECT COALESCE(l.value_override_expression,m.default_value_expression,'') AS value_expression,m.target,m.modifier_type
+      FROM effect_ids active JOIN effect_modifier_links l ON l.effect_id=active.effect_id
+      JOIN modifier_definitions m ON m.id=l.modifier_id
+      UNION ALL
+      SELECT COALESCE(l.value_override_expression,m.default_value_expression,''),m.target,m.modifier_type
+      FROM character_content_instances instance JOIN content_modifier_links l ON l.content_id=instance.content_id
+      JOIN modifier_definitions m ON m.id=l.modifier_id WHERE instance.character_id=$1 AND instance.is_active
+        AND (l.activation_type='manual' OR (l.activation_type='known' AND instance.is_known)
+          OR (l.activation_type='prepared' AND instance.is_prepared))
+      UNION ALL
+      SELECT COALESCE(l.value_override_expression,m.default_value_expression,''),m.target,m.modifier_type
+      FROM character_inventory_items inventory JOIN content_modifier_links l ON l.content_id=inventory.source_content_id
+      JOIN modifier_definitions m ON m.id=l.modifier_id WHERE inventory.character_id=$1
+        AND (l.activation_type='carried' OR (l.activation_type='equipped' AND inventory.equipped)
+          OR (l.activation_type='attuned' AND inventory.attuned))
+    ) SELECT COALESCE(sum(CASE WHEN value_expression ~ '^-?[0-9]+$' THEN value_expression::integer ELSE 0 END),0)::text AS bonus
+    FROM modifier_values WHERE target='spell_slots.highest.max' AND modifier_type='bonus'`, [characterId]);
   const highestIndex = standard.findLastIndex((maximum) => maximum > 0);
   if (highestIndex >= 0) standard[highestIndex] = Math.max(0, standard[highestIndex] + (Number(bonusResult.rows[0]?.bonus) || 0));
   await client.query(`DELETE FROM character_spell_slots WHERE character_id = $1 AND slot_type = 'standard'

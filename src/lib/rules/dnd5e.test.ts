@@ -7,8 +7,12 @@ import {
   effectiveCasterLevel,
   pactMagicSlots,
   proficiencyBonus,
+  resolveDicePool,
   resolveResourceMaximum,
+  rollD20Pool,
   rollDiceExpression,
+  modifierConditionMatches,
+  resolveAdvantageState,
   resolvedFlatBonuses,
   resolvedNumericModifiers,
   skillModifier,
@@ -147,5 +151,41 @@ describe('D&D 5e helpers', () => {
   it('rolls additive and subtractive resource expressions safely',()=>{
     expect(rollDiceExpression('2d4+3-1d6',()=>2)).toBe(5);
     expect(rollDiceExpression('process.exit()',()=>20)).toBe(0);
+  });
+
+  it('evaluates supported modifier conditions and rejects unknown predicates',()=>{
+    const context={classes:[{className:'Barbarian',level:5}],ability:'str' as const,attackType:'melee_weapon' as const};
+    expect(modifierConditionMatches('class:barbarian && ability:str',context)).toBe(true);
+    expect(modifierConditionMatches('attack:ranged_weapon',context)).toBe(false);
+    expect(modifierConditionMatches('user_supplied_javascript()',context)).toBe(false);
+  });
+
+  it('derives the advantage/disadvantage label from the net of a dice-pool resolution',()=>{
+    const source=(name:string,modifierType:string):ActiveCharacterEffect=>({id:name,effectId:name,effectKey:name,name,
+      sourceType:'effect',sourceName:name,description:'',durationType:'',requiresConcentration:false,isCondition:false,
+      isSelectable:true,remainingRounds:null,modifiers:[{target:'attack_roll.all',modifierType,valueExpression:'',
+        defaultValueExpression:'',valueOverrideExpression:'',conditionExpression:'',priority:0}]});
+    expect(resolveAdvantageState([source('Blessing','advantage')],['attack_roll.weapon'])).toBe('advantage');
+    expect(resolveAdvantageState([source('Blessing','advantage'),source('Poisoned','disadvantage')],['attack_roll.weapon'])).toBe('normal');
+  });
+
+  it('nets advantage/disadvantage sources by count, per modifier-primacy.md §3.3 (a deliberate departure from standard 5e binary cancellation)',()=>{
+    expect(resolveDicePool(3,0)).toEqual({advantageCount:3,disadvantageCount:0,net:3,poolSize:4,direction:'highest'});
+    expect(resolveDicePool(0,3)).toEqual({advantageCount:0,disadvantageCount:3,net:-3,poolSize:4,direction:'lowest'});
+    expect(resolveDicePool(3,1)).toEqual({advantageCount:3,disadvantageCount:1,net:2,poolSize:3,direction:'highest'});
+    expect(resolveDicePool(1,3)).toEqual({advantageCount:1,disadvantageCount:3,net:-2,poolSize:3,direction:'lowest'});
+    expect(resolveDicePool(2,2)).toEqual({advantageCount:2,disadvantageCount:2,net:0,poolSize:1,direction:'flat'});
+    expect(resolveDicePool(0,0)).toEqual({advantageCount:0,disadvantageCount:0,net:0,poolSize:1,direction:'flat'});
+  });
+
+  it('rolls a d20 pool of the requested size and takes the highest, lowest, or the single flat die',()=>{
+    const scripted=[14,7,19,2];
+    let index=0;
+    const rollDie=()=>scripted[index++];
+    expect(rollD20Pool(4,'highest',rollDie)).toEqual({rolls:[14,7,19,2],chosen:19});
+    index=0;
+    expect(rollD20Pool(4,'lowest',rollDie)).toEqual({rolls:[14,7,19,2],chosen:2});
+    index=0;
+    expect(rollD20Pool(1,'flat',rollDie)).toEqual({rolls:[14],chosen:14});
   });
 });

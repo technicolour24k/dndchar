@@ -1,7 +1,7 @@
 import { error, fail } from '@sveltejs/kit';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, updateCharacter } from '$lib/server/services/characters';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem } from '$lib/server/services/catalogue';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 
 export async function load({ params, locals }) {
   const character = await getCharacter(locals.user!.id, params.id);
@@ -74,6 +74,7 @@ export const actions = {
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true };
   },
+  inventoryResource:async({request,params,locals})=>{const form=await request.formData();await useInventoryResource(locals.user!.id,params.id,String(form.get('resourceId')||''),Number(form.get('delta'))||0);emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true};},
   spellSlot: async ({ request, params, locals }) => {
     const form = await request.formData();
     await spendSpellSlot(locals.user!.id, params.id, String(form.get('slotType')) as 'standard' | 'pact', Number(form.get('slotLevel')), Number(form.get('delta')) || 0);
@@ -107,5 +108,9 @@ export const actions = {
     const itemResult=await triggerCharacterContentActions(locals.user!.id,params.id,String(form.get('instanceId')||''));
     emitRealtimeEvent('resource:changed',{characterId:params.id});
     return{contentUpdated:true,itemResult};
+  },
+  castSpell:async({request,params,locals})=>{
+    const itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());
+    emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
   }
 };

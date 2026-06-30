@@ -38,6 +38,7 @@ export type InventoryItem = {
   effects: string;
   abilityBonuses: Partial<Record<AbilityKey, number>>;
   notes: string;
+  resources?: Array<{id:string;key:string;label:string;currentValue:number;maxValue:number;rechargePeriod:string}>;
 };
 
 export type ItemCategory = {
@@ -124,6 +125,8 @@ export type CharacterDetail = {
   notes: CharacterNote[];
   proficiencies: CharacterProficiencies;
   activeEffects: ActiveCharacterEffect[];
+  modifierSources: ActiveCharacterEffect[];
+  modifierAudit: import('$lib/types/rules').ResolvedModifier[];
   availableEffects: EffectDefinition[];
   exhaustionLevel: number;
   content: import('$lib/types/content').CharacterContentInstance[];

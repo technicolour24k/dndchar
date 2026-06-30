@@ -2,6 +2,8 @@ import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { abilityKeys, clampResource } from '$lib/rules/dnd5e';
 import { getCombatClock, listCharacterContent, listSpellSlots, syncCharacterSpellSlots } from '$lib/server/services/catalogue';
+import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
+import { applyCharacterEffect } from '$lib/server/services/effects';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -69,10 +71,11 @@ type CharacterSnapshot = {
   attacks?: Array<{ name?: string; attack_ability?: AbilityKey; proficient?: boolean; damage_dice?: string; notes?: string }>;
   notes?: Array<{ note_key?: string; title?: string; content?: string }>;
   proficiencies?: Array<{ proficiency_type?: string; proficiency_key?: string }>;
-  active_effects?: Array<{ effect_key?: string; remaining_rounds?: number | null; metadata_json?: Record<string, unknown>; source_content_instance_id?: string | null; expiry_boundary?: string }>;
+  active_effects?: Array<{ effect_key?: string; application_key?: string; source_key?: string|null; remaining_rounds?: number | null; metadata_json?: Record<string, unknown>; source_content_instance_id?: string | null; expiry_boundary?: string }>;
   exhaustion?: { exhaustion_level?: number };
   content_instances?: any[];
   content_resources?: any[];
+  inventory_resources?: any[];
   spell_slots?: any[];
   combat_clock?: any;
 };
@@ -221,6 +224,7 @@ export async function getCharacter(userId: string, characterId: string): Promise
   );
   const row = result.rows[0];
   if (!row) return null;
+  const resolvedModifiers = await resolveCharacterModifierSources(characterId);
 
   return mapCharacterRow(row, {
     classes: await getClasses(characterId),
@@ -231,6 +235,8 @@ export async function getCharacter(userId: string, characterId: string): Promise
     notes: await getNotes(characterId),
     proficiencies: await getProficiencies(characterId),
     activeEffects: await getActiveEffects(characterId),
+    modifierSources: resolvedModifiers.sources,
+    modifierAudit: resolvedModifiers.audit,
     availableEffects: await listEffectDefinitions(),
     exhaustionLevel: await getExhaustionLevel(characterId),
     content: await listCharacterContent(characterId),
@@ -373,7 +379,8 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const activeEffects = await client.query(
     `
       SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json,
-        active_character_effects.source_content_instance_id, active_character_effects.expiry_boundary
+        active_character_effects.source_content_instance_id, active_character_effects.expiry_boundary,
+        active_character_effects.application_key,active_character_effects.source_key
       FROM active_character_effects
       JOIN effect_definitions ON effect_definitions.id = active_character_effects.effect_id
       WHERE active_character_effects.character_id = $1
@@ -386,6 +393,8 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const contentResources = await client.query(`SELECT r.* FROM character_content_resources r
     JOIN character_content_instances i ON i.id = r.character_content_id WHERE i.character_id = $1`, [characterId]);
   const spellSlots = await client.query('SELECT * FROM character_spell_slots WHERE character_id = $1 ORDER BY slot_type, slot_level', [characterId]);
+  const inventoryResources=await client.query(`SELECT resource.* FROM character_inventory_resources resource
+    JOIN character_inventory_items inventory ON inventory.id=resource.inventory_item_id WHERE inventory.character_id=$1`,[characterId]);
   const combatClock = await client.query('SELECT * FROM character_combat_clocks WHERE character_id = $1', [characterId]);
 
   return {
@@ -401,6 +410,7 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
     exhaustion: exhaustion.rows[0] ?? { exhaustion_level: 0 },
     content_instances: contentInstances.rows,
     content_resources: contentResources.rows,
+    inventory_resources:inventoryResources.rows,
     spell_slots: spellSlots.rows,
     combat_clock: combatClock.rows[0] ?? null
   };
@@ -524,6 +534,10 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       content: row.content || ''
     }))
   );
+  for(const row of snapshot.inventory_resources??[]){await client.query(`INSERT INTO character_inventory_resources
+    (id,inventory_item_id,resource_definition_id,current_value,max_value)
+    SELECT $1,$2,$3,$4,$5 WHERE EXISTS(SELECT 1 FROM character_inventory_items WHERE id=$2)
+      AND EXISTS(SELECT 1 FROM content_resource_definitions WHERE id=$3)`,[row.id,row.inventory_item_id,row.resource_definition_id,row.current_value,row.max_value]);}
   await replaceProficiencies(
     client,
     characterId,
@@ -533,17 +547,13 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
     }))
   );
   await restoreStructuredContent(client, characterId, snapshot);
-  await replaceActiveEffects(
-    client,
-    characterId,
-    (snapshot.active_effects ?? []).map((row) => row.effect_key || '').filter(Boolean)
-  );
+  await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
   for (const row of snapshot.active_effects ?? []) {
-    await client.query(`UPDATE active_character_effects active SET remaining_rounds=$1, metadata_json=$2,
-      source_content_instance_id=$3, expiry_boundary=COALESCE($4,'round_end')
-      FROM effect_definitions effect WHERE active.character_id=$5 AND active.effect_id=effect.id AND effect.effect_key=$6`,
-      [row.remaining_rounds ?? null, JSON.stringify(row.metadata_json || {}), row.source_content_instance_id || null,
-        row.expiry_boundary || 'round_end', characterId, row.effect_key]);
+    await client.query(`INSERT INTO active_character_effects(character_id,effect_id,remaining_rounds,metadata_json,
+      source_content_instance_id,expiry_boundary,application_key,source_key)
+      SELECT $1,effect.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7 FROM effect_definitions effect WHERE effect.effect_key=$8`,
+      [characterId,row.remaining_rounds??null,JSON.stringify(row.metadata_json||{}),row.source_content_instance_id||null,
+        row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,row.effect_key]);
   }
   await setExhaustionLevel(client, characterId, Number(snapshot.exhaustion?.exhaustion_level) || 0);
 }
@@ -635,6 +645,10 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     source_content_id: string | null;
     attuned: boolean;
   }>('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order ASC', [characterId]);
+  const resources=await query<any>(`SELECT resource.id,resource.inventory_item_id,definition.resource_key,definition.label,
+    definition.recharge_period,resource.current_value,resource.max_value FROM character_inventory_resources resource
+    JOIN content_resource_definitions definition ON definition.id=resource.resource_definition_id
+    JOIN character_inventory_items inventory ON inventory.id=resource.inventory_item_id WHERE inventory.character_id=$1`,[characterId]);
   return result.rows.map((row) => ({
     id: row.id,
     name: row.name,
@@ -660,7 +674,9 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
       wis: row.wis_bonus,
       cha: row.cha_bonus
     },
-    notes: row.notes
+    notes: row.notes,
+    resources:resources.rows.filter((resource:any)=>resource.inventory_item_id===row.id).map((resource:any)=>({id:resource.id,key:resource.resource_key,
+      label:resource.label,currentValue:resource.current_value,maxValue:resource.max_value,rechargePeriod:resource.recharge_period}))
   }));
 }
 
@@ -709,7 +725,7 @@ async function getProficiencies(characterId: string): Promise<CharacterProficien
   }
 }
 
-async function listEffectDefinitions(): Promise<EffectDefinition[]> {
+async function listEffectDefinitions(includeArchived=false): Promise<EffectDefinition[]> {
   try {
     const effects = await query<{
       id: string;
@@ -747,8 +763,10 @@ async function listEffectDefinitions(): Promise<EffectDefinition[]> {
           ORDER BY effect_sources.created_at ASC
           LIMIT 1
         ) source_label ON true
+        WHERE ($1::boolean OR effect_definitions.is_archived=false)
         ORDER BY effect_definitions.is_condition DESC, effect_definitions.sort_order ASC, effect_definitions.name ASC
       `
+      ,[includeArchived]
     );
 
     const modifiers = await listEffectModifiers();
@@ -826,7 +844,7 @@ async function listEffectModifiers(): Promise<Array<{
 }
 
 async function getActiveEffects(characterId: string): Promise<CharacterDetail['activeEffects']> {
-  const definitions = await listEffectDefinitions();
+  const definitions = await listEffectDefinitions(true);
   const byId = new Map(definitions.map((definition) => [definition.id, definition]));
   try {
     const active = await query<{
@@ -1035,16 +1053,11 @@ async function replaceActiveEffects(client: pg.PoolClient, characterId: string, 
     AND NOT EXISTS (SELECT 1 FROM effect_definitions effect WHERE effect.id=active.effect_id AND effect.effect_key=ANY($2::text[]))`,
     [characterId, uniqueKeys]);
   for (const key of uniqueKeys) {
-    await client.query(
-      `
-        INSERT INTO active_character_effects (character_id, effect_id)
-        SELECT $1, id
-        FROM effect_definitions
-        WHERE effect_key = $2
-        ON CONFLICT (character_id, effect_id) DO NOTHING
-      `,
-      [characterId, key]
-    );
+    const effect=await client.query<{id:string}>('SELECT id FROM effect_definitions WHERE effect_key=$1 AND is_archived=false',[key]);
+    if(effect.rowCount){
+      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND effect_id=$2',[characterId,effect.rows[0].id]);
+      if(!active.rowCount)await applyCharacterEffect(client,characterId,effect.rows[0].id);
+    }
   }
 }
 
