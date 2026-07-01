@@ -25,6 +25,7 @@
     </div>
   </section>
 
+  {#if data.user?.role === 'admin'}
   <aside class="panel stack">
     <h2>Create Homebrew</h2>
     <form method="POST" action="?/create" class="stack">
@@ -52,4 +53,5 @@
       <button type="submit">Add Uses Counter</button>
     </form>
   </aside>
+  {/if}
 </div>

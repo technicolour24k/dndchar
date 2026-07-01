@@ -1,5 +1,6 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
+  import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
   import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -10,12 +11,14 @@
     catalogue = [],
     itemCategories = [],
     result,
+    isAdmin = false,
     onVersionHistory
   }: {
     character: CharacterDetail;
     catalogue?: ContentDefinition[];
     itemCategories?: ItemCategory[];
     result?: Record<string, unknown>;
+    isAdmin?: boolean;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -97,9 +100,15 @@
   let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '' });
   let contentBusy = $state(false);
   let modifierSearch = $state('');
-  let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all' | 'catalogue'>('active');
+  let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
   let newItemOpen = $state(false);
   let newItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
+  let simpleItemOpen = $state(false);
+  let simpleItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
+  let simpleItemName = $state('');
+  let simpleItemQuantity = $state(1);
+  let simpleItemCategory = $state('gear');
+  let simpleItemNotes = $state('');
   let rollResult = $state<{
     title: string;
     attack: string;
@@ -125,8 +134,7 @@
     { key: 'combat', label: 'Combat' },
     { key: 'class_feature', label: 'Class' },
     { key: 'environment', label: 'Environment' },
-    { key: 'all', label: 'All' },
-    { key: 'catalogue', label: 'Catalogue' }
+    { key: 'all', label: 'All' }
   ] as const;
   const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
   const skillChecks: Array<{ key: string; name: string; ability: AbilityKey }> = [
@@ -167,7 +175,6 @@
         .includes(query);
       const matchesFilter =
         (modifierFilter === 'all' && effect.isSelectable) ||
-        modifierFilter === 'catalogue' ||
         (modifierFilter === 'active' && selectedEffectKeys.includes(effect.key)) ||
         (modifierFilter === 'automated' && effect.modifiers.length > 0) ||
         (modifierFilter === 'potential' && effect.modifiers.length === 0 && !effect.isSelectable) ||
@@ -314,8 +321,14 @@
   }
 
   function openNewItem(location: 'equipped' | 'backpack' | 'misc') {
-    newItemLocation = location;
-    newItemOpen = true;
+    if (!isAdmin) {
+      simpleItemLocation = location;
+      simpleItemCategory = location === 'misc' ? 'misc' : 'gear';
+      simpleItemOpen = true;
+    } else {
+      newItemLocation = location;
+      newItemOpen = true;
+    }
   }
 
   function clampDeathSave(value: unknown) {
@@ -462,13 +475,31 @@
     for (const [key, value] of Object.entries(values)) body.set(key, String(value));
     const response = await fetch(`?/${action}`, { method: 'POST', body });
     contentBusy = false;
-    if (response.ok) location.reload();
+    if (response.ok) await invalidateAll();
     else inventoryMessage = `Could not update character content (${response.status}).`;
   }
 
   function addSelectedContent(type: ContentType) {
     const contentId = selectedCatalogue[type];
     if (contentId) void runContentAction('addContent', { contentId });
+  }
+
+  async function addSimpleItem() {
+    const name = simpleItemName.trim();
+    if (!name) return;
+    await runContentAction('addInventoryItem', {
+      name,
+      quantity: simpleItemQuantity,
+      category: simpleItemCategory,
+      location: simpleItemLocation,
+      notes: simpleItemNotes
+    });
+    simpleItemOpen = false;
+    simpleItemName = '';
+    simpleItemQuantity = 1;
+    simpleItemCategory = 'gear';
+    simpleItemLocation = 'backpack';
+    simpleItemNotes = '';
   }
 
   function addClassRow() {
@@ -700,10 +731,8 @@
   });
 
   function removeInventoryItem(event: MouseEvent) {
-    const row = findInventoryRow(event);
-    const name = row?.querySelector<HTMLInputElement>('input[name="inventoryName"]')?.value || 'Item';
     setInventoryQuantity(event, 0);
-    inventoryMessage = `${name} set to 0. Save to remove it from the backpack.`;
+    (event.currentTarget as HTMLElement).closest('form')?.requestSubmit();
   }
 
   function toggleEquipped(event: MouseEvent, equipped: boolean) {
@@ -751,6 +780,7 @@
     if (rollResult) { rollResult = null; return; }
     if (simpleRollResult) { simpleRollResult = null; return; }
     if (inventoryMessage) { inventoryMessage = null; return; }
+    if (simpleItemOpen) { simpleItemOpen = false; return; }
     if (newItemOpen) { newItemOpen = false; return; }
     if (formulaHelp) { formulaHelp = null; return; }
     if (playerModificationsOpen) { playerModificationsOpen = false; return; }
@@ -1027,7 +1057,7 @@
             </div>
           </div>
           <div class="structured-section">
-            <div class="catalogue-add-row"><select bind:value={selectedCatalogue.spell}><option value="">Add a spell...</option>{#each catalogue.filter((entry) => entry.type === 'spell') as entry}<option value={entry.id}>{entry.name} (level {entry.spell?.level ?? 0})</option>{/each}</select><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button><a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a></div>
+            <div class="catalogue-add-row"><select bind:value={selectedCatalogue.spell}><option value="">Add a spell...</option>{#each catalogue.filter((entry) => entry.type === 'spell') as entry}<option value={entry.id}>{entry.name} (level {entry.spell?.level ?? 0})</option>{/each}</select><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
                 <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}</span></div><div class="actions"><button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
@@ -1064,7 +1094,7 @@
       </div>
     </section>
     <section class="panel stack">
-      <div class="panel-head"><h2>Structured Features</h2><a href="/catalogue">Create Homebrew</a></div>
+      <div class="panel-head"><h2>Structured Features</h2>{#if isAdmin}<a href="/catalogue">Create Homebrew</a>{/if}</div>
       {#each [['class_feature', 'Class Feature'], ['feat', 'Feat']] as option}
         <div class="catalogue-add-row">
           <select value={selectedCatalogue[option[0] as ContentType]} onchange={(event) => (selectedCatalogue[option[0] as ContentType] = event.currentTarget.value)}>
@@ -1093,7 +1123,7 @@
   {#if activeTab === 'inventory'}
     <section class="panel catalogue-add-panel">
       <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
-      <div class="catalogue-add-row"><select bind:value={selectedCatalogue.item}><option value="">Choose an item...</option>{#each catalogue.filter((entry) => entry.type === 'item') as entry}<option value={entry.id}>{entry.name}</option>{/each}</select><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button><a class="compact-button" href="/catalogue?type=item">Create Homebrew</a></div>
+      <div class="catalogue-add-row"><select bind:value={selectedCatalogue.item}><option value="">Choose an item...</option>{#each catalogue.filter((entry) => entry.type === 'item') as entry}<option value={entry.id}>{entry.name}</option>{/each}</select><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
     </section>
     <section class="inventory-layout">
       <section class="panel stack inventory-section">
@@ -1684,6 +1714,38 @@
           <button type="button" class="text-button" onclick={() => (inventoryMessage = null)}>Close</button>
         </div>
         <p class="muted inventory-action-result">{inventoryMessage}</p>
+      </div>
+    </div>
+  {/if}
+
+  {#if simpleItemOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleItemOpen = false)}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="simple-item-title">Add Item</h2>
+          <button type="button" class="text-button" onclick={() => (simpleItemOpen = false)}>Close</button>
+        </div>
+        <div class="new-item-grid">
+          <label>Item <input bind:value={simpleItemName} placeholder="Gold watch, emerald ring, six cabbages" /></label>
+          <label>Category
+            <select bind:value={simpleItemCategory}>
+              {#each categoryOptions as category}
+                <option value={category.key}>{category.label}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="qty-label">Quantity
+            <span class="qty-control">
+              <button type="button" class="qty-button" onclick={() => (simpleItemQuantity = Math.max(1, simpleItemQuantity - 1))}>-</button>
+              <input type="number" min="1" bind:value={simpleItemQuantity} />
+              <button type="button" class="qty-button" onclick={() => (simpleItemQuantity = simpleItemQuantity + 1)}>+</button>
+            </span>
+          </label>
+          <label>Notes <input bind:value={simpleItemNotes} /></label>
+        </div>
+        <div class="modal-actions">
+          <button type="button" disabled={!simpleItemName.trim() || contentBusy} onclick={addSimpleItem}>Add Item</button>
+        </div>
       </div>
     </div>
   {/if}
