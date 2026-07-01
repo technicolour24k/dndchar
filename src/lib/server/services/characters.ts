@@ -958,7 +958,7 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
 }
 
 async function replaceInventory(client: pg.PoolClient, characterId: string, inventory: InventoryItem[]): Promise<void> {
-  const retainedIds = inventory.map((row) => row.id).filter(Boolean);
+  const retainedIds = inventory.filter((row) => row.name.trim() && Number(row.quantity) > 0).map((row) => row.id).filter(Boolean);
   await client.query('DELETE FROM character_inventory_items WHERE character_id = $1 AND NOT (id = ANY($2::uuid[]))', [characterId, retainedIds]);
   for (const [index, row] of inventory.entries()) {
     if (!row.name.trim() || Number(row.quantity) <= 0) continue;
@@ -1142,7 +1142,7 @@ function parseInventory(form: FormData): InventoryItem[] {
         name,
         category: categories[index] || 'gear',
         location,
-        quantity: Math.max(0, quantities[index] || 1),
+        quantity: Math.max(0, quantities[index] || 0),
         equipped: location === 'equipped',
         isEquipment: Boolean(isEquipment[index]),
         acBonus: acBonuses[index] || 0,
