@@ -2,7 +2,7 @@ import { error, fail } from '@sveltejs/kit';
 import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, updateCharacter } from '$lib/server/services/characters';
+import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 
 export async function load({ params, locals }) {
@@ -138,5 +138,15 @@ export const actions = {
   castSpell:async({request,params,locals})=>{
     const itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
+  },
+  spendHitDice: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const classIndex = Math.max(0, Number(form.get('classIndex')) || 0);
+    const spent = Math.max(1, Math.min(99, Number(form.get('spent')) || 1));
+    const classLevel = Math.max(1, Number(form.get('classLevel')) || 1);
+    const hpGained = Math.max(0, Number(form.get('hpGained')) || 0);
+    await spendHitDice(locals.user!.id, params.id, classIndex, spent, classLevel, hpGained);
+    emitRealtimeEvent('resource:changed', { characterId: params.id });
+    return { contentUpdated: true };
   }
 };

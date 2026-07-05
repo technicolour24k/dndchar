@@ -1111,7 +1111,14 @@ function parseResources(form: FormData): CharacterResource[] {
       label: 'Inspiration',
       currentValue: Math.max(0, Number(form.get('inspiration')) || 0),
       maxValue: Math.max(1, Number(form.get('inspiration')) || 0)
-    }
+    },
+    // Per-class hit dice (one resource per class, indexed hit_dice_0, hit_dice_1, ...)
+    ...form.getAll('className').map((_, i) => ({
+      key: `hit_dice_${i}`,
+      label: 'Hit Dice',
+      currentValue: Math.max(0, Number(form.get(`hitDiceCurrent_${i}`)) || 0),
+      maxValue: Math.max(0, Number(form.get(`hitDiceMax_${i}`)) || 0)
+    }))
   ];
 }
 
@@ -1221,4 +1228,39 @@ function parseNotes(form: FormData): CharacterNote[] {
     { key: 'appearance', title: 'Appearance', content: String(form.get('appearanceNote') || '') },
     { key: 'additional_notes', title: 'Additional Notes', content: String(form.get('additionalNotesNote') || '') }
   ];
+}
+
+export async function spendHitDice(
+  userId: string,
+  characterId: string,
+  classIndex: number,
+  spent: number,
+  classLevel: number,
+  hpGained: number
+): Promise<void> {
+  await withTransaction(async (client) => {
+    const owned = await client.query(
+      'SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2',
+      [characterId, userId]
+    );
+    if (!owned.rowCount) throw new Error('Character not found.');
+
+    // Decrement hit dice pool for this class
+    await client.query(`
+      INSERT INTO character_resources (character_id, resource_key, label, current_value, max_value, sort_order)
+      VALUES ($1, $2, 'Hit Dice', GREATEST(0, $3::int - $4::int), $3::int, ${99 + classIndex})
+      ON CONFLICT (character_id, resource_key) DO UPDATE
+        SET current_value = GREATEST(0, LEAST(character_resources.max_value, character_resources.current_value - $4)),
+            max_value = $3
+    `, [characterId, `hit_dice_${classIndex}`, Math.max(1, classLevel), Math.max(0, spent)]);
+
+    // Recover HP up to max
+    if (hpGained > 0) {
+      await client.query(`
+        UPDATE character_resources
+        SET current_value = LEAST(max_value, current_value + $1)
+        WHERE character_id = $2 AND resource_key = 'hp'
+      `, [hpGained, characterId]);
+    }
+  });
 }
