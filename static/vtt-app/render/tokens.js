@@ -5,11 +5,11 @@ function colorForType(type) {
   return TYPE_COLOR[type] || '#9e9e9e';
 }
 
-export function drawTokens(ctx, tokens, gridSizePx, imageCache) {
+export function drawTokens(ctx, tokens, gridSizePx, getImage) {
   const radius = gridSizePx * 0.4;
 
   for (const token of tokens) {
-    const img = token.imageUrl ? imageCache.get(token.imageUrl) : null;
+    const img = token.imageUrl ? getImage(token.imageUrl) : null;
 
     ctx.save();
     if (img && img.complete && img.naturalWidth) {

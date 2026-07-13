@@ -6,6 +6,20 @@ function canEditToken(meta, token) {
   return token.ownerId === meta.playerId;
 }
 
+// token:stat:update writes into token.stats[stat] by default (arbitrary,
+// free-form combat stats). These fields are top-level token properties
+// instead — condition is set alongside HP by the GM (Section 5), the vision*
+// fields are token-level traits, not something tracked per-round, and
+// imageUrl is how the token-image picker changes a token's art post-creation.
+const TOKEN_LEVEL_STAT_FIELDS = new Set([
+  'condition',
+  'imageUrl',
+  'visionNormalFt',
+  'visionDarkFt',
+  'visionTrueFt',
+  'visionDevilFt',
+]);
+
 // Broadcasts a token-bearing event: GM always gets the raw token; players get
 // it filtered, and not at all if the token is GM-hidden (Section 5).
 function broadcastToken(context, sessionId, eventType, token, extra = {}) {
@@ -59,8 +73,8 @@ function handleTokenEvent(meta, msg, context) {
     case 'token:stat:update': {
       const token = session.tokens[msg.tokenId];
       if (!token || !canEditToken(meta, token)) return;
-      if (msg.stat === 'condition') {
-        token.condition = msg.value;
+      if (TOKEN_LEVEL_STAT_FIELDS.has(msg.stat)) {
+        token[msg.stat] = msg.value;
       } else {
         token.stats = token.stats || {};
         token.stats[msg.stat] = msg.value;

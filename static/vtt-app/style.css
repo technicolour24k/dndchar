@@ -60,5 +60,94 @@ body {
 #canvas { display: block; cursor: grab; }
 #canvas.dragging { cursor: grabbing; }
 
+#zoomControls {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  gap: 2px;
+  background: #1c1e24;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  z-index: 10;
+}
+#zoomControls button {
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px;
+  background: #2a2d34;
+  color: #eee;
+  cursor: pointer;
+  font-size: 13px;
+  min-width: 32px;
+}
+#zoomControls button:hover { background: #3a3d44; }
+#zoomResetBtn { min-width: 52px; font-size: 12px; color: #aaa; }
+
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal-overlay.visible { display: flex; }
+.modal {
+  background: #1c1e24;
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+  padding: 20px;
+  width: 280px;
+}
+.modal h2 { margin: 0 0 14px; font-size: 15px; color: #eee; }
+.modal .field { margin-bottom: 10px; }
+.modal label { display: block; font-size: 12px; color: #999; margin-bottom: 2px; }
+.modal input { width: 100%; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 13px; }
+.modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal .actions button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; background: #4a7fff; color: #fff; }
+.modal .actions button.secondary { background: #3a3d44; }
+
 .thumb { width: 100%; max-height: 90px; object-fit: contain; background: #000; border-radius: 4px; margin-top: 6px; display: none; }
 .thumb.visible { display: block; }
+
+.modal-wide { width: 520px; max-width: 90vw; }
+
+.picker-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid #3a3d44; }
+.picker-tabs .picker-tab {
+  padding: 8px 14px;
+  border: none;
+  background: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 2px solid transparent;
+}
+.picker-tabs .picker-tab.active { color: #eee; border-bottom-color: #4a7fff; }
+
+.picker-status { font-size: 12px; color: #888; margin: 8px 0; min-height: 16px; }
+
+.picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.picker-item {
+  background: #14161b;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 4px;
+  cursor: pointer;
+  text-align: center;
+}
+.picker-item:hover { border-color: #4a7fff; }
+.picker-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #000; display: block; }
+.picker-item span { display: block; font-size: 10px; color: #aaa; margin-top: 4px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.token-thumb { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; vertical-align: middle; margin-right: 6px; background: #000; }

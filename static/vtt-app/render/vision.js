@@ -4,23 +4,38 @@
 //   bright: color out to visionNormalFt, darkvision irrelevant, no gray band.
 //   dim:    everyone gets grayscale out to max(normal, dark), no color band.
 //   dark:   normal default — color/gray/black bands as above.
+//
+// Truesight and devil's sight both mean "see clearly even in darkness" —
+// unlike darkvision they aren't degraded to grayscale by ambient darkness, so
+// they simply extend the full-color radius out to their own range regardless
+// of `brightness`. This POC doesn't model magical darkness/illusions/
+// invisibility separately, so the two are mechanically identical here; kept
+// as separate fields on the token for clarity/future distinction.
 export function getTokenVisionRadii(token, brightness, pxPerFoot) {
   const normalFt = token.visionNormalFt || 0;
   const darkFt = token.visionDarkFt || 0;
+  const specialFt = Math.max(token.visionTrueFt || 0, token.visionDevilFt || 0);
+
+  let colorRadius;
+  let grayRadius;
 
   if (brightness === 'dim') {
     const maxFt = Math.max(normalFt, darkFt);
-    return { colorRadius: 0, grayRadius: maxFt * pxPerFoot };
+    colorRadius = 0;
+    grayRadius = maxFt * pxPerFoot;
+  } else if (brightness === 'bright') {
+    colorRadius = normalFt * pxPerFoot;
+    grayRadius = colorRadius;
+  } else {
+    // 'dark' (default ambient)
+    colorRadius = normalFt * pxPerFoot;
+    grayRadius = darkFt > normalFt ? darkFt * pxPerFoot : colorRadius;
   }
 
-  if (brightness === 'bright') {
-    const r = normalFt * pxPerFoot;
-    return { colorRadius: r, grayRadius: r };
-  }
+  const specialRadius = specialFt * pxPerFoot;
+  colorRadius = Math.max(colorRadius, specialRadius);
+  grayRadius = Math.max(grayRadius, specialRadius);
 
-  // 'dark' (default ambient)
-  const colorRadius = normalFt * pxPerFoot;
-  const grayRadius = darkFt > normalFt ? darkFt * pxPerFoot : colorRadius;
   return { colorRadius, grayRadius };
 }
 
