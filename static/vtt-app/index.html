@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VTT POC</title>
+  <link rel="stylesheet" href="/vtt-app/style.css" />
+</head>
+<body>
+
+  <div id="login">
+    <h1>VTT Proof of Concept</h1>
+
+    <div id="identityKnown" style="display:none;">
+      <label>Playing as</label>
+      <div id="identityName" style="padding:6px 8px;background:#1a1c22;border-radius:4px;border:1px solid #444;"></div>
+    </div>
+    <div id="identityUnknown">
+      <label>Your name</label>
+      <input id="nameInput" type="text" placeholder="Tony" />
+    </div>
+
+    <div class="panel">
+      <h2 style="font-size:14px;margin:0 0 8px;color:#888;">Game Master</h2>
+      <button id="createRoomBtn">Create room</button>
+    </div>
+
+    <div class="panel">
+      <h2 style="font-size:14px;margin:0 0 8px;color:#888;">Player</h2>
+      <label>Room code</label>
+      <input id="joinCodeInput" type="text" placeholder="ABCD12" maxlength="6" style="text-transform:uppercase" />
+      <button id="joinRoomBtn">Join room</button>
+    </div>
+
+    <div class="error" id="loginError"></div>
+  </div>
+
+  <div id="app">
+    <div id="sidebar"></div>
+    <div id="mapWrap">
+      <canvas id="canvas" width="800" height="600"></canvas>
+    </div>
+  </div>
+
+  <script type="module" src="/vtt-app/main.js"></script>
+</body>
+</html>

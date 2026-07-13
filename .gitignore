@@ -6,4 +6,5 @@ build/
 !.env.example
 npm-debug.log*
 data/*.sqlite
+data/vtt-uploads/
 *.local
