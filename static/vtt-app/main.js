@@ -421,6 +421,7 @@ const pickerTabLibraryBtn = document.getElementById('pickerTabLibraryBtn');
 const pickerTabUploadBtn = document.getElementById('pickerTabUploadBtn');
 const pickerLibraryPane = document.getElementById('pickerLibraryPane');
 const pickerUploadPane = document.getElementById('pickerUploadPane');
+const pickerSourceSelect = document.getElementById('pickerSourceSelect');
 const pickerCategorySelect = document.getElementById('pickerCategorySelect');
 const pickerSearchInput = document.getElementById('pickerSearchInput');
 const pickerStatus = document.getElementById('pickerStatus');
@@ -439,6 +440,11 @@ async function ensureTokenLibraryIndex() {
   const data = await res.json();
   tokenLibraryIndex = data.tokens || [];
 
+  const sources = [...new Set(tokenLibraryIndex.map((t) => t.source))].sort();
+  pickerSourceSelect.innerHTML =
+    '<option value="">All sources</option>' +
+    sources.map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
+
   const categories = [...new Set(tokenLibraryIndex.map((t) => t.category))].sort();
   pickerCategorySelect.innerHTML =
     '<option value="">All categories</option>' +
@@ -452,16 +458,18 @@ function libraryImageUrl(entry) {
 }
 
 function renderPickerResults() {
+  const source = pickerSourceSelect.value;
   const category = pickerCategorySelect.value;
   const search = pickerSearchInput.value.trim().toLowerCase();
 
-  if (!category && !search) {
+  if (!source && !category && !search) {
     pickerResults.innerHTML = '';
-    pickerStatus.textContent = 'Pick a category or type to search the library…';
+    pickerStatus.textContent = 'Pick a source/category or type to search the library…';
     return;
   }
 
   const matches = (tokenLibraryIndex || []).filter((entry) => {
+    if (source && entry.source !== source) return false;
     if (category && entry.category !== category) return false;
     if (search && !entry.friendlyName.toLowerCase().includes(search)) return false;
     return true;
@@ -476,8 +484,9 @@ function renderPickerResults() {
   pickerResults.innerHTML = shown
     .map((entry) => {
       const url = libraryImageUrl(entry);
+      const title = `${entry.friendlyName} — ${entry.source}`;
       return `
-        <div class="picker-item" data-url="${escapeHtml(url)}" title="${escapeHtml(entry.friendlyName)}">
+        <div class="picker-item" data-url="${escapeHtml(url)}" title="${escapeHtml(title)}">
           <img src="${url}" loading="lazy" alt="${escapeHtml(entry.friendlyName)}" />
           <span>${escapeHtml(entry.friendlyName)}</span>
         </div>
@@ -496,6 +505,7 @@ function setPickerTab(tab) {
 
 async function openImagePicker(onSelect) {
   pickerOnSelect = onSelect;
+  pickerSourceSelect.value = '';
   pickerCategorySelect.value = '';
   pickerSearchInput.value = '';
   pickerFileInput.value = '';
@@ -515,6 +525,7 @@ function closeImagePicker() {
 
 pickerTabLibraryBtn.addEventListener('click', () => setPickerTab('library'));
 pickerTabUploadBtn.addEventListener('click', () => setPickerTab('upload'));
+pickerSourceSelect.addEventListener('change', renderPickerResults);
 pickerCategorySelect.addEventListener('change', renderPickerResults);
 pickerSearchInput.addEventListener('input', () => {
   clearTimeout(pickerSearchDebounce);

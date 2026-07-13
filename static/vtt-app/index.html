@@ -71,15 +71,21 @@
       <div id="pickerLibraryPane">
         <div class="field row">
           <div>
+            <label>Source</label>
+            <select id="pickerSourceSelect">
+              <option value="">All sources</option>
+            </select>
+          </div>
+          <div>
             <label>Category</label>
             <select id="pickerCategorySelect">
               <option value="">All categories</option>
             </select>
           </div>
-          <div>
-            <label>Search</label>
-            <input type="text" id="pickerSearchInput" placeholder="e.g. drow, wolf, cleric…" />
-          </div>
+        </div>
+        <div class="field">
+          <label>Search</label>
+          <input type="text" id="pickerSearchInput" placeholder="e.g. drow, wolf, cleric…" />
         </div>
         <div id="pickerStatus" class="picker-status"></div>
         <div id="pickerResults" class="picker-grid"></div>
