@@ -1,6 +1,7 @@
 import { drawMap } from './render/map.js';
 import { drawTokens } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed, renderVisionMaskedMap } from './render/vision.js';
+import { drawMovementRange } from './render/movement.js';
 
 // Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js — these
 // token:stat:update fields write directly onto the token, not into
@@ -12,6 +13,8 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'visionDarkFt',
   'visionTrueFt',
   'visionDevilFt',
+  'speedFt',
+  'speedRemainingFt',
 ]);
 
 const canvas = document.getElementById('canvas');
@@ -35,7 +38,7 @@ let playerId = null;
 let playerName = null;
 let sessionId = null;
 let session = null; // local mirror of the (already role-filtered) session state
-let dragState = null; // { tokenId, x, y } — visual ghost only, see canvas handlers
+let dragState = null; // { tokenId, originX, originY, x, y } — visual ghost only, see canvas handlers
 let currentRenderedTokens = []; // whichever token list render() last actually drew, for hit-testing
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
 
@@ -254,6 +257,7 @@ function render() {
 
   if (role === 'gm') {
     drawMap(ctx, mapImage, map);
+    drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage);
     currentRenderedTokens = allTokens;
   } else {
@@ -261,19 +265,46 @@ function render() {
     const radii = computeVisionRadii(ownedTokens, map);
     renderVisionMaskedMap(ctx, mapImage, radii, map);
     const visibleTokens = allTokens.filter((t) => isPointRevealed(t.x, t.y, radii));
+    drawMovementRange(ctx, visibleTokens, map.gridSizePx);
     drawTokens(ctx, visibleTokens, map.gridSizePx, getImage);
     currentRenderedTokens = visibleTokens;
   }
 
   if (dragState) {
     const radius = map.gridSizePx * 0.4;
+    const pxPerFoot = map.gridSizePx / 5;
+    const distanceFt = Math.round(Math.hypot(dragState.x - dragState.originX, dragState.y - dragState.originY) / pxPerFoot);
+    const token = session.tokens[dragState.tokenId];
+    const remainingFt = token ? token.speedRemainingFt ?? token.speedFt ?? null : null;
+    const overBudget = remainingFt !== null && distanceFt > remainingFt;
+
     ctx.save();
     ctx.beginPath();
     ctx.arc(dragState.x, dragState.y, radius, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.strokeStyle = overBudget ? 'rgba(229,57,53,0.9)' : 'rgba(255,255,255,0.85)';
     ctx.setLineDash([4, 4]);
     ctx.lineWidth = 2;
     ctx.stroke();
+
+    // A line back to the token's actual starting point makes "distance
+    // between these two points" legible even after dragging far from it.
+    ctx.beginPath();
+    ctx.moveTo(dragState.originX, dragState.originY);
+    ctx.lineTo(dragState.x, dragState.y);
+    ctx.strokeStyle = overBudget ? 'rgba(229,57,53,0.6)' : 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+
+    const label = remainingFt !== null ? `${distanceFt} ft (of ${remainingFt} ft)` : `${distanceFt} ft`;
+    ctx.save();
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = overBudget ? '#ff8a80' : '#fff';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+    ctx.strokeText(label, dragState.x, dragState.y - radius - 10);
+    ctx.fillText(label, dragState.x, dragState.y - radius - 10);
     ctx.restore();
   }
 }
@@ -308,7 +339,11 @@ canvas.addEventListener('mousedown', (e) => {
   const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
 
   if (canDragToken) {
-    dragState = { tokenId: token.id, x, y };
+    // originX/originY are the token's actual pre-drag position — that's the
+    // true distance the token will travel, not the (possibly off-center)
+    // point clicked within its radius. x/y track the live cursor for the
+    // ghost circle.
+    dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y };
   } else {
     panState = {
       startClientX: e.clientX,
@@ -604,6 +639,25 @@ visionModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Movement quick-adjust — shared between the GM's card for any token and a
+// player's card for their own token (Section 3: same event, different sender).
+// ---------------------------------------------------------------------------
+
+function adjustTokenSpeedRemaining(tokenId, delta) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  const current = token.speedRemainingFt ?? token.speedFt ?? 0;
+  const value = Math.max(0, current + delta);
+  send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value });
+}
+
+function resetTokenSpeedRemaining(tokenId) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: token.speedFt || 0 });
+}
+
+// ---------------------------------------------------------------------------
 // Sidebar
 // ---------------------------------------------------------------------------
 
@@ -681,6 +735,7 @@ function gmSidebarHtml() {
       <div><label>HP</label><input type="number" id="tokenHpInput" value="10" /></div>
       <div><label>Max HP</label><input type="number" id="tokenMaxHpInput" value="10" /></div>
     </div>
+    <div class="field"><label>Speed (ft)</label><input type="number" id="tokenSpeedInput" value="30" /></div>
     <div class="field"><button type="button" id="tokenBrowseLibraryBtn" class="secondary">Browse Token Library…</button></div>
     <div class="field"><label>Or upload a custom image</label><input type="file" id="tokenFileInput" accept="image/*" /></div>
     <img id="tokenThumb" class="thumb" />
@@ -701,6 +756,8 @@ function gmTokenListHtml() {
     .map((t) => {
       const hp = t.stats?.hp ?? '';
       const maxHp = t.stats?.maxHp ?? '';
+      const speed = t.speedFt ?? '';
+      const speedRemaining = t.speedRemainingFt ?? '';
       return `
         <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title">
@@ -719,6 +776,15 @@ function gmTokenListHtml() {
             </select>
           </div>
           <div class="field"><label><input type="checkbox" class="darkvisionToggle" ${(t.visionDarkFt || 0) > 0 ? 'checked' : ''} /> Darkvision</label></div>
+          <div class="field row">
+            <div><label>Speed (ft)</label><input type="number" class="speedInput" value="${speed}" /></div>
+            <div><label>Remaining (ft)</label><input type="number" class="speedRemainingInput" value="${speedRemaining}" /></div>
+          </div>
+          <div class="actions">
+            <button class="secondary speedMinusBtn">−5 ft</button>
+            <button class="secondary speedPlusBtn">+5 ft</button>
+            <button class="secondary speedResetBtn">Reset move</button>
+          </div>
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
             <button class="secondary advancedVisionBtn">Advanced Vision…</button>
@@ -817,6 +883,8 @@ function wireGmSidebar() {
       visionDarkFt: Number(document.getElementById('tokenVisionDarkInput').value) || 0,
       visionTrueFt: 0,
       visionDevilFt: 0,
+      speedFt: Number(document.getElementById('tokenSpeedInput').value) || 0,
+      speedRemainingFt: Number(document.getElementById('tokenSpeedInput').value) || 0,
       hidden: document.getElementById('tokenHiddenInput').checked,
       stats: {
         hp: Number(document.getElementById('tokenHpInput').value) || 0,
@@ -841,6 +909,15 @@ function wireGmSidebar() {
       // the GM dial in a non-standard range without losing the checkbox's
       // on/off reading (it just reflects visionDarkFt > 0).
       send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
+    } else if (e.target.classList.contains('speedInput')) {
+      // Editing base Speed resets remaining movement to match — it's the
+      // "this creature now has a fresh X ft to work with" control; the
+      // Remaining field and +/- buttons are for adjusting mid-turn.
+      const value = Number(e.target.value) || 0;
+      send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });
+      send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value });
+    } else if (e.target.classList.contains('speedRemainingInput')) {
+      send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: Number(e.target.value) || 0 });
     }
   });
 
@@ -856,6 +933,12 @@ function wireGmSidebar() {
       openVisionModal(tokenId);
     } else if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
+    } else if (e.target.classList.contains('speedMinusBtn')) {
+      adjustTokenSpeedRemaining(tokenId, -5);
+    } else if (e.target.classList.contains('speedPlusBtn')) {
+      adjustTokenSpeedRemaining(tokenId, 5);
+    } else if (e.target.classList.contains('speedResetBtn')) {
+      resetTokenSpeedRemaining(tokenId);
     }
   });
 }
@@ -884,12 +967,23 @@ function ownTokenListHtml(tokens) {
     .map((t) => {
       const hp = t.stats?.hp ?? '';
       const maxHp = t.stats?.maxHp ?? '';
+      const speed = t.speedFt ?? '';
+      const speedRemaining = t.speedRemainingFt ?? '';
       return `
         <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title"><span>${t.imageUrl ? `<img class="token-thumb" src="${escapeHtml(t.imageUrl)}" alt="" />` : ''}${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>
           <div class="field row">
             <div><label>HP</label><input type="number" class="hpInput" value="${hp}" /></div>
             <div><label>Max HP</label><input type="number" class="maxHpInput" value="${maxHp}" /></div>
+          </div>
+          <div class="field row">
+            <div><label>Speed (ft)</label><input type="number" class="speedInput" value="${speed}" /></div>
+            <div><label>Remaining (ft)</label><input type="number" class="speedRemainingInput" value="${speedRemaining}" /></div>
+          </div>
+          <div class="actions">
+            <button class="secondary speedMinusBtn">−5 ft</button>
+            <button class="secondary speedPlusBtn">+5 ft</button>
+            <button class="secondary speedResetBtn">Reset move</button>
           </div>
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
@@ -931,6 +1025,12 @@ function wirePlayerSidebar() {
       send({ type: 'token:stat:update', tokenId, stat: 'hp', value: Number(e.target.value) });
     } else if (e.target.classList.contains('maxHpInput')) {
       send({ type: 'token:stat:update', tokenId, stat: 'maxHp', value: Number(e.target.value) });
+    } else if (e.target.classList.contains('speedInput')) {
+      const value = Number(e.target.value) || 0;
+      send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });
+      send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value });
+    } else if (e.target.classList.contains('speedRemainingInput')) {
+      send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: Number(e.target.value) || 0 });
     }
   });
   ownList.addEventListener('click', (e) => {
@@ -939,6 +1039,12 @@ function wirePlayerSidebar() {
     const tokenId = card.dataset.tokenId;
     if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
+    } else if (e.target.classList.contains('speedMinusBtn')) {
+      adjustTokenSpeedRemaining(tokenId, -5);
+    } else if (e.target.classList.contains('speedPlusBtn')) {
+      adjustTokenSpeedRemaining(tokenId, 5);
+    } else if (e.target.classList.contains('speedResetBtn')) {
+      resetTokenSpeedRemaining(tokenId);
     }
   });
 }

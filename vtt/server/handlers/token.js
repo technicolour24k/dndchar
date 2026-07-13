@@ -9,8 +9,10 @@ function canEditToken(meta, token) {
 // token:stat:update writes into token.stats[stat] by default (arbitrary,
 // free-form combat stats). These fields are top-level token properties
 // instead — condition is set alongside HP by the GM (Section 5), the vision*
-// fields are token-level traits, not something tracked per-round, and
-// imageUrl is how the token-image picker changes a token's art post-creation.
+// fields are token-level traits, imageUrl is how the token-image picker
+// changes a token's art post-creation, and speedFt/speedRemainingFt drive the
+// movement-range highlight (speedFt is the base/reset value, speedRemainingFt
+// is what +/- and Reset actually adjust during play).
 const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'condition',
   'imageUrl',
@@ -18,6 +20,8 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'visionDarkFt',
   'visionTrueFt',
   'visionDevilFt',
+  'speedFt',
+  'speedRemainingFt',
 ]);
 
 // Broadcasts a token-bearing event: GM always gets the raw token; players get
