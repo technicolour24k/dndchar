@@ -56,6 +56,8 @@ body {
 .token-card .actions { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
 .token-card .actions button { margin-top: 0; font-size: 11px; padding: 3px 6px; }
 
+.marker-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+
 #mapWrap { overflow: auto; position: relative; background: #0c0d10; }
 #canvas { display: block; cursor: grab; }
 #canvas.dragging { cursor: grabbing; }
@@ -85,6 +87,26 @@ body {
 }
 #zoomControls button:hover { background: #3a3d44; }
 #zoomResetBtn { min-width: 52px; font-size: 12px; color: #aaa; }
+
+.marker-placement-banner {
+  display: none;
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 10px;
+  background: #1c1e24;
+  border: 1px solid #4a7fff;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: #eee;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  z-index: 20;
+}
+.marker-placement-banner.visible { display: flex; }
+.marker-placement-banner button { padding: 4px 10px; border: none; border-radius: 4px; background: #3a3d44; color: #fff; cursor: pointer; font-size: 12px; }
 
 .modal-overlay {
   display: none;

@@ -4,6 +4,7 @@ import { sessions, socketsBySession, broadcast } from './store.js';
 import handleJoin from './handlers/join.js';
 import handleTokenEvent from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
+import handleMarkerEvent from './handlers/marker.js';
 
 const WS_PATH = '/vtt-ws';
 const context = { sessions, socketsBySession, broadcast };
@@ -51,6 +52,11 @@ export function attachVttWebSocketServer(httpServer) {
           break;
         case 'map:set':
           handleMapEvent(meta, msg, context);
+          break;
+        case 'marker:add':
+        case 'marker:remove':
+        case 'marker:visibility:toggle':
+          handleMarkerEvent(meta, msg, context);
           break;
         default:
           break;

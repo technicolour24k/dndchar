@@ -46,6 +46,7 @@ export function createSession(id) {
     map: null,
     tokens: {},
     players: {},
+    markers: {},
   };
 }
 
@@ -62,9 +63,17 @@ export function filterTokenForPlayer(token) {
   return token;
 }
 
+// A marker (AOE/point-on-map) is visible to a player if they placed it
+// themselves or the GM has flipped its "visible to all" toggle — otherwise
+// it's private to its owner + the GM, same shape as the hidden-token rule.
+export function shouldPlayerSeeMarker(marker, playerId) {
+  return marker.visibleToAll || marker.ownerId === playerId;
+}
+
 // Canonical filter used both for state:full on join and for filtering any
-// broadcast that includes token data. GM always gets the unfiltered session.
-export function filterSessionForRole(session, role) {
+// broadcast that includes token/marker data. GM always gets the unfiltered
+// session; playerId is required to resolve per-player marker ownership.
+export function filterSessionForRole(session, role, playerId) {
   if (role === 'gm') return session;
 
   const tokens = {};
@@ -72,7 +81,13 @@ export function filterSessionForRole(session, role) {
     if (token.hidden) continue;
     tokens[id] = filterTokenForPlayer(token);
   }
-  return { ...session, tokens };
+
+  const markers = {};
+  for (const [id, marker] of Object.entries(session.markers || {})) {
+    if (shouldPlayerSeeMarker(marker, playerId)) markers[id] = marker;
+  }
+
+  return { ...session, tokens, markers };
 }
 
 // Sends a per-recipient payload to every socket in a session. buildPayload

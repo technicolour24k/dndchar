@@ -2,6 +2,7 @@ import { drawMap } from './render/map.js';
 import { drawTokens } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed, renderVisionMaskedMap } from './render/vision.js';
 import { drawMovementRange } from './render/movement.js';
+import { drawMarkers } from './render/markers.js';
 
 // Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js — these
 // token:stat:update fields write directly onto the token, not into
@@ -103,6 +104,7 @@ function handleMessage(msg) {
 
     case 'state:full':
       session = msg.session;
+      session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
       renderSidebar();
       render();
@@ -160,6 +162,25 @@ function handleMessage(msg) {
       const t = session.tokens[msg.tokenId];
       if (t) t.hidden = msg.hidden;
       render();
+      renderSidebar();
+      break;
+    }
+
+    case 'marker:add':
+      session.markers[msg.marker.id] = msg.marker;
+      render();
+      renderSidebar();
+      break;
+
+    case 'marker:remove':
+      delete session.markers[msg.markerId];
+      render();
+      renderSidebar();
+      break;
+
+    case 'marker:visibility:toggle': {
+      const m = session.markers[msg.markerId];
+      if (m) m.visibleToAll = msg.visibleToAll;
       renderSidebar();
       break;
     }
@@ -255,9 +276,15 @@ function render() {
   const mapImage = getImage(map.imageUrl);
   const allTokens = Object.values(session.tokens);
 
+  // session.markers is already server-filtered to whatever this client is
+  // allowed to see (own markers + anything the GM has toggled visible-to-all)
+  // — no client-side owner/vision gating needed, unlike tokens.
+  const visibleMarkers = Object.values(session.markers || {});
+
   if (role === 'gm') {
     drawMap(ctx, mapImage, map);
     drawMovementRange(ctx, allTokens, map.gridSizePx);
+    drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage);
     currentRenderedTokens = allTokens;
   } else {
@@ -266,6 +293,7 @@ function render() {
     renderVisionMaskedMap(ctx, mapImage, radii, map);
     const visibleTokens = allTokens.filter((t) => isPointRevealed(t.x, t.y, radii));
     drawMovementRange(ctx, visibleTokens, map.gridSizePx);
+    drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, visibleTokens, map.gridSizePx, getImage);
     currentRenderedTokens = visibleTokens;
   }
@@ -327,6 +355,28 @@ function hitTestToken(x, y) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Marker placement — "click the map to place your marker" mode, armed by the
+// Place on Map button in either sidebar (see wireGmSidebar/wirePlayerSidebar).
+// ---------------------------------------------------------------------------
+
+const markerPlacementBanner = document.getElementById('markerPlacementBanner');
+let pendingMarkerPlacement = null; // { radiusFt, color, label } or null while armed
+
+function armMarkerPlacement(config) {
+  pendingMarkerPlacement = config;
+  markerPlacementBanner.classList.add('visible');
+  canvas.style.cursor = 'crosshair';
+}
+
+function disarmMarkerPlacement() {
+  pendingMarkerPlacement = null;
+  markerPlacementBanner.classList.remove('visible');
+  canvas.style.cursor = '';
+}
+
+document.getElementById('markerPlacementCancelBtn').addEventListener('click', disarmMarkerPlacement);
+
 // Clicking a token you can move drags the token; clicking empty space (or a
 // token you don't control) pans the map instead — same click-and-drag
 // gesture, disambiguated by what's under the cursor.
@@ -334,6 +384,26 @@ let panState = null; // { startClientX, startClientY, startScrollLeft, startScro
 
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); // avoid native text-selection/drag-ghost while panning
+
+  if (pendingMarkerPlacement) {
+    const { x, y } = canvasCoords(e);
+    const config = pendingMarkerPlacement;
+    send({
+      type: 'marker:add',
+      marker: {
+        id: `marker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        x,
+        y,
+        radiusFt: config.radiusFt,
+        color: config.color,
+        label: config.label,
+        ownerId: role === 'player' ? playerId : null,
+      },
+    });
+    disarmMarkerPlacement();
+    return;
+  }
+
   const { x, y } = canvasCoords(e);
   const token = hitTestToken(x, y);
   const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
@@ -745,6 +815,15 @@ function gmSidebarHtml() {
 
     <h2>Tokens</h2>
     <div id="tokenList">${gmTokenListHtml()}</div>
+
+    <h2>Markers</h2>
+    <div class="field row">
+      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
+      <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
+    </div>
+    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
+    <button id="placeMarkerBtn">Place on Map</button>
+    <div id="markerList">${markerListHtml(true)}</div>
   `;
 }
 
@@ -791,6 +870,38 @@ function gmTokenListHtml() {
             <button class="secondary toggleHiddenBtn">${t.hidden ? 'Unhide' : 'Hide'}</button>
             <button class="danger removeBtn">Remove</button>
           </div>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+// Shared by both sidebars — session.markers is already server-filtered to
+// whatever this client is allowed to see, so no client-side filtering here.
+// isGm controls whether the "visible to all" toggle shows (GM-only control)
+// and whether Remove shows for markers the viewer doesn't own.
+function markerListHtml(isGm) {
+  const markers = Object.values(session.markers || {});
+  if (!markers.length) return '<p style="color:#666;font-size:12px;">No markers placed.</p>';
+
+  return markers
+    .map((m) => {
+      const isOwn = isGm || m.ownerId === playerId;
+      const canRemove = isGm || isOwn;
+      return `
+        <div class="token-card" data-marker-id="${escapeHtml(m.id)}">
+          <div class="title">
+            <span>
+              <span class="marker-swatch" style="background:${escapeHtml(m.color)}"></span>
+              ${escapeHtml(m.label || 'Marker')} <span class="tag">${m.radiusFt} ft</span>${!isOwn ? ' <span class="tag">shared</span>' : ''}
+            </span>
+          </div>
+          ${
+            isGm
+              ? `<div class="field"><label><input type="checkbox" class="markerVisibleToAllToggle" ${m.visibleToAll ? 'checked' : ''} /> Visible to all players</label></div>`
+              : ''
+          }
+          ${canRemove ? `<div class="actions"><button class="danger removeMarkerBtn">Remove</button></div>` : ''}
         </div>
       `;
     })
@@ -941,6 +1052,32 @@ function wireGmSidebar() {
       resetTokenSpeedRemaining(tokenId);
     }
   });
+
+  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
+    armMarkerPlacement({
+      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
+      color: document.getElementById('markerColorInput').value || '#ff5252',
+      label: document.getElementById('markerLabelInput').value.trim(),
+    });
+  });
+
+  document.getElementById('markerList').addEventListener('change', (e) => {
+    const card = e.target.closest('[data-marker-id]');
+    if (!card) return;
+    const markerId = card.dataset.markerId;
+    if (e.target.classList.contains('markerVisibleToAllToggle')) {
+      send({ type: 'marker:visibility:toggle', markerId });
+    }
+  });
+
+  document.getElementById('markerList').addEventListener('click', (e) => {
+    const card = e.target.closest('[data-marker-id]');
+    if (!card) return;
+    const markerId = card.dataset.markerId;
+    if (e.target.classList.contains('removeMarkerBtn')) {
+      send({ type: 'marker:remove', markerId });
+    }
+  });
 }
 
 // --- Player sidebar ------------------------------------------------------
@@ -958,6 +1095,15 @@ function playerSidebarHtml() {
 
     <h2>Other tokens in view</h2>
     <div id="otherTokenList">${otherTokenListHtml(otherTokens)}</div>
+
+    <h2>Markers</h2>
+    <div class="field row">
+      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
+      <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
+    </div>
+    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
+    <button id="placeMarkerBtn">Place on Map</button>
+    <div id="markerList">${markerListHtml(false)}</div>
   `;
 }
 
@@ -1045,6 +1191,23 @@ function wirePlayerSidebar() {
       adjustTokenSpeedRemaining(tokenId, 5);
     } else if (e.target.classList.contains('speedResetBtn')) {
       resetTokenSpeedRemaining(tokenId);
+    }
+  });
+
+  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
+    armMarkerPlacement({
+      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
+      color: document.getElementById('markerColorInput').value || '#ff5252',
+      label: document.getElementById('markerLabelInput').value.trim(),
+    });
+  });
+
+  document.getElementById('markerList').addEventListener('click', (e) => {
+    const card = e.target.closest('[data-marker-id]');
+    if (!card) return;
+    const markerId = card.dataset.markerId;
+    if (e.target.classList.contains('removeMarkerBtn')) {
+      send({ type: 'marker:remove', markerId });
     }
   });
 }

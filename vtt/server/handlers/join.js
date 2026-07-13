@@ -41,7 +41,7 @@ function handleJoin(meta, msg, context) {
 
   meta.ws.send(JSON.stringify({
     type: 'state:full',
-    session: filterSessionForRole(session, meta.role),
+    session: filterSessionForRole(session, meta.role, meta.playerId),
   }));
 
   if (meta.role === 'player') {
