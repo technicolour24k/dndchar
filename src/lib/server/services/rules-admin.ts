@@ -30,7 +30,7 @@ export async function loadRuleHooks(search = '') {
     isArchived: row.is_archived, isSystem: row.is_system, referenced: row.referenced }));
 }
 
-export async function loadModifiers(selectedId = '', search = '') {
+export async function loadModifiers(search = '') {
   const rows = await query<any>(`SELECT modifier.id,modifier.target,modifier.modifier_type,
     COALESCE(modifier.default_value_expression,'') AS base_value,COALESCE(modifier.label,'') AS label,
     COALESCE(modifier.description,'') AS description,modifier.is_archived,modifier.is_system,
@@ -41,21 +41,26 @@ export async function loadModifiers(selectedId = '', search = '') {
     WHERE ($1='' OR hook.label ILIKE '%'||$1||'%' OR modifier.target ILIKE '%'||$1||'%'
       OR modifier.modifier_type ILIKE '%'||$1||'%' OR modifier.label ILIKE '%'||$1||'%')
     ORDER BY modifier.is_archived,hook.label,modifier.modifier_type,base_value`, [search.trim()]);
-  const modifiers = rows.rows.map(mapModifier);
-  const id = modifiers.some((entry: any) => entry.id === selectedId) ? selectedId : modifiers[0]?.id || '';
-  const references = id ? await query<any>(`SELECT 'effect' AS owner_type,effect.id AS owner_id,effect.name,
-      link.id AS link_id,COALESCE(link.value_override_expression,'') AS override_value
-    FROM effect_modifier_links link JOIN effect_definitions effect ON effect.id=link.effect_id WHERE link.modifier_id=$1
+
+  // Load all references in one query and embed them per modifier.
+  const allRefs = await query<any>(`
+    SELECT link.modifier_id,'effect' AS owner_type,effect.name,COALESCE(link.value_override_expression,'') AS override_value
+    FROM effect_modifier_links link JOIN effect_definitions effect ON effect.id=link.effect_id
     UNION ALL
-    SELECT 'content',content.id,content.name,link.id,COALESCE(link.value_override_expression,'')
-    FROM content_modifier_links link JOIN content_definitions content ON content.id=link.content_id WHERE link.modifier_id=$1
-    ORDER BY owner_type,name`, [id]) : { rows: [] };
-  return { modifiers, selectedModifierId: id, references: references.rows.map((row: any) => ({
-    ownerType: row.owner_type, ownerId: row.owner_id, name: row.name, linkId: row.link_id, overrideValue: row.override_value
-  })) };
+    SELECT link.modifier_id,'content',content.name,COALESCE(link.value_override_expression,'')
+    FROM content_modifier_links link JOIN content_definitions content ON content.id=link.content_id
+    ORDER BY name`);
+  const refsByModifier = new Map<string,Array<{ownerType:string;name:string;overrideValue:string}>>();
+  for(const row of allRefs.rows){
+    const list=refsByModifier.get(row.modifier_id)??[];
+    list.push({ownerType:row.owner_type,name:row.name,overrideValue:row.override_value});
+    refsByModifier.set(row.modifier_id,list);
+  }
+
+  return { modifiers: rows.rows.map((row:any)=>({...mapModifier(row),references:refsByModifier.get(row.id)??[]})) };
 }
 
-export async function loadEffects(selectedId = '', search = '') {
+export async function loadEffects(selectedId = '', search = '', showArchived = false) {
   const rows = await query<any>(`SELECT effect.id,effect.effect_key,effect.name,effect.source_type,
     COALESCE(effect.description,'') AS description,COALESCE(effect.duration_type,'variable') AS duration_type,
     effect.duration_rounds,effect.requires_concentration,effect.is_condition,effect.is_selectable,
@@ -64,8 +69,9 @@ export async function loadEffects(selectedId = '', search = '') {
     (SELECT count(*)::int FROM content_effect_links WHERE effect_id=effect.id) AS reference_count
     FROM effect_definitions effect LEFT JOIN effect_modifier_links modifier_link ON modifier_link.effect_id=effect.id
     WHERE COALESCE((effect.metadata_json->>'managedByContentAdmin')::boolean,false)=false
-      AND ($1='' OR effect.name ILIKE '%'||$1||'%' OR effect.effect_key ILIKE '%'||$1||'%')
-    GROUP BY effect.id ORDER BY effect.is_archived,effect.name`, [search.trim()]);
+      AND ($1 OR effect.is_archived=false)
+      AND ($2='' OR effect.name ILIKE '%'||$2||'%' OR effect.effect_key ILIKE '%'||$2||'%')
+    GROUP BY effect.id ORDER BY effect.is_archived,effect.name`, [showArchived, search.trim()]);
   const effects = rows.rows.map((row: any) => ({ id: row.id, key: row.effect_key, name: row.name,
     sourceType: row.source_type, description: row.description, durationType: row.duration_type,
     durationRounds: row.duration_rounds, requiresConcentration: row.requires_concentration,
@@ -134,39 +140,99 @@ export async function saveEffect(userId: string, form: FormData) {
   const id = String(form.get('effectId') || '');
   const name = String(form.get('name') || '').trim();
   if (!name) throw new Error('Effect name is required.');
-  const values = [name,String(form.get('sourceType')||'homebrew'),String(form.get('description')||''),
-    String(form.get('durationType')||'variable'),nullableInt(form.get('durationRounds')),form.get('requiresConcentration')==='on',
-    form.get('isCondition')==='on',form.get('isSelectable')==='on',String(form.get('stackBehavior')||'refresh'),
-    String(form.get('expiryBoundary')||'round_end')];
-  if (id) {
-    await query(`UPDATE effect_definitions SET name=$2,source_type=$3,description=$4,duration_type=$5,duration_rounds=$6,
-      requires_concentration=$7,is_condition=$8,is_selectable=$9,stack_behavior=$10,default_expiry_boundary=$11,updated_at=now()
-      WHERE id=$1`,[id,...values]);
-    return id;
-  }
-  const key=`homebrew:${userId}:${slug(name)}:${Date.now()}`;
-  const result=await query<{id:string}>(`INSERT INTO effect_definitions(effect_key,name,source_type,description,duration_type,
-    duration_rounds,requires_concentration,is_condition,is_selectable,stack_behavior,default_expiry_boundary,is_homebrew,
-    owner_user_id,is_system) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,$12,false) RETURNING id`,[key,...values,userId]);
-  return result.rows[0].id;
+  const durationType = String(form.get('durationType')||'variable');
+  const description = String(form.get('description')||'');
+  const durationRounds = nullableInt(form.get('durationRounds'));
+  const requiresConcentration = form.get('requiresConcentration')==='on';
+  const stackBehavior = String(form.get('stackBehavior')||'refresh');
+  const expiryBoundary = String(form.get('expiryBoundary')||'round_end');
+  const values = [name,String(form.get('sourceType')||'homebrew'),description,
+    durationType,durationRounds,requiresConcentration,
+    form.get('isCondition')==='on',form.get('isSelectable')==='on',stackBehavior,expiryBoundary];
+  const mappedDuration = legacyDurationToNew(durationType);
+
+  return withTransaction(async (client) => {
+    if (id) {
+      await client.query(`UPDATE effect_definitions SET name=$2,source_type=$3,description=$4,duration_type=$5,duration_rounds=$6,
+        requires_concentration=$7,is_condition=$8,is_selectable=$9,stack_behavior=$10,default_expiry_boundary=$11,updated_at=now()
+        WHERE id=$1`,[id,...values]);
+      // Sync to unified Container — use a subquery to resolve effect_key → content_key.
+      await client.query(`UPDATE content_definitions SET name=$2,description=$3,duration_type=$4,duration_rounds=$5,
+        requires_concentration=$6,stack_behavior=$7,expiry_boundary=$8,updated_at=now()
+        WHERE content_key=(SELECT 'condition:'||effect_key FROM effect_definitions WHERE id=$1)
+          AND content_type='condition'`,
+        [id,name,description,mappedDuration,durationRounds,requiresConcentration,stackBehavior,expiryBoundary]);
+      return id;
+    }
+    const key=`homebrew:${userId}:${slug(name)}:${Date.now()}`;
+    const result=await client.query<{id:string}>(`INSERT INTO effect_definitions(effect_key,name,source_type,description,duration_type,
+      duration_rounds,requires_concentration,is_condition,is_selectable,stack_behavior,default_expiry_boundary,is_homebrew,
+      owner_user_id,is_system) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,$12,false) RETURNING id`,[key,...values,userId]);
+    const effectId = result.rows[0].id;
+    await client.query(`INSERT INTO content_definitions(content_key,content_type,name,description,source_kind,
+      is_system,is_archived,activation_type,duration_type,duration_rounds,requires_concentration,
+      expiry_boundary,stack_behavior) VALUES($1,'condition',$2,$3,'homebrew',false,false,'passive',$4,$5,$6,$7,$8)
+      ON CONFLICT DO NOTHING`,
+      ['condition:'+key,name,description,mappedDuration,durationRounds,requiresConcentration,expiryBoundary,stackBehavior]);
+    return effectId;
+  });
 }
 
 export async function attachEffectModifier(form: FormData) {
   const effectId=String(form.get('effectId')||'');const modifierId=String(form.get('modifierId')||'');
   if(!effectId||!modifierId)throw new Error('Effect and Modifier are required.');
-  await query(`INSERT INTO effect_modifier_links(effect_id,modifier_id,value_override_expression,condition_expression,priority)
-    VALUES($1,$2,NULLIF($3,''),NULLIF($4,''),$5) ON CONFLICT DO NOTHING`,[effectId,modifierId,
-    String(form.get('valueOverride')||'').trim(),String(form.get('condition')||'').trim(),Number(form.get('priority'))||0]);
-  return effectId;
+  const override=String(form.get('valueOverride')||'').trim();
+  const condition=String(form.get('condition')||'').trim();
+  const priority=Number(form.get('priority'))||0;
+  return withTransaction(async (client) => {
+    await client.query(`INSERT INTO effect_modifier_links(effect_id,modifier_id,value_override_expression,condition_expression,priority)
+      VALUES($1,$2,NULLIF($3,''),NULLIF($4,''),$5) ON CONFLICT DO NOTHING`,[effectId,modifierId,override,condition,priority]);
+    // Dual-write: resolve the unified Container id via the effect's key, then insert into content_modifier_links.
+    await client.query(`INSERT INTO content_modifier_links(content_id,modifier_id,activation_type,value_override_expression,condition_expression,priority,sort_order)
+      SELECT cd.id,$2,'carried',NULLIF($3,''),NULLIF($4,''),$5,$5
+      FROM content_definitions cd JOIN effect_definitions ed ON cd.content_key='condition:'||ed.effect_key
+      WHERE ed.id=$1 AND cd.content_type='condition'
+      ON CONFLICT DO NOTHING`,[effectId,modifierId,override,condition,priority]);
+    return effectId;
+  });
 }
 
 export async function detachEffectModifier(effectId:string,linkId:string){
-  await query('DELETE FROM effect_modifier_links WHERE id=$1 AND effect_id=$2',[linkId,effectId]);
+  await withTransaction(async (client) => {
+    // Read link details first so we can match the corresponding content_modifier_links row.
+    const link=await client.query<{modifier_id:string;value_override_expression:string|null;condition_expression:string|null;priority:number}>(
+      'SELECT modifier_id,value_override_expression,condition_expression,priority FROM effect_modifier_links WHERE id=$1 AND effect_id=$2',
+      [linkId,effectId]);
+    if(link.rowCount){
+      const {modifier_id,value_override_expression,condition_expression,priority}=link.rows[0];
+      await client.query(`DELETE FROM content_modifier_links
+        WHERE modifier_id=$1
+          AND COALESCE(value_override_expression,'')=COALESCE($2::text,'')
+          AND COALESCE(condition_expression,'')=COALESCE($3::text,'')
+          AND priority=$4
+          AND content_id=(SELECT cd.id FROM content_definitions cd
+            JOIN effect_definitions ed ON cd.content_key='condition:'||ed.effect_key
+            WHERE ed.id=$5 AND cd.content_type='condition' LIMIT 1)`,
+        [modifier_id,value_override_expression,condition_expression,priority,effectId]);
+    }
+    await client.query('DELETE FROM effect_modifier_links WHERE id=$1 AND effect_id=$2',[linkId,effectId]);
+  });
 }
 
 export async function archiveEffect(id:string){
-  const result=await query('UPDATE effect_definitions SET is_archived=NOT is_archived,updated_at=now() WHERE id=$1 RETURNING id',[id]);
+  const result=await query<{effect_key:string;is_archived:boolean}>(
+    'UPDATE effect_definitions SET is_archived=NOT is_archived,updated_at=now() WHERE id=$1 RETURNING effect_key,is_archived',[id]);
   if(!result.rowCount)throw new Error('Effect not found.');
+  await query(`UPDATE content_definitions SET is_archived=$1,updated_at=now()
+    WHERE content_key=$2 AND content_type='condition'`,
+    [result.rows[0].is_archived,'condition:'+result.rows[0].effect_key]);
+}
+
+function legacyDurationToNew(d:string):string|null{
+  if(d==='concentration')return'concentration';
+  if(d==='timed'||d==='until_start_of_next_turn')return'rounds';
+  if(d==='variable'||d==='while_applicable')return'indefinite';
+  return null;
 }
 
 function validateModifierValue(operation:ModifierOperation,value:string){

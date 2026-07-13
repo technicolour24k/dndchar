@@ -5,11 +5,24 @@ import { applyCharacterEffect, removeCharacterEffect } from '$lib/server/service
 export type ActionResult = { label:string; target:string; expression:string; rolled:number; before:number|null; after:number|null; detail?:string };
 
 export async function executeContentActions(client:pg.PoolClient,characterId:string,contentId:string,triggers:string[],context:{inventoryId?:string;instanceId?:string}={}):Promise<ActionResult[]>{
-  const rows=await client.query<any>(`SELECT action.id,action.name,step.* FROM content_action_links link
-    JOIN action_definitions action ON action.id=link.action_id
-    JOIN action_steps step ON step.action_id=action.id
-    WHERE link.content_id=$1 AND link.trigger_type=ANY($2::text[]) AND action.is_archived=false
-    ORDER BY link.sort_order,action.name,step.sort_order,step.created_at`,[contentId,triggers]);
+  const rows=await client.query<any>(`
+    WITH resolved AS (
+      SELECT link.sort_order AS link_order, container.name, step.*
+      FROM content_action_links link
+      JOIN content_definitions container ON container.id=link.action_container_id
+      JOIN action_steps step ON step.container_id=link.action_container_id
+      WHERE link.content_id=$1 AND link.trigger_type=ANY($2::text[])
+        AND container.is_archived=false AND link.action_container_id IS NOT NULL
+      UNION ALL
+      SELECT link.sort_order, action.name, step.*
+      FROM content_action_links link
+      JOIN action_definitions action ON action.id=link.action_id
+      JOIN action_steps step ON step.action_id=action.id
+      WHERE link.content_id=$1 AND link.trigger_type=ANY($2::text[])
+        AND action.is_archived=false AND link.action_container_id IS NULL
+    )
+    SELECT * FROM resolved ORDER BY link_order,name,sort_order,created_at
+  `,[contentId,triggers]);
   const results:ActionResult[]=[];
   for(const step of rows.rows)results.push(...await executeStep(client,characterId,step,context));
   return results;

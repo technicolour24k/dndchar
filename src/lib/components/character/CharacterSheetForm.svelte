@@ -109,7 +109,7 @@
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
   let selectedSkillProficiencies = $state<string[]>([]);
-  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '' });
+  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
   let contentBusy = $state(false);
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
