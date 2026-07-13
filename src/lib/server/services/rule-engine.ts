@@ -26,8 +26,11 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
 }> {
   const result = await query<ModifierRow>(`
     WITH modifier_rows AS (
-      SELECT active.id::text AS source_id, 'effect'::text AS source_type, effect.name AS source_name,
-        COALESCE(effect.description, '') AS source_description, link.id::text AS attachment_id,
+      -- Branch 1a: active effects resolved via unified Container (container_id path)
+      SELECT active.id::text AS source_id, 'effect'::text AS source_type,
+        container.name AS source_name,
+        COALESCE(container.description, '') AS source_description,
+        link.id::text AS attachment_id,
         modifier.id::text AS modifier_id, modifier.target, modifier.modifier_type,
         COALESCE(modifier.label, '') AS modifier_label,
         COALESCE(link.value_override_expression, modifier.default_value_expression, '') AS value_expression,
@@ -36,11 +39,27 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
         COALESCE(link.condition_expression, '') AS condition_expression, link.priority,
         COALESCE(hook.runtime_supported, false) AS runtime_supported
       FROM active_character_effects active
+      JOIN content_definitions container ON container.id = active.container_id
+      JOIN content_modifier_links link ON link.content_id = container.id
+      JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
+      LEFT JOIN modifier_targets hook ON hook.target_key = modifier.target
+      WHERE active.character_id = $1
+
+      UNION ALL
+
+      -- Branch 1b: active effects legacy path (rows not yet back-filled with container_id)
+      SELECT active.id::text, 'effect', effect.name,
+        COALESCE(effect.description, ''), link.id::text, modifier.id::text,
+        modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
+        COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
+        COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
+      FROM active_character_effects active
       JOIN effect_definitions effect ON effect.id = active.effect_id
       JOIN effect_modifier_links link ON link.effect_id = effect.id
       JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
       LEFT JOIN modifier_targets hook ON hook.target_key = modifier.target
-      WHERE active.character_id = $1
+      WHERE active.character_id = $1 AND active.container_id IS NULL
 
       UNION ALL
 

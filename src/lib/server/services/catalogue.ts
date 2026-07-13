@@ -5,7 +5,7 @@ import { executeContentActions, type ActionResult } from '$lib/server/services/a
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
 import type { CharacterContentInstance, ContentDefinition, ContentType, RechargePeriod, SpellSlot } from '$lib/types/content';
 
-const contentTypes = new Set<ContentType>(['item', 'spell', 'feat', 'class_feature']);
+const contentTypes = new Set<ContentType>(['item', 'spell', 'feat', 'class_feature', 'condition', 'action']);
 const rechargePeriods = new Set<RechargePeriod>(['short_rest', 'long_rest', 'dawn', 'round', 'encounter', 'manual']);
 
 function slug(value: string): string {
@@ -51,7 +51,17 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
     sourceRef: row.source_ref || '',
     ownerUserId: row.owner_user_id,
     isArchived: row.is_archived,
+    isSystem: row.is_system ?? false,
     metadata: row.metadata_json || {},
+    activationType: row.activation_type ?? 'passive',
+    costJson: row.cost_json ?? null,
+    durationData: {
+      type: row.duration_type ?? null,
+      rounds: row.duration_rounds ?? null,
+      requiresConcentration: row.requires_concentration ?? false,
+      expiryBoundary: row.expiry_boundary ?? null,
+      stackBehavior: row.stack_behavior ?? 'stack'
+    },
     spell: row.content_type === 'spell' ? {
       level: row.spell_level, school: row.school, castingTime: row.casting_time, range: row.spell_range,
       components: row.components, duration: row.duration, ritual: row.ritual, concentration: row.concentration,
@@ -128,8 +138,17 @@ export async function attachEffectToContent(form: FormData): Promise<void> {
   const contentId = String(form.get('contentId') || '');
   const effectId = String(form.get('effectId') || '');
   const activationType = String(form.get('activationType') || 'manual');
+  // Legacy write: keep content_effect_links for backward compat during transition.
   await query(`INSERT INTO content_effect_links (content_id, effect_id, activation_type)
     VALUES ($1,$2,$3) ON CONFLICT (content_id, effect_id, activation_type) DO NOTHING`,
+    [contentId, effectId, activationType]);
+  // Unified Container write: insert into content_grants pointing at the condition Container.
+  await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
+    SELECT $1, cd.id, $3
+    FROM content_definitions cd
+    JOIN effect_definitions ed ON cd.content_key='condition:'||ed.effect_key
+    WHERE ed.id=$2 AND cd.content_type='condition'
+    ON CONFLICT DO NOTHING`,
     [contentId, effectId, activationType]);
 }
 
@@ -137,14 +156,36 @@ export async function attachEffectToOwnedContent(userId: string, form: FormData)
   const contentId = String(form.get('contentId') || '');
   const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
   if (!owned.rowCount) throw new Error('Private homebrew content not found.');
-  if(String(form.get('activationType')||'manual')==='on_use'){
-    await withTransaction(async client=>{const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[contentId]);
-      const action=await client.query<{id:string}>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id)
-        VALUES($1,$2,$3,$4) ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,[`content:${contentId}:on_use`,`Use ${content.rows[0].name}`,`Actions for ${content.rows[0].name}`,content.rows[0].owner_user_id]);
-      await client.query("INSERT INTO content_action_links(content_id,action_id,trigger_type) VALUES($1,$2,'on_use') ON CONFLICT DO NOTHING",[contentId,action.rows[0].id]);
-      await client.query(`INSERT INTO action_steps(action_id,step_type,operation,effect_id,label,sort_order)
-        SELECT $1,'apply_effect','apply',$2,effect.name,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
-        FROM effect_definitions effect WHERE effect.id=$2 AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,[action.rows[0].id,String(form.get('effectId')||'')]);});return;
+  if (String(form.get('activationType') || 'manual') === 'on_use') {
+    await withTransaction(async (client) => {
+      const content = await client.query<any>('SELECT name, owner_user_id FROM content_definitions WHERE id=$1', [contentId]);
+      const actionKey = `content:${contentId}:on_use`;
+      const actionName = `Use ${content.rows[0].name}`;
+      const actionDesc = `Actions for ${content.rows[0].name}`;
+      // Legacy write: action_definitions.
+      const action = await client.query<{ id: string }>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id)
+        VALUES($1,$2,$3,$4) ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
+        [actionKey, actionName, actionDesc, content.rows[0].owner_user_id]);
+      // Unified Container write: content_definitions as type='action'.
+      const actionContainer = await client.query<{ id: string }>(`INSERT INTO content_definitions(content_key,content_type,name,description,source_kind,owner_user_id,activation_type)
+        VALUES($1,'action',$2,$3,'homebrew',$4,'active_use')
+        ON CONFLICT DO NOTHING RETURNING id`,
+        [actionKey, actionName, actionDesc, content.rows[0].owner_user_id]);
+      const actionContainerId = actionContainer.rows[0]?.id ?? null;
+      // Link action to content (legacy action_id path + new action_container_id path).
+      await client.query(`INSERT INTO content_action_links(content_id,action_id,action_container_id,trigger_type)
+        VALUES($1,$2,$3,'on_use') ON CONFLICT(content_id,action_id,trigger_type) DO UPDATE SET action_container_id=EXCLUDED.action_container_id`,
+        [contentId, action.rows[0].id, actionContainerId]);
+      const effectId = String(form.get('effectId') || '');
+      // Legacy action_steps write.
+      await client.query(`INSERT INTO action_steps(action_id,container_id,step_type,operation,effect_id,label,sort_order)
+        SELECT $1,$5,'apply_effect','apply',$2,effect.name,
+          COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
+        FROM effect_definitions effect WHERE effect.id=$2
+          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,
+        [action.rows[0].id, effectId, null, null, actionContainerId]);
+    });
+    return;
   }
   await attachEffectToContent(form);
 }

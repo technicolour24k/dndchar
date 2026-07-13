@@ -31,6 +31,18 @@
   const abilityScores = $derived(abilityMap(character.abilities));
   const level = $derived(totalLevel(classRows));
   const prof = $derived(proficiencyBonus(level));
+  const classHitDice = $derived(classRows.map((row, i) => ({
+    className: row.className || 'Class',
+    level: row.level,
+    dieSize: parseInt(hitDieForRow(row)) || 8,
+    remaining: character.resources.find((r) => r.key === `hit_dice_${i}`)?.currentValue ?? row.level
+  })));
+  const hitDiceDisplay = $derived(
+    classHitDice.map((c) => `${c.remaining}d${c.dieSize}`).join(' + ') || '—'
+  );
+  const hitDiceRemainingTotal = $derived(classHitDice.reduce((s, c) => s + c.remaining, 0));
+  let hitDiceCount = $state(1);
+  let hitDiceClassIndex = $state(0);
   const metadata = $derived(character.metadata ?? {});
   const race = $derived(String(character.metadata?.race ?? ''));
   const d20Icon = '/images/dice-twenty-faces-one-svgrepo-com.svg';
@@ -97,7 +109,7 @@
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
   let selectedSkillProficiencies = $state<string[]>([]);
-  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '' });
+  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
   let contentBusy = $state(false);
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
@@ -118,6 +130,7 @@
   let simpleRollResult = $state<{
     title: string;
     lines: Array<{ label: string; text: string; natural: number }>;
+    passiveNote?: string;
   } | null>(null);
   let formulaHelp = $state<{
     title: string;
@@ -236,6 +249,26 @@
       (isSkillProficient('perception') ? prof : 0) +
       passivePerceptionBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
   );
+  const passiveInsightBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows }));
+  const computedPassiveInsight = $derived(
+    10 +
+      abilityModifier(abilityScores.wis) +
+      (isSkillProficient('insight') ? prof : 0) +
+      passiveInsightBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+  );
+  const passiveInvestigationBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows }));
+  const computedPassiveInvestigation = $derived(
+    10 +
+      abilityModifier(abilityScores.int) +
+      (isSkillProficient('investigation') ? prof : 0) +
+      passiveInvestigationBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+  );
+  const savingThrowModifierBonuses = $derived(
+    Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>
+  );
+  const skillCheckModifierBonuses = $derived(
+    Object.fromEntries(skillChecks.map((skill) => [skill.key, resolvedAdditiveModifiers(character.modifierSources, [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], { classes: classRows })])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
+  );
   const combatFormulaHelp = $derived.by(() => {
     const dexMod = abilityModifier(abilityScores.dex);
     const wisMod = abilityModifier(abilityScores.wis);
@@ -263,6 +296,20 @@
         `Perception proficiency: ${isSkillProficient('perception') ? signed(prof) : '+0'}`,
         ...passivePerceptionBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
         `Total: ${computedPassivePerception}`
+      ],
+      passiveInsight: [
+        'Base: 10',
+        `WIS modifier: ${signed(wisMod)}`,
+        `Insight proficiency: ${isSkillProficient('insight') ? signed(prof) : '+0'}`,
+        ...passiveInsightBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${computedPassiveInsight}`
+      ],
+      passiveInvestigation: [
+        'Base: 10',
+        `INT modifier: ${signed(abilityModifier(abilityScores.int))}`,
+        `Investigation proficiency: ${isSkillProficient('investigation') ? signed(prof) : '+0'}`,
+        ...passiveInvestigationBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${computedPassiveInvestigation}`
       ],
       initiative: [
         `DEX modifier: ${signed(dexMod)}`,
@@ -300,8 +347,8 @@
 
   const hitDiceFormulaLines = $derived(
     [
-      ...classRows.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${hitDieForRow(row)}`),
-      `Total: ${computedHitDice || 'None'}`
+      ...classHitDice.map((c) => `${c.className} ${c.level}: ${c.remaining}/${c.level}d${c.dieSize}`),
+      `Total: ${hitDiceRemainingTotal} / ${level}`
     ]
   );
 
@@ -387,11 +434,33 @@
   }
 
   function savingThrowTotal(key: AbilityKey) {
-    return abilityModifier(abilityScores[key]) + (isSavingThrowProficient(key) ? prof : 0);
+    const bonuses = savingThrowModifierBonuses[key] ?? [];
+    return abilityModifier(abilityScores[key]) + (isSavingThrowProficient(key) ? prof : 0) + bonuses.reduce((sum, b) => sum + b.value, 0);
+  }
+
+  function savingThrowFormula(key: AbilityKey): string[] {
+    const bonuses = savingThrowModifierBonuses[key] ?? [];
+    return [
+      `${key.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[key]))}`,
+      ...(isSavingThrowProficient(key) ? [`Proficiency: ${signed(prof)}`] : []),
+      ...bonuses.map((b) => `${b.label}: ${signed(b.value)}`),
+      `Total: ${signed(savingThrowTotal(key))}`
+    ];
   }
 
   function skillCheckTotal(skill: { key: string; ability: AbilityKey }) {
-    return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0);
+    const bonuses = skillCheckModifierBonuses[skill.key] ?? [];
+    return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0) + bonuses.reduce((sum, b) => sum + b.value, 0);
+  }
+
+  function skillCheckFormula(skill: { key: string; ability: AbilityKey; name: string }): string[] {
+    const bonuses = skillCheckModifierBonuses[skill.key] ?? [];
+    return [
+      `${skill.ability.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[skill.ability]))}`,
+      ...(isSkillProficient(skill.key) ? [`Proficiency: ${signed(prof)}`] : []),
+      ...bonuses.map((b) => `${b.label}: ${signed(b.value)}`),
+      `Total: ${signed(skillCheckTotal(skill))}`
+    ];
   }
 
   function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = []) {
@@ -458,7 +527,19 @@
   }
 
   function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
-    simpleRollResult = { title: skill.name, lines: [{ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }] };
+    const passiveScores: Record<string, number> = {
+      perception: computedPassivePerception,
+      insight: computedPassiveInsight,
+      investigation: computedPassiveInvestigation
+    };
+    const passiveNote = skill.key in passiveScores
+      ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
+      : undefined;
+    simpleRollResult = {
+      title: skill.name,
+      lines: [{ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }],
+      passiveNote
+    };
   }
 
   function rollAbilityCheck(key: AbilityKey) {
@@ -467,6 +548,46 @@
 
   function rollInitiative() {
     simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...rollText(computedInitiative, ['initiative']) }] };
+  }
+
+  async function useHitDie() {
+    const idx = Math.min(hitDiceClassIndex, classHitDice.length - 1);
+    const hdc = classHitDice[idx];
+    if (!hdc || hdc.remaining <= 0) return;
+    const count = Math.min(Math.max(1, hitDiceCount), hdc.remaining);
+    const rolls = Array.from({ length: count }, () => rollDie(hdc.dieSize));
+    const totalRoll = rolls.reduce((sum, r) => sum + r, 0);
+    const conMod = abilityModifier(abilityScores.con);
+    const conTotal = conMod * count;
+    const rolled = Math.max(1, totalRoll + conTotal);
+    // Cap recovery by the actual HP headroom so the modal is honest
+    const hpHeadroom = hp.maxValue - hp.currentValue;
+    const hpGained = Math.min(rolled, Math.max(0, hpHeadroom));
+    const classLabel = classHitDice.length > 1 ? ` (${hdc.className})` : '';
+    const diceLabel = `${count}d${hdc.dieSize}${classLabel}`;
+    const rollPart = count > 1 ? `[${rolls.join(', ')}] = ${totalRoll}` : `${rolls[0]}`;
+    const conPart = conMod !== 0
+      ? ` + ${count > 1 ? `${count}×` : ''}CON (${conMod >= 0 ? '+' : ''}${conMod}${count > 1 ? ` = ${conTotal >= 0 ? '+' : ''}${conTotal}` : ''}) = ${rolled}`
+      : ` = ${rolled}`;
+    const passiveNote = hpHeadroom <= 0
+      ? `Already at full HP — hit ${count === 1 ? 'die' : 'dice'} spent.`
+      : `Recovered ${hpGained} HP (${hp.currentValue} → ${hp.currentValue + hpGained}).`;
+    simpleRollResult = {
+      title: 'Use Hit Dice',
+      lines: [{ label: diceLabel, text: `${rollPart}${conPart}`, natural: count === 1 ? rolls[0] : rolled }],
+      passiveNote
+    };
+    const body = new FormData();
+    body.set('classIndex', String(idx));
+    body.set('spent', String(count));
+    body.set('classLevel', String(hdc.level));
+    body.set('hpGained', String(hpGained));
+    const response = await fetch('?/spendHitDice', { method: 'POST', body });
+    if (!response.ok) {
+      simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) — refresh the page.` };
+      return;
+    }
+    await invalidateAll();
   }
 
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
@@ -853,6 +974,24 @@
             <label>Temp HP <input name="tempHp" type="number" value={tempHp.currentValue} /></label>
             <label>Inspiration <input name="inspiration" type="number" min="0" value={inspiration} /></label>
           </div>
+          <label class="hit-dice-label">
+            <span class="field-label-with-help">
+              Hit Dice
+              <button type="button" class="formula-help-button" title={helpTitle(hitDiceFormulaLines)} aria-label="Hit Dice formula breakdown" onclick={() => openFormulaHelp('Hit Dice', hitDiceFormulaLines)}>?</button>
+            </span>
+            <span class="summary-input-roll">
+              <input value={hitDiceDisplay} readonly title="{hitDiceRemainingTotal} / {level} remaining" />
+              {#if classHitDice.length > 1}
+                <select bind:value={hitDiceClassIndex} aria-label="Hit die type" class="hit-dice-class-select">
+                  {#each classHitDice as hdc, i}
+                    <option value={i} disabled={hdc.remaining <= 0}>{hdc.remaining}d{hdc.dieSize}</option>
+                  {/each}
+                </select>
+              {/if}
+              <input type="number" class="hit-dice-count-input" min="1" max={classHitDice[hitDiceClassIndex]?.remaining ?? 1} bind:value={hitDiceCount} aria-label="Number of hit dice to use" />
+              <button type="button" class="compact-use-button" disabled={(classHitDice[hitDiceClassIndex]?.remaining ?? 0) <= 0} onclick={useHitDie}>Use</button>
+            </span>
+          </label>
         </section>
 
         <section class="panel stack compact-panel">
@@ -872,14 +1011,7 @@
               </span>
               <input name="armorClass" type="number" value={computedArmorClass} readonly />
             </label>
-            <label>
-              <span class="field-label-with-help">
-                Hit Dice
-                <button type="button" class="formula-help-button" title={helpTitle(hitDiceFormulaLines)} aria-label="Hit Dice formula breakdown" onclick={() => openFormulaHelp('Hit Dice', hitDiceFormulaLines)}>?</button>
-              </span>
-              <input name="hitDice" value={computedHitDice} readonly />
-            </label>
-            <label>
+            <label class="combat-stat-pp">
               <span class="field-label-with-help">
                 Passive Perception
                 <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passivePerception)} aria-label="Passive Perception formula breakdown" onclick={() => openFormulaHelp('Passive Perception', combatFormulaHelp.passivePerception)}>?</button>
@@ -904,6 +1036,13 @@
                 <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.speed)} aria-label="Speed formula breakdown" onclick={() => openFormulaHelp('Speed', combatFormulaHelp.speed)}>?</button>
               </span>
               <input name="speed" value={computedSpeed} readonly />
+            </label>
+            <label class="combat-stat-pi">
+              <span class="field-label-with-help">
+                Passive Insight
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passiveInsight)} aria-label="Passive Insight formula breakdown" onclick={() => openFormulaHelp('Passive Insight', combatFormulaHelp.passiveInsight)}>?</button>
+              </span>
+              <input type="number" value={computedPassiveInsight} readonly />
             </label>
             <div class="death-save-grid" aria-label="Death saves">
               <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
@@ -939,6 +1078,13 @@
                 </div>
               </div>
             </div>
+            <label class="combat-stat-piv">
+              <span class="field-label-with-help">
+                Passive Investigation
+                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passiveInvestigation)} aria-label="Passive Investigation formula breakdown" onclick={() => openFormulaHelp('Passive Investigation', combatFormulaHelp.passiveInvestigation)}>?</button>
+              </span>
+              <input type="number" value={computedPassiveInvestigation} readonly />
+            </label>
           </div>
         </section>
 
@@ -1362,6 +1508,10 @@
     {#each proficiencies.weapons as key}
       <input name="weaponProficiency" type="hidden" value={key} />
     {/each}
+    {#each classHitDice as hdc, i}
+      <input name="hitDiceCurrent_{i}" type="hidden" value={hdc.remaining} />
+      <input name="hitDiceMax_{i}" type="hidden" value={hdc.level} />
+    {/each}
 
     {#if activeTab !== 'battle'}
       <input name="hpCurrent" type="hidden" value={hp.currentValue} />
@@ -1485,10 +1635,11 @@
                 <input name="savingThrowProficiency" type="checkbox" value={key} checked={isSavingThrowProficient(key)} onchange={() => toggleSavingThrowProficiency(key)} />
                 <span>
                   <strong>{key.toUpperCase()}</strong>
-                  <small>{signed(abilityModifier(abilityScores[key]))}{isSavingThrowProficient(key) ? ` + ${prof} proficiency` : ''}</small>
+                  <small>{signed(abilityModifier(abilityScores[key]))}{isSavingThrowProficient(key) ? ` + ${prof} proficiency` : ''}{(savingThrowModifierBonuses[key] ?? []).length ? ' + modifiers' : ''}</small>
                 </span>
                 <b>{signed(savingThrowTotal(key))}</b>
               </label>
+              <button type="button" class="formula-help-button" title={helpTitle(savingThrowFormula(key))} aria-label={`${key.toUpperCase()} saving throw breakdown`} onclick={() => openFormulaHelp(`${key.toUpperCase()} Saving Throw`, savingThrowFormula(key))}>?</button>
               <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => rollSingleSavingThrow(key)}>
                 <img src={d20Icon} alt="" />
               </button>
@@ -1522,10 +1673,11 @@
                 <input name="skillProficiency" type="checkbox" value={skill.key} checked={isSkillProficient(skill.key)} onchange={() => toggleSkillProficiency(skill.key)} />
                 <span>
                   <strong>{skill.name}</strong>
-                  <small>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}{isSkillProficient(skill.key) ? ` + ${prof} proficiency` : ''}</small>
+                  <small>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}{isSkillProficient(skill.key) ? ` + ${prof} proficiency` : ''}{(skillCheckModifierBonuses[skill.key] ?? []).length ? ' + modifiers' : ''}</small>
                 </span>
                 <b>{signed(skillCheckTotal(skill))}</b>
               </label>
+              <button type="button" class="formula-help-button" title={helpTitle(skillCheckFormula(skill))} aria-label={`${skill.name} breakdown`} onclick={() => openFormulaHelp(skill.name, skillCheckFormula(skill))}>?</button>
               <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => rollSingleSkillCheck(skill)}>
                 <img src={d20Icon} alt="" />
               </button>
@@ -1701,6 +1853,9 @@
               <strong class:nat-one={line.natural === 1} class:nat-twenty={line.natural === 20}>{line.text}</strong>
             </div>
           {/each}
+          {#if simpleRollResult.passiveNote}
+            <p class="muted passive-note">{simpleRollResult.passiveNote}</p>
+          {/if}
         </div>
       </div>
     </div>

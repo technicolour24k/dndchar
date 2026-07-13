@@ -1,8 +1,19 @@
 import type { AbilityKey } from '$lib/types/character';
 
-export type ContentType = 'item' | 'spell' | 'feat' | 'class_feature';
+export type ContentType = 'item' | 'spell' | 'feat' | 'class_feature' | 'condition' | 'action';
+export type ContainerActivationType = 'passive' | 'triggered' | 'active_use';
 export type ActivationType = 'carried' | 'equipped' | 'attuned' | 'on_use' | 'manual';
 export type RechargePeriod = 'short_rest' | 'long_rest' | 'dawn' | 'round' | 'encounter' | 'manual';
+export type DurationType = 'instant' | 'rounds' | 'encounter' | 'concentration' | 'indefinite' | 'permanent';
+export type StackBehavior = 'refresh' | 'stack' | 'reject';
+export type ExpiryBoundary = 'turn_start' | 'turn_end' | 'round_end' | 'manual';
+
+/** Structured cost entry — one pool and how much of it is consumed. */
+export type ContainerCostEntry = {
+  pool: string;
+  amount: number;
+  level?: number; // for spell slots: the slot level required
+};
 
 export type ContentEffectLink = {
   effectId: string;
@@ -28,7 +39,18 @@ export type ContentDefinition = {
   sourceRef: string;
   ownerUserId: string | null;
   isArchived: boolean;
+  isSystem: boolean;
   metadata: Record<string, unknown>;
+  // Container-level fields (populated for all types after migration 019)
+  activationType: ContainerActivationType;
+  costJson: ContainerCostEntry[] | null;
+  durationData: {
+    type: DurationType | null;
+    rounds: number | null;
+    requiresConcentration: boolean;
+    expiryBoundary: ExpiryBoundary | null;
+    stackBehavior: StackBehavior;
+  };
   spell?: {
     level: number;
     school: string;

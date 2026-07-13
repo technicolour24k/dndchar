@@ -549,9 +549,12 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
   await restoreStructuredContent(client, characterId, snapshot);
   await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
   for (const row of snapshot.active_effects ?? []) {
-    await client.query(`INSERT INTO active_character_effects(character_id,effect_id,remaining_rounds,metadata_json,
+    await client.query(`INSERT INTO active_character_effects(character_id,effect_id,container_id,remaining_rounds,metadata_json,
       source_content_instance_id,expiry_boundary,application_key,source_key)
-      SELECT $1,effect.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7 FROM effect_definitions effect WHERE effect.effect_key=$8`,
+      SELECT $1,effect.id,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
+      FROM effect_definitions effect
+      LEFT JOIN content_definitions cd ON cd.content_key='condition:'||effect.effect_key AND cd.content_type='condition'
+      WHERE effect.effect_key=$8`,
       [characterId,row.remaining_rounds??null,JSON.stringify(row.metadata_json||{}),row.source_content_instance_id||null,
         row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,row.effect_key]);
   }
@@ -727,46 +730,26 @@ async function getProficiencies(characterId: string): Promise<CharacterProficien
 
 async function listEffectDefinitions(includeArchived=false): Promise<EffectDefinition[]> {
   try {
+    // Primary path: conditions as unified Containers in content_definitions.
     const effects = await query<{
       id: string;
       effect_key: string;
       name: string;
-      source_type: string;
-      source_ref: string;
-      source_name: string;
       description: string;
       duration_type: string;
       duration_rounds: number | null;
       requires_concentration: boolean;
+      source_kind: string;
       is_condition: boolean;
-      is_selectable: boolean;
     }>(
-      `
-        SELECT
-          effect_definitions.id,
-          effect_definitions.effect_key,
-          effect_definitions.name,
-          effect_definitions.source_type,
-          effect_definitions.source_ref,
-          COALESCE(source_label.source_name, effect_definitions.name) AS source_name,
-          effect_definitions.description,
-          effect_definitions.duration_type,
-          effect_definitions.duration_rounds,
-          effect_definitions.requires_concentration,
-          effect_definitions.is_condition,
-          COALESCE(effect_definitions.is_selectable, true) AS is_selectable
-        FROM effect_definitions
-        LEFT JOIN LATERAL (
-          SELECT effect_sources.source_name
-          FROM effect_sources
-          WHERE effect_sources.effect_id = effect_definitions.id
-          ORDER BY effect_sources.created_at ASC
-          LIMIT 1
-        ) source_label ON true
-        WHERE ($1::boolean OR effect_definitions.is_archived=false)
-        ORDER BY effect_definitions.is_condition DESC, effect_definitions.sort_order ASC, effect_definitions.name ASC
-      `
-      ,[includeArchived]
+      `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
+        cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
+        COALESCE(ed.is_condition, false) AS is_condition
+       FROM content_definitions cd
+       LEFT JOIN effect_definitions ed ON cd.content_key = 'condition:' || ed.effect_key
+       WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
+       ORDER BY cd.name ASC`,
+      [includeArchived]
     );
 
     const modifiers = await listEffectModifiers();
@@ -774,14 +757,11 @@ async function listEffectDefinitions(includeArchived=false): Promise<EffectDefin
     for (const row of modifiers) {
       const list = modifiersByEffect.get(row.effect_id) ?? [];
       list.push({
-        target: row.target,
-        modifierType: row.modifier_type,
-        label: '',
+        target: row.target, modifierType: row.modifier_type, label: '',
         valueExpression: row.value_expression || '',
         defaultValueExpression: row.default_value_expression || '',
         valueOverrideExpression: row.value_override_expression || '',
-        conditionExpression: row.condition_expression || '',
-        priority: row.priority
+        conditionExpression: row.condition_expression || '', priority: row.priority
       });
       modifiersByEffect.set(row.effect_id, list);
     }
@@ -790,15 +770,15 @@ async function listEffectDefinitions(includeArchived=false): Promise<EffectDefin
       id: row.id,
       key: row.effect_key,
       name: row.name,
-      sourceType: row.source_type,
-      sourceRef: row.source_ref || '',
-      sourceName: row.source_name || row.name,
+      sourceType: row.source_kind,
+      sourceRef: '',
+      sourceName: row.name,
       description: row.description || '',
       durationType: row.duration_type || '',
       durationRounds: row.duration_rounds,
       requiresConcentration: row.requires_concentration,
       isCondition: row.is_condition,
-      isSelectable: row.is_selectable,
+      isSelectable: true,
       modifiers: modifiersByEffect.get(row.id) ?? []
     }));
   } catch {
@@ -816,6 +796,7 @@ async function listEffectModifiers(): Promise<Array<{
   condition_expression: string;
   priority: number;
 }>> {
+  // Query via content_modifier_links for condition Containers.
   const result = await query<{
     effect_id: string;
     target: string;
@@ -826,72 +807,70 @@ async function listEffectModifiers(): Promise<Array<{
     condition_expression: string;
     priority: number;
   }>(
-    `
-      SELECT
-        effect_modifier_links.effect_id,
-        modifier_definitions.target,
-        modifier_definitions.modifier_type,
-        modifier_definitions.default_value_expression,
-        effect_modifier_links.value_override_expression,
-        COALESCE(effect_modifier_links.value_override_expression, modifier_definitions.default_value_expression) AS value_expression,
-        effect_modifier_links.condition_expression,
-        effect_modifier_links.priority
-      FROM effect_modifier_links
-      JOIN modifier_definitions ON modifier_definitions.id = effect_modifier_links.modifier_id
-      ORDER BY effect_modifier_links.priority ASC, modifier_definitions.target ASC
-    `
+    `SELECT cml.content_id AS effect_id,
+       md.target, md.modifier_type, COALESCE(md.default_value_expression,'') AS default_value_expression,
+       COALESCE(cml.value_override_expression,'') AS value_override_expression,
+       COALESCE(cml.value_override_expression, md.default_value_expression,'') AS value_expression,
+       COALESCE(cml.condition_expression,'') AS condition_expression, cml.priority
+     FROM content_modifier_links cml
+     JOIN modifier_definitions md ON md.id=cml.modifier_id
+     JOIN content_definitions cd ON cd.id=cml.content_id AND cd.content_type='condition'
+     ORDER BY cml.priority ASC, md.target ASC`
   );
   return result.rows;
 }
 
 async function getActiveEffects(characterId: string): Promise<CharacterDetail['activeEffects']> {
   const definitions = await listEffectDefinitions(true);
-  const byId = new Map(definitions.map((definition) => [definition.id, definition]));
+  const byId = new Map(definitions.map((d) => [d.id, d]));
   try {
-    const active = await query<{
-      id: string;
-      effect_id: string;
-      remaining_rounds: number | null;
-    }>(
-      `
-        SELECT id::text, effect_id, remaining_rounds FROM active_character_effects WHERE character_id = $1
-        UNION ALL
-        SELECT ('content:' || i.id::text || ':' || l.id::text), l.effect_id, NULL
-        FROM character_content_instances i
-        JOIN content_definitions c ON c.id = i.content_id
-        JOIN content_effect_links l ON l.content_id = i.content_id
-        WHERE i.character_id = $1 AND i.is_active = true AND c.content_type <> 'item'
-          AND l.activation_type IN ('carried', 'equipped', 'attuned', 'manual')
-        UNION ALL
-        SELECT ('item:' || inventory.id::text || ':' || l.id::text), l.effect_id, NULL
-        FROM character_inventory_items inventory
-        JOIN content_effect_links l ON l.content_id = inventory.source_content_id
-        WHERE inventory.character_id = $1 AND (
-          l.activation_type = 'carried'
-          OR (l.activation_type = 'equipped' AND inventory.equipped)
-          OR (l.activation_type = 'attuned' AND inventory.attuned)
-        )
-        UNION ALL
-        SELECT ('grant:' || inventory.id::text || ':' || granted_link.id::text), granted_link.effect_id, NULL
-        FROM character_inventory_items inventory
-        JOIN content_grants grant_link ON grant_link.source_content_id = inventory.source_content_id
-        JOIN content_effect_links granted_link ON granted_link.content_id = grant_link.granted_content_id
-        WHERE inventory.character_id = $1 AND (
-          grant_link.activation_type = 'carried'
-          OR (grant_link.activation_type = 'equipped' AND inventory.equipped)
-          OR (grant_link.activation_type = 'attuned' AND inventory.attuned)
-        )
-      `,
+    const active = await query<{ id: string; container_id: string; remaining_rounds: number | null }>(
+      `-- Direct active effects (primary: container_id)
+       SELECT id::text, container_id::text AS container_id, remaining_rounds
+       FROM active_character_effects
+       WHERE character_id=$1 AND container_id IS NOT NULL
+       UNION ALL
+       -- Conditions granted by active content instances
+       SELECT 'content:' || i.id || ':' || cg.id, cg.granted_content_id::text, NULL
+       FROM character_content_instances i
+       JOIN content_definitions c ON c.id=i.content_id
+       JOIN content_grants cg ON cg.source_content_id=i.content_id
+       JOIN content_definitions granted ON granted.id=cg.granted_content_id AND granted.content_type='condition'
+       WHERE i.character_id=$1 AND i.is_active=true AND c.content_type <> 'item'
+         AND cg.activation_type IN ('carried','equipped','attuned','manual')
+       UNION ALL
+       -- Conditions granted by equipped/carried inventory items
+       SELECT 'item:' || inv.id || ':' || cg.id, cg.granted_content_id::text, NULL
+       FROM character_inventory_items inv
+       JOIN content_grants cg ON cg.source_content_id=inv.source_content_id
+       JOIN content_definitions granted ON granted.id=cg.granted_content_id AND granted.content_type='condition'
+       WHERE inv.character_id=$1 AND (
+         cg.activation_type='carried'
+         OR (cg.activation_type='equipped' AND inv.equipped)
+         OR (cg.activation_type='attuned' AND inv.attuned)
+       )
+       UNION ALL
+       -- Conditions granted transitively (item grants a content, that content grants a condition)
+       SELECT 'grant:' || inv.id || ':' || cg2.id, cg2.granted_content_id::text, NULL
+       FROM character_inventory_items inv
+       JOIN content_grants cg1 ON cg1.source_content_id=inv.source_content_id
+       JOIN content_grants cg2 ON cg2.source_content_id=cg1.granted_content_id
+       JOIN content_definitions granted ON granted.id=cg2.granted_content_id AND granted.content_type='condition'
+       WHERE inv.character_id=$1 AND (
+         cg1.activation_type='carried'
+         OR (cg1.activation_type='equipped' AND inv.equipped)
+         OR (cg1.activation_type='attuned' AND inv.attuned)
+       )`,
       [characterId]
     );
 
     return active.rows
       .map((row) => {
-        const definition = byId.get(row.effect_id);
+        const definition = byId.get(row.container_id);
         if (!definition) return null;
         return {
           id: row.id,
-          effectId: row.effect_id,
+          effectId: definition.id,
           effectKey: definition.key,
           name: definition.name,
           sourceType: definition.sourceType,
@@ -1111,7 +1090,14 @@ function parseResources(form: FormData): CharacterResource[] {
       label: 'Inspiration',
       currentValue: Math.max(0, Number(form.get('inspiration')) || 0),
       maxValue: Math.max(1, Number(form.get('inspiration')) || 0)
-    }
+    },
+    // Per-class hit dice (one resource per class, indexed hit_dice_0, hit_dice_1, ...)
+    ...form.getAll('className').map((_, i) => ({
+      key: `hit_dice_${i}`,
+      label: 'Hit Dice',
+      currentValue: Math.max(0, Number(form.get(`hitDiceCurrent_${i}`)) || 0),
+      maxValue: Math.max(0, Number(form.get(`hitDiceMax_${i}`)) || 0)
+    }))
   ];
 }
 
@@ -1221,4 +1207,39 @@ function parseNotes(form: FormData): CharacterNote[] {
     { key: 'appearance', title: 'Appearance', content: String(form.get('appearanceNote') || '') },
     { key: 'additional_notes', title: 'Additional Notes', content: String(form.get('additionalNotesNote') || '') }
   ];
+}
+
+export async function spendHitDice(
+  userId: string,
+  characterId: string,
+  classIndex: number,
+  spent: number,
+  classLevel: number,
+  hpGained: number
+): Promise<void> {
+  await withTransaction(async (client) => {
+    const owned = await client.query(
+      'SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2',
+      [characterId, userId]
+    );
+    if (!owned.rowCount) throw new Error('Character not found.');
+
+    // Decrement hit dice pool for this class
+    await client.query(`
+      INSERT INTO character_resources (character_id, resource_key, label, current_value, max_value, sort_order)
+      VALUES ($1, $2, 'Hit Dice', GREATEST(0, $3::int - $4::int), $3::int, ${99 + classIndex})
+      ON CONFLICT (character_id, resource_key) DO UPDATE
+        SET current_value = GREATEST(0, LEAST(character_resources.max_value, character_resources.current_value - $4)),
+            max_value = $3
+    `, [characterId, `hit_dice_${classIndex}`, Math.max(1, classLevel), Math.max(0, spent)]);
+
+    // Recover HP up to max
+    if (hpGained > 0) {
+      await client.query(`
+        UPDATE character_resources
+        SET current_value = LEAST(max_value, current_value + $1)
+        WHERE character_id = $2 AND resource_key = 'hp'
+      `, [hpGained, characterId]);
+    }
+  });
 }
