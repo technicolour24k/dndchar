@@ -1,6 +1,13 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { shouldPlayerSeeMarker } from '../store.js';
 
+// Phase 2 Section 4 - cone/cube/sphere alongside the original circle. The
+// server stays geometry-agnostic (per store.js's shape-agnostic
+// shouldPlayerSeeMarker) - it just trusts shape from a fixed allowlist and
+// passes the shape-specific fields through opaquely, exactly like radiusFt
+// already did for circles.
+const ALLOWED_SHAPES = new Set(['circle', 'cone', 'cube', 'sphere']);
+
 function canEditMarker(meta, marker) {
   if (meta.role === 'gm') return true;
   return marker.ownerId === meta.playerId;
@@ -30,13 +37,19 @@ function handleMarkerEvent(meta, msg, context) {
       // boundary as canEditToken. GM-placed markers have no owner.
       const ownerId = meta.role === 'gm' ? (input.ownerId ?? null) : meta.playerId;
 
+      const shape = ALLOWED_SHAPES.has(input.shape) ? input.shape : 'circle';
+
       const marker = {
         id: input.id,
         ownerId,
-        shape: 'circle', // only shape implemented for now; kept explicit for future shapes
+        shape,
         x: input.x,
         y: input.y,
-        radiusFt: Number(input.radiusFt) || 0,
+        radiusFt: Number(input.radiusFt) || 0, // circle/sphere
+        angleDeg: Number(input.angleDeg) || 0, // cone/cube facing
+        lengthFt: Number(input.lengthFt) || 0, // cone length / cube depth
+        widthFt: Number(input.widthFt) || 0, // cube width
+        coneAngleDeg: Number(input.coneAngleDeg) || 60, // 5e-standard default; per-spell override
         color: input.color || '#ff5252',
         label: input.label || '',
         visibleToAll: false, // starts private to owner+GM; GM shares it via the toggle below

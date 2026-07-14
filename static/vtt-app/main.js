@@ -3,6 +3,8 @@ import { drawTokens } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed, renderVisionMaskedMap } from './render/vision.js';
 import { drawMovementRange } from './render/movement.js';
 import { drawMarkers } from './render/markers.js';
+import { drawTargetRings } from './render/targeting.js';
+import { getTokensInShape } from './render/shapeGeometry.js';
 
 // Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js - these
 // token:stat:update fields write directly onto the token, not into
@@ -16,6 +18,12 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'visionDevilFt',
   'speedFt',
   'speedRemainingFt',
+  'characterId',
+  'ac',
+  'saves',
+  'actions',
+  'spellSlots',
+  'preparedSpells',
 ]);
 
 const canvas = document.getElementById('canvas');
@@ -42,6 +50,8 @@ let session = null; // local mirror of the (already role-filtered) session state
 let dragState = null; // { tokenId, originX, originY, x, y } - visual ghost only, see canvas handlers
 let currentRenderedTokens = []; // whichever token list render() last actually drew, for hit-testing
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
+let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
+let shapeDrag = null; // { config, originX, originY, currentX, currentY } while dragging a cone/cube's direction+length
 
 const imageCache = new Map();
 
@@ -97,7 +107,9 @@ function connect(joinPayload) {
 function handleMessage(msg) {
   switch (msg.type) {
     case 'join:error':
-      loginError.textContent = msg.reason === 'session_not_found' ? 'Room not found.' : msg.reason;
+      if (msg.reason === 'session_not_found') loginError.textContent = 'Room not found.';
+      else if (msg.reason === 'gm_already_claimed') loginError.textContent = 'This room already has a GM connected.';
+      else loginError.textContent = msg.reason;
       session = null;
       if (ws) ws.close();
       break;
@@ -116,7 +128,15 @@ function handleMessage(msg) {
           id: msg.playerId,
           name: msg.playerName,
           tokenIds: session.players[msg.playerId]?.tokenIds || [],
+          connected: true,
         };
+      }
+      renderSidebar();
+      break;
+
+    case 'player:left':
+      if (session && session.players[msg.playerId]) {
+        session.players[msg.playerId].connected = false;
       }
       renderSidebar();
       break;
@@ -149,7 +169,10 @@ function handleMessage(msg) {
 
     case 'token:stat:update': {
       const t = session.tokens[msg.tokenId];
-      if (t) {
+      // value is omitted by the server for filtered fields (e.g. an enemy's
+      // hp, per the server-side comment in handlers/token.js) - nothing to
+      // apply in that case, since we were never sent the number.
+      if (t && msg.value !== undefined) {
         if (TOKEN_LEVEL_STAT_FIELDS.has(msg.stat)) t[msg.stat] = msg.value;
         else { t.stats = t.stats || {}; t.stats[msg.stat] = msg.value; }
       }
@@ -165,6 +188,22 @@ function handleMessage(msg) {
       renderSidebar();
       break;
     }
+
+    case 'token:stat:update:error':
+      // Server rejected a write our own UI shouldn't have offered in the
+      // first place - surface it without tearing down the session.
+      console.warn(`token:stat:update rejected for ${msg.stat} on ${msg.tokenId}: ${msg.reason}`);
+      break;
+
+    case 'target:select':
+      currentTargetTokenIds = msg.targetTokenIds || [];
+      render();
+      break;
+
+    case 'target:clear':
+      currentTargetTokenIds = [];
+      render();
+      break;
 
     case 'marker:add':
       session.markers[msg.marker.id] = msg.marker;
@@ -286,6 +325,7 @@ function render() {
     drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage);
+    drawTargetRings(ctx, currentTargetTokenIds, allTokens, map.gridSizePx);
     currentRenderedTokens = allTokens;
   } else {
     const ownedTokens = allTokens.filter((t) => t.ownerId === playerId);
@@ -295,7 +335,12 @@ function render() {
     drawMovementRange(ctx, visibleTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, visibleTokens, map.gridSizePx, getImage);
+    drawTargetRings(ctx, currentTargetTokenIds, visibleTokens, map.gridSizePx);
     currentRenderedTokens = visibleTokens;
+  }
+
+  if (shapeDrag) {
+    drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx);
   }
 
   if (dragState) {
@@ -364,6 +409,7 @@ const markerPlacementBanner = document.getElementById('markerPlacementBanner');
 let pendingMarkerPlacement = null; // { radiusFt, color, label } or null while armed
 
 function armMarkerPlacement(config) {
+  disarmActionTargeting(); // only one click-the-map mode armed at a time
   pendingMarkerPlacement = config;
   markerPlacementBanner.classList.add('visible');
   canvas.style.cursor = 'crosshair';
@@ -377,6 +423,56 @@ function disarmMarkerPlacement() {
 
 document.getElementById('markerPlacementCancelBtn').addEventListener('click', disarmMarkerPlacement);
 
+// ---------------------------------------------------------------------------
+// Action targeting (Section 3) - click a weapon/spell action in the mini
+// sheet, then click a token on the map to resolve it against. Same
+// arm/disarm-banner pattern as marker placement. Damage is rolled
+// client-side per the phase-2 spec's explicit recommendation (the character
+// sheet's math engine already runs client-side; porting it server-side is a
+// bigger lift the trust level at this scale doesn't need).
+// ---------------------------------------------------------------------------
+
+const actionTargetBanner = document.getElementById('actionTargetBanner');
+const actionTargetBannerText = document.getElementById('actionTargetBannerText');
+let pendingActionTarget = null; // { sourceTokenId, action } or null while armed
+
+function armActionTargeting(sourceTokenId, action) {
+  disarmMarkerPlacement();
+  pendingActionTarget = { sourceTokenId, action };
+  actionTargetBannerText.textContent = `Click a token to attack with ${action.name}`;
+  actionTargetBanner.classList.add('visible');
+  canvas.style.cursor = 'crosshair';
+}
+
+function disarmActionTargeting() {
+  pendingActionTarget = null;
+  actionTargetBanner.classList.remove('visible');
+  canvas.style.cursor = '';
+}
+
+document.getElementById('actionTargetCancelBtn').addEventListener('click', disarmActionTargeting);
+
+// Minimal 'XdY+Z' dice roller - the vanilla VTT client has no build step and
+// can't import $lib/rules/dnd5e's rollDiceExpression (SvelteKit-only
+// aliases/imports), so this is a small standalone equivalent covering just
+// the "roll a weapon's damage dice" case the mini-sheet needs.
+function rollDamageDice(damageRolls, damageBonus) {
+  let total = Number(damageBonus) || 0;
+  const rolls = [];
+  for (const term of String(damageRolls || '').split(/\s*\+\s*/)) {
+    const match = term.trim().match(/^(\d*)d(\d+)$/i);
+    if (!match) continue;
+    const count = Math.max(1, Number(match[1]) || 1);
+    const sides = Math.max(1, Number(match[2]) || 1);
+    for (let i = 0; i < count; i++) {
+      const roll = Math.floor(Math.random() * sides) + 1;
+      rolls.push(roll);
+      total += roll;
+    }
+  }
+  return { total: Math.max(0, total), rolls };
+}
+
 // Clicking a token you can move drags the token; clicking empty space (or a
 // token you don't control) pans the map instead - same click-and-drag
 // gesture, disambiguated by what's under the cursor.
@@ -385,20 +481,40 @@ let panState = null; // { startClientX, startClientY, startScrollLeft, startScro
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); // avoid native text-selection/drag-ghost while panning
 
+  if (pendingActionTarget) {
+    const { x, y } = canvasCoords(e);
+    const target = hitTestToken(x, y);
+    const { sourceTokenId, action } = pendingActionTarget;
+    disarmActionTargeting();
+    if (!target) return;
+
+    send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
+
+    const { total, rolls } = rollDamageDice(action.damageRolls, action.damageBonus);
+    send({ type: 'token:stat:update', tokenId: target.id, stat: 'hp', delta: -total });
+    alert(`${action.name} hits ${target.name} for ${total} damage (${rolls.join(' + ') || total}).`);
+    return;
+  }
+
   if (pendingMarkerPlacement) {
     const { x, y } = canvasCoords(e);
     const config = pendingMarkerPlacement;
-    send({
-      type: 'marker:add',
-      marker: {
-        id: `marker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        x,
-        y,
-        radiusFt: config.radiusFt,
-        color: config.color,
-        label: config.label,
-        ownerId: role === 'player' ? playerId : null,
-      },
+
+    if (config.shape === 'cone' || config.shape === 'cube') {
+      // Directional shapes need a second point to set facing/length - start
+      // a drag instead of placing immediately. Confirmed on mouseup below.
+      shapeDrag = { config, originX: x, originY: y, currentX: x, currentY: y };
+      render();
+      return;
+    }
+
+    placeMarker({
+      shape: config.shape,
+      x,
+      y,
+      radiusFt: config.radiusFt,
+      color: config.color,
+      label: config.label,
     });
     disarmMarkerPlacement();
     return;
@@ -428,7 +544,12 @@ canvas.addEventListener('mousedown', (e) => {
 // window-level (not canvas-level) so a fast drag that leaves the canvas
 // bounds - easy to do while panning a zoomed-out map - keeps tracking.
 window.addEventListener('mousemove', (e) => {
-  if (dragState) {
+  if (shapeDrag) {
+    const { x, y } = canvasCoords(e);
+    shapeDrag.currentX = x;
+    shapeDrag.currentY = y;
+    render();
+  } else if (dragState) {
     const { x, y } = canvasCoords(e);
     dragState.x = x;
     dragState.y = y;
@@ -439,7 +560,54 @@ window.addEventListener('mousemove', (e) => {
   }
 });
 
+// Turns a shapeDrag's origin+current cursor position into the marker's
+// facing (angleDeg) and length (lengthFt, rounded to the nearest 5ft like
+// the rest of the app's distance readouts) - shared by the live preview
+// (render()) and the final placement on mouseup.
+function markerFromShapeDrag(drag) {
+  const pxPerFoot = (session?.map?.gridSizePx || 50) / 5;
+  const dx = drag.currentX - drag.originX;
+  const dy = drag.currentY - drag.originY;
+  const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+  const lengthFt = Math.max(5, Math.round(Math.hypot(dx, dy) / pxPerFoot / 5) * 5);
+  return {
+    shape: drag.config.shape,
+    x: drag.originX,
+    y: drag.originY,
+    angleDeg,
+    lengthFt,
+    widthFt: drag.config.widthFt,
+    coneAngleDeg: drag.config.coneAngleDeg,
+    color: drag.config.color,
+    label: drag.config.label,
+  };
+}
+
+// Sends marker:add, then auto-selects whichever tokens the placed shape
+// catches (Section 4b's second bullet) - removes the need to manually
+// multi-select targets for an AoE, which is exactly the friction this
+// feature exists to cut. Circle/sphere and cone/cube all go through this one
+// path; there's nothing shape-specific about the auto-targeting step itself.
+function placeMarker(marker) {
+  const id = `marker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const fullMarker = { id, ownerId: role === 'player' ? playerId : null, ...marker };
+  send({ type: 'marker:add', marker: fullMarker });
+
+  const pxPerFoot = (session?.map?.gridSizePx || 50) / 5;
+  const caughtTokens = getTokensInShape(fullMarker, Object.values(session.tokens), pxPerFoot);
+  if (caughtTokens.length) {
+    send({ type: 'target:select', sourceTokenId: null, targetTokenIds: caughtTokens.map((t) => t.id) });
+  }
+}
+
 window.addEventListener('mouseup', (e) => {
+  if (shapeDrag) {
+    placeMarker(markerFromShapeDrag(shapeDrag));
+    shapeDrag = null;
+    disarmMarkerPlacement();
+    render();
+    return;
+  }
   if (dragState) {
     const { x, y } = canvasCoords(e);
     const { tokenId } = dragState;
@@ -667,6 +835,97 @@ imagePickerModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Character picker (Phase 2, Section 1a) - a player selects one of their own
+// characters, pulling live combat stats (Section 1b) into a token created on
+// their behalf, instead of manually typing stats into a blank token. Same
+// modal-overlay/callback-free pattern as the image picker, simplified since
+// there's only one thing this modal ever does (unlike the image picker,
+// which is reused from multiple call sites via onSelect).
+// ---------------------------------------------------------------------------
+
+const characterPickerModal = document.getElementById('characterPickerModal');
+const characterPickerStatus = document.getElementById('characterPickerStatus');
+const characterPickerList = document.getElementById('characterPickerList');
+
+async function openCharacterPicker() {
+  characterPickerModal.classList.add('visible');
+  characterPickerList.innerHTML = '';
+  characterPickerStatus.textContent = 'Loading your characters…';
+  try {
+    const res = await fetch('/vtt/api/characters');
+    if (!res.ok) throw new Error('failed');
+    const characters = await res.json();
+    if (!characters.length) {
+      characterPickerStatus.textContent = 'No characters found - create one in the main app first.';
+      return;
+    }
+    characterPickerStatus.textContent = '';
+    characterPickerList.innerHTML = characters
+      .map((c) => {
+        const classSummary = (c.classes || []).map((cls) => `${cls.className} ${cls.level}`).join(' / ') || 'No class';
+        return `
+          <div class="character-picker-item" data-character-id="${escapeHtml(c.id)}">
+            <div class="name">${escapeHtml(c.name)}</div>
+            <div class="summary">${escapeHtml(classSummary)} - HP ${c.hpCurrent}/${c.hpMax}</div>
+          </div>
+        `;
+      })
+      .join('');
+  } catch {
+    characterPickerStatus.textContent = 'Could not load characters.';
+  }
+}
+
+function closeCharacterPicker() {
+  characterPickerModal.classList.remove('visible');
+}
+
+document.getElementById('characterPickerCancelBtn').addEventListener('click', closeCharacterPicker);
+characterPickerModal.addEventListener('click', (e) => {
+  if (e.target === characterPickerModal) closeCharacterPicker();
+});
+
+characterPickerList.addEventListener('click', async (e) => {
+  const item = e.target.closest('.character-picker-item');
+  if (!item) return;
+  const characterId = item.dataset.characterId;
+  const characterName = item.querySelector('.name').textContent;
+  closeCharacterPicker();
+
+  const res = await fetch('/vtt/api/characters/' + characterId);
+  if (!res.ok) return alert('Could not load that character.');
+  const snapshot = await res.json();
+  const map = session.map || { widthPx: 800, heightPx: 600 };
+
+  send({
+    type: 'token:add',
+    token: {
+      id: `token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name: characterName,
+      type: 'pc',
+      ownerId: playerId,
+      x: Math.round(map.widthPx / 2),
+      y: Math.round(map.heightPx / 2),
+      imageUrl: null,
+      visionNormalFt: snapshot.vision.normalFt,
+      visionDarkFt: snapshot.vision.darkFt,
+      visionTrueFt: snapshot.vision.trueFt,
+      visionDevilFt: snapshot.vision.devilFt,
+      speedFt: snapshot.speedFt,
+      speedRemainingFt: snapshot.speedFt,
+      hidden: false,
+      characterId,
+      ac: snapshot.ac,
+      saves: snapshot.saves,
+      actions: snapshot.actions,
+      spellSlots: snapshot.spellSlots,
+      preparedSpells: snapshot.preparedSpells,
+      stats: { hp: snapshot.hp, maxHp: snapshot.maxHp },
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Advanced Vision modal - normal/darkvision/truesight/devil's sight ranges,
 // pulled out of the token card itself since these are edited rarely.
 // ---------------------------------------------------------------------------
@@ -738,8 +997,12 @@ function renderSidebar() {
 }
 
 function playerListHtml() {
-  const names = Object.values(session.players).map((p) => escapeHtml(p.name));
-  return names.length ? names.join(', ') : '(none yet)';
+  const entries = Object.values(session.players).map((p) =>
+    p.connected === false
+      ? `<span style="color:#666;">${escapeHtml(p.name)} (disconnected)</span>`
+      : escapeHtml(p.name),
+  );
+  return entries.length ? entries.join(', ') : '(none yet)';
 }
 
 function roomInfoHtml(roleLabel) {
@@ -816,15 +1079,69 @@ function gmSidebarHtml() {
     <h2>Tokens</h2>
     <div id="tokenList">${gmTokenListHtml()}</div>
 
+    ${markerFormHtml()}
+    <div id="markerList">${markerListHtml(true)}</div>
+  `;
+}
+
+// Shared by both sidebars (Phase 2, Section 4) - shape select plus the
+// fields each shape needs. Circle/sphere only use radius; cone/cube only use
+// length/width/cone-angle - shown/hidden by wireMarkerForm() based on the
+// selected shape, rather than building four near-identical forms.
+function markerFormHtml() {
+  return `
     <h2>Markers</h2>
-    <div class="field row">
+    <div class="field">
+      <label>Shape</label>
+      <select id="markerShapeSelect">
+        <option value="circle">Circle (token-anchored point)</option>
+        <option value="sphere">Sphere/Burst (placed point)</option>
+        <option value="cone">Cone</option>
+        <option value="cube">Cube/Line</option>
+      </select>
+    </div>
+    <div class="field row" id="markerRadiusField">
       <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
       <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
     </div>
+    <div class="field row" id="markerShapeFields" style="display:none;">
+      <div><label>Width (ft)</label><input type="number" id="markerWidthInput" value="10" /></div>
+      <div><label>Cone angle (deg)</label><input type="number" id="markerConeAngleInput" value="60" /></div>
+    </div>
+    <p id="markerShapeHint" style="color:#666;font-size:12px;display:none;">Click the map to place the origin, then drag to aim and set length - release to confirm.</p>
     <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
     <button id="placeMarkerBtn">Place on Map</button>
-    <div id="markerList">${markerListHtml(true)}</div>
   `;
+}
+
+// Shared wiring for markerFormHtml() - shape-field show/hide plus the
+// Place on Map click handler, called from both wireGmSidebar and
+// wirePlayerSidebar.
+function wireMarkerForm() {
+  const shapeSelect = document.getElementById('markerShapeSelect');
+  const radiusField = document.getElementById('markerRadiusField');
+  const shapeFields = document.getElementById('markerShapeFields');
+  const shapeHint = document.getElementById('markerShapeHint');
+
+  function syncShapeFields() {
+    const isDirectional = shapeSelect.value === 'cone' || shapeSelect.value === 'cube';
+    radiusField.style.display = isDirectional ? 'none' : '';
+    shapeFields.style.display = isDirectional ? '' : 'none';
+    shapeHint.style.display = isDirectional ? '' : 'none';
+  }
+  shapeSelect.addEventListener('change', syncShapeFields);
+  syncShapeFields();
+
+  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
+    armMarkerPlacement({
+      shape: shapeSelect.value,
+      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
+      widthFt: Number(document.getElementById('markerWidthInput').value) || 0,
+      coneAngleDeg: Number(document.getElementById('markerConeAngleInput').value) || 60,
+      color: document.getElementById('markerColorInput').value || '#ff5252',
+      label: document.getElementById('markerLabelInput').value.trim(),
+    });
+  });
 }
 
 function gmTokenListHtml() {
@@ -880,6 +1197,12 @@ function gmTokenListHtml() {
 // whatever this client is allowed to see, so no client-side filtering here.
 // isGm controls whether the "visible to all" toggle shows (GM-only control)
 // and whether Remove shows for markers the viewer doesn't own.
+function markerSizeLabel(marker) {
+  if (marker.shape === 'cone') return `${marker.lengthFt}ft cone`;
+  if (marker.shape === 'cube') return `${marker.lengthFt}x${marker.widthFt}ft`;
+  return `${marker.radiusFt} ft`;
+}
+
 function markerListHtml(isGm) {
   const markers = Object.values(session.markers || {});
   if (!markers.length) return '<p style="color:#666;font-size:12px;">No markers placed.</p>';
@@ -893,7 +1216,7 @@ function markerListHtml(isGm) {
           <div class="title">
             <span>
               <span class="marker-swatch" style="background:${escapeHtml(m.color)}"></span>
-              ${escapeHtml(m.label || 'Marker')} <span class="tag">${m.radiusFt} ft</span>${!isOwn ? ' <span class="tag">shared</span>' : ''}
+              ${escapeHtml(m.label || 'Marker')} <span class="tag">${markerSizeLabel(m)}</span>${!isOwn ? ' <span class="tag">shared</span>' : ''}
             </span>
           </div>
           ${
@@ -1053,13 +1376,7 @@ function wireGmSidebar() {
     }
   });
 
-  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
-    armMarkerPlacement({
-      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
-      color: document.getElementById('markerColorInput').value || '#ff5252',
-      label: document.getElementById('markerLabelInput').value.trim(),
-    });
-  });
+  wireMarkerForm();
 
   document.getElementById('markerList').addEventListener('change', (e) => {
     const card = e.target.closest('[data-marker-id]');
@@ -1091,18 +1408,13 @@ function playerSidebarHtml() {
     ${roomInfoHtml('Player')}
 
     <h2>My tokens</h2>
+    <button type="button" id="addCharacterTokenBtn" class="secondary">Add My Character…</button>
     <div id="ownTokenList">${ownTokenListHtml(ownTokens)}</div>
 
     <h2>Other tokens in view</h2>
     <div id="otherTokenList">${otherTokenListHtml(otherTokens)}</div>
 
-    <h2>Markers</h2>
-    <div class="field row">
-      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
-      <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
-    </div>
-    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
-    <button id="placeMarkerBtn">Place on Map</button>
+    ${markerFormHtml()}
     <div id="markerList">${markerListHtml(false)}</div>
   `;
 }
@@ -1134,10 +1446,76 @@ function ownTokenListHtml(tokens) {
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
           </div>
+          ${miniSheetHtml(t)}
         </div>
       `;
     })
     .join('');
+}
+
+// Mini character sheet (Phase 2, Section 2) - only renders for tokens that
+// carry a character-sheet pull-through (characterId set, from the character
+// picker in Section 1a). Manually-created tokens (the POC's original blank
+// "Add token" flow, still used by the GM) simply don't have this data, so
+// there's nothing to show. Everything here reads straight off the token
+// object - it's already synced via the normal token broadcast plumbing, no
+// separate fetch, same "populate once at creation, don't auto-resync"
+// limitation as the rest of Section 1.
+function miniSheetHtml(t) {
+  if (!t.characterId) return '';
+
+  const savesHtml = Object.entries(t.saves || {})
+    .map(([key, value]) => `<span class="tag">${key.toUpperCase()} ${signedVtt(value)}</span>`)
+    .join(' ') || '<span style="color:#666;">None</span>';
+
+  const actionsHtml = (t.actions || []).length
+    ? (t.actions || [])
+        .map(
+          (a) => `
+        <div class="mini-sheet-action" data-action-name="${escapeHtml(a.name)}">
+          <span>${escapeHtml(a.name)}</span>
+          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${a.damageRolls || ''}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
+        </div>
+      `
+        )
+        .join('')
+    : '<p style="color:#666;font-size:12px;">No equipped weapons.</p>';
+
+  const slotsHtml = (t.spellSlots || []).length
+    ? (t.spellSlots || [])
+        .map(
+          (s) => `
+        <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
+          <span>${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
+          <button type="button" class="secondary slotUseBtn" ${s.current <= 0 ? 'disabled' : ''}>Use</button>
+          <button type="button" class="secondary slotResetBtn">Reset</button>
+        </div>
+      `
+        )
+        .join('')
+    : '';
+
+  const spellsHtml = (t.preparedSpells || []).length
+    ? (t.preparedSpells || []).map((s) => `<div class="mini-sheet-action" data-spell-name="${escapeHtml(s.name)}"><span>${escapeHtml(s.name)}</span><span style="color:#aaa;">Lvl ${s.spellLevel ?? 0}</span></div>`).join('')
+    : '';
+
+  return `
+    <div class="mini-sheet">
+      <div class="field row">
+        <div><label>AC</label><input type="number" value="${t.ac ?? ''}" readonly /></div>
+        <div><label>Saves</label><div style="padding-top:4px;">${savesHtml}</div></div>
+      </div>
+      <label style="font-size:11px;color:#888;">Actions</label>
+      ${actionsHtml}
+      ${slotsHtml ? `<label style="font-size:11px;color:#888;">Spell slots</label>${slotsHtml}` : ''}
+      ${spellsHtml ? `<label style="font-size:11px;color:#888;">Prepared spells</label>${spellsHtml}` : ''}
+    </div>
+  `;
+}
+
+function signedVtt(value) {
+  const n = Number(value) || 0;
+  return n >= 0 ? `+${n}` : `${n}`;
 }
 
 function otherTokenListHtml(tokens) {
@@ -1161,6 +1539,8 @@ function otherTokenListHtml(tokens) {
 }
 
 function wirePlayerSidebar() {
+  document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
+
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;
   ownList.addEventListener('change', (e) => {
@@ -1191,16 +1571,29 @@ function wirePlayerSidebar() {
       adjustTokenSpeedRemaining(tokenId, 5);
     } else if (e.target.classList.contains('speedResetBtn')) {
       resetTokenSpeedRemaining(tokenId);
+    } else if (e.target.classList.contains('slotUseBtn') || e.target.classList.contains('slotResetBtn')) {
+      const slotRow = e.target.closest('.mini-sheet-slot');
+      const token = session.tokens[tokenId];
+      if (!slotRow || !token) return;
+      const type = slotRow.dataset.slotType;
+      const level = Number(slotRow.dataset.slotLevel);
+      const useSlot = e.target.classList.contains('slotUseBtn');
+      const value = (token.spellSlots || []).map((s) => {
+        if (s.type !== type || s.level !== level) return s;
+        return { ...s, current: useSlot ? Math.max(0, s.current - 1) : s.max };
+      });
+      send({ type: 'token:stat:update', tokenId, stat: 'spellSlots', value });
+    } else {
+      const actionRow = e.target.closest('.mini-sheet-action');
+      const token = session.tokens[tokenId];
+      if (actionRow && token && actionRow.dataset.actionName) {
+        const action = (token.actions || []).find((a) => a.name === actionRow.dataset.actionName);
+        if (action) armActionTargeting(tokenId, action);
+      }
     }
   });
 
-  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
-    armMarkerPlacement({
-      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
-      color: document.getElementById('markerColorInput').value || '#ff5252',
-      label: document.getElementById('markerLabelInput').value.trim(),
-    });
-  });
+  wireMarkerForm();
 
   document.getElementById('markerList').addEventListener('click', (e) => {
     const card = e.target.closest('[data-marker-id]');

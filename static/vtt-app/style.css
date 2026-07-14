@@ -173,3 +173,28 @@ body {
 .picker-item span { display: block; font-size: 10px; color: #aaa; margin-top: 4px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .token-thumb { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; vertical-align: middle; margin-right: 6px; background: #000; }
+
+.character-picker-item {
+  background: #14161b;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+.character-picker-item:hover { border-color: #4a7fff; }
+.character-picker-item .name { font-weight: 600; font-size: 13px; }
+.character-picker-item .summary { font-size: 11px; color: #aaa; margin-top: 2px; }
+
+.mini-sheet { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c2f36; }
+.mini-sheet-action, .mini-sheet-slot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 0;
+}
+.mini-sheet-action[data-action-name] { cursor: pointer; border-radius: 4px; }
+.mini-sheet-action[data-action-name]:hover { background: #1c1f26; }
+.mini-sheet-slot button { margin-top: 0; font-size: 11px; padding: 2px 6px; }

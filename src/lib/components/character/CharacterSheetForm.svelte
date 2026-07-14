@@ -2,7 +2,7 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, hitDiceSummary, initiativeBonus, modifierTargetMatches, passiveScore, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -83,9 +83,7 @@
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
   );
   const miscInventoryRows = $derived(inventoryRows.filter((item) => item.location === 'misc'));
-  const battleActionItems = $derived(
-    inventoryRows.filter((item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus))
-  );
+  const battleActionItems = $derived(equippedAttackItems(inventoryRows));
   const attack = $derived(character.attacks[0] ?? {
     name: '',
     attackAbility: 'str' as AbilityKey,
@@ -208,17 +206,9 @@
     equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
   );
   const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ac'], { classes: classRows }));
-  const computedArmorClass = $derived(
-    10 +
-      abilityModifier(abilityScores.dex) +
-      equippedAcBonus +
-      acModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
-  );
+  const computedArmorClass = $derived(armorClass(abilityScores.dex, equippedAcBonus, character.modifierSources, { classes: classRows }));
   const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['initiative'], { classes: classRows }));
-  const computedInitiative = $derived(
-    abilityModifier(abilityScores.dex) +
-      initiativeModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
-  );
+  const computedInitiative = $derived(initiativeBonus(abilityScores.dex, character.modifierSources, { classes: classRows }));
   const spellcastingAbility = $derived((classes.spellcastingAbility || meta('spellcastingAbility', 'int').toLowerCase()) as AbilityKey);
   const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_save_dc'], { classes: classRows }));
   const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
@@ -231,37 +221,20 @@
   const characterSpells = $derived(character.content.filter((entry) => entry.type === 'spell'));
   const characterFeats = $derived(character.content.filter((entry) => entry.type === 'feat'));
   const characterFeatures = $derived(character.content.filter((entry) => entry.type === 'class_feature'));
-  const computedSpeedValue = $derived.by(() => {
-    const setValues = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
-    const bonuses = resolvedAdditiveModifiers(character.modifierSources, ['speed.all', 'speed.walk'], { classes: classRows });
-    const multipliers = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
-    const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
-    const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
-    const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
-    return Math.max(0, Math.floor(multiplied));
-  });
+  const computedSpeedValue = $derived(speedFt(character.modifierSources, { classes: classRows }));
   const computedSpeed = $derived(`${computedSpeedValue} ft.`);
   const computedHitDice = $derived(hitDiceSummary(classRows));
   const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
   const computedPassivePerception = $derived(
-    10 +
-      abilityModifier(abilityScores.wis) +
-      (isSkillProficient('perception') ? prof : 0) +
-      passivePerceptionBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+    passiveScore(abilityScores.wis, isSkillProficient('perception'), prof, character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows })
   );
   const passiveInsightBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows }));
   const computedPassiveInsight = $derived(
-    10 +
-      abilityModifier(abilityScores.wis) +
-      (isSkillProficient('insight') ? prof : 0) +
-      passiveInsightBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+    passiveScore(abilityScores.wis, isSkillProficient('insight'), prof, character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows })
   );
   const passiveInvestigationBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows }));
   const computedPassiveInvestigation = $derived(
-    10 +
-      abilityModifier(abilityScores.int) +
-      (isSkillProficient('investigation') ? prof : 0) +
-      passiveInvestigationBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+    passiveScore(abilityScores.int, isSkillProficient('investigation'), prof, character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows })
   );
   const savingThrowModifierBonuses = $derived(
     Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>

@@ -1,4 +1,4 @@
-import type { AbilityKey, ActiveCharacterEffect, CharacterAbility, CharacterClass, EffectModifier } from '$lib/types/character';
+import type { AbilityKey, ActiveCharacterEffect, CharacterAbility, CharacterClass, EffectModifier, InventoryItem } from '$lib/types/character';
 
 export const abilityKeys: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
 
@@ -368,6 +368,91 @@ export function spellSaveDc(score: number, level: number, bonuses: number[] = []
 
 export function spellAttackBonus(score: number, level: number, bonuses: number[] = []): number {
   return abilityModifier(score) + proficiencyBonus(level) + bonuses.reduce((sum, value) => sum + value, 0);
+}
+
+// The following were previously inline $derived formulas in
+// CharacterSheetForm.svelte, only reachable from within that component -
+// extracted so VTT Phase 2's server-side character API can compute the same
+// live numbers the sheet displays, instead of reading a stale metadata_json
+// snapshot from the last save. Moved verbatim; the component now calls these
+// instead of recomputing the math itself.
+
+export function armorClass(
+  dexScore: number,
+  equippedAcBonus: number,
+  modifierSources: ActiveCharacterEffect[],
+  context: ModifierContext = {}
+): number {
+  const bonuses = resolvedAdditiveModifiers(modifierSources, ['ac'], context);
+  return 10 + abilityModifier(dexScore) + equippedAcBonus + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
+}
+
+export function initiativeBonus(
+  dexScore: number,
+  modifierSources: ActiveCharacterEffect[],
+  context: ModifierContext = {}
+): number {
+  const bonuses = resolvedAdditiveModifiers(modifierSources, ['initiative'], context);
+  return abilityModifier(dexScore) + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
+}
+
+// Order of operations matters here and must stay exact: base (or the last
+// 'set' modifier, if any) -> additive bonuses -> chained multipliers (each
+// multiplier compounds on the running total, not on the base) -> floor,
+// clamped to >= 0.
+export function speedFt(modifierSources: ActiveCharacterEffect[], context: ModifierContext = {}): number {
+  const setValues = resolvedNumericModifiers(modifierSources, ['speed.all', 'speed.walk'], ['set'], context);
+  const bonuses = resolvedAdditiveModifiers(modifierSources, ['speed.all', 'speed.walk'], context);
+  const multipliers = resolvedNumericModifiers(modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], context);
+  const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
+  const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
+  const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
+  return Math.max(0, Math.floor(multiplied));
+}
+
+// Generalizes the near-identical passive perception/insight/investigation
+// formulas (10 + ability mod + proficiency (if proficient) + bonuses).
+export function passiveScore(
+  abilityScore: number,
+  proficient: boolean,
+  prof: number,
+  modifierSources: ActiveCharacterEffect[],
+  candidates: string[],
+  context: ModifierContext = {}
+): number {
+  const bonuses = resolvedAdditiveModifiers(modifierSources, candidates, context);
+  return 10 + abilityModifier(abilityScore) + (proficient ? prof : 0) + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
+}
+
+// New for VTT Phase 2 - vision.*_ft aren't feats or race traits in this
+// codebase's data model, they're just Modifiers like everything else
+// (docs/architecture/modifier-primacy-architecture.md), resolved the same
+// way AC/speed are. Baselines are standard human vision (30ft normal, no
+// darkvision/truesight/devil's sight) with any granted Modifiers added on
+// top - deliberately additive ('bonus'), not 'set', since the tie-break rule
+// for 'set' operations is an explicitly open question in the architecture
+// doc and additive bonuses on a fixed baseline sidestep it entirely.
+export function visionRadii(
+  modifierSources: ActiveCharacterEffect[],
+  context: ModifierContext = {}
+): { normalFt: number; darkFt: number; trueFt: number; devilFt: number } {
+  const bonusFor = (target: string) =>
+    resolvedAdditiveModifiers(modifierSources, [target], context).reduce((sum, bonus) => sum + bonus.value, 0);
+  return {
+    normalFt: 30 + bonusFor('vision.normal_ft'),
+    darkFt: bonusFor('vision.dark_ft'),
+    trueFt: bonusFor('vision.true_ft'),
+    devilFt: bonusFor('vision.devil_ft')
+  };
+}
+
+// Same "equipped and has combat-relevant fields" predicate the sheet's
+// battle-actions tab already uses (CharacterSheetForm.svelte), extracted so
+// the VTT's "available actions" list matches it exactly.
+export function equippedAttackItems(inventory: InventoryItem[]): InventoryItem[] {
+  return inventory.filter(
+    (item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus)
+  );
 }
 
 export function resolveResourceMaximum(expression: string, context: { level?: number; proficiencyBonus?: number; abilityModifier?: number } = {}): number {
