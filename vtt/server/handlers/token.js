@@ -35,25 +35,42 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
 ]);
 
 // Fields a player may write on their own token via token:stat:update.
-// hp/maxHp are included deliberately - players self-tracking their own HP is
-// existing, already-shipped behavior (see ownTokenListHtml/wirePlayerSidebar
-// in main.js), not the risk this allowlist closes. What stays GM-only even on
-// a player's own token is defeated/condition (a GM narrative-timing call, per
-// the original POC spec's "never auto-derive death from HP" rule) and the
-// free-form ac/saves/actions/characterId/preparedSpells reference fields
-// pulled from the character sheet at creation (Section 1) - nothing needs to
-// write those post-creation yet. spellSlots is added beyond the phase-2
+// hp/maxHp/imageUrl/speedFt are included deliberately - players self-tracking
+// their own HP, changing their own token's art via "Change Image...", and
+// editing their own base Speed field are all existing, already-shipped
+// behavior (see ownTokenListHtml/wirePlayerSidebar in main.js), not the risk
+// this allowlist closes. ac/saves/actions/preparedSpells and the vision*
+// fields are here so the character-resync poller (main.js's
+// syncOwnedCharacterTokens) can push updated reference data from the source
+// character sheet onto a player's own token - same trust boundary as
+// token:add already extending full client-constructed data for an owned
+// token, not a new risk. What stays GM-only even on a player's own token is
+// defeated/condition (a GM narrative-timing call, per the original POC
+// spec's "never auto-derive death from HP" rule) and characterId (never
+// needs rewriting post-creation). spellSlots is added beyond the phase-2
 // spec's example list since self-service spell casting needs to decrement
-// the player's own slots.
+// the player's own slots - but hp and spellSlots are deliberately the two
+// fields the resync poller never touches, since both are VTT-session-
+// authoritative once pulled (current combat HP, spent slots) and a poll
+// landing mid-session shouldn't silently overwrite them with the sheet's
+// at-rest values.
 const PLAYER_EDITABLE_FIELDS = new Set([
   'hp',
   'maxHp',
+  'speedFt',
   'speedRemainingFt',
   'visionNormalFt',
   'visionDarkFt',
+  'visionTrueFt',
+  'visionDevilFt',
+  'ac',
+  'saves',
+  'actions',
+  'preparedSpells',
   'x',
   'y',
   'spellSlots',
+  'imageUrl',
 ]);
 
 function isFieldEditAllowed(role, isOwner, field) {

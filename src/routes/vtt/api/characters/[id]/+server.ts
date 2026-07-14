@@ -5,6 +5,7 @@ import {
   abilityMap,
   armorClass,
   equippedAttackItems,
+  equippedItems,
   proficiencyBonus,
   savingThrowModifier,
   speedFt,
@@ -28,8 +29,8 @@ export const GET: RequestHandler = async ({ locals, params }) => {
   const abilities = abilityMap(character.abilities);
   const level = totalLevel(character.classes);
   const prof = proficiencyBonus(level);
-  const equipped = equippedAttackItems(character.inventory);
-  const equippedAcBonus = equipped.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0);
+  const attackItems = equippedAttackItems(character.inventory);
+  const equippedAcBonus = equippedItems(character.inventory).reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0);
 
   const hpResource = character.resources.find((resource) => resource.key === 'hp');
 
@@ -47,7 +48,7 @@ export const GET: RequestHandler = async ({ locals, params }) => {
     vision: visionRadii(character.modifierSources, context),
     ac: armorClass(abilities.dex, equippedAcBonus, character.modifierSources, context),
     saves,
-    actions: equipped.map((item) => ({
+    actions: attackItems.map((item) => ({
       name: item.name,
       toHitBonus: item.toHitBonus,
       damageBonus: item.damageBonus,

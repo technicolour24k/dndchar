@@ -2,7 +2,7 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, hitDiceSummary, initiativeBonus, modifierTargetMatches, passiveScore, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, modifierTargetMatches, passiveScore, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -76,9 +76,7 @@
     { key: 'misc', label: 'Misc' }
   ]);
   const inventoryRows = $derived(character.inventory);
-  const equippedInventoryRows = $derived(
-    inventoryRows.filter((item) => item.location === 'equipped' || item.equipped)
-  );
+  const equippedInventoryRows = $derived(equippedItems(inventoryRows));
   const backpackInventoryRows = $derived(
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
   );

@@ -118,8 +118,13 @@ function handleMessage(msg) {
       session = msg.session;
       session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
-      renderSidebar();
+      // render() first - it computes currentRenderedTokens (vision-filtered
+      // for a player), which renderSidebar()'s "other tokens in view" list
+      // now reads from; the reverse order would show a stale/empty list
+      // until the next unrelated event happened to re-render.
       render();
+      renderSidebar();
+      if (role === 'player') startCharacterSync();
       break;
 
     case 'player:joined':
@@ -164,6 +169,11 @@ function handleMessage(msg) {
       if (t) { t.x = msg.x; t.y = msg.y; }
       if (dragState && dragState.tokenId === msg.tokenId) dragState = null;
       render();
+      // A move can push a token into or out of vision range, which changes
+      // the player sidebar's "other tokens in view" list - this was
+      // previously missing, so that list only ever updated on unrelated
+      // events (a stat change, a new token) rather than on the move itself.
+      renderSidebar();
       break;
     }
 
@@ -926,6 +936,64 @@ characterPickerList.addEventListener('click', async (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Character resync polling - re-pulls each owned token's source character
+// periodically and pushes any changed reference fields through the existing
+// token:stat:update event, so leveling up / re-equipping mid-session doesn't
+// require removing and re-adding the token. Deliberately narrower than "sync
+// everything": hp and spellSlots stay VTT-session-authoritative once pulled
+// (the whole point of tracking them live during play) - a poll landing
+// mid-fight must not silently overwrite in-progress damage or spent slots
+// with the sheet's at-rest values. This is the interim, self-contained
+// version; a real push-based system (sheet save -> VTT) is the longer-term
+// direction once there's a real realtime layer to hang it on (see the
+// current-state doc's Known Fragility notes).
+// ---------------------------------------------------------------------------
+
+const CHARACTER_SYNC_INTERVAL_MS = 30000;
+let characterSyncTimer = null;
+
+function startCharacterSync() {
+  if (characterSyncTimer) clearInterval(characterSyncTimer);
+  characterSyncTimer = setInterval(syncOwnedCharacterTokens, CHARACTER_SYNC_INTERVAL_MS);
+}
+
+async function syncOwnedCharacterTokens() {
+  if (!session || role !== 'player') return;
+  const tokens = Object.values(session.tokens).filter((t) => t.ownerId === playerId && t.characterId);
+  for (const token of tokens) {
+    try {
+      const res = await fetch('/vtt/api/characters/' + token.characterId);
+      if (!res.ok) continue; // character deleted, or a transient error - try again next tick
+      const snapshot = await res.json();
+      applyCharacterSyncFields(token, snapshot);
+    } catch {
+      // A single character's fetch failing (network blip) shouldn't stop
+      // the rest of this player's tokens from syncing on this tick.
+    }
+  }
+}
+
+function applyCharacterSyncFields(token, snapshot) {
+  const updates = {
+    maxHp: snapshot.maxHp,
+    speedFt: snapshot.speedFt,
+    visionNormalFt: snapshot.vision.normalFt,
+    visionDarkFt: snapshot.vision.darkFt,
+    visionTrueFt: snapshot.vision.trueFt,
+    visionDevilFt: snapshot.vision.devilFt,
+    ac: snapshot.ac,
+    saves: snapshot.saves,
+    actions: snapshot.actions,
+    preparedSpells: snapshot.preparedSpells,
+  };
+  for (const [stat, value] of Object.entries(updates)) {
+    if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
+      send({ type: 'token:stat:update', tokenId: token.id, stat, value });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Advanced Vision modal - normal/darkvision/truesight/devil's sight ranges,
 // pulled out of the token card itself since these are edited rarely.
 // ---------------------------------------------------------------------------
@@ -1402,7 +1470,13 @@ function wireGmSidebar() {
 function playerSidebarHtml() {
   const allTokens = Object.values(session.tokens);
   const ownTokens = allTokens.filter((t) => t.ownerId === playerId);
-  const otherTokens = allTokens.filter((t) => t.ownerId !== playerId);
+  // currentRenderedTokens is whatever render() last actually drew - for a
+  // player that's already the vision-filtered set (see render()'s isPointRevealed
+  // pass), so "other tokens" here matches what's actually visible on the map
+  // instead of every token that merely isn't the player's own. Previously this
+  // read straight from allTokens, so a token's HP/status kept showing here
+  // (and stayed live-updating) even after it moved out of vision.
+  const otherTokens = currentRenderedTokens.filter((t) => t.ownerId !== playerId);
 
   return `
     ${roomInfoHtml('Player')}

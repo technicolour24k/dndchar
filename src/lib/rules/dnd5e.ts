@@ -449,6 +449,18 @@ export function visionRadii(
 // Same "equipped and has combat-relevant fields" predicate the sheet's
 // battle-actions tab already uses (CharacterSheetForm.svelte), extracted so
 // the VTT's "available actions" list matches it exactly.
+// Broader than equippedAttackItems() below - "is this item equipped at all"
+// (armor, shields, anything), not "is it weapon-like enough to show as an
+// attack option." AC bonuses come from every equipped item, not just ones
+// with damage fields - conflating the two (as the VTT's character-detail
+// route originally did) silently drops shield/armor AC bonuses, since a
+// shield has no damageRolls/toHitBonus/damageBonus to match the narrower
+// filter. Same predicate CharacterSheetForm.svelte's own equippedInventoryRows
+// already used inline.
+export function equippedItems(inventory: InventoryItem[]): InventoryItem[] {
+  return inventory.filter((item) => item.location === 'equipped' || item.equipped);
+}
+
 export function equippedAttackItems(inventory: InventoryItem[]): InventoryItem[] {
   return inventory.filter(
     (item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus)
