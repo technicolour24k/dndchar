@@ -4,7 +4,14 @@
 // RAW's darkvision text: "you can see in dim light within [range] as if it
 // were bright light, and in darkness as if it were dim light. You can't
 // discern color in darkness, only shades of gray."
-//   bright: color out to visionNormalFt, darkvision irrelevant, no gray band.
+//   bright: color out to BRIGHT_LIGHT_RADIUS_FT (or the token's own
+//           visionNormalFt if that's larger), darkvision irrelevant, no gray
+//           band. 5e doesn't actually cap unaided daylight sight at a fixed
+//           radius the way it does darkvision - visionNormalFt is a POC
+//           fog-of-war convenience, not a RAW distance, so bright light
+//           (where fog-of-war typically isn't wanted at all) uses a much
+//           larger flat radius instead of the same short indoor-scale number
+//           dim/dark use, where vision actually is the meaningful constraint.
 //   dim:    darkvision sees dim light AS bright light - full color out to
 //           visionDarkFt for tokens that have it. Tokens without darkvision
 //           still get grayscale out to visionNormalFt (a POC simplification
@@ -19,6 +26,8 @@
 // of `brightness`. This POC doesn't model magical darkness/illusions/
 // invisibility separately, so the two are mechanically identical here; kept
 // as separate fields on the token for clarity/future distinction.
+const BRIGHT_LIGHT_RADIUS_FT = 150;
+
 export function getTokenVisionRadii(token, brightness, pxPerFoot) {
   const normalFt = token.visionNormalFt || 0;
   const darkFt = token.visionDarkFt || 0;
@@ -34,7 +43,7 @@ export function getTokenVisionRadii(token, brightness, pxPerFoot) {
     colorRadius = darkFt * pxPerFoot;
     grayRadius = Math.max(normalFt, darkFt) * pxPerFoot;
   } else if (brightness === 'bright') {
-    colorRadius = normalFt * pxPerFoot;
+    colorRadius = Math.max(normalFt, BRIGHT_LIGHT_RADIUS_FT) * pxPerFoot;
     grayRadius = colorRadius;
   } else {
     // 'dark' (default ambient)

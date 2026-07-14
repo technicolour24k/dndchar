@@ -93,7 +93,7 @@ if (brightness === 'dim') {
   colorRadius = darkFt * pxPerFoot;               // darkvision = full color in dim light (RAW)
   grayRadius = Math.max(normalFt, darkFt) * pxPerFoot;
 } else if (brightness === 'bright') {
-  colorRadius = normalFt * pxPerFoot; grayRadius = colorRadius;   // no gray band
+  colorRadius = Math.max(normalFt, BRIGHT_LIGHT_RADIUS_FT) * pxPerFoot;   // 150ft floor, no gray band
 } else { // 'dark'
   colorRadius = normalFt * pxPerFoot;
   grayRadius = darkFt > normalFt ? darkFt * pxPerFoot : colorRadius;
@@ -101,6 +101,8 @@ if (brightness === 'dim') {
 ```
 
 The original POC version had `colorRadius = 0` unconditionally in `dim` mode (everyone grayscale, no exception for darkvision) - the spec itself flagged this as an allowed simplification ("POC can skip nuance here... if easier"), but it produced a genuinely backwards result: a darkvision creature got *less* color in dim light than in true darkness, when RAW says the opposite (dim = as bright for darkvision; darkness = grayscale only, never color). Fixed so `dim` mode's color radius depends on `darkFt`, same as everything else already did.
+
+**🔁 Extension beyond spec**: `bright` mode's color radius is no longer capped at the token's own `visionNormalFt` (typically 30ft) - it now uses a 150ft floor (`Math.max(normalFt, 150)`), following a user observation that 5e doesn't actually cap unaided daylight sight at a fixed distance the way it caps darkvision; `visionNormalFt` is a POC fog-of-war convenience, not a RAW-defined range, and 30ft made outdoor daylight scenes feel far more constrained than they should. `dim`/`dark` are unaffected - vision genuinely is the meaningful constraint there, which is exactly where the token-specific radius stat should still apply.
 
 Hard-edged circles, no soft falloff - exactly what the spec allowed for POC simplicity.
 
@@ -401,3 +403,10 @@ Separately clarified with the user: this is a data-ownership property, not a tra
 User question: "why does dim light show darkvision range in grey, and dark light show vision range in color + darkvision range in grey - shouldn't it be the other way around?" Correct on inspection - this traced to the original POC spec's own text, which explicitly allowed "dim: everyone gets grayscale, no color band" as a simplification, without noting that it inverts 5e RAW's actual darkvision rule: *"you can see in dim light... as if it were bright light, and in darkness as if it were dim light. You can't discern color in darkness, only shades of gray"* (PHB). Per RAW, a darkvision creature should get **full color** in dim light (dim = bright, for them) and only **grayscale** in true darkness - the POC's simplified version gave the opposite (zero color in dim, some color in dark), making `dark` accidentally better than `dim` for a darkvision creature when it should be the reverse.
 
 Fixed in `render/vision.js`'s `getTokenVisionRadii()`: `dim` mode's `colorRadius` now scales with `visionDarkFt` (0 if no darkvision, full color out to darkvision range if the token has it) instead of being hardcoded to 0; `dark` mode is unchanged (already RAW-correct: color within normal vision, grayscale beyond via darkvision, matching the "darkness never restores color" rule). Verified two ways: a direct unit-level check of `getTokenVisionRadii()` confirming the exact radii for darkvision/no-darkvision tokens across all three brightness modes (including an explicit "dim gives more color than dark" severity check), and a visual headless-browser test against a real four-color test map, screenshotted in all three brightness modes - `bright` shows color to 30ft, `dim` now shows full color all the way to 60ft (previously would have shown zero color), `dark` shows color to 30ft with grayscale from 30-60ft (unchanged).
+
+### 2026-07-14 - Bright light no longer capped at the token's short indoor vision radius
+Follow-up to the same conversation as the dim/dark fix above. User observation: unaided daylight sight isn't capped at a fixed distance in reality (or in 5e RAW) - only darkvision has a defined range - so treating `bright` mode's reveal radius as the same ~30ft `visionNormalFt` used for indoor/dark scenes made outdoor daylight maps feel far more fog-of-war-constrained than the scenario calls for.
+
+Added a `BRIGHT_LIGHT_RADIUS_FT = 150` constant in `render/vision.js`; `bright` mode's `colorRadius` is now `Math.max(normalFt, 150) * pxPerFoot` instead of just `normalFt * pxPerFoot` - a floor, not a replacement, so a token with an unusually large `visionNormalFt` (e.g. from a future homebrew effect) still gets its own larger value rather than being clamped down to 150. `dim` and `dark` are untouched - the token-specific radius is still the meaningful constraint in both, which is exactly where vision *should* matter. Verified via a direct unit-level check (`getTokenVisionRadii` returns 1500px/150ft for a standard 30ft-normal-vision token in bright light, confirmed the 150ft floor doesn't clamp down a token whose own `visionNormalFt` already exceeds it, and confirmed `dim`/`dark` results are unchanged).
+
+150ft is a flat, un-derived number - picked as "large enough to feel like daylight, small enough to still be a number" rather than computed from any rule. Worth revisiting if actual play shows it's too small (very large outdoor maps) or unnecessary (if fog-of-war for bright scenes turns out not to matter enough to warrant a floor at all, vs. just fully unbounded/whole-map reveal).
