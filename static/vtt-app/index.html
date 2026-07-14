@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VTT POC</title>
+  <link rel="stylesheet" href="/vtt-app/style.css" />
+</head>
+<body>
+
+  <div id="login">
+    <h1>VTT Proof of Concept</h1>
+
+    <div id="identityKnown" style="display:none;">
+      <label>Playing as</label>
+      <div id="identityName" style="padding:6px 8px;background:#1a1c22;border-radius:4px;border:1px solid #444;"></div>
+    </div>
+    <div id="identityUnknown">
+      <label>Your name</label>
+      <input id="nameInput" type="text" placeholder="Tony" />
+    </div>
+
+    <div class="panel">
+      <h2 style="font-size:14px;margin:0 0 8px;color:#888;">Game Master</h2>
+      <button id="createRoomBtn">Create room</button>
+    </div>
+
+    <div class="panel">
+      <h2 style="font-size:14px;margin:0 0 8px;color:#888;">Player</h2>
+      <label>Room code</label>
+      <input id="joinCodeInput" type="text" placeholder="ABCD12" maxlength="6" style="text-transform:uppercase" />
+      <button id="joinRoomBtn">Join room</button>
+    </div>
+
+    <div class="error" id="loginError"></div>
+  </div>
+
+  <div id="app">
+    <div id="sidebar"></div>
+    <div id="mapWrap">
+      <canvas id="canvas" width="800" height="600"></canvas>
+      <div id="zoomControls">
+        <button id="zoomOutBtn" title="Zoom out">&minus;</button>
+        <button id="zoomResetBtn" title="Reset zoom">100%</button>
+        <button id="zoomInBtn" title="Zoom in">+</button>
+      </div>
+      <div id="markerPlacementBanner" class="marker-placement-banner">
+        <span>Click the map to place your marker</span>
+        <button type="button" id="markerPlacementCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="visionModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Advanced Vision Options</h2>
+      <div class="field"><label>Normal vision (ft)</label><input type="number" id="visionModalNormal" min="0" /></div>
+      <div class="field"><label>Darkvision (ft)</label><input type="number" id="visionModalDark" min="0" /></div>
+      <div class="field"><label>Truesight (ft)</label><input type="number" id="visionModalTrue" min="0" /></div>
+      <div class="field"><label>Devil's Sight (ft)</label><input type="number" id="visionModalDevil" min="0" /></div>
+      <div class="actions">
+        <button id="visionModalCancel" class="secondary">Cancel</button>
+        <button id="visionModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="imagePickerModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Choose Token Image</h2>
+      <div class="picker-tabs">
+        <button type="button" id="pickerTabLibraryBtn" class="picker-tab active">Browse Library</button>
+        <button type="button" id="pickerTabUploadBtn" class="picker-tab">Upload Custom</button>
+      </div>
+
+      <div id="pickerLibraryPane">
+        <div class="field row">
+          <div>
+            <label>Source</label>
+            <select id="pickerSourceSelect">
+              <option value="">All sources</option>
+            </select>
+          </div>
+          <div>
+            <label>Category</label>
+            <select id="pickerCategorySelect">
+              <option value="">All categories</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Search</label>
+          <input type="text" id="pickerSearchInput" placeholder="e.g. drow, wolf, cleric…" />
+        </div>
+        <div id="pickerStatus" class="picker-status"></div>
+        <div id="pickerResults" class="picker-grid"></div>
+      </div>
+
+      <div id="pickerUploadPane" style="display:none;">
+        <div class="field"><label>Upload image</label><input type="file" id="pickerFileInput" accept="image/*" /></div>
+        <img id="pickerUploadThumb" class="thumb" />
+      </div>
+
+      <div class="actions">
+        <button type="button" id="pickerCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/vtt-app/main.js"></script>
+</body>
+</html>
