@@ -1,4 +1,4 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
 import { sessions, socketsBySession, broadcast } from './store.js';
 import handleJoin from './handlers/join.js';
@@ -14,7 +14,7 @@ let wss = null;
 // Attaches the VTT WebSocket layer to an existing http.Server, filtering
 // upgrade requests by path so it coexists with whatever else is listening on
 // that server (SvelteKit's own dev-server HMR socket in dev, nothing extra in
-// prod). Safe to call more than once per process — only the first call does
+// prod). Safe to call more than once per process - only the first call does
 // anything.
 export function attachVttWebSocketServer(httpServer) {
   if (wss) return wss;

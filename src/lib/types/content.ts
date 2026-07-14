@@ -8,7 +8,7 @@ export type DurationType = 'instant' | 'rounds' | 'encounter' | 'concentration' 
 export type StackBehavior = 'refresh' | 'stack' | 'reject';
 export type ExpiryBoundary = 'turn_start' | 'turn_end' | 'round_end' | 'manual';
 
-/** Structured cost entry — one pool and how much of it is consumed. */
+/** Structured cost entry - one pool and how much of it is consumed. */
 export type ContainerCostEntry = {
   pool: string;
   amount: number;

@@ -1,4 +1,4 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { filterTokenForPlayer } from '../store.js';
 
 function canEditToken(meta, token) {
@@ -8,7 +8,7 @@ function canEditToken(meta, token) {
 
 // token:stat:update writes into token.stats[stat] by default (arbitrary,
 // free-form combat stats). These fields are top-level token properties
-// instead — condition is set alongside HP by the GM (Section 5), the vision*
+// instead - condition is set alongside HP by the GM (Section 5), the vision*
 // fields are token-level traits, imageUrl is how the token-image picker
 // changes a token's art post-creation, and speedFt/speedRemainingFt drive the
 // movement-range highlight (speedFt is the base/reset value, speedRemainingFt
@@ -97,7 +97,7 @@ function handleTokenEvent(meta, msg, context) {
       if (!token) return;
       token.hidden = !token.hidden;
       // Players never see a hidden:toggle event itself (that would leak the
-      // token's existence) — instead they see it appear/disappear.
+      // token's existence) - instead they see it appear/disappear.
       context.broadcast(meta.sessionId, (recipient) => {
         if (recipient.role === 'gm') {
           return { type: 'token:hidden:toggle', tokenId: token.id, hidden: token.hidden };

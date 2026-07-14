@@ -1,4 +1,4 @@
-D&D Character Sheet Website — Migration Handover
+D&D Character Sheet Website - Migration Handover
 
 Purpose of this document: This captures the project context, decisions, intent, unresolved questions, and working constraints discussed outside the repository. It deliberately avoids code and reproduces the distinction between confirmed decisions, older ideas that were superseded, and things merely discussed. The new assistant should treat the repository as the source of truth for implementation details, while this document explains why those details may exist.
 
@@ -75,7 +75,7 @@ Legacy / existing implementation context
 
 Selected rewrite direction
 
-- SvelteKit — explicitly SvelteKit, not plain Svelte
+- SvelteKit - explicitly SvelteKit, not plain Svelte
 - TypeScript
 - Node.js runtime
 - PostgreSQL
@@ -88,11 +88,11 @@ Selected rewrite direction
 
 Discussed but not adopted as the selected stack
 
-- Drizzle ORM — mentioned in an earlier general recommendation, but not confirmed as chosen
-- Supabase — mentioned in an earlier general recommendation for auth/database/realtime/storage, but not selected after Railway + Neon
-- Vercel, Netlify, Cloudflare, Render, DigitalOcean — discussed as possible hosts, not selected
-- PWA / offline support — desired future capability, not a committed initial implementation
-- normal shared PHP/cPanel hosting — specifically not considered suitable as the main hosting direction after moving to Node/SvelteKit
+- Drizzle ORM - mentioned in an earlier general recommendation, but not confirmed as chosen
+- Supabase - mentioned in an earlier general recommendation for auth/database/realtime/storage, but not selected after Railway + Neon
+- Vercel, Netlify, Cloudflare, Render, DigitalOcean - discussed as possible hosts, not selected
+- PWA / offline support - desired future capability, not a committed initial implementation
+- normal shared PHP/cPanel hosting - specifically not considered suitable as the main hosting direction after moving to Node/SvelteKit
 
 Hosting/cost context
 
@@ -315,7 +315,7 @@ Consequences
 - This is a direction, not a requirement to implement multi-system support immediately.
 - The current repository may reasonably be 5e-first while leaving clear seams for system templates later.
 
-2.12 Earlier JSON-sheet / relational metadata model — historical decision with unresolved current status
+2.12 Earlier JSON-sheet / relational metadata model - historical decision with unresolved current status
 
 Earlier decision / proposal
 
@@ -504,9 +504,9 @@ Intended workflow/layout
 
 Keep a three-column workflow:
 
-1. Library — find existing content/definitions.
-2. Editor — create or edit the selected modifier/effect/etc.
-3. Attach/configure — attach an existing component to the relevant content and configure source-specific parameters.
+1. Library - find existing content/definitions.
+2. Editor - create or edit the selected modifier/effect/etc.
+3. Attach/configure - attach an existing component to the relevant content and configure source-specific parameters.
 
 Intended top-level tabs
 
@@ -553,7 +553,7 @@ Consequences
 - An item author should be able to add/edit all required categories without jumping through unrelated editor modes.
 - The content author needs enough context to see what each attachment will do, but not be buried in implementation detail.
 
-2.20 Effects catalogue and free data source question — not resolved
+2.20 Effects catalogue and free data source question - not resolved
 
 Problem
 
@@ -788,7 +788,7 @@ Consequences
 - Offline/PWA work should not be allowed to derail the core online product until needed.
 - Session logging may later intersect with version history and encounter rounds, but no final integration has been decided.
 
-2.32 Map drawing canvas with version history — exploratory, not committed
+2.32 Map drawing canvas with version history - exploratory, not committed
 
 Discussion
 
@@ -837,7 +837,7 @@ Consequence
 
 Do not reintroduce Drizzle or Supabase as though they are existing project dependencies unless the repo proves they are. A prior assistant recommendation is not a user decision.
 
-2.35 Fundamental system redesign conversation — separate, not the character-site’s immediate rules baseline
+2.35 Fundamental system redesign conversation - separate, not the character-site’s immediate rules baseline
 
 Context
 
@@ -908,7 +908,7 @@ There may still be useful distinctions such as creator/GM/player in the UI later
 
 A party is a grouping of characters within a campaign. Characters should be able to move into and out of a party.
 
-The user described the product as character-focused, with party support—not party-first.
+The user described the product as character-focused, with party support-not party-first.
 
 Likely conceptual relationships:
 
@@ -1553,7 +1553,7 @@ The known risk areas, not confirmed bugs, are:
 
 No single day-by-day implementation plan was formally finalised. The priorities below are reconstructed from the most recent and strongest design discussions, with the key caveat that the repository may already have completed some of them.
 
-Priority 1 — Inspect the existing rewrite state before proposing changes
+Priority 1 - Inspect the existing rewrite state before proposing changes
 
 The new assistant should first inspect:
 
@@ -1570,7 +1570,7 @@ The new assistant should first inspect:
 
 The user explicitly wants a handover because the new assistant will have direct codebase access. The assistant must not assume this document supersedes code on implementation facts.
 
-Priority 2 — Confirm the character-sheet storage boundary
+Priority 2 - Confirm the character-sheet storage boundary
 
 Before building much more domain functionality, establish and document:
 
@@ -1584,7 +1584,7 @@ This is the largest unresolved architecture decision and affects modifiers, acti
 
 The answer should be simple enough to maintain and free enough for homebrew. It should not be selected solely because it is fashionable.
 
-Priority 3 — Formalise the modifier/effect/action vocabulary
+Priority 3 - Formalise the modifier/effect/action vocabulary
 
 Build a short, explicit domain specification before implementing a massive effect catalogue:
 
@@ -1597,7 +1597,7 @@ Build a short, explicit domain specification before implementing a massive effec
 
 The purpose is to prevent a different bespoke model being invented for every content type.
 
-Priority 4 — Design item composition and spell grants properly
+Priority 4 - Design item composition and spell grants properly
 
 The next piece of the recent discussion was the item UI/data model.
 
@@ -1614,7 +1614,7 @@ Resolve item spell grant semantics before hard-coding an insufficient version.
 
 Decide definition-versus-instance handling if not already present, especially for charges and character-specific state.
 
-Priority 5 — Implement/validate the content-editor workflow
+Priority 5 - Implement/validate the content-editor workflow
 
 Implement or refine distinct content management interfaces:
 
@@ -1623,7 +1623,7 @@ Implement or refine distinct content management interfaces:
 
 Key goal: attach existing reusable components before duplicating new ones.
 
-Priority 6 — Establish character-facing sheet workflow
+Priority 6 - Establish character-facing sheet workflow
 
 Make the sheet work as a digital paper sheet:
 
@@ -1636,7 +1636,7 @@ Make the sheet work as a digital paper sheet:
 
 The UI should remain pleasant in actual tabletop use, not only administratively correct.
 
-Priority 7 — Implement autosave and full version history early enough to matter
+Priority 7 - Implement autosave and full version history early enough to matter
 
 Because the user values it strongly, version history should be built into ordinary save flows rather than bolted on after years of data have accumulated.
 
@@ -1649,7 +1649,7 @@ At a minimum:
 
 Resolve restoration/comparison progressively, but do not omit long-term retention.
 
-Priority 8 — Build encounters/rounds after effects have a sound model
+Priority 8 - Build encounters/rounds after effects have a sound model
 
 Implement:
 
@@ -1662,7 +1662,7 @@ Implement:
 
 Avoid building it before modifiers/effects/actions can represent the things it must process.
 
-Priority 9 — Add Level-Up Wizard and system templates as convenience, not enforcement
+Priority 9 - Add Level-Up Wizard and system templates as convenience, not enforcement
 
 Once the character/content model exists:
 
@@ -1672,7 +1672,7 @@ Once the character/content model exists:
 
 This should build on templates/system definitions rather than hard-coded page logic.
 
-Priority 10 — Future / later milestones
+Priority 10 - Future / later milestones
 
 After the core:
 

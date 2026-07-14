@@ -1,4 +1,4 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { shouldPlayerSeeMarker } from '../store.js';
 
 function canEditMarker(meta, marker) {
@@ -25,7 +25,7 @@ function handleMarkerEvent(meta, msg, context) {
       const input = msg.marker;
       if (!input || !input.id) return;
 
-      // Players can only ever place markers owned by themselves — the client
+      // Players can only ever place markers owned by themselves - the client
       // suggests ownerId but the server is authoritative, same trust
       // boundary as canEditToken. GM-placed markers have no owner.
       const ownerId = meta.role === 'gm' ? (input.ownerId ?? null) : meta.playerId;
@@ -73,7 +73,7 @@ function handleMarkerEvent(meta, msg, context) {
         const isOwner = marker.ownerId === recipient.playerId;
         if (isOwner) return null; // the owner could already see it either way
         // Non-owners are gaining or losing visibility of a marker they may
-        // never have received before — that's an add/remove, not an update.
+        // never have received before - that's an add/remove, not an update.
         return marker.visibleToAll
           ? { type: 'marker:add', marker }
           : { type: 'marker:remove', markerId: marker.id };

@@ -4,7 +4,7 @@ import { computeVisionRadii, isPointRevealed, renderVisionMaskedMap } from './re
 import { drawMovementRange } from './render/movement.js';
 import { drawMarkers } from './render/markers.js';
 
-// Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js — these
+// Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js - these
 // token:stat:update fields write directly onto the token, not into
 // token.stats (which is otherwise free-form combat stats).
 const TOKEN_LEVEL_STAT_FIELDS = new Set([
@@ -39,7 +39,7 @@ let playerId = null;
 let playerName = null;
 let sessionId = null;
 let session = null; // local mirror of the (already role-filtered) session state
-let dragState = null; // { tokenId, originX, originY, x, y } — visual ghost only, see canvas handlers
+let dragState = null; // { tokenId, originX, originY, x, y } - visual ghost only, see canvas handlers
 let currentRenderedTokens = []; // whichever token list render() last actually drew, for hit-testing
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
 
@@ -89,7 +89,7 @@ function connect(joinPayload) {
   ws.addEventListener('open', () => ws.send(JSON.stringify(joinPayload)));
   ws.addEventListener('message', (ev) => handleMessage(JSON.parse(ev.data)));
   ws.addEventListener('close', () => {
-    // Only auto-retry after a successful join — a bad room code shouldn't loop.
+    // Only auto-retry after a successful join - a bad room code shouldn't loop.
     if (session) setTimeout(() => connect(joinPayload), 1500);
   });
 }
@@ -224,7 +224,7 @@ document.getElementById('createRoomBtn').addEventListener('click', async () => {
     playerName = name;
     connect({ type: 'join', sessionId, role: 'gm', playerId: accountPlayerId, playerName: name });
   } catch {
-    loginError.textContent = 'Could not create room — is the server running?';
+    loginError.textContent = 'Could not create room - is the server running?';
   }
 });
 
@@ -278,7 +278,7 @@ function render() {
 
   // session.markers is already server-filtered to whatever this client is
   // allowed to see (own markers + anything the GM has toggled visible-to-all)
-  // — no client-side owner/vision gating needed, unlike tokens.
+  // - no client-side owner/vision gating needed, unlike tokens.
   const visibleMarkers = Object.values(session.markers || {});
 
   if (role === 'gm') {
@@ -356,7 +356,7 @@ function hitTestToken(x, y) {
 }
 
 // ---------------------------------------------------------------------------
-// Marker placement — "click the map to place your marker" mode, armed by the
+// Marker placement - "click the map to place your marker" mode, armed by the
 // Place on Map button in either sidebar (see wireGmSidebar/wirePlayerSidebar).
 // ---------------------------------------------------------------------------
 
@@ -378,7 +378,7 @@ function disarmMarkerPlacement() {
 document.getElementById('markerPlacementCancelBtn').addEventListener('click', disarmMarkerPlacement);
 
 // Clicking a token you can move drags the token; clicking empty space (or a
-// token you don't control) pans the map instead — same click-and-drag
+// token you don't control) pans the map instead - same click-and-drag
 // gesture, disambiguated by what's under the cursor.
 let panState = null; // { startClientX, startClientY, startScrollLeft, startScrollTop }
 
@@ -409,7 +409,7 @@ canvas.addEventListener('mousedown', (e) => {
   const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
 
   if (canDragToken) {
-    // originX/originY are the token's actual pre-drag position — that's the
+    // originX/originY are the token's actual pre-drag position - that's the
     // true distance the token will travel, not the (possibly off-center)
     // point clicked within its radius. x/y track the live cursor for the
     // ghost circle.
@@ -426,7 +426,7 @@ canvas.addEventListener('mousedown', (e) => {
 });
 
 // window-level (not canvas-level) so a fast drag that leaves the canvas
-// bounds — easy to do while panning a zoomed-out map — keeps tracking.
+// bounds - easy to do while panning a zoomed-out map - keeps tracking.
 window.addEventListener('mousemove', (e) => {
   if (dragState) {
     const { x, y } = canvasCoords(e);
@@ -445,7 +445,7 @@ window.addEventListener('mouseup', (e) => {
     const { tokenId } = dragState;
     send({ type: 'token:move', tokenId, x, y });
     // dragState itself is cleared once the server echoes the move back (see
-    // handleMessage's token:move case) — the token doesn't actually move on
+    // handleMessage's token:move case) - the token doesn't actually move on
     // screen until then, per the "server is the only writer" rule.
   }
   panState = null;
@@ -453,7 +453,7 @@ window.addEventListener('mouseup', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Zoom — pure CSS scale of the canvas (backing pixel buffer stays at the
+// Zoom - pure CSS scale of the canvas (backing pixel buffer stays at the
 // map's native size, see render()). canvasCoords() already derives its scale
 // factor from getBoundingClientRect(), so drag/hit-testing need no changes.
 // ---------------------------------------------------------------------------
@@ -489,7 +489,7 @@ document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(zo
 zoomResetBtn.addEventListener('click', () => setZoom(1));
 
 // Ctrl/Cmd+wheel to zoom (matches the Figma/Google Maps convention, and is
-// what trackpad pinch-to-zoom sends) — plain wheel still scrolls/pans.
+// what trackpad pinch-to-zoom sends) - plain wheel still scrolls/pans.
 mapWrap.addEventListener(
   'wheel',
   (e) => {
@@ -501,7 +501,7 @@ mapWrap.addEventListener(
 );
 
 // ---------------------------------------------------------------------------
-// Image upload (map + token art) — POST /upload, returns a URL to use
+// Image upload (map + token art) - POST /upload, returns a URL to use
 // ---------------------------------------------------------------------------
 
 async function uploadImage(file) {
@@ -514,7 +514,7 @@ async function uploadImage(file) {
 }
 
 // ---------------------------------------------------------------------------
-// Token image picker — browse the bundled art library (fetched once and
+// Token image picker - browse the bundled art library (fetched once and
 // filtered client-side; ~1400 entries is small enough for that) or upload a
 // custom image, same as before. Used both when adding a new token and when
 // changing an existing one's art, via the onSelect callback: the caller
@@ -583,13 +583,13 @@ function renderPickerResults() {
   const shown = matches.slice(0, PICKER_RESULT_LIMIT);
   pickerStatus.textContent =
     matches.length > shown.length
-      ? `Showing ${shown.length} of ${matches.length} matches — refine your search to narrow further.`
+      ? `Showing ${shown.length} of ${matches.length} matches - refine your search to narrow further.`
       : `${matches.length} match${matches.length === 1 ? '' : 'es'}`;
 
   pickerResults.innerHTML = shown
     .map((entry) => {
       const url = libraryImageUrl(entry);
-      const title = `${entry.friendlyName} — ${entry.source}`;
+      const title = `${entry.friendlyName} - ${entry.source}`;
       return `
         <div class="picker-item" data-url="${escapeHtml(url)}" title="${escapeHtml(title)}">
           <img src="${url}" loading="lazy" alt="${escapeHtml(entry.friendlyName)}" />
@@ -667,7 +667,7 @@ imagePickerModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Advanced Vision modal — normal/darkvision/truesight/devil's sight ranges,
+// Advanced Vision modal - normal/darkvision/truesight/devil's sight ranges,
 // pulled out of the token card itself since these are edited rarely.
 // ---------------------------------------------------------------------------
 
@@ -709,7 +709,7 @@ visionModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Movement quick-adjust — shared between the GM's card for any token and a
+// Movement quick-adjust - shared between the GM's card for any token and a
 // player's card for their own token (Section 3: same event, different sender).
 // ---------------------------------------------------------------------------
 
@@ -794,7 +794,7 @@ function gmSidebarHtml() {
         </select>
       </div>
       <div><label>Owner (for PCs)</label>
-        <select id="tokenOwnerSelect"><option value="">— none —</option>${ownerOptions}</select>
+        <select id="tokenOwnerSelect"><option value="">- none -</option>${ownerOptions}</select>
       </div>
     </div>
     <div class="field row">
@@ -848,7 +848,7 @@ function gmTokenListHtml() {
           </div>
           <div class="field"><label>Condition</label>
             <select class="conditionSelect">
-              <option value="" ${!t.condition ? 'selected' : ''}>—</option>
+              <option value="" ${!t.condition ? 'selected' : ''}>-</option>
               <option value="healthy" ${t.condition === 'healthy' ? 'selected' : ''}>Healthy</option>
               <option value="bloodied" ${t.condition === 'bloodied' ? 'selected' : ''}>Bloodied</option>
               <option value="critical" ${t.condition === 'critical' ? 'selected' : ''}>Critical</option>
@@ -876,7 +876,7 @@ function gmTokenListHtml() {
     .join('');
 }
 
-// Shared by both sidebars — session.markers is already server-filtered to
+// Shared by both sidebars - session.markers is already server-filtered to
 // whatever this client is allowed to see, so no client-side filtering here.
 // isGm controls whether the "visible to all" toggle shows (GM-only control)
 // and whether Remove shows for markers the viewer doesn't own.
@@ -1021,7 +1021,7 @@ function wireGmSidebar() {
       // on/off reading (it just reflects visionDarkFt > 0).
       send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
     } else if (e.target.classList.contains('speedInput')) {
-      // Editing base Speed resets remaining movement to match — it's the
+      // Editing base Speed resets remaining movement to match - it's the
       // "this creature now has a fresh X ft to work with" control; the
       // Remaining field and +/- buttons are for adjusting mid-turn.
       const value = Number(e.target.value) || 0;
@@ -1108,7 +1108,7 @@ function playerSidebarHtml() {
 }
 
 function ownTokenListHtml(tokens) {
-  if (!tokens.length) return '<p style="color:#666;font-size:12px;">You don\'t control any tokens yet — ask the GM to assign one.</p>';
+  if (!tokens.length) return '<p style="color:#666;font-size:12px;">You don\'t control any tokens yet - ask the GM to assign one.</p>';
   return tokens
     .map((t) => {
       const hp = t.stats?.hp ?? '';

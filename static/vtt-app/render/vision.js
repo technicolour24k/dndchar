@@ -3,9 +3,9 @@
 // = grayscale, beyond = black. `map.brightness` shifts the calculation:
 //   bright: color out to visionNormalFt, darkvision irrelevant, no gray band.
 //   dim:    everyone gets grayscale out to max(normal, dark), no color band.
-//   dark:   normal default — color/gray/black bands as above.
+//   dark:   normal default - color/gray/black bands as above.
 //
-// Truesight and devil's sight both mean "see clearly even in darkness" —
+// Truesight and devil's sight both mean "see clearly even in darkness" -
 // unlike darkvision they aren't degraded to grayscale by ambient darkness, so
 // they simply extend the full-color radius out to their own range regardless
 // of `brightness`. This POC doesn't model magical darkness/illusions/
@@ -63,7 +63,7 @@ export function isPointRevealed(x, y, radii) {
 // token's gray-band circle drawn first (grayscale map clipped to that
 // circle), then each token's color-band circle drawn on top (full-color map
 // clipped to the smaller circle). Doing this in two full passes across all
-// tokens — rather than per-token — is what makes multi-token union correct:
+// tokens - rather than per-token - is what makes multi-token union correct:
 // a pixel ends up in color if ANY token's color radius covers it, regardless
 // of draw order or overlap with another token's gray radius.
 export function renderVisionMaskedMap(ctx, mapImage, radii, map) {

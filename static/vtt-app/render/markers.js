@@ -1,4 +1,4 @@
-// Player/GM-placed AOE markers (spell templates etc). Circle-only for now —
+// Player/GM-placed AOE markers (spell templates etc). Circle-only for now -
 // shape is on the data already so cone/line/cube can be added as new
 // branches here later without touching the sync/visibility plumbing.
 export function drawMarkers(ctx, markers, gridSizePx) {

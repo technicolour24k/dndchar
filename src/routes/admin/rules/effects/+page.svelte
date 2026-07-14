@@ -120,7 +120,7 @@
       </div>
     </form>
 
-    <!-- Attached Modifiers — only when editing an existing effect -->
+    <!-- Attached Modifiers - only when editing an existing effect -->
     {#if editing}
       <div class="effect-modifiers-section">
         <div class="panel-head" style="margin-top:4px"><h3>Attached Modifiers</h3></div>

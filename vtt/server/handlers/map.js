@@ -1,4 +1,4 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 function handleMapEvent(meta, msg, context) {
   if (meta.role !== 'gm') return;
   const session = context.sessions.get(meta.sessionId);

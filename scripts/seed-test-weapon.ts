@@ -97,7 +97,7 @@ async function main() {
       [characterName]
     );
     if (!character.rowCount) {
-      throw new Error(`No character named "${characterName}" found — set TEST_CHARACTER_NAME to an existing character.`);
+      throw new Error(`No character named "${characterName}" found - set TEST_CHARACTER_NAME to an existing character.`);
     }
     const characterId = character.rows[0].id;
 

@@ -1,8 +1,8 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { filterSessionForRole } from '../store.js';
 
 // Handles `join` for both a brand-new join and a reconnect after a dropped
-// connection — same code path, full state resend, per spec Section 2.
+// connection - same code path, full state resend, per spec Section 2.
 function handleJoin(meta, msg, context) {
   const { sessions, socketsBySession } = context;
   const { sessionId, role, playerId, playerName } = msg;

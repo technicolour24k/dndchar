@@ -38,7 +38,7 @@
     remaining: character.resources.find((r) => r.key === `hit_dice_${i}`)?.currentValue ?? row.level
   })));
   const hitDiceDisplay = $derived(
-    classHitDice.map((c) => `${c.remaining}d${c.dieSize}`).join(' + ') || '—'
+    classHitDice.map((c) => `${c.remaining}d${c.dieSize}`).join(' + ') || '-'
   );
   const hitDiceRemainingTotal = $derived(classHitDice.reduce((s, c) => s + c.remaining, 0));
   let hitDiceCount = $state(1);
@@ -467,7 +467,7 @@
     const relevant = character.modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
       .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
 
-    // modifier-primacy.md §3.3 — count advantage/disadvantage sources per bucket (don't just
+    // modifier-primacy.md §3.3 - count advantage/disadvantage sources per bucket (don't just
     // detect presence), net them, and roll a 1+|net|-size d20 pool in the net's direction.
     const advantageSources = relevant.filter(({ entry }) => entry.modifierType === 'advantage').map(({ effect }) => effect);
     const disadvantageSources = relevant.filter(({ entry }) => entry.modifierType === 'disadvantage').map(({ effect }) => effect);
@@ -483,10 +483,10 @@
     const total = d20 + modifier + flat + extraTotal;
 
     // Source-attributed audit trail per modifier-primacy.md §2.6: name which effects granted
-    // advantage/disadvantage, show the net and pool size, and show every die actually rolled —
+    // advantage/disadvantage, show the net and pool size, and show every die actually rolled -
     // even when sources fully cancel, since "nothing changed" is itself worth showing why.
     const extras = extraDice.map((die) => `${die.label} ${die.expression} (${die.rolls.join(', ')})`).join(' + ');
-    // §2.6 audit trail — when the caller supplies a labeled breakdown of the flat modifier (e.g.
+    // §2.6 audit trail - when the caller supplies a labeled breakdown of the flat modifier (e.g.
     // Proficiency + ability mod), show its components instead of just the summed total.
     const breakdownText = modifierBreakdown.length ? ` (${modifierBreakdown.map((entry) => `${entry.label} ${entry.value}`).join(' + ')})` : '';
     const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${breakdownText}${extras ? ` + ${extras}` : ''} = ${total}`;
@@ -570,7 +570,7 @@
       ? ` + ${count > 1 ? `${count}×` : ''}CON (${conMod >= 0 ? '+' : ''}${conMod}${count > 1 ? ` = ${conTotal >= 0 ? '+' : ''}${conTotal}` : ''}) = ${rolled}`
       : ` = ${rolled}`;
     const passiveNote = hpHeadroom <= 0
-      ? `Already at full HP — hit ${count === 1 ? 'die' : 'dice'} spent.`
+      ? `Already at full HP - hit ${count === 1 ? 'die' : 'dice'} spent.`
       : `Recovered ${hpGained} HP (${hp.currentValue} → ${hp.currentValue + hpGained}).`;
     simpleRollResult = {
       title: 'Use Hit Dice',
@@ -584,7 +584,7 @@
     body.set('hpGained', String(hpGained));
     const response = await fetch('?/spendHitDice', { method: 'POST', body });
     if (!response.ok) {
-      simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) — refresh the page.` };
+      simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) - refresh the page.` };
       return;
     }
     await invalidateAll();
@@ -684,7 +684,7 @@
       }
     }
 
-    // modifier-primacy.md §2.1/§6.3 — a Container's own attached 'extra_die' Modifiers (e.g. its
+    // modifier-primacy.md §2.1/§6.3 - a Container's own attached 'extra_die' Modifiers (e.g. its
     // base weapon damage die, sourced from the Modifier system rather than the legacy flat
     // expression above) get their own attributed line, same as any other modifier-granted die.
     for (const die of extraDice) {
@@ -752,7 +752,7 @@
       item.category === 'weapon' ? 'attack_roll.melee_weapon' : '',
       item.category === 'weapon' ? `attack_roll.melee_weapon.${item.attackAbility}` : ''].filter(Boolean);
 
-    // Phase 1 (modifier-primacy.md §6.4) — resolve the triggering (to-hit) roll first.
+    // Phase 1 (modifier-primacy.md §6.4) - resolve the triggering (to-hit) roll first.
     const attackRoll = rollText(attackBonus, attackCandidates, attackBreakdown);
 
     // Phase 1 -> 2 handoff: turn the to-hit result into the named outcomes it satisfied, before
@@ -760,7 +760,7 @@
     const critThreshold = resolveCritThreshold(character.modifierSources, { ability: item.attackAbility, attackType: 'melee_weapon' });
     const outcomes = resolveD20Outcomes(attackRoll.natural, critThreshold);
 
-    // Phase 2 — resolve the dependent (damage) roll using the now-known outcome set.
+    // Phase 2 - resolve the dependent (damage) roll using the now-known outcome set.
     const damageCandidates = damageCandidatesFor(item);
     const damageContext = { classes: classRows, attackType: 'melee_weapon', ability: item.attackAbility, outcomes } as const;
     const extraDice = resolveExtraDiceRolls(character.modifierSources, damageCandidates, damageContext, rollDie);
@@ -768,7 +768,7 @@
 
     rollResult = {
       title: item.name || 'Battle Action',
-      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` — ${outcomes.join(', ')}` : ''}`,
+      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` - ${outcomes.join(', ')}` : ''}`,
       damage: damage.lines,
       effects: item.effects || item.notes || '-'
     };

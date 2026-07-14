@@ -1,13 +1,13 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 //
 // Indexes token art bundled under assets/images/tokens/ so the GM/players can
 // browse/search it in the token picker instead of only uploading custom art.
-// Each top-level folder in there is treated as its own "source" pack — e.g.
-// Forgotten_Adventures_Tokens/ — whose (prettified) folder name doubles as
+// Each top-level folder in there is treated as its own "source" pack - e.g.
+// Forgotten_Adventures_Tokens/ - whose (prettified) folder name doubles as
 // both the picker's source filter and credit to whoever made it. Kept
 // separate from the rest of assets/images/ (which holds unrelated one-off UI
-// icons) and outside static/ on purpose — these packs run into the hundreds
-// of MB, which shouldn't be baked into the production build — so it's served
+// icons) and outside static/ on purpose - these packs run into the hundreds
+// of MB, which shouldn't be baked into the production build - so it's served
 // at runtime the same way vtt-uploads is.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,7 +65,7 @@ function walk(dir, relativeSegments, source, category, entries) {
   }
 }
 
-// Lazily built once per process — this is a fixed set of bundled art, not
+// Lazily built once per process - this is a fixed set of bundled art, not
 // user content, so there's nothing to invalidate short of a restart.
 export function getTokenLibraryIndex() {
   if (cachedIndex) return cachedIndex;

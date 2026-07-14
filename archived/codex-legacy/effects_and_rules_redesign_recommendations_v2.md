@@ -1,4 +1,4 @@
-# Modifiers, Effects & Catalogue Content — Revised Recommended Model
+# Modifiers, Effects & Catalogue Content - Revised Recommended Model
 
 ## 1. Decision Summary
 
@@ -10,7 +10,7 @@ The better approach is:
 
 - Admins create and maintain **Modifiers** as reusable mechanical building blocks.
 - Admins create **Effects** when a group of modifiers needs a name, active state, duration, expiry, stacking behaviour, or other lifecycle context.
-- **Catalogue content** — Items, Equipment, Spells, Feats, Class Features, Subclass Features, and similar entries — stitches those building blocks together into player-facing rules.
+- **Catalogue content** - Items, Equipment, Spells, Feats, Class Features, Subclass Features, and similar entries - stitches those building blocks together into player-facing rules.
 - Catalogue content may attach a Modifier directly when the mechanic is a simple passive rule.
 - Items may also grant Features, Effects, Actions, and Spell Access.
 
@@ -25,7 +25,7 @@ Catalogue content is the finished cake.
 
 ## 2. Core Concepts
 
-### 2.1 Rule Hook — Advanced Engine Configuration
+### 2.1 Rule Hook - Advanced Engine Configuration
 
 A **Rule Hook** identifies the calculation or state that can be changed.
 
@@ -41,7 +41,7 @@ movement.walk
 
 Rule Hooks are engine-facing configuration. Normal admins should rarely create or edit them directly.
 
-### 2.2 Modifier — Reusable Atomic Mechanic
+### 2.2 Modifier - Reusable Atomic Mechanic
 
 A **Modifier** is one reusable mechanical instruction.
 
@@ -65,7 +65,7 @@ Strength Saving Throws → Advantage
 
 A Modifier normally points to one Rule Hook, one operation, and an optional default value.
 
-### 2.3 Effect — Named Active State
+### 2.3 Effect - Named Active State
 
 An **Effect** is a named bundle of one or more Modifiers that needs active-state context.
 
@@ -93,7 +93,7 @@ Aura of Terror
 Boots of Speed Active
 ```
 
-### 2.4 Action / Resolution — Immediate Event
+### 2.4 Action / Resolution - Immediate Event
 
 An **Action** resolves something immediately rather than changing an ongoing calculation.
 
@@ -111,7 +111,7 @@ Create a summoned creature
 
 Actions may apply or remove Effects, but they are not Effects themselves.
 
-### 2.5 Catalogue Content — Player-Facing Finished Entries
+### 2.5 Catalogue Content - Player-Facing Finished Entries
 
 **Catalogue Content** is the player-facing layer that assembles the rules.
 
@@ -294,7 +294,7 @@ Wand of Fireballs
 └── Granted Spell: Fireball
     ├── Access Type: Cast from this item
     ├── Availability: While held
-    ├── Cost: 1–3 item charges
+    ├── Cost: 1-3 item charges
     ├── Cast Level: Derived from charges spent
     ├── Save DC: Item-defined, 15
     └── Spell Attack Bonus: Item-defined, +7

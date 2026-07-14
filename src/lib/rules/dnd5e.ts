@@ -74,7 +74,7 @@ export type ModifierContext = {
   attackType?: 'melee_weapon' | 'ranged_weapon' | 'spell' | 'weapon';
   ability?: AbilityKey;
   flags?: string[];
-  // modifier-primacy.md §6.4 — named outcomes a prior triggering roll satisfied (e.g.
+  // modifier-primacy.md §6.4 - named outcomes a prior triggering roll satisfied (e.g.
   // 'critical_hit'), so a dependent roll's Modifiers can condition on "on:<outcome>". Open-ended:
   // any roll type can register its own outcome names without changing how conditions check them.
   outcomes?: string[];
@@ -114,11 +114,11 @@ export function barbarianRageDamageBonus(classes: CharacterClass[] = []): number
   return 0;
 }
 
-// modifier-primacy.md §2.1 — "Derived from a sibling": a value computed at resolution time from
+// modifier-primacy.md §2.1 - "Derived from a sibling": a value computed at resolution time from
 // another Modifier instance on the SAME Container, rather than from the character or a fixed
 // value. Encoded as `sibling:<transform>:<target>` so new transforms (e.g. 'current', 'half_max')
 // can be added later without changing how a sibling is referenced. A sibling reference never
-// resolves to another sibling reference — that disambiguates self when both share a target and
+// resolves to another sibling reference - that disambiguates self when both share a target and
 // keeps the mechanism single-hop (no chains) without depending on object identity to exclude self.
 const SIBLING_VALUE_PATTERN = /^sibling:(\w+):(.+)$/;
 
@@ -177,7 +177,7 @@ export function modifierConditionMatches(expression:string,context:ModifierConte
     if(part.startsWith('ability:'))return context.ability===part.slice(8);
     if(part.startsWith('attack:'))return context.attackType===part.slice(7);
     if(part.startsWith('flag:'))return (context.flags||[]).includes(part.slice(5));
-    // modifier-primacy.md §6.4 — "on:<outcome>" checks the named outcomes a prior triggering
+    // modifier-primacy.md §6.4 - "on:<outcome>" checks the named outcomes a prior triggering
     // roll produced (e.g. 'on:critical_hit'). Generic over any outcome name; new roll types
     // register new outcome strings without this predicate changing.
     if(part.startsWith('on:'))return (context.outcomes||[]).includes(part.slice(3));
@@ -185,8 +185,8 @@ export function modifierConditionMatches(expression:string,context:ModifierConte
   });
 }
 
-// modifier-primacy.md §6.4 — phase 1 of a two-phase roll: turn a resolved d20 into the named,
-// open-ended set of outcomes it satisfied. Not a crit-only boolean — any future roll type can
+// modifier-primacy.md §6.4 - phase 1 of a two-phase roll: turn a resolved d20 into the named,
+// open-ended set of outcomes it satisfied. Not a crit-only boolean - any future roll type can
 // compute its own outcome strings (e.g. 'beat_dc_by_5') and feed them through the same
 // `context.outcomes` / "on:<outcome>" condition-check plumbing without this function changing.
 export function resolveD20Outcomes(natural: number, critThreshold = 20): string[] {
@@ -208,7 +208,7 @@ export function resolveCritThreshold(effects: ActiveCharacterEffect[], context: 
 export type ExtraDieResult = { label: string; expression: string; rolls: number[]; value: number };
 
 // Shared by any roll that needs to resolve 'extra_die' Modifiers (Bless's 1d4, a weapon's own
-// base damage die, etc.) with condition-awareness — including outcome-gated conditions, so a
+// base damage die, etc.) with condition-awareness - including outcome-gated conditions, so a
 // Container's base damage die and an "on:critical_hit"-gated companion die both flow through
 // the same path.
 export function resolveExtraDiceRolls(
@@ -232,7 +232,7 @@ export function resolveExtraDiceRolls(
   );
 }
 
-// modifier-primacy.md §3.3 — advantage/disadvantage is a dice pool, not a binary state.
+// modifier-primacy.md §3.3 - advantage/disadvantage is a dice pool, not a binary state.
 // Net = advantage sources - disadvantage sources (within one bucket). Pool size = 1 + |net|;
 // canceled sources contribute nothing to the pool. Sign of net picks the take-highest /
 // take-lowest direction; net 0 is a true flat 1-die roll, not "normal" because nothing happened.
