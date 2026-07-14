@@ -135,6 +135,8 @@ export function filterTokenForPlayer(token) {
 
 **How to verify**: same steps as Section 3's hidden-token check, plus: set HP on an enemy token as GM, confirm the player's WS frames never carry a `stats` key for that token, only `condition` if one's been set.
 
+**🔁 Extension beyond spec (client-side, not protocol-level)**: PC tokens' `stats` are still sent over the wire unfiltered to all players (unchanged, matches the spec's "HP isn't secret between allies" stance) - but as of a later user request, the client itself now only *displays* a token's real HP bar/number if the viewer owns that token, falling back to the coarse `condition` badge for everything else regardless of type. This closes an inconsistency (players could see exact HP for other players' PCs but not enemies) without changing what the server actually sends - see the "Raw HP no longer shown for any non-owned token" changelog entry below.
+
 ---
 
 ## 6. File/Component Map
@@ -211,6 +213,7 @@ None of these were requested by the spec; all were added during implementation b
 - **Zoom & pan** (Section 4).
 - **Coarse `condition` badge** - the spec *suggested* this as a way to give players a non-numeric enemy-health signal (Section 5); it's actually built: a GM dropdown (`healthy`/`bloodied`/`critical`) rendered as a colored badge on the player's view of that token.
 - **Batch token spawning** - a "Quantity" field on the GM's Add Token form (default 1, max 50). Quantity 1 behaves exactly as before (bare name, no suffix); quantity > 1 sends one `token:add` per copy, auto-numbered `"Name 1"`, `"Name 2"`, etc., arranged in a grid centered on the map (spaced by `gridSizePx`) rather than stacked exactly on top of each other. No new event or server-side concept - purely a client-side loop over the existing `token:add`.
+- **Standard 5e status conditions** - `token.conditions` (a plural array - Poisoned, Prone, etc., can stack) alongside the pre-existing singular `token.condition` (the coarse healthy/bloodied/critical HP signal). Set via a checkbox modal, visible to all players for any token (not secret like HP), editable by the GM for any token or a player for their own.
 
 ---
 
@@ -432,3 +435,27 @@ User request: a visual affordance for the GM to tell at a glance which tokens on
 Added `HIDDEN_TOKEN_OPACITY = 0.5` in `render/tokens.js`; `drawTokens()` now sets `ctx.globalAlpha` per-token before drawing (image/fill, border, name label, HP bar/condition badge all affected uniformly, wrapped in an outer save/restore around the existing per-token drawing so it doesn't leak into the next token's alpha). No role-branching needed - hidden tokens never reach a player's client at all (`filterSessionForRole` strips them entirely), so this function only ever sees `hidden: true` tokens when called from the GM's own render path.
 
 Verified visually via headless browser: a hidden enemy token renders clearly faded (muted color, dimmer name label) next to a normal, fully-opaque enemy token of the same type.
+
+### 2026-07-14 - Raw HP no longer shown for any non-owned token, not just enemy/npc
+Follow-up to a user report while testing the vision fix: "Other tokens in view" was showing exact HP numbers (e.g. "HP 1000/1000") for other players' PC tokens. This was working as originally spec'd - the POC spec's Section 3 explicitly says "HP isn't secret info in most games" for PC-to-PC visibility, so the server never strips PC stats the way it strips enemy/npc stats - but the user decided they'd rather not show raw HP for anything that isn't the viewer's own token, PC or otherwise, and simplify to one consistent rule.
+
+This is a client-side display change, not a protocol/security one - the server still sends real PC stats to all players (unchanged, still matches the spec's data model), the client just chooses not to display them for tokens it doesn't own. Two places needed the same treatment:
+- `otherTokenListHtml()` in `main.js` - dropped the `hasStats` branch entirely, now always shows `condition` (if the GM has set one) or "No status known," regardless of token type.
+- `drawTokens()` in `render/tokens.js` - gained a `viewerId` parameter (`null` for the GM, meaning "show every token's real bar"; the viewing player's own id otherwise). The on-canvas HP bar now only renders for a token if `viewerId === null || token.ownerId === viewerId`; everything else falls back to the condition badge, same rule as the sidebar list. Both `render()` call sites updated (`null` for the GM branch, `playerId` for the player branch).
+
+Verified via headless browser with two separate players (Alice, Bob) each owning their own PC token: Alice's sidebar list shows "No status known" for Bob's token (previously would have shown his exact HP), and Alice's canvas shows a real HP bar over her own token but none over Bob's; the GM's canvas still shows real bars for both, confirming the GM's view is unaffected.
+
+### 2026-07-14 - Standard 5e status conditions (Poisoned, Prone, etc.)
+User request: a way to track the standard 5e status conditions on tokens, via a modal with checkboxes.
+
+Added as a genuinely new field, not an extension of the existing one - `token.conditions` (a plural array, e.g. `['poisoned', 'prone']`) is entirely separate from the pre-existing singular `token.condition` (the GM's coarse "healthy"/"bloodied"/"critical" HP-severity signal). The two serve different purposes and have different cardinality: conditions genuinely stack in 5e (a creature can be both Poisoned and Prone at once), while the health signal is a single mutually-exclusive value. Conflating them would have broken the single-select health dropdown the moment two conditions were needed simultaneously.
+
+Visibility: conditions are treated as observable battlefield state, not secret like HP - `filterTokenForPlayer` already only strips `stats` from enemy/npc tokens (confirmed by reading `vtt/server/store.js`), so the new field passes through unfiltered for every token type with no server-side change needed. Editing follows the existing ownership rule: `conditions` was added to `PLAYER_EDITABLE_FIELDS` in `vtt/server/handlers/token.js` (a player can toggle conditions on their own token - "I just got poisoned by a trap" is the same self-service pattern as tracking their own HP) and to `TOKEN_LEVEL_STAT_FIELDS` in both the server and client (a top-level token field, not nested under the free-form `stats` bucket).
+
+Client: a new `conditionsModal` (`static/vtt-app/index.html`) with checkboxes for the 14 standard 5e conditions (Blinded, Charmed, Deafened, Exhaustion, Frightened, Grappled, Incapacitated, Invisible, Paralyzed, Petrified, Poisoned, Prone, Restrained, Stunned, Unconscious - hardcoded list, not configurable, matching POC scope), generated dynamically rather than hand-written per checkbox. A "Conditions…" button was added to both the GM's token card (any token) and a player's own token card (their own only), opening the same modal; saving sends one `token:stat:update` with the full checked array. A small `conditionTagsHtml()` helper renders the active list as read-only tags, reused in the GM card, the player's own card, and the "Other tokens in view" list (all three contexts, since none of them are secret).
+
+Canvas: `drawTokens()` in `render/tokens.js` gained `drawConditionsRow()` - a compact row of 3-letter abbreviations (e.g. "POI PRO") drawn above the token, positioned above the HP bar/health-condition badge so it can coexist with either.
+
+Verified via headless browser: GM sets Poisoned + Prone on a hidden-stats enemy token, confirms both tags show on the GM's card and the canvas renders "POI PRO"; confirms a player (whose session never receives that enemy's `stats`) still sees "Poisoned Prone" in their "Other tokens in view" list, proving the new field isn't accidentally being stripped alongside `stats`; confirms a player can independently set a condition on their own token via the same modal.
+
+Known limitation, noted rather than addressed: Exhaustion is 5e's one condition with levels (1-6) rather than being binary - it's tracked here as a simple on/off checkbox like the other 13, not a level counter. Fine for the POC; revisit if exhaustion tracking in practice needs the granularity.

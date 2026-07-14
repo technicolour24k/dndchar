@@ -16,6 +16,7 @@ function canEditToken(meta, token) {
 // is what +/- and Reset actually adjust during play).
 const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'condition',
+  'conditions',
   'imageUrl',
   'visionNormalFt',
   'visionDarkFt',
@@ -53,7 +54,12 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
 // fields the resync poller never touches, since both are VTT-session-
 // authoritative once pulled (current combat HP, spent slots) and a poll
 // landing mid-session shouldn't silently overwrite them with the sheet's
-// at-rest values.
+// at-rest values. conditions (the standard 5e status-effect array - Poisoned,
+// Prone, etc.) is included since these are observable battlefield state, not
+// secret like HP - a player marking their own token Poisoned after failing a
+// save is the same self-service pattern as self-tracking HP, distinct from
+// the singular `condition` field above (the GM's coarse health-severity
+// signal), which stays GM-only regardless of ownership.
 const PLAYER_EDITABLE_FIELDS = new Set([
   'hp',
   'maxHp',
@@ -65,6 +71,7 @@ const PLAYER_EDITABLE_FIELDS = new Set([
   'saves',
   'actions',
   'preparedSpells',
+  'conditions',
   'x',
   'y',
   'spellSlots',

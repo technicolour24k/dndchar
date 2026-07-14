@@ -12,7 +12,14 @@ function colorForType(type) {
 // cue for "this one's hidden," at a glance, without opening its card.
 const HIDDEN_TOKEN_OPACITY = 0.5;
 
-export function drawTokens(ctx, tokens, gridSizePx, getImage) {
+// viewerId is null for the GM (always sees every token's real HP bar) or the
+// viewing player's own id (sees a real bar only for tokens they own - other
+// tokens fall back to the coarse condition badge, or nothing, same rule
+// already applied to enemy/npc stats now applied uniformly regardless of
+// type). PC stats aren't stripped server-side - allies' HP isn't secret at
+// the protocol level, per the original spec - so this is a client-side
+// display choice layered on top of that, not a security boundary.
+export function drawTokens(ctx, tokens, gridSizePx, getImage, viewerId = null) {
   const radius = gridSizePx * 0.4;
 
   for (const token of tokens) {
@@ -49,11 +56,18 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage) {
     ctx.strokeText(token.name || '', token.x, token.y + radius + 14);
     ctx.fillText(token.name || '', token.x, token.y + radius + 14);
 
-    if (token.stats && typeof token.stats.hp === 'number' && typeof token.stats.maxHp === 'number') {
+    const canSeeRealHp = viewerId === null || token.ownerId === viewerId;
+    if (canSeeRealHp && token.stats && typeof token.stats.hp === 'number' && typeof token.stats.maxHp === 'number') {
       drawHpBar(ctx, token, radius);
     } else if (token.condition) {
       drawConditionBadge(ctx, token, radius);
     }
+
+    // Standard 5e status conditions (Poisoned, Prone, etc.) - a separate,
+    // observable-to-everyone signal from the coarse health condition above,
+    // so drawn independently and can appear alongside either the HP bar or
+    // the health-condition badge.
+    drawConditionsRow(ctx, token, radius);
 
     ctx.restore();
   }
@@ -84,4 +98,21 @@ function drawConditionBadge(ctx, token, radius) {
   ctx.strokeStyle = '#000';
   ctx.lineWidth = 1;
   ctx.stroke();
+}
+
+// A compact abbreviated row above the token (3-letter codes, e.g. "POI PRO")
+// - full names are readable in the token card/sidebar; the canvas just needs
+// an at-a-glance "something's active" cue given how little space there is at
+// typical token sizes.
+function drawConditionsRow(ctx, token, radius) {
+  if (!token.conditions || !token.conditions.length) return;
+  const label = token.conditions.map((c) => c.slice(0, 3).toUpperCase()).join(' ');
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffca28';
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 3;
+  const y = token.y - radius - 18;
+  ctx.strokeText(label, token.x, y);
+  ctx.fillText(label, token.x, y);
 }

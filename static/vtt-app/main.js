@@ -11,6 +11,7 @@ import { getTokensInShape } from './render/shapeGeometry.js';
 // token.stats (which is otherwise free-form combat stats).
 const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'condition',
+  'conditions',
   'imageUrl',
   'visionNormalFt',
   'visionDarkFt',
@@ -335,7 +336,7 @@ function render() {
     drawMap(ctx, mapImage, map);
     if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
-    drawTokens(ctx, allTokens, map.gridSizePx, getImage);
+    drawTokens(ctx, allTokens, map.gridSizePx, getImage, null);
     drawTargetRings(ctx, currentTargetTokenIds, allTokens, map.gridSizePx);
     currentRenderedTokens = allTokens;
   } else {
@@ -348,7 +349,7 @@ function render() {
     // information a player shouldn't see, same trust boundary as HP.
     drawMovementRange(ctx, ownedTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
-    drawTokens(ctx, visibleTokens, map.gridSizePx, getImage);
+    drawTokens(ctx, visibleTokens, map.gridSizePx, getImage, playerId);
     drawTargetRings(ctx, currentTargetTokenIds, visibleTokens, map.gridSizePx);
     currentRenderedTokens = visibleTokens;
   }
@@ -1045,6 +1046,60 @@ visionModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Conditions modal - standard 5e status conditions (Poisoned, Prone, etc.),
+// a multi-select array (token.conditions) distinct from the existing single-
+// value token.condition ("healthy"/"bloodied"/"critical" - the coarse HP
+// signal). Conditions are visible battlefield state, not secret like HP, so
+// they aren't stripped from enemy/npc tokens the way stats are - anyone who
+// can see a token can see what conditions are on it. Editing follows the
+// same ownership rule as everything else: GM can edit any token's, a player
+// only their own (see PLAYER_EDITABLE_FIELDS in vtt/server/handlers/token.js).
+// ---------------------------------------------------------------------------
+
+const STANDARD_CONDITIONS = [
+  'blinded', 'charmed', 'deafened', 'exhaustion', 'frightened', 'grappled',
+  'incapacitated', 'invisible', 'paralyzed', 'petrified', 'poisoned', 'prone',
+  'restrained', 'stunned', 'unconscious',
+];
+
+const conditionsModal = document.getElementById('conditionsModal');
+const conditionsModalList = document.getElementById('conditionsModalList');
+let conditionsModalTokenId = null;
+
+function openConditionsModal(tokenId) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  conditionsModalTokenId = tokenId;
+  const active = new Set(token.conditions || []);
+  conditionsModalList.innerHTML = STANDARD_CONDITIONS.map((key) => `
+    <div class="field">
+      <label>
+        <input type="checkbox" class="conditionCheckbox" value="${key}" ${active.has(key) ? 'checked' : ''} />
+        ${key.charAt(0).toUpperCase()}${key.slice(1)}
+      </label>
+    </div>
+  `).join('');
+  conditionsModal.classList.add('visible');
+}
+
+function closeConditionsModal() {
+  conditionsModal.classList.remove('visible');
+  conditionsModalTokenId = null;
+}
+
+document.getElementById('conditionsModalCancel').addEventListener('click', closeConditionsModal);
+document.getElementById('conditionsModalSave').addEventListener('click', () => {
+  if (!conditionsModalTokenId) return;
+  const tokenId = conditionsModalTokenId;
+  const value = [...conditionsModalList.querySelectorAll('.conditionCheckbox:checked')].map((el) => el.value);
+  send({ type: 'token:stat:update', tokenId, stat: 'conditions', value });
+  closeConditionsModal();
+});
+conditionsModal.addEventListener('click', (e) => {
+  if (e.target === conditionsModal) closeConditionsModal();
+});
+
+// ---------------------------------------------------------------------------
 // Movement quick-adjust - shared between the GM's card for any token and a
 // player's card for their own token (Section 3: same event, different sender).
 // ---------------------------------------------------------------------------
@@ -1262,9 +1317,11 @@ function gmTokenListHtml() {
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
           </div>
+          <div class="field">${conditionTagsHtml(t.conditions)}</div>
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
             <button class="secondary advancedVisionBtn">Advanced Vision…</button>
+            <button class="secondary conditionsBtn">Conditions…</button>
             <button class="secondary toggleHiddenBtn">${t.hidden ? 'Unhide' : 'Hide'}</button>
             <button class="danger removeBtn">Remove</button>
           </div>
@@ -1282,6 +1339,15 @@ function markerSizeLabel(marker) {
   if (marker.shape === 'cone') return `${marker.lengthFt}ft cone`;
   if (marker.shape === 'cube') return `${marker.lengthFt}x${marker.widthFt}ft`;
   return `${marker.radiusFt} ft`;
+}
+
+// Small read-only tag row for a token card - shows which standard conditions
+// are currently active (set via the Conditions… modal). Not secret info
+// (unlike stats), so this same markup is safe to use in both the GM's and a
+// player's own token card.
+function conditionTagsHtml(conditions) {
+  if (!conditions || !conditions.length) return '<span style="color:#666;font-size:12px;">No conditions</span>';
+  return conditions.map((c) => `<span class="tag">${escapeHtml(c.charAt(0).toUpperCase() + c.slice(1))}</span>`).join(' ');
 }
 
 function markerListHtml(isGm) {
@@ -1472,6 +1538,8 @@ function wireGmSidebar() {
       if (confirm('Remove this token?')) send({ type: 'token:remove', tokenId });
     } else if (e.target.classList.contains('advancedVisionBtn')) {
       openVisionModal(tokenId);
+    } else if (e.target.classList.contains('conditionsBtn')) {
+      openConditionsModal(tokenId);
     } else if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
     } else if (e.target.classList.contains('speedMinusBtn')) {
@@ -1556,8 +1624,10 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
           </div>
+          <div class="field">${conditionTagsHtml(t.conditions)}</div>
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
+            <button class="secondary conditionsBtn">Conditions…</button>
           </div>
           ${miniSheetHtml(t)}
         </div>
@@ -1635,16 +1705,18 @@ function otherTokenListHtml(tokens) {
   if (!tokens.length) return '<p style="color:#666;font-size:12px;">None visible right now.</p>';
   return tokens
     .map((t) => {
-      const hasStats = t.stats && typeof t.stats.hp === 'number';
-      const detail = hasStats
-        ? `HP ${t.stats.hp}/${t.stats.maxHp}`
-        : t.condition
-          ? `Condition: ${escapeHtml(t.condition)}`
-          : 'No status known';
+      // Never show a raw HP number for a token that isn't the viewer's own -
+      // condition (if the GM has set one) or nothing, same rule already
+      // applied to enemy/npc, now applied uniformly regardless of type. PC
+      // stats aren't stripped server-side (allies' HP isn't secret at the
+      // protocol level, per the original spec), so this is a client-side
+      // display choice on top of that, not a security boundary.
+      const detail = t.condition ? `Condition: ${escapeHtml(t.condition)}` : 'No status known';
       return `
         <div class="token-card">
           <div class="title"><span>${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>
           <div style="font-size:12px;color:#aaa;">${detail}</div>
+          ${t.conditions && t.conditions.length ? `<div class="field">${conditionTagsHtml(t.conditions)}</div>` : ''}
         </div>
       `;
     })
@@ -1678,6 +1750,8 @@ function wirePlayerSidebar() {
     const tokenId = card.dataset.tokenId;
     if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
+    } else if (e.target.classList.contains('conditionsBtn')) {
+      openConditionsModal(tokenId);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {
