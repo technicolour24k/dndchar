@@ -939,14 +939,21 @@ characterPickerList.addEventListener('click', async (e) => {
 // Character resync polling - re-pulls each owned token's source character
 // periodically and pushes any changed reference fields through the existing
 // token:stat:update event, so leveling up / re-equipping mid-session doesn't
-// require removing and re-adding the token. Deliberately narrower than "sync
-// everything": hp and spellSlots stay VTT-session-authoritative once pulled
-// (the whole point of tracking them live during play) - a poll landing
-// mid-fight must not silently overwrite in-progress damage or spent slots
-// with the sheet's at-rest values. This is the interim, self-contained
-// version; a real push-based system (sheet save -> VTT) is the longer-term
-// direction once there's a real realtime layer to hang it on (see the
-// current-state doc's Known Fragility notes).
+// require removing and re-adding the token. Only syncs fields with NO
+// editable control anywhere in the VTT session (ac, saves, actions,
+// preparedSpells) - not just hp/spellSlots as originally scoped. The first
+// version also synced speedFt/vision*/maxHp, which are each editable by the
+// GM or player during a session (the Speed field, the Darkvision checkbox,
+// the Advanced Vision modal, Max HP) - a poll landing after a GM manually
+// granted a player temporary darkvision (a spell, a potion) would silently
+// revert it back to the sheet's baseline on the very next tick, which is
+// exactly the "reverts to unchecked and 0" bug this was found from. The
+// dividing line is simple: if a human can edit it in the VTT, the poll must
+// never touch it - only genuinely read-only-in-VTT reference data is safe to
+// auto-sync. This is the interim, self-contained version; a real push-based
+// system (sheet save -> VTT) is the longer-term direction once there's a
+// real realtime layer to hang it on (see the current-state doc's Known
+// Fragility notes).
 // ---------------------------------------------------------------------------
 
 const CHARACTER_SYNC_INTERVAL_MS = 30000;
@@ -974,13 +981,11 @@ async function syncOwnedCharacterTokens() {
 }
 
 function applyCharacterSyncFields(token, snapshot) {
+  // hp, maxHp, speedFt, and all four vision fields are deliberately excluded -
+  // each has an editable control somewhere in the VTT (HP/Max HP/Speed
+  // inputs, the Darkvision checkbox, the Advanced Vision modal) and must stay
+  // session-authoritative once set, the same way hp/spellSlots already are.
   const updates = {
-    maxHp: snapshot.maxHp,
-    speedFt: snapshot.speedFt,
-    visionNormalFt: snapshot.vision.normalFt,
-    visionDarkFt: snapshot.vision.darkFt,
-    visionTrueFt: snapshot.vision.trueFt,
-    visionDevilFt: snapshot.vision.devilFt,
     ac: snapshot.ac,
     saves: snapshot.saves,
     actions: snapshot.actions,

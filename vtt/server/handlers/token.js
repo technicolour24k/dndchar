@@ -61,8 +61,6 @@ const PLAYER_EDITABLE_FIELDS = new Set([
   'speedRemainingFt',
   'visionNormalFt',
   'visionDarkFt',
-  'visionTrueFt',
-  'visionDevilFt',
   'ac',
   'saves',
   'actions',

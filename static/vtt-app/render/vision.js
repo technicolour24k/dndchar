@@ -1,9 +1,17 @@
 // Radius-based per-token vision, no wall/line-of-sight geometry (spec Section 4).
 // Bands, in feet-from-token: 0..visionNormalFt = full color, that..visionDarkFt
-// = grayscale, beyond = black. `map.brightness` shifts the calculation:
+// = grayscale, beyond = black. `map.brightness` shifts the calculation, per 5e
+// RAW's darkvision text: "you can see in dim light within [range] as if it
+// were bright light, and in darkness as if it were dim light. You can't
+// discern color in darkness, only shades of gray."
 //   bright: color out to visionNormalFt, darkvision irrelevant, no gray band.
-//   dim:    everyone gets grayscale out to max(normal, dark), no color band.
-//   dark:   normal default - color/gray/black bands as above.
+//   dim:    darkvision sees dim light AS bright light - full color out to
+//           visionDarkFt for tokens that have it. Tokens without darkvision
+//           still get grayscale out to visionNormalFt (a POC simplification
+//           of "lightly obscured" rather than true blindness/disadvantage).
+//   dark:   normal default - color/gray/black bands as above. Darkvision
+//           never restores color in true darkness (RAW is explicit on this),
+//           only grayscale out to visionDarkFt.
 //
 // Truesight and devil's sight both mean "see clearly even in darkness" -
 // unlike darkvision they aren't degraded to grayscale by ambient darkness, so
@@ -20,9 +28,11 @@ export function getTokenVisionRadii(token, brightness, pxPerFoot) {
   let grayRadius;
 
   if (brightness === 'dim') {
-    const maxFt = Math.max(normalFt, darkFt);
-    colorRadius = 0;
-    grayRadius = maxFt * pxPerFoot;
+    // Darkvision treats dim light as bright light, so it gets full color out
+    // to its own range (0 if the token has none) - not just grayscale like
+    // the original POC simplification had it.
+    colorRadius = darkFt * pxPerFoot;
+    grayRadius = Math.max(normalFt, darkFt) * pxPerFoot;
   } else if (brightness === 'bright') {
     colorRadius = normalFt * pxPerFoot;
     grayRadius = colorRadius;
