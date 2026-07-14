@@ -52,6 +52,7 @@ let currentRenderedTokens = []; // whichever token list render() last actually d
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
 let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
 let shapeDrag = null; // { config, originX, originY, currentX, currentY } while dragging a cone/cube's direction+length
+let showMovementRanges = true; // GM-only declutter toggle - purely a local view preference, not synced to session
 
 const imageCache = new Map();
 
@@ -332,7 +333,7 @@ function render() {
 
   if (role === 'gm') {
     drawMap(ctx, mapImage, map);
-    drawMovementRange(ctx, allTokens, map.gridSizePx);
+    if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage);
     drawTargetRings(ctx, currentTargetTokenIds, allTokens, map.gridSizePx);
@@ -342,7 +343,10 @@ function render() {
     const radii = computeVisionRadii(ownedTokens, map);
     renderVisionMaskedMap(ctx, mapImage, radii, map);
     const visibleTokens = allTokens.filter((t) => isPointRevealed(t.x, t.y, radii));
-    drawMovementRange(ctx, visibleTokens, map.gridSizePx);
+    // Only the player's own tokens' remaining-movement circle is shown - how
+    // far an enemy or another player's token can still move is tactical
+    // information a player shouldn't see, same trust boundary as HP.
+    drawMovementRange(ctx, ownedTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, visibleTokens, map.gridSizePx, getImage);
     drawTargetRings(ctx, currentTargetTokenIds, visibleTokens, map.gridSizePx);
@@ -1120,7 +1124,10 @@ function gmSidebarHtml() {
     <button id="setMapBtn">Set map</button>
 
     <h2>Add token</h2>
-    <div class="field"><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
+    <div class="field row">
+      <div><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
+      <div><label>Quantity</label><input type="number" id="tokenQuantityInput" value="1" min="1" max="50" /></div>
+    </div>
     <div class="field row">
       <div><label>Type</label>
         <select id="tokenTypeSelect">
@@ -1150,6 +1157,7 @@ function gmSidebarHtml() {
     <button id="addTokenBtn">Add token</button>
 
     <h2>Tokens</h2>
+    <div class="field"><label><input type="checkbox" id="showMovementRangesToggle" ${showMovementRanges ? 'checked' : ''} /> Show movement ranges</label></div>
     <div id="tokenList">${gmTokenListHtml()}</div>
 
     ${markerFormHtml()}
@@ -1305,6 +1313,11 @@ function markerListHtml(isGm) {
 }
 
 function wireGmSidebar() {
+  document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
+    showMovementRanges = e.target.checked;
+    render(); // a view preference only - doesn't touch session state, no renderSidebar() needed
+  });
+
   const mapFileInput = document.getElementById('mapFileInput');
   const mapImageUrlInput = document.getElementById('mapImageUrlInput');
   const mapWidthInput = document.getElementById('mapWidthInput');
@@ -1377,14 +1390,11 @@ function wireGmSidebar() {
   document.getElementById('addTokenBtn').addEventListener('click', () => {
     const name = document.getElementById('tokenNameInput').value.trim();
     if (!name) return alert('Give the token a name.');
+    const quantity = Math.max(1, Math.min(50, Number(document.getElementById('tokenQuantityInput').value) || 1));
     const map = session.map || { widthPx: 800, heightPx: 600 };
-    const token = {
-      id: `token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      name,
+    const baseToken = {
       type: document.getElementById('tokenTypeSelect').value,
       ownerId: document.getElementById('tokenOwnerSelect').value || null,
-      x: Math.round(map.widthPx / 2),
-      y: Math.round(map.heightPx / 2),
       imageUrl: tokenImageUrlInput.value.trim() || null,
       visionNormalFt: Number(document.getElementById('tokenVisionNormalInput').value) || 0,
       visionDarkFt: Number(document.getElementById('tokenVisionDarkInput').value) || 0,
@@ -1398,7 +1408,31 @@ function wireGmSidebar() {
         maxHp: Number(document.getElementById('tokenMaxHpInput').value) || 0,
       },
     };
-    send({ type: 'token:add', token });
+
+    // Quantity > 1 spawns a small grid of tokens centered on the map, named
+    // "Name 1", "Name 2", etc., rather than stacking them all on the exact
+    // same square - each still just a separate token:add, no new event or
+    // server-side concept needed. Quantity 1 keeps the original bare name
+    // (no " 1" suffix) so existing single-token behavior is unchanged.
+    const spacingPx = map.gridSizePx || 50;
+    const perRow = Math.ceil(Math.sqrt(quantity));
+    const rows = Math.ceil(quantity / perRow);
+    for (let i = 0; i < quantity; i++) {
+      const col = i % perRow;
+      const row = Math.floor(i / perRow);
+      const offsetX = (col - (perRow - 1) / 2) * spacingPx;
+      const offsetY = (row - (rows - 1) / 2) * spacingPx;
+      send({
+        type: 'token:add',
+        token: {
+          ...baseToken,
+          id: `token-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+          name: quantity > 1 ? `${name} ${i + 1}` : name,
+          x: Math.round(map.widthPx / 2 + offsetX),
+          y: Math.round(map.heightPx / 2 + offsetY),
+        },
+      });
+    }
   });
 
   document.getElementById('tokenList').addEventListener('change', (e) => {

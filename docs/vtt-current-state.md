@@ -204,12 +204,13 @@ assets/images/tokens/Forgotten_Adventures_Tokens/   1,436 bundled token images (
 None of these were requested by the spec; all were added during implementation because they made the POC materially more usable for actually running a session.
 
 - **Marker/AoE placement** (`marker:add/remove/visibility:toggle`) - players and GM can drop circular markers (spell templates, points of interest) on the map, private to owner+GM by default with a GM togglable "visible to all." New session collection (`markers`), own filter logic (`shouldPlayerSeeMarker`) mirroring the token-hiding pattern.
-- **Movement range visualization** - `speedFt`/`speedRemainingFt` fields, `+5/-5/Reset` sidebar controls, a translucent remaining-movement radius (`render/movement.js`), and a live drag-distance readout that turns red when a drag exceeds the token's remaining budget.
+- **Movement range visualization** - `speedFt`/`speedRemainingFt` fields, `+5/-5/Reset` sidebar controls, a translucent remaining-movement radius (`render/movement.js`), and a live drag-distance readout that turns red when a drag exceeds the token's remaining budget. Players only ever see this circle for their *own* tokens (fixed - see changelog); the GM has a "Show movement ranges" toggle to declutter their own view of all tokens' circles at once.
 - **Forgotten Adventures token library** - 1,436 bundled token images, indexed and served via `GET /vtt/api/token-library`, browsable in an in-app picker (filter by source/category/free text).
 - **Image upload pipeline** for both map and token art (`POST /vtt/api/upload`, writes to gitignored `data/vtt-uploads/`, extension/size/mimetype validated, served back with path-traversal protection). Spec explicitly said a hardcoded static URL would be fine and called upload pipelines out of scope - this went beyond that because typing raw URLs turned out to be annoying in practice. Pasting a URL directly still works as a fallback.
 - **Truesight / devil's sight vision bands** (Section 4).
 - **Zoom & pan** (Section 4).
 - **Coarse `condition` badge** - the spec *suggested* this as a way to give players a non-numeric enemy-health signal (Section 5); it's actually built: a GM dropdown (`healthy`/`bloodied`/`critical`) rendered as a colored badge on the player's view of that token.
+- **Batch token spawning** - a "Quantity" field on the GM's Add Token form (default 1, max 50). Quantity 1 behaves exactly as before (bare name, no suffix); quantity > 1 sends one `token:add` per copy, auto-numbered `"Name 1"`, `"Name 2"`, etc., arranged in a grid centered on the map (spaced by `gridSizePx`) rather than stacked exactly on top of each other. No new event or server-side concept - purely a client-side loop over the existing `token:add`.
 
 ---
 
@@ -410,3 +411,24 @@ Follow-up to the same conversation as the dim/dark fix above. User observation: 
 Added a `BRIGHT_LIGHT_RADIUS_FT = 150` constant in `render/vision.js`; `bright` mode's `colorRadius` is now `Math.max(normalFt, 150) * pxPerFoot` instead of just `normalFt * pxPerFoot` - a floor, not a replacement, so a token with an unusually large `visionNormalFt` (e.g. from a future homebrew effect) still gets its own larger value rather than being clamped down to 150. `dim` and `dark` are untouched - the token-specific radius is still the meaningful constraint in both, which is exactly where vision *should* matter. Verified via a direct unit-level check (`getTokenVisionRadii` returns 1500px/150ft for a standard 30ft-normal-vision token in bright light, confirmed the 150ft floor doesn't clamp down a token whose own `visionNormalFt` already exceeds it, and confirmed `dim`/`dark` results are unchanged).
 
 150ft is a flat, un-derived number - picked as "large enough to feel like daylight, small enough to still be a number" rather than computed from any rule. Worth revisiting if actual play shows it's too small (very large outdoor maps) or unnecessary (if fog-of-war for bright scenes turns out not to matter enough to warrant a floor at all, vs. just fully unbounded/whole-map reveal).
+
+### 2026-07-14 - Batch token spawning ("make 10 spiders at once")
+User request: fill in a token's details once, pick a quantity, get that many copies auto-numbered ("Spider 1", "Spider 2", ...) instead of repeating the whole Add Token form per enemy.
+
+Added a "Quantity" field (default 1, max 50) next to Name in the GM's Add Token form (`static/vtt-app/main.js`). The `addTokenBtn` handler now builds one shared `baseToken` (everything except id/name/x/y) and loops `quantity` times, sending a separate `token:add` per copy with a unique id, name suffixed `" {n}"` only when quantity > 1 (quantity 1 keeps the exact bare-name behavior from before - no regression for the common single-token case), and position arranged in a roughly square grid centered on the map (`Math.ceil(Math.sqrt(quantity))` columns, spaced by `map.gridSizePx`) so a batch of enemies doesn't spawn stacked exactly on top of each other. No new event type or server-side concept - the server already treats each `token:add` independently, so this is purely a client-side loop over the existing event.
+
+Verified via headless browser: quantity=1 still produces a bare "Goblin" token card (no suffix); quantity=10 with name "Spider" produces ten token cards named "Spider 1" through "Spider 10" exactly, visually confirmed arranged in a clean grid rather than stacked.
+
+### 2026-07-14 - Movement-range circles leaked to players for tokens they don't own
+User report: players could see the translucent remaining-movement circle for enemy tokens and other players' tokens, not just their own. Root cause: `render()`'s player branch called `drawMovementRange(ctx, visibleTokens, ...)` - every token within the player's vision, rather than being scoped to their own tokens the way vision-masking and the mini-sheet already are.
+
+Fixed by changing that call to `drawMovementRange(ctx, ownedTokens, ...)` - a player now only ever sees the remaining-movement circle for tokens they own, same trust boundary as HP/other tactical information. Also added a GM-only "Show movement ranges" checkbox (new `showMovementRanges` client-side view-preference state, default on, not synced to `session` - purely a local declutter toggle) in the Tokens section of the GM sidebar, gating the GM's own `drawMovementRange` call.
+
+Verified via headless browser with a player-owned PC token and a separate enemy token: player's canvas shows only their own token's movement circle, confirmed the enemy's circle is entirely absent (previously both would have rendered); GM's toggle correctly hides/shows both circles at once when unchecked/checked.
+
+### 2026-07-14 - Hidden tokens render at 50% opacity on the GM's canvas
+User request: a visual affordance for the GM to tell at a glance which tokens on the map are hidden from players, without opening each token's card to check the checkbox.
+
+Added `HIDDEN_TOKEN_OPACITY = 0.5` in `render/tokens.js`; `drawTokens()` now sets `ctx.globalAlpha` per-token before drawing (image/fill, border, name label, HP bar/condition badge all affected uniformly, wrapped in an outer save/restore around the existing per-token drawing so it doesn't leak into the next token's alpha). No role-branching needed - hidden tokens never reach a player's client at all (`filterSessionForRole` strips them entirely), so this function only ever sees `hidden: true` tokens when called from the GM's own render path.
+
+Verified visually via headless browser: a hidden enemy token renders clearly faded (muted color, dimmer name label) next to a normal, fully-opaque enemy token of the same type.

@@ -5,6 +5,13 @@ function colorForType(type) {
   return TYPE_COLOR[type] || '#9e9e9e';
 }
 
+// Hidden tokens only ever reach this function on the GM's own client -
+// filterSessionForRole strips them from a player's session entirely, so
+// there's no risk of the transparency itself being a tell for players who
+// were never sent the token in the first place. It's purely a GM-side visual
+// cue for "this one's hidden," at a glance, without opening its card.
+const HIDDEN_TOKEN_OPACITY = 0.5;
+
 export function drawTokens(ctx, tokens, gridSizePx, getImage) {
   const radius = gridSizePx * 0.4;
 
@@ -12,7 +19,10 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage) {
     const img = token.imageUrl ? getImage(token.imageUrl) : null;
 
     ctx.save();
+    ctx.globalAlpha = token.hidden ? HIDDEN_TOKEN_OPACITY : 1;
+
     if (img && img.complete && img.naturalWidth) {
+      ctx.save();
       ctx.beginPath();
       ctx.arc(token.x, token.y, radius, 0, Math.PI * 2);
       ctx.clip();
@@ -29,7 +39,6 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage) {
       ctx.arc(token.x, token.y, radius, 0, Math.PI * 2);
       ctx.fillStyle = colorForType(token.type);
       ctx.fill();
-      ctx.restore();
     }
 
     ctx.fillStyle = '#fff';
@@ -45,6 +54,8 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage) {
     } else if (token.condition) {
       drawConditionBadge(ctx, token, radius);
     }
+
+    ctx.restore();
   }
 }
 
