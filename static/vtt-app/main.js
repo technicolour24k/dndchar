@@ -3,12 +3,15 @@ import { drawTokens } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed, renderVisionMaskedMap } from './render/vision.js';
 import { drawMovementRange } from './render/movement.js';
 import { drawMarkers } from './render/markers.js';
+import { drawTargetRings } from './render/targeting.js';
+import { getTokensInShape } from './render/shapeGeometry.js';
 
-// Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js — these
+// Mirrors TOKEN_LEVEL_STAT_FIELDS in vtt/server/handlers/token.js - these
 // token:stat:update fields write directly onto the token, not into
 // token.stats (which is otherwise free-form combat stats).
 const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'condition',
+  'conditions',
   'imageUrl',
   'visionNormalFt',
   'visionDarkFt',
@@ -16,6 +19,12 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'visionDevilFt',
   'speedFt',
   'speedRemainingFt',
+  'characterId',
+  'ac',
+  'saves',
+  'actions',
+  'spellSlots',
+  'preparedSpells',
 ]);
 
 const canvas = document.getElementById('canvas');
@@ -39,9 +48,12 @@ let playerId = null;
 let playerName = null;
 let sessionId = null;
 let session = null; // local mirror of the (already role-filtered) session state
-let dragState = null; // { tokenId, originX, originY, x, y } — visual ghost only, see canvas handlers
+let dragState = null; // { tokenId, originX, originY, x, y } - visual ghost only, see canvas handlers
 let currentRenderedTokens = []; // whichever token list render() last actually drew, for hit-testing
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
+let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
+let shapeDrag = null; // { config, originX, originY, currentX, currentY } while dragging a cone/cube's direction+length
+let showMovementRanges = true; // GM-only declutter toggle - purely a local view preference, not synced to session
 
 const imageCache = new Map();
 
@@ -89,7 +101,7 @@ function connect(joinPayload) {
   ws.addEventListener('open', () => ws.send(JSON.stringify(joinPayload)));
   ws.addEventListener('message', (ev) => handleMessage(JSON.parse(ev.data)));
   ws.addEventListener('close', () => {
-    // Only auto-retry after a successful join — a bad room code shouldn't loop.
+    // Only auto-retry after a successful join - a bad room code shouldn't loop.
     if (session) setTimeout(() => connect(joinPayload), 1500);
   });
 }
@@ -97,7 +109,9 @@ function connect(joinPayload) {
 function handleMessage(msg) {
   switch (msg.type) {
     case 'join:error':
-      loginError.textContent = msg.reason === 'session_not_found' ? 'Room not found.' : msg.reason;
+      if (msg.reason === 'session_not_found') loginError.textContent = 'Room not found.';
+      else if (msg.reason === 'gm_already_claimed') loginError.textContent = 'This room already has a GM connected.';
+      else loginError.textContent = msg.reason;
       session = null;
       if (ws) ws.close();
       break;
@@ -106,8 +120,13 @@ function handleMessage(msg) {
       session = msg.session;
       session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
-      renderSidebar();
+      // render() first - it computes currentRenderedTokens (vision-filtered
+      // for a player), which renderSidebar()'s "other tokens in view" list
+      // now reads from; the reverse order would show a stale/empty list
+      // until the next unrelated event happened to re-render.
       render();
+      renderSidebar();
+      if (role === 'player') startCharacterSync();
       break;
 
     case 'player:joined':
@@ -116,7 +135,15 @@ function handleMessage(msg) {
           id: msg.playerId,
           name: msg.playerName,
           tokenIds: session.players[msg.playerId]?.tokenIds || [],
+          connected: true,
         };
+      }
+      renderSidebar();
+      break;
+
+    case 'player:left':
+      if (session && session.players[msg.playerId]) {
+        session.players[msg.playerId].connected = false;
       }
       renderSidebar();
       break;
@@ -144,12 +171,20 @@ function handleMessage(msg) {
       if (t) { t.x = msg.x; t.y = msg.y; }
       if (dragState && dragState.tokenId === msg.tokenId) dragState = null;
       render();
+      // A move can push a token into or out of vision range, which changes
+      // the player sidebar's "other tokens in view" list - this was
+      // previously missing, so that list only ever updated on unrelated
+      // events (a stat change, a new token) rather than on the move itself.
+      renderSidebar();
       break;
     }
 
     case 'token:stat:update': {
       const t = session.tokens[msg.tokenId];
-      if (t) {
+      // value is omitted by the server for filtered fields (e.g. an enemy's
+      // hp, per the server-side comment in handlers/token.js) - nothing to
+      // apply in that case, since we were never sent the number.
+      if (t && msg.value !== undefined) {
         if (TOKEN_LEVEL_STAT_FIELDS.has(msg.stat)) t[msg.stat] = msg.value;
         else { t.stats = t.stats || {}; t.stats[msg.stat] = msg.value; }
       }
@@ -165,6 +200,22 @@ function handleMessage(msg) {
       renderSidebar();
       break;
     }
+
+    case 'token:stat:update:error':
+      // Server rejected a write our own UI shouldn't have offered in the
+      // first place - surface it without tearing down the session.
+      console.warn(`token:stat:update rejected for ${msg.stat} on ${msg.tokenId}: ${msg.reason}`);
+      break;
+
+    case 'target:select':
+      currentTargetTokenIds = msg.targetTokenIds || [];
+      render();
+      break;
+
+    case 'target:clear':
+      currentTargetTokenIds = [];
+      render();
+      break;
 
     case 'marker:add':
       session.markers[msg.marker.id] = msg.marker;
@@ -224,7 +275,7 @@ document.getElementById('createRoomBtn').addEventListener('click', async () => {
     playerName = name;
     connect({ type: 'join', sessionId, role: 'gm', playerId: accountPlayerId, playerName: name });
   } catch {
-    loginError.textContent = 'Could not create room — is the server running?';
+    loginError.textContent = 'Could not create room - is the server running?';
   }
 });
 
@@ -278,24 +329,33 @@ function render() {
 
   // session.markers is already server-filtered to whatever this client is
   // allowed to see (own markers + anything the GM has toggled visible-to-all)
-  // — no client-side owner/vision gating needed, unlike tokens.
+  // - no client-side owner/vision gating needed, unlike tokens.
   const visibleMarkers = Object.values(session.markers || {});
 
   if (role === 'gm') {
     drawMap(ctx, mapImage, map);
-    drawMovementRange(ctx, allTokens, map.gridSizePx);
+    if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
-    drawTokens(ctx, allTokens, map.gridSizePx, getImage);
+    drawTokens(ctx, allTokens, map.gridSizePx, getImage, null);
+    drawTargetRings(ctx, currentTargetTokenIds, allTokens, map.gridSizePx);
     currentRenderedTokens = allTokens;
   } else {
     const ownedTokens = allTokens.filter((t) => t.ownerId === playerId);
     const radii = computeVisionRadii(ownedTokens, map);
     renderVisionMaskedMap(ctx, mapImage, radii, map);
     const visibleTokens = allTokens.filter((t) => isPointRevealed(t.x, t.y, radii));
-    drawMovementRange(ctx, visibleTokens, map.gridSizePx);
+    // Only the player's own tokens' remaining-movement circle is shown - how
+    // far an enemy or another player's token can still move is tactical
+    // information a player shouldn't see, same trust boundary as HP.
+    drawMovementRange(ctx, ownedTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
-    drawTokens(ctx, visibleTokens, map.gridSizePx, getImage);
+    drawTokens(ctx, visibleTokens, map.gridSizePx, getImage, playerId);
+    drawTargetRings(ctx, currentTargetTokenIds, visibleTokens, map.gridSizePx);
     currentRenderedTokens = visibleTokens;
+  }
+
+  if (shapeDrag) {
+    drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx);
   }
 
   if (dragState) {
@@ -356,7 +416,7 @@ function hitTestToken(x, y) {
 }
 
 // ---------------------------------------------------------------------------
-// Marker placement — "click the map to place your marker" mode, armed by the
+// Marker placement - "click the map to place your marker" mode, armed by the
 // Place on Map button in either sidebar (see wireGmSidebar/wirePlayerSidebar).
 // ---------------------------------------------------------------------------
 
@@ -364,6 +424,7 @@ const markerPlacementBanner = document.getElementById('markerPlacementBanner');
 let pendingMarkerPlacement = null; // { radiusFt, color, label } or null while armed
 
 function armMarkerPlacement(config) {
+  disarmActionTargeting(); // only one click-the-map mode armed at a time
   pendingMarkerPlacement = config;
   markerPlacementBanner.classList.add('visible');
   canvas.style.cursor = 'crosshair';
@@ -377,28 +438,98 @@ function disarmMarkerPlacement() {
 
 document.getElementById('markerPlacementCancelBtn').addEventListener('click', disarmMarkerPlacement);
 
+// ---------------------------------------------------------------------------
+// Action targeting (Section 3) - click a weapon/spell action in the mini
+// sheet, then click a token on the map to resolve it against. Same
+// arm/disarm-banner pattern as marker placement. Damage is rolled
+// client-side per the phase-2 spec's explicit recommendation (the character
+// sheet's math engine already runs client-side; porting it server-side is a
+// bigger lift the trust level at this scale doesn't need).
+// ---------------------------------------------------------------------------
+
+const actionTargetBanner = document.getElementById('actionTargetBanner');
+const actionTargetBannerText = document.getElementById('actionTargetBannerText');
+let pendingActionTarget = null; // { sourceTokenId, action } or null while armed
+
+function armActionTargeting(sourceTokenId, action) {
+  disarmMarkerPlacement();
+  pendingActionTarget = { sourceTokenId, action };
+  actionTargetBannerText.textContent = `Click a token to attack with ${action.name}`;
+  actionTargetBanner.classList.add('visible');
+  canvas.style.cursor = 'crosshair';
+}
+
+function disarmActionTargeting() {
+  pendingActionTarget = null;
+  actionTargetBanner.classList.remove('visible');
+  canvas.style.cursor = '';
+}
+
+document.getElementById('actionTargetCancelBtn').addEventListener('click', disarmActionTargeting);
+
+// Minimal 'XdY+Z' dice roller - the vanilla VTT client has no build step and
+// can't import $lib/rules/dnd5e's rollDiceExpression (SvelteKit-only
+// aliases/imports), so this is a small standalone equivalent covering just
+// the "roll a weapon's damage dice" case the mini-sheet needs.
+function rollDamageDice(damageRolls, damageBonus) {
+  let total = Number(damageBonus) || 0;
+  const rolls = [];
+  for (const term of String(damageRolls || '').split(/\s*\+\s*/)) {
+    const match = term.trim().match(/^(\d*)d(\d+)$/i);
+    if (!match) continue;
+    const count = Math.max(1, Number(match[1]) || 1);
+    const sides = Math.max(1, Number(match[2]) || 1);
+    for (let i = 0; i < count; i++) {
+      const roll = Math.floor(Math.random() * sides) + 1;
+      rolls.push(roll);
+      total += roll;
+    }
+  }
+  return { total: Math.max(0, total), rolls };
+}
+
 // Clicking a token you can move drags the token; clicking empty space (or a
-// token you don't control) pans the map instead — same click-and-drag
+// token you don't control) pans the map instead - same click-and-drag
 // gesture, disambiguated by what's under the cursor.
 let panState = null; // { startClientX, startClientY, startScrollLeft, startScrollTop }
 
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); // avoid native text-selection/drag-ghost while panning
 
+  if (pendingActionTarget) {
+    const { x, y } = canvasCoords(e);
+    const target = hitTestToken(x, y);
+    const { sourceTokenId, action } = pendingActionTarget;
+    disarmActionTargeting();
+    if (!target) return;
+
+    send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
+
+    const { total, rolls } = rollDamageDice(action.damageRolls, action.damageBonus);
+    send({ type: 'token:stat:update', tokenId: target.id, stat: 'hp', delta: -total });
+    alert(`${action.name} hits ${target.name} for ${total} damage (${rolls.join(' + ') || total}).`);
+    return;
+  }
+
   if (pendingMarkerPlacement) {
     const { x, y } = canvasCoords(e);
     const config = pendingMarkerPlacement;
-    send({
-      type: 'marker:add',
-      marker: {
-        id: `marker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        x,
-        y,
-        radiusFt: config.radiusFt,
-        color: config.color,
-        label: config.label,
-        ownerId: role === 'player' ? playerId : null,
-      },
+
+    if (config.shape === 'cone' || config.shape === 'cube') {
+      // Directional shapes need a second point to set facing/length - start
+      // a drag instead of placing immediately. Confirmed on mouseup below.
+      shapeDrag = { config, originX: x, originY: y, currentX: x, currentY: y };
+      render();
+      return;
+    }
+
+    placeMarker({
+      shape: config.shape,
+      x,
+      y,
+      radiusFt: config.radiusFt,
+      color: config.color,
+      label: config.label,
     });
     disarmMarkerPlacement();
     return;
@@ -409,7 +540,7 @@ canvas.addEventListener('mousedown', (e) => {
   const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
 
   if (canDragToken) {
-    // originX/originY are the token's actual pre-drag position — that's the
+    // originX/originY are the token's actual pre-drag position - that's the
     // true distance the token will travel, not the (possibly off-center)
     // point clicked within its radius. x/y track the live cursor for the
     // ghost circle.
@@ -426,9 +557,14 @@ canvas.addEventListener('mousedown', (e) => {
 });
 
 // window-level (not canvas-level) so a fast drag that leaves the canvas
-// bounds — easy to do while panning a zoomed-out map — keeps tracking.
+// bounds - easy to do while panning a zoomed-out map - keeps tracking.
 window.addEventListener('mousemove', (e) => {
-  if (dragState) {
+  if (shapeDrag) {
+    const { x, y } = canvasCoords(e);
+    shapeDrag.currentX = x;
+    shapeDrag.currentY = y;
+    render();
+  } else if (dragState) {
     const { x, y } = canvasCoords(e);
     dragState.x = x;
     dragState.y = y;
@@ -439,13 +575,60 @@ window.addEventListener('mousemove', (e) => {
   }
 });
 
+// Turns a shapeDrag's origin+current cursor position into the marker's
+// facing (angleDeg) and length (lengthFt, rounded to the nearest 5ft like
+// the rest of the app's distance readouts) - shared by the live preview
+// (render()) and the final placement on mouseup.
+function markerFromShapeDrag(drag) {
+  const pxPerFoot = (session?.map?.gridSizePx || 50) / 5;
+  const dx = drag.currentX - drag.originX;
+  const dy = drag.currentY - drag.originY;
+  const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+  const lengthFt = Math.max(5, Math.round(Math.hypot(dx, dy) / pxPerFoot / 5) * 5);
+  return {
+    shape: drag.config.shape,
+    x: drag.originX,
+    y: drag.originY,
+    angleDeg,
+    lengthFt,
+    widthFt: drag.config.widthFt,
+    coneAngleDeg: drag.config.coneAngleDeg,
+    color: drag.config.color,
+    label: drag.config.label,
+  };
+}
+
+// Sends marker:add, then auto-selects whichever tokens the placed shape
+// catches (Section 4b's second bullet) - removes the need to manually
+// multi-select targets for an AoE, which is exactly the friction this
+// feature exists to cut. Circle/sphere and cone/cube all go through this one
+// path; there's nothing shape-specific about the auto-targeting step itself.
+function placeMarker(marker) {
+  const id = `marker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const fullMarker = { id, ownerId: role === 'player' ? playerId : null, ...marker };
+  send({ type: 'marker:add', marker: fullMarker });
+
+  const pxPerFoot = (session?.map?.gridSizePx || 50) / 5;
+  const caughtTokens = getTokensInShape(fullMarker, Object.values(session.tokens), pxPerFoot);
+  if (caughtTokens.length) {
+    send({ type: 'target:select', sourceTokenId: null, targetTokenIds: caughtTokens.map((t) => t.id) });
+  }
+}
+
 window.addEventListener('mouseup', (e) => {
+  if (shapeDrag) {
+    placeMarker(markerFromShapeDrag(shapeDrag));
+    shapeDrag = null;
+    disarmMarkerPlacement();
+    render();
+    return;
+  }
   if (dragState) {
     const { x, y } = canvasCoords(e);
     const { tokenId } = dragState;
     send({ type: 'token:move', tokenId, x, y });
     // dragState itself is cleared once the server echoes the move back (see
-    // handleMessage's token:move case) — the token doesn't actually move on
+    // handleMessage's token:move case) - the token doesn't actually move on
     // screen until then, per the "server is the only writer" rule.
   }
   panState = null;
@@ -453,7 +636,7 @@ window.addEventListener('mouseup', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Zoom — pure CSS scale of the canvas (backing pixel buffer stays at the
+// Zoom - pure CSS scale of the canvas (backing pixel buffer stays at the
 // map's native size, see render()). canvasCoords() already derives its scale
 // factor from getBoundingClientRect(), so drag/hit-testing need no changes.
 // ---------------------------------------------------------------------------
@@ -489,7 +672,7 @@ document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(zo
 zoomResetBtn.addEventListener('click', () => setZoom(1));
 
 // Ctrl/Cmd+wheel to zoom (matches the Figma/Google Maps convention, and is
-// what trackpad pinch-to-zoom sends) — plain wheel still scrolls/pans.
+// what trackpad pinch-to-zoom sends) - plain wheel still scrolls/pans.
 mapWrap.addEventListener(
   'wheel',
   (e) => {
@@ -501,7 +684,7 @@ mapWrap.addEventListener(
 );
 
 // ---------------------------------------------------------------------------
-// Image upload (map + token art) — POST /upload, returns a URL to use
+// Image upload (map + token art) - POST /upload, returns a URL to use
 // ---------------------------------------------------------------------------
 
 async function uploadImage(file) {
@@ -514,7 +697,7 @@ async function uploadImage(file) {
 }
 
 // ---------------------------------------------------------------------------
-// Token image picker — browse the bundled art library (fetched once and
+// Token image picker - browse the bundled art library (fetched once and
 // filtered client-side; ~1400 entries is small enough for that) or upload a
 // custom image, same as before. Used both when adding a new token and when
 // changing an existing one's art, via the onSelect callback: the caller
@@ -583,13 +766,13 @@ function renderPickerResults() {
   const shown = matches.slice(0, PICKER_RESULT_LIMIT);
   pickerStatus.textContent =
     matches.length > shown.length
-      ? `Showing ${shown.length} of ${matches.length} matches — refine your search to narrow further.`
+      ? `Showing ${shown.length} of ${matches.length} matches - refine your search to narrow further.`
       : `${matches.length} match${matches.length === 1 ? '' : 'es'}`;
 
   pickerResults.innerHTML = shown
     .map((entry) => {
       const url = libraryImageUrl(entry);
-      const title = `${entry.friendlyName} — ${entry.source}`;
+      const title = `${entry.friendlyName} - ${entry.source}`;
       return `
         <div class="picker-item" data-url="${escapeHtml(url)}" title="${escapeHtml(title)}">
           <img src="${url}" loading="lazy" alt="${escapeHtml(entry.friendlyName)}" />
@@ -667,7 +850,161 @@ imagePickerModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Advanced Vision modal — normal/darkvision/truesight/devil's sight ranges,
+// Character picker (Phase 2, Section 1a) - a player selects one of their own
+// characters, pulling live combat stats (Section 1b) into a token created on
+// their behalf, instead of manually typing stats into a blank token. Same
+// modal-overlay/callback-free pattern as the image picker, simplified since
+// there's only one thing this modal ever does (unlike the image picker,
+// which is reused from multiple call sites via onSelect).
+// ---------------------------------------------------------------------------
+
+const characterPickerModal = document.getElementById('characterPickerModal');
+const characterPickerStatus = document.getElementById('characterPickerStatus');
+const characterPickerList = document.getElementById('characterPickerList');
+
+async function openCharacterPicker() {
+  characterPickerModal.classList.add('visible');
+  characterPickerList.innerHTML = '';
+  characterPickerStatus.textContent = 'Loading your characters…';
+  try {
+    const res = await fetch('/vtt/api/characters');
+    if (!res.ok) throw new Error('failed');
+    const characters = await res.json();
+    if (!characters.length) {
+      characterPickerStatus.textContent = 'No characters found - create one in the main app first.';
+      return;
+    }
+    characterPickerStatus.textContent = '';
+    characterPickerList.innerHTML = characters
+      .map((c) => {
+        const classSummary = (c.classes || []).map((cls) => `${cls.className} ${cls.level}`).join(' / ') || 'No class';
+        return `
+          <div class="character-picker-item" data-character-id="${escapeHtml(c.id)}">
+            <div class="name">${escapeHtml(c.name)}</div>
+            <div class="summary">${escapeHtml(classSummary)} - HP ${c.hpCurrent}/${c.hpMax}</div>
+          </div>
+        `;
+      })
+      .join('');
+  } catch {
+    characterPickerStatus.textContent = 'Could not load characters.';
+  }
+}
+
+function closeCharacterPicker() {
+  characterPickerModal.classList.remove('visible');
+}
+
+document.getElementById('characterPickerCancelBtn').addEventListener('click', closeCharacterPicker);
+characterPickerModal.addEventListener('click', (e) => {
+  if (e.target === characterPickerModal) closeCharacterPicker();
+});
+
+characterPickerList.addEventListener('click', async (e) => {
+  const item = e.target.closest('.character-picker-item');
+  if (!item) return;
+  const characterId = item.dataset.characterId;
+  const characterName = item.querySelector('.name').textContent;
+  closeCharacterPicker();
+
+  const res = await fetch('/vtt/api/characters/' + characterId);
+  if (!res.ok) return alert('Could not load that character.');
+  const snapshot = await res.json();
+  const map = session.map || { widthPx: 800, heightPx: 600 };
+
+  send({
+    type: 'token:add',
+    token: {
+      id: `token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name: characterName,
+      type: 'pc',
+      ownerId: playerId,
+      x: Math.round(map.widthPx / 2),
+      y: Math.round(map.heightPx / 2),
+      imageUrl: null,
+      visionNormalFt: snapshot.vision.normalFt,
+      visionDarkFt: snapshot.vision.darkFt,
+      visionTrueFt: snapshot.vision.trueFt,
+      visionDevilFt: snapshot.vision.devilFt,
+      speedFt: snapshot.speedFt,
+      speedRemainingFt: snapshot.speedFt,
+      hidden: false,
+      characterId,
+      ac: snapshot.ac,
+      saves: snapshot.saves,
+      actions: snapshot.actions,
+      spellSlots: snapshot.spellSlots,
+      preparedSpells: snapshot.preparedSpells,
+      stats: { hp: snapshot.hp, maxHp: snapshot.maxHp },
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Character resync polling - re-pulls each owned token's source character
+// periodically and pushes any changed reference fields through the existing
+// token:stat:update event, so leveling up / re-equipping mid-session doesn't
+// require removing and re-adding the token. Only syncs fields with NO
+// editable control anywhere in the VTT session (ac, saves, actions,
+// preparedSpells) - not just hp/spellSlots as originally scoped. The first
+// version also synced speedFt/vision*/maxHp, which are each editable by the
+// GM or player during a session (the Speed field, the Darkvision checkbox,
+// the Advanced Vision modal, Max HP) - a poll landing after a GM manually
+// granted a player temporary darkvision (a spell, a potion) would silently
+// revert it back to the sheet's baseline on the very next tick, which is
+// exactly the "reverts to unchecked and 0" bug this was found from. The
+// dividing line is simple: if a human can edit it in the VTT, the poll must
+// never touch it - only genuinely read-only-in-VTT reference data is safe to
+// auto-sync. This is the interim, self-contained version; a real push-based
+// system (sheet save -> VTT) is the longer-term direction once there's a
+// real realtime layer to hang it on (see the current-state doc's Known
+// Fragility notes).
+// ---------------------------------------------------------------------------
+
+const CHARACTER_SYNC_INTERVAL_MS = 30000;
+let characterSyncTimer = null;
+
+function startCharacterSync() {
+  if (characterSyncTimer) clearInterval(characterSyncTimer);
+  characterSyncTimer = setInterval(syncOwnedCharacterTokens, CHARACTER_SYNC_INTERVAL_MS);
+}
+
+async function syncOwnedCharacterTokens() {
+  if (!session || role !== 'player') return;
+  const tokens = Object.values(session.tokens).filter((t) => t.ownerId === playerId && t.characterId);
+  for (const token of tokens) {
+    try {
+      const res = await fetch('/vtt/api/characters/' + token.characterId);
+      if (!res.ok) continue; // character deleted, or a transient error - try again next tick
+      const snapshot = await res.json();
+      applyCharacterSyncFields(token, snapshot);
+    } catch {
+      // A single character's fetch failing (network blip) shouldn't stop
+      // the rest of this player's tokens from syncing on this tick.
+    }
+  }
+}
+
+function applyCharacterSyncFields(token, snapshot) {
+  // hp, maxHp, speedFt, and all four vision fields are deliberately excluded -
+  // each has an editable control somewhere in the VTT (HP/Max HP/Speed
+  // inputs, the Darkvision checkbox, the Advanced Vision modal) and must stay
+  // session-authoritative once set, the same way hp/spellSlots already are.
+  const updates = {
+    ac: snapshot.ac,
+    saves: snapshot.saves,
+    actions: snapshot.actions,
+    preparedSpells: snapshot.preparedSpells,
+  };
+  for (const [stat, value] of Object.entries(updates)) {
+    if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
+      send({ type: 'token:stat:update', tokenId: token.id, stat, value });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Advanced Vision modal - normal/darkvision/truesight/devil's sight ranges,
 // pulled out of the token card itself since these are edited rarely.
 // ---------------------------------------------------------------------------
 
@@ -709,7 +1046,61 @@ visionModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Movement quick-adjust — shared between the GM's card for any token and a
+// Conditions modal - standard 5e status conditions (Poisoned, Prone, etc.),
+// a multi-select array (token.conditions) distinct from the existing single-
+// value token.condition ("healthy"/"bloodied"/"critical" - the coarse HP
+// signal). Conditions are visible battlefield state, not secret like HP, so
+// they aren't stripped from enemy/npc tokens the way stats are - anyone who
+// can see a token can see what conditions are on it. Editing follows the
+// same ownership rule as everything else: GM can edit any token's, a player
+// only their own (see PLAYER_EDITABLE_FIELDS in vtt/server/handlers/token.js).
+// ---------------------------------------------------------------------------
+
+const STANDARD_CONDITIONS = [
+  'blinded', 'charmed', 'deafened', 'exhaustion', 'frightened', 'grappled',
+  'incapacitated', 'invisible', 'paralyzed', 'petrified', 'poisoned', 'prone',
+  'restrained', 'stunned', 'unconscious',
+];
+
+const conditionsModal = document.getElementById('conditionsModal');
+const conditionsModalList = document.getElementById('conditionsModalList');
+let conditionsModalTokenId = null;
+
+function openConditionsModal(tokenId) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  conditionsModalTokenId = tokenId;
+  const active = new Set(token.conditions || []);
+  conditionsModalList.innerHTML = STANDARD_CONDITIONS.map((key) => `
+    <div class="field">
+      <label>
+        <input type="checkbox" class="conditionCheckbox" value="${key}" ${active.has(key) ? 'checked' : ''} />
+        ${key.charAt(0).toUpperCase()}${key.slice(1)}
+      </label>
+    </div>
+  `).join('');
+  conditionsModal.classList.add('visible');
+}
+
+function closeConditionsModal() {
+  conditionsModal.classList.remove('visible');
+  conditionsModalTokenId = null;
+}
+
+document.getElementById('conditionsModalCancel').addEventListener('click', closeConditionsModal);
+document.getElementById('conditionsModalSave').addEventListener('click', () => {
+  if (!conditionsModalTokenId) return;
+  const tokenId = conditionsModalTokenId;
+  const value = [...conditionsModalList.querySelectorAll('.conditionCheckbox:checked')].map((el) => el.value);
+  send({ type: 'token:stat:update', tokenId, stat: 'conditions', value });
+  closeConditionsModal();
+});
+conditionsModal.addEventListener('click', (e) => {
+  if (e.target === conditionsModal) closeConditionsModal();
+});
+
+// ---------------------------------------------------------------------------
+// Movement quick-adjust - shared between the GM's card for any token and a
 // player's card for their own token (Section 3: same event, different sender).
 // ---------------------------------------------------------------------------
 
@@ -738,8 +1129,12 @@ function renderSidebar() {
 }
 
 function playerListHtml() {
-  const names = Object.values(session.players).map((p) => escapeHtml(p.name));
-  return names.length ? names.join(', ') : '(none yet)';
+  const entries = Object.values(session.players).map((p) =>
+    p.connected === false
+      ? `<span style="color:#666;">${escapeHtml(p.name)} (disconnected)</span>`
+      : escapeHtml(p.name),
+  );
+  return entries.length ? entries.join(', ') : '(none yet)';
 }
 
 function roomInfoHtml(roleLabel) {
@@ -784,7 +1179,10 @@ function gmSidebarHtml() {
     <button id="setMapBtn">Set map</button>
 
     <h2>Add token</h2>
-    <div class="field"><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
+    <div class="field row">
+      <div><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
+      <div><label>Quantity</label><input type="number" id="tokenQuantityInput" value="1" min="1" max="50" /></div>
+    </div>
     <div class="field row">
       <div><label>Type</label>
         <select id="tokenTypeSelect">
@@ -794,7 +1192,7 @@ function gmSidebarHtml() {
         </select>
       </div>
       <div><label>Owner (for PCs)</label>
-        <select id="tokenOwnerSelect"><option value="">— none —</option>${ownerOptions}</select>
+        <select id="tokenOwnerSelect"><option value="">- none -</option>${ownerOptions}</select>
       </div>
     </div>
     <div class="field row">
@@ -814,17 +1212,72 @@ function gmSidebarHtml() {
     <button id="addTokenBtn">Add token</button>
 
     <h2>Tokens</h2>
+    <div class="field"><label><input type="checkbox" id="showMovementRangesToggle" ${showMovementRanges ? 'checked' : ''} /> Show movement ranges</label></div>
     <div id="tokenList">${gmTokenListHtml()}</div>
 
+    ${markerFormHtml()}
+    <div id="markerList">${markerListHtml(true)}</div>
+  `;
+}
+
+// Shared by both sidebars (Phase 2, Section 4) - shape select plus the
+// fields each shape needs. Circle/sphere only use radius; cone/cube only use
+// length/width/cone-angle - shown/hidden by wireMarkerForm() based on the
+// selected shape, rather than building four near-identical forms.
+function markerFormHtml() {
+  return `
     <h2>Markers</h2>
-    <div class="field row">
+    <div class="field">
+      <label>Shape</label>
+      <select id="markerShapeSelect">
+        <option value="circle">Circle (token-anchored point)</option>
+        <option value="sphere">Sphere/Burst (placed point)</option>
+        <option value="cone">Cone</option>
+        <option value="cube">Cube/Line</option>
+      </select>
+    </div>
+    <div class="field row" id="markerRadiusField">
       <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
       <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
     </div>
+    <div class="field row" id="markerShapeFields" style="display:none;">
+      <div><label>Width (ft)</label><input type="number" id="markerWidthInput" value="10" /></div>
+      <div><label>Cone angle (deg)</label><input type="number" id="markerConeAngleInput" value="60" /></div>
+    </div>
+    <p id="markerShapeHint" style="color:#666;font-size:12px;display:none;">Click the map to place the origin, then drag to aim and set length - release to confirm.</p>
     <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
     <button id="placeMarkerBtn">Place on Map</button>
-    <div id="markerList">${markerListHtml(true)}</div>
   `;
+}
+
+// Shared wiring for markerFormHtml() - shape-field show/hide plus the
+// Place on Map click handler, called from both wireGmSidebar and
+// wirePlayerSidebar.
+function wireMarkerForm() {
+  const shapeSelect = document.getElementById('markerShapeSelect');
+  const radiusField = document.getElementById('markerRadiusField');
+  const shapeFields = document.getElementById('markerShapeFields');
+  const shapeHint = document.getElementById('markerShapeHint');
+
+  function syncShapeFields() {
+    const isDirectional = shapeSelect.value === 'cone' || shapeSelect.value === 'cube';
+    radiusField.style.display = isDirectional ? 'none' : '';
+    shapeFields.style.display = isDirectional ? '' : 'none';
+    shapeHint.style.display = isDirectional ? '' : 'none';
+  }
+  shapeSelect.addEventListener('change', syncShapeFields);
+  syncShapeFields();
+
+  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
+    armMarkerPlacement({
+      shape: shapeSelect.value,
+      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
+      widthFt: Number(document.getElementById('markerWidthInput').value) || 0,
+      coneAngleDeg: Number(document.getElementById('markerConeAngleInput').value) || 60,
+      color: document.getElementById('markerColorInput').value || '#ff5252',
+      label: document.getElementById('markerLabelInput').value.trim(),
+    });
+  });
 }
 
 function gmTokenListHtml() {
@@ -848,7 +1301,7 @@ function gmTokenListHtml() {
           </div>
           <div class="field"><label>Condition</label>
             <select class="conditionSelect">
-              <option value="" ${!t.condition ? 'selected' : ''}>—</option>
+              <option value="" ${!t.condition ? 'selected' : ''}>-</option>
               <option value="healthy" ${t.condition === 'healthy' ? 'selected' : ''}>Healthy</option>
               <option value="bloodied" ${t.condition === 'bloodied' ? 'selected' : ''}>Bloodied</option>
               <option value="critical" ${t.condition === 'critical' ? 'selected' : ''}>Critical</option>
@@ -864,9 +1317,11 @@ function gmTokenListHtml() {
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
           </div>
+          <div class="field">${conditionTagsHtml(t.conditions)}</div>
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
             <button class="secondary advancedVisionBtn">Advanced Vision…</button>
+            <button class="secondary conditionsBtn">Conditions…</button>
             <button class="secondary toggleHiddenBtn">${t.hidden ? 'Unhide' : 'Hide'}</button>
             <button class="danger removeBtn">Remove</button>
           </div>
@@ -876,10 +1331,25 @@ function gmTokenListHtml() {
     .join('');
 }
 
-// Shared by both sidebars — session.markers is already server-filtered to
+// Shared by both sidebars - session.markers is already server-filtered to
 // whatever this client is allowed to see, so no client-side filtering here.
 // isGm controls whether the "visible to all" toggle shows (GM-only control)
 // and whether Remove shows for markers the viewer doesn't own.
+function markerSizeLabel(marker) {
+  if (marker.shape === 'cone') return `${marker.lengthFt}ft cone`;
+  if (marker.shape === 'cube') return `${marker.lengthFt}x${marker.widthFt}ft`;
+  return `${marker.radiusFt} ft`;
+}
+
+// Small read-only tag row for a token card - shows which standard conditions
+// are currently active (set via the Conditions… modal). Not secret info
+// (unlike stats), so this same markup is safe to use in both the GM's and a
+// player's own token card.
+function conditionTagsHtml(conditions) {
+  if (!conditions || !conditions.length) return '<span style="color:#666;font-size:12px;">No conditions</span>';
+  return conditions.map((c) => `<span class="tag">${escapeHtml(c.charAt(0).toUpperCase() + c.slice(1))}</span>`).join(' ');
+}
+
 function markerListHtml(isGm) {
   const markers = Object.values(session.markers || {});
   if (!markers.length) return '<p style="color:#666;font-size:12px;">No markers placed.</p>';
@@ -893,7 +1363,7 @@ function markerListHtml(isGm) {
           <div class="title">
             <span>
               <span class="marker-swatch" style="background:${escapeHtml(m.color)}"></span>
-              ${escapeHtml(m.label || 'Marker')} <span class="tag">${m.radiusFt} ft</span>${!isOwn ? ' <span class="tag">shared</span>' : ''}
+              ${escapeHtml(m.label || 'Marker')} <span class="tag">${markerSizeLabel(m)}</span>${!isOwn ? ' <span class="tag">shared</span>' : ''}
             </span>
           </div>
           ${
@@ -909,6 +1379,11 @@ function markerListHtml(isGm) {
 }
 
 function wireGmSidebar() {
+  document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
+    showMovementRanges = e.target.checked;
+    render(); // a view preference only - doesn't touch session state, no renderSidebar() needed
+  });
+
   const mapFileInput = document.getElementById('mapFileInput');
   const mapImageUrlInput = document.getElementById('mapImageUrlInput');
   const mapWidthInput = document.getElementById('mapWidthInput');
@@ -981,14 +1456,11 @@ function wireGmSidebar() {
   document.getElementById('addTokenBtn').addEventListener('click', () => {
     const name = document.getElementById('tokenNameInput').value.trim();
     if (!name) return alert('Give the token a name.');
+    const quantity = Math.max(1, Math.min(50, Number(document.getElementById('tokenQuantityInput').value) || 1));
     const map = session.map || { widthPx: 800, heightPx: 600 };
-    const token = {
-      id: `token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      name,
+    const baseToken = {
       type: document.getElementById('tokenTypeSelect').value,
       ownerId: document.getElementById('tokenOwnerSelect').value || null,
-      x: Math.round(map.widthPx / 2),
-      y: Math.round(map.heightPx / 2),
       imageUrl: tokenImageUrlInput.value.trim() || null,
       visionNormalFt: Number(document.getElementById('tokenVisionNormalInput').value) || 0,
       visionDarkFt: Number(document.getElementById('tokenVisionDarkInput').value) || 0,
@@ -1002,7 +1474,31 @@ function wireGmSidebar() {
         maxHp: Number(document.getElementById('tokenMaxHpInput').value) || 0,
       },
     };
-    send({ type: 'token:add', token });
+
+    // Quantity > 1 spawns a small grid of tokens centered on the map, named
+    // "Name 1", "Name 2", etc., rather than stacking them all on the exact
+    // same square - each still just a separate token:add, no new event or
+    // server-side concept needed. Quantity 1 keeps the original bare name
+    // (no " 1" suffix) so existing single-token behavior is unchanged.
+    const spacingPx = map.gridSizePx || 50;
+    const perRow = Math.ceil(Math.sqrt(quantity));
+    const rows = Math.ceil(quantity / perRow);
+    for (let i = 0; i < quantity; i++) {
+      const col = i % perRow;
+      const row = Math.floor(i / perRow);
+      const offsetX = (col - (perRow - 1) / 2) * spacingPx;
+      const offsetY = (row - (rows - 1) / 2) * spacingPx;
+      send({
+        type: 'token:add',
+        token: {
+          ...baseToken,
+          id: `token-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+          name: quantity > 1 ? `${name} ${i + 1}` : name,
+          x: Math.round(map.widthPx / 2 + offsetX),
+          y: Math.round(map.heightPx / 2 + offsetY),
+        },
+      });
+    }
   });
 
   document.getElementById('tokenList').addEventListener('change', (e) => {
@@ -1021,7 +1517,7 @@ function wireGmSidebar() {
       // on/off reading (it just reflects visionDarkFt > 0).
       send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
     } else if (e.target.classList.contains('speedInput')) {
-      // Editing base Speed resets remaining movement to match — it's the
+      // Editing base Speed resets remaining movement to match - it's the
       // "this creature now has a fresh X ft to work with" control; the
       // Remaining field and +/- buttons are for adjusting mid-turn.
       const value = Number(e.target.value) || 0;
@@ -1042,6 +1538,8 @@ function wireGmSidebar() {
       if (confirm('Remove this token?')) send({ type: 'token:remove', tokenId });
     } else if (e.target.classList.contains('advancedVisionBtn')) {
       openVisionModal(tokenId);
+    } else if (e.target.classList.contains('conditionsBtn')) {
+      openConditionsModal(tokenId);
     } else if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
     } else if (e.target.classList.contains('speedMinusBtn')) {
@@ -1053,13 +1551,7 @@ function wireGmSidebar() {
     }
   });
 
-  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
-    armMarkerPlacement({
-      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
-      color: document.getElementById('markerColorInput').value || '#ff5252',
-      label: document.getElementById('markerLabelInput').value.trim(),
-    });
-  });
+  wireMarkerForm();
 
   document.getElementById('markerList').addEventListener('change', (e) => {
     const card = e.target.closest('[data-marker-id]');
@@ -1085,30 +1577,31 @@ function wireGmSidebar() {
 function playerSidebarHtml() {
   const allTokens = Object.values(session.tokens);
   const ownTokens = allTokens.filter((t) => t.ownerId === playerId);
-  const otherTokens = allTokens.filter((t) => t.ownerId !== playerId);
+  // currentRenderedTokens is whatever render() last actually drew - for a
+  // player that's already the vision-filtered set (see render()'s isPointRevealed
+  // pass), so "other tokens" here matches what's actually visible on the map
+  // instead of every token that merely isn't the player's own. Previously this
+  // read straight from allTokens, so a token's HP/status kept showing here
+  // (and stayed live-updating) even after it moved out of vision.
+  const otherTokens = currentRenderedTokens.filter((t) => t.ownerId !== playerId);
 
   return `
     ${roomInfoHtml('Player')}
 
     <h2>My tokens</h2>
+    <button type="button" id="addCharacterTokenBtn" class="secondary">Add My Character…</button>
     <div id="ownTokenList">${ownTokenListHtml(ownTokens)}</div>
 
     <h2>Other tokens in view</h2>
     <div id="otherTokenList">${otherTokenListHtml(otherTokens)}</div>
 
-    <h2>Markers</h2>
-    <div class="field row">
-      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
-      <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
-    </div>
-    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
-    <button id="placeMarkerBtn">Place on Map</button>
+    ${markerFormHtml()}
     <div id="markerList">${markerListHtml(false)}</div>
   `;
 }
 
 function ownTokenListHtml(tokens) {
-  if (!tokens.length) return '<p style="color:#666;font-size:12px;">You don\'t control any tokens yet — ask the GM to assign one.</p>';
+  if (!tokens.length) return '<p style="color:#666;font-size:12px;">You don\'t control any tokens yet - ask the GM to assign one.</p>';
   return tokens
     .map((t) => {
       const hp = t.stats?.hp ?? '';
@@ -1131,29 +1624,99 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
           </div>
+          <div class="field">${conditionTagsHtml(t.conditions)}</div>
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
+            <button class="secondary conditionsBtn">Conditions…</button>
           </div>
+          ${miniSheetHtml(t)}
         </div>
       `;
     })
     .join('');
 }
 
+// Mini character sheet (Phase 2, Section 2) - only renders for tokens that
+// carry a character-sheet pull-through (characterId set, from the character
+// picker in Section 1a). Manually-created tokens (the POC's original blank
+// "Add token" flow, still used by the GM) simply don't have this data, so
+// there's nothing to show. Everything here reads straight off the token
+// object - it's already synced via the normal token broadcast plumbing, no
+// separate fetch, same "populate once at creation, don't auto-resync"
+// limitation as the rest of Section 1.
+function miniSheetHtml(t) {
+  if (!t.characterId) return '';
+
+  const savesHtml = Object.entries(t.saves || {})
+    .map(([key, value]) => `<span class="tag">${key.toUpperCase()} ${signedVtt(value)}</span>`)
+    .join(' ') || '<span style="color:#666;">None</span>';
+
+  const actionsHtml = (t.actions || []).length
+    ? (t.actions || [])
+        .map(
+          (a) => `
+        <div class="mini-sheet-action" data-action-name="${escapeHtml(a.name)}">
+          <span>${escapeHtml(a.name)}</span>
+          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${a.damageRolls || ''}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
+        </div>
+      `
+        )
+        .join('')
+    : '<p style="color:#666;font-size:12px;">No equipped weapons.</p>';
+
+  const slotsHtml = (t.spellSlots || []).length
+    ? (t.spellSlots || [])
+        .map(
+          (s) => `
+        <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
+          <span>${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
+          <button type="button" class="secondary slotUseBtn" ${s.current <= 0 ? 'disabled' : ''}>Use</button>
+          <button type="button" class="secondary slotResetBtn">Reset</button>
+        </div>
+      `
+        )
+        .join('')
+    : '';
+
+  const spellsHtml = (t.preparedSpells || []).length
+    ? (t.preparedSpells || []).map((s) => `<div class="mini-sheet-action" data-spell-name="${escapeHtml(s.name)}"><span>${escapeHtml(s.name)}</span><span style="color:#aaa;">Lvl ${s.spellLevel ?? 0}</span></div>`).join('')
+    : '';
+
+  return `
+    <div class="mini-sheet">
+      <div class="field row">
+        <div><label>AC</label><input type="number" value="${t.ac ?? ''}" readonly /></div>
+        <div><label>Saves</label><div style="padding-top:4px;">${savesHtml}</div></div>
+      </div>
+      <label style="font-size:11px;color:#888;">Actions</label>
+      ${actionsHtml}
+      ${slotsHtml ? `<label style="font-size:11px;color:#888;">Spell slots</label>${slotsHtml}` : ''}
+      ${spellsHtml ? `<label style="font-size:11px;color:#888;">Prepared spells</label>${spellsHtml}` : ''}
+    </div>
+  `;
+}
+
+function signedVtt(value) {
+  const n = Number(value) || 0;
+  return n >= 0 ? `+${n}` : `${n}`;
+}
+
 function otherTokenListHtml(tokens) {
   if (!tokens.length) return '<p style="color:#666;font-size:12px;">None visible right now.</p>';
   return tokens
     .map((t) => {
-      const hasStats = t.stats && typeof t.stats.hp === 'number';
-      const detail = hasStats
-        ? `HP ${t.stats.hp}/${t.stats.maxHp}`
-        : t.condition
-          ? `Condition: ${escapeHtml(t.condition)}`
-          : 'No status known';
+      // Never show a raw HP number for a token that isn't the viewer's own -
+      // condition (if the GM has set one) or nothing, same rule already
+      // applied to enemy/npc, now applied uniformly regardless of type. PC
+      // stats aren't stripped server-side (allies' HP isn't secret at the
+      // protocol level, per the original spec), so this is a client-side
+      // display choice on top of that, not a security boundary.
+      const detail = t.condition ? `Condition: ${escapeHtml(t.condition)}` : 'No status known';
       return `
         <div class="token-card">
           <div class="title"><span>${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>
           <div style="font-size:12px;color:#aaa;">${detail}</div>
+          ${t.conditions && t.conditions.length ? `<div class="field">${conditionTagsHtml(t.conditions)}</div>` : ''}
         </div>
       `;
     })
@@ -1161,6 +1724,8 @@ function otherTokenListHtml(tokens) {
 }
 
 function wirePlayerSidebar() {
+  document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
+
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;
   ownList.addEventListener('change', (e) => {
@@ -1185,22 +1750,37 @@ function wirePlayerSidebar() {
     const tokenId = card.dataset.tokenId;
     if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
+    } else if (e.target.classList.contains('conditionsBtn')) {
+      openConditionsModal(tokenId);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {
       adjustTokenSpeedRemaining(tokenId, 5);
     } else if (e.target.classList.contains('speedResetBtn')) {
       resetTokenSpeedRemaining(tokenId);
+    } else if (e.target.classList.contains('slotUseBtn') || e.target.classList.contains('slotResetBtn')) {
+      const slotRow = e.target.closest('.mini-sheet-slot');
+      const token = session.tokens[tokenId];
+      if (!slotRow || !token) return;
+      const type = slotRow.dataset.slotType;
+      const level = Number(slotRow.dataset.slotLevel);
+      const useSlot = e.target.classList.contains('slotUseBtn');
+      const value = (token.spellSlots || []).map((s) => {
+        if (s.type !== type || s.level !== level) return s;
+        return { ...s, current: useSlot ? Math.max(0, s.current - 1) : s.max };
+      });
+      send({ type: 'token:stat:update', tokenId, stat: 'spellSlots', value });
+    } else {
+      const actionRow = e.target.closest('.mini-sheet-action');
+      const token = session.tokens[tokenId];
+      if (actionRow && token && actionRow.dataset.actionName) {
+        const action = (token.actions || []).find((a) => a.name === actionRow.dataset.actionName);
+        if (action) armActionTargeting(tokenId, action);
+      }
     }
   });
 
-  document.getElementById('placeMarkerBtn').addEventListener('click', () => {
-    armMarkerPlacement({
-      radiusFt: Number(document.getElementById('markerRadiusInput').value) || 0,
-      color: document.getElementById('markerColorInput').value || '#ff5252',
-      label: document.getElementById('markerLabelInput').value.trim(),
-    });
-  });
+  wireMarkerForm();
 
   document.getElementById('markerList').addEventListener('click', (e) => {
     const card = e.target.closest('[data-marker-id]');

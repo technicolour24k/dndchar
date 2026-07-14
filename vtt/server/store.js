@@ -1,4 +1,4 @@
-// @ts-nocheck — plain untyped JS by design (see vtt/README.md); shared as-is
+// @ts-nocheck - plain untyped JS by design (see vtt/README.md); shared as-is
 // between the SvelteKit route bundle, the Vite dev plugin, and server.js.
 import crypto from 'node:crypto';
 
@@ -10,7 +10,7 @@ const ROOM_CODE_LENGTH = 6;
 // process: directly (vite.config.ts's dev plugin / server.js in prod) and
 // indirectly via SvelteKit's bundled `+server.ts` routes (through the $vtt
 // alias). Those two paths aren't guaranteed to resolve to the same module
-// instance, so the actual state lives on `globalThis` — both paths end up
+// instance, so the actual state lives on `globalThis` - both paths end up
 // pointing at the same Maps regardless of how many times this file's top
 // level runs.
 const GLOBAL_KEY = '__vttStore__';
@@ -51,7 +51,7 @@ export function createSession(id) {
 }
 
 // Strips secret info from a single token for a player-role recipient.
-// Enemy/npc tokens never expose real stats to players — only the GM-set
+// Enemy/npc tokens never expose real stats to players - only the GM-set
 // coarse `condition` field, if present. PC tokens are untouched (HP isn't
 // secret between allies).
 export function filterTokenForPlayer(token) {
@@ -64,7 +64,7 @@ export function filterTokenForPlayer(token) {
 }
 
 // A marker (AOE/point-on-map) is visible to a player if they placed it
-// themselves or the GM has flipped its "visible to all" toggle — otherwise
+// themselves or the GM has flipped its "visible to all" toggle - otherwise
 // it's private to its owner + the GM, same shape as the hidden-token rule.
 export function shouldPlayerSeeMarker(marker, playerId) {
   return marker.visibleToAll || marker.ownerId === playerId;

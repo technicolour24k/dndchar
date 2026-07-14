@@ -1,10 +1,11 @@
-// @ts-nocheck — plain untyped JS by design, see vtt/README.md.
+// @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
 import { sessions, socketsBySession, broadcast } from './store.js';
 import handleJoin from './handlers/join.js';
 import handleTokenEvent from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
 import handleMarkerEvent from './handlers/marker.js';
+import handleTargetEvent from './handlers/target.js';
 
 const WS_PATH = '/vtt-ws';
 const context = { sessions, socketsBySession, broadcast };
@@ -14,7 +15,7 @@ let wss = null;
 // Attaches the VTT WebSocket layer to an existing http.Server, filtering
 // upgrade requests by path so it coexists with whatever else is listening on
 // that server (SvelteKit's own dev-server HMR socket in dev, nothing extra in
-// prod). Safe to call more than once per process — only the first call does
+// prod). Safe to call more than once per process - only the first call does
 // anything.
 export function attachVttWebSocketServer(httpServer) {
   if (wss) return wss;
@@ -58,6 +59,10 @@ export function attachVttWebSocketServer(httpServer) {
         case 'marker:visibility:toggle':
           handleMarkerEvent(meta, msg, context);
           break;
+        case 'target:select':
+        case 'target:clear':
+          handleTargetEvent(meta, msg, context);
+          break;
         default:
           break;
       }
@@ -67,6 +72,18 @@ export function attachVttWebSocketServer(httpServer) {
       if (!meta.sessionId) return;
       const sockets = socketsBySession.get(meta.sessionId);
       if (sockets) sockets.delete(meta);
+
+      const session = sessions.get(meta.sessionId);
+      if (!session) return;
+
+      if (meta.role === 'player' && meta.playerId && session.players[meta.playerId]) {
+        // Don't delete the player outright - they should reappear correctly
+        // on reconnect via the same state:full path join.js already uses.
+        session.players[meta.playerId].connected = false;
+        broadcast(meta.sessionId, () => ({ type: 'player:left', playerId: meta.playerId }));
+      } else if (meta.role === 'gm' && session.gmSocketId === (meta.playerId || 'gm')) {
+        session.gmSocketId = null;
+      }
     });
   });
 

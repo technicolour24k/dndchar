@@ -156,7 +156,7 @@ export async function saveEffect(userId: string, form: FormData) {
       await client.query(`UPDATE effect_definitions SET name=$2,source_type=$3,description=$4,duration_type=$5,duration_rounds=$6,
         requires_concentration=$7,is_condition=$8,is_selectable=$9,stack_behavior=$10,default_expiry_boundary=$11,updated_at=now()
         WHERE id=$1`,[id,...values]);
-      // Sync to unified Container — use a subquery to resolve effect_key → content_key.
+      // Sync to unified Container - use a subquery to resolve effect_key → content_key.
       await client.query(`UPDATE content_definitions SET name=$2,description=$3,duration_type=$4,duration_rounds=$5,
         requires_concentration=$6,stack_behavior=$7,expiry_boundary=$8,updated_at=now()
         WHERE content_key=(SELECT 'condition:'||effect_key FROM effect_definitions WHERE id=$1)

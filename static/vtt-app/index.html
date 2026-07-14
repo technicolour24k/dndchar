@@ -47,6 +47,10 @@
         <span>Click the map to place your marker</span>
         <button type="button" id="markerPlacementCancelBtn" class="secondary">Cancel</button>
       </div>
+      <div id="actionTargetBanner" class="marker-placement-banner">
+        <span id="actionTargetBannerText">Click a token to target</span>
+        <button type="button" id="actionTargetCancelBtn" class="secondary">Cancel</button>
+      </div>
     </div>
   </div>
 
@@ -60,6 +64,28 @@
       <div class="actions">
         <button id="visionModalCancel" class="secondary">Cancel</button>
         <button id="visionModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="conditionsModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Conditions</h2>
+      <div id="conditionsModalList"></div>
+      <div class="actions">
+        <button id="conditionsModalCancel" class="secondary">Cancel</button>
+        <button id="conditionsModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="characterPickerModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Pick Your Character</h2>
+      <div id="characterPickerStatus" class="picker-status"></div>
+      <div id="characterPickerList"></div>
+      <div class="actions">
+        <button type="button" id="characterPickerCancelBtn" class="secondary">Cancel</button>
       </div>
     </div>
   </div>

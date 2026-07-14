@@ -1,5 +1,5 @@
 // Translucent highlight showing how far a token can still move this turn.
-// Drawn as a plain radius circle, same "no walls" simplification as vision —
+// Drawn as a plain radius circle, same "no walls" simplification as vision -
 // it's a planning aid, not a pathfinding/terrain-aware range.
 export function drawMovementRange(ctx, tokens, gridSizePx) {
   const pxPerFoot = gridSizePx / 5;

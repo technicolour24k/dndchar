@@ -2,7 +2,7 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, hitDiceSummary, modifierTargetMatches, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, modifierTargetMatches, passiveScore, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -38,7 +38,7 @@
     remaining: character.resources.find((r) => r.key === `hit_dice_${i}`)?.currentValue ?? row.level
   })));
   const hitDiceDisplay = $derived(
-    classHitDice.map((c) => `${c.remaining}d${c.dieSize}`).join(' + ') || '—'
+    classHitDice.map((c) => `${c.remaining}d${c.dieSize}`).join(' + ') || '-'
   );
   const hitDiceRemainingTotal = $derived(classHitDice.reduce((s, c) => s + c.remaining, 0));
   let hitDiceCount = $state(1);
@@ -76,16 +76,12 @@
     { key: 'misc', label: 'Misc' }
   ]);
   const inventoryRows = $derived(character.inventory);
-  const equippedInventoryRows = $derived(
-    inventoryRows.filter((item) => item.location === 'equipped' || item.equipped)
-  );
+  const equippedInventoryRows = $derived(equippedItems(inventoryRows));
   const backpackInventoryRows = $derived(
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
   );
   const miscInventoryRows = $derived(inventoryRows.filter((item) => item.location === 'misc'));
-  const battleActionItems = $derived(
-    inventoryRows.filter((item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus))
-  );
+  const battleActionItems = $derived(equippedAttackItems(inventoryRows));
   const attack = $derived(character.attacks[0] ?? {
     name: '',
     attackAbility: 'str' as AbilityKey,
@@ -208,17 +204,9 @@
     equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
   );
   const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ac'], { classes: classRows }));
-  const computedArmorClass = $derived(
-    10 +
-      abilityModifier(abilityScores.dex) +
-      equippedAcBonus +
-      acModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
-  );
+  const computedArmorClass = $derived(armorClass(abilityScores.dex, equippedAcBonus, character.modifierSources, { classes: classRows }));
   const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['initiative'], { classes: classRows }));
-  const computedInitiative = $derived(
-    abilityModifier(abilityScores.dex) +
-      initiativeModifierBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
-  );
+  const computedInitiative = $derived(initiativeBonus(abilityScores.dex, character.modifierSources, { classes: classRows }));
   const spellcastingAbility = $derived((classes.spellcastingAbility || meta('spellcastingAbility', 'int').toLowerCase()) as AbilityKey);
   const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_save_dc'], { classes: classRows }));
   const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
@@ -231,37 +219,20 @@
   const characterSpells = $derived(character.content.filter((entry) => entry.type === 'spell'));
   const characterFeats = $derived(character.content.filter((entry) => entry.type === 'feat'));
   const characterFeatures = $derived(character.content.filter((entry) => entry.type === 'class_feature'));
-  const computedSpeedValue = $derived.by(() => {
-    const setValues = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
-    const bonuses = resolvedAdditiveModifiers(character.modifierSources, ['speed.all', 'speed.walk'], { classes: classRows });
-    const multipliers = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
-    const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
-    const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
-    const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
-    return Math.max(0, Math.floor(multiplied));
-  });
+  const computedSpeedValue = $derived(speedFt(character.modifierSources, { classes: classRows }));
   const computedSpeed = $derived(`${computedSpeedValue} ft.`);
   const computedHitDice = $derived(hitDiceSummary(classRows));
   const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
   const computedPassivePerception = $derived(
-    10 +
-      abilityModifier(abilityScores.wis) +
-      (isSkillProficient('perception') ? prof : 0) +
-      passivePerceptionBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+    passiveScore(abilityScores.wis, isSkillProficient('perception'), prof, character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows })
   );
   const passiveInsightBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows }));
   const computedPassiveInsight = $derived(
-    10 +
-      abilityModifier(abilityScores.wis) +
-      (isSkillProficient('insight') ? prof : 0) +
-      passiveInsightBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+    passiveScore(abilityScores.wis, isSkillProficient('insight'), prof, character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows })
   );
   const passiveInvestigationBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows }));
   const computedPassiveInvestigation = $derived(
-    10 +
-      abilityModifier(abilityScores.int) +
-      (isSkillProficient('investigation') ? prof : 0) +
-      passiveInvestigationBonuses.reduce((sum, bonus) => sum + bonus.value, 0)
+    passiveScore(abilityScores.int, isSkillProficient('investigation'), prof, character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows })
   );
   const savingThrowModifierBonuses = $derived(
     Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>
@@ -467,7 +438,7 @@
     const relevant = character.modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
       .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
 
-    // modifier-primacy.md §3.3 — count advantage/disadvantage sources per bucket (don't just
+    // modifier-primacy.md §3.3 - count advantage/disadvantage sources per bucket (don't just
     // detect presence), net them, and roll a 1+|net|-size d20 pool in the net's direction.
     const advantageSources = relevant.filter(({ entry }) => entry.modifierType === 'advantage').map(({ effect }) => effect);
     const disadvantageSources = relevant.filter(({ entry }) => entry.modifierType === 'disadvantage').map(({ effect }) => effect);
@@ -483,10 +454,10 @@
     const total = d20 + modifier + flat + extraTotal;
 
     // Source-attributed audit trail per modifier-primacy.md §2.6: name which effects granted
-    // advantage/disadvantage, show the net and pool size, and show every die actually rolled —
+    // advantage/disadvantage, show the net and pool size, and show every die actually rolled -
     // even when sources fully cancel, since "nothing changed" is itself worth showing why.
     const extras = extraDice.map((die) => `${die.label} ${die.expression} (${die.rolls.join(', ')})`).join(' + ');
-    // §2.6 audit trail — when the caller supplies a labeled breakdown of the flat modifier (e.g.
+    // §2.6 audit trail - when the caller supplies a labeled breakdown of the flat modifier (e.g.
     // Proficiency + ability mod), show its components instead of just the summed total.
     const breakdownText = modifierBreakdown.length ? ` (${modifierBreakdown.map((entry) => `${entry.label} ${entry.value}`).join(' + ')})` : '';
     const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${breakdownText}${extras ? ` + ${extras}` : ''} = ${total}`;
@@ -570,7 +541,7 @@
       ? ` + ${count > 1 ? `${count}×` : ''}CON (${conMod >= 0 ? '+' : ''}${conMod}${count > 1 ? ` = ${conTotal >= 0 ? '+' : ''}${conTotal}` : ''}) = ${rolled}`
       : ` = ${rolled}`;
     const passiveNote = hpHeadroom <= 0
-      ? `Already at full HP — hit ${count === 1 ? 'die' : 'dice'} spent.`
+      ? `Already at full HP - hit ${count === 1 ? 'die' : 'dice'} spent.`
       : `Recovered ${hpGained} HP (${hp.currentValue} → ${hp.currentValue + hpGained}).`;
     simpleRollResult = {
       title: 'Use Hit Dice',
@@ -584,7 +555,7 @@
     body.set('hpGained', String(hpGained));
     const response = await fetch('?/spendHitDice', { method: 'POST', body });
     if (!response.ok) {
-      simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) — refresh the page.` };
+      simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) - refresh the page.` };
       return;
     }
     await invalidateAll();
@@ -684,7 +655,7 @@
       }
     }
 
-    // modifier-primacy.md §2.1/§6.3 — a Container's own attached 'extra_die' Modifiers (e.g. its
+    // modifier-primacy.md §2.1/§6.3 - a Container's own attached 'extra_die' Modifiers (e.g. its
     // base weapon damage die, sourced from the Modifier system rather than the legacy flat
     // expression above) get their own attributed line, same as any other modifier-granted die.
     for (const die of extraDice) {
@@ -752,7 +723,7 @@
       item.category === 'weapon' ? 'attack_roll.melee_weapon' : '',
       item.category === 'weapon' ? `attack_roll.melee_weapon.${item.attackAbility}` : ''].filter(Boolean);
 
-    // Phase 1 (modifier-primacy.md §6.4) — resolve the triggering (to-hit) roll first.
+    // Phase 1 (modifier-primacy.md §6.4) - resolve the triggering (to-hit) roll first.
     const attackRoll = rollText(attackBonus, attackCandidates, attackBreakdown);
 
     // Phase 1 -> 2 handoff: turn the to-hit result into the named outcomes it satisfied, before
@@ -760,7 +731,7 @@
     const critThreshold = resolveCritThreshold(character.modifierSources, { ability: item.attackAbility, attackType: 'melee_weapon' });
     const outcomes = resolveD20Outcomes(attackRoll.natural, critThreshold);
 
-    // Phase 2 — resolve the dependent (damage) roll using the now-known outcome set.
+    // Phase 2 - resolve the dependent (damage) roll using the now-known outcome set.
     const damageCandidates = damageCandidatesFor(item);
     const damageContext = { classes: classRows, attackType: 'melee_weapon', ability: item.attackAbility, outcomes } as const;
     const extraDice = resolveExtraDiceRolls(character.modifierSources, damageCandidates, damageContext, rollDie);
@@ -768,7 +739,7 @@
 
     rollResult = {
       title: item.name || 'Battle Action',
-      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` — ${outcomes.join(', ')}` : ''}`,
+      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` - ${outcomes.join(', ')}` : ''}`,
       damage: damage.lines,
       effects: item.effects || item.notes || '-'
     };
