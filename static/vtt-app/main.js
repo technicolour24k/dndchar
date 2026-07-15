@@ -21,6 +21,7 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'speedRemainingFt',
   'characterId',
   'ac',
+  'knownAc',
   'saves',
   'actions',
   'spellSlots',
@@ -217,6 +218,13 @@ function handleMessage(msg) {
       render();
       break;
 
+    case 'attack:result':
+      // Server's hit/miss verdict for an attack we just resolved (it decided
+      // against the target's hidden AC and already applied any damage). Update
+      // the open attack modal, if it's still the one awaiting this target.
+      handleAttackResult(msg);
+      break;
+
     case 'marker:add':
       session.markers[msg.marker.id] = msg.marker;
       render();
@@ -354,6 +362,10 @@ function render() {
     currentRenderedTokens = visibleTokens;
   }
 
+  if (pendingActionTarget) {
+    drawArmedTargetHighlights(ctx, currentRenderedTokens, map.gridSizePx, pendingActionTarget.sourceTokenId);
+  }
+
   if (shapeDrag) {
     drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx);
   }
@@ -449,43 +461,198 @@ document.getElementById('markerPlacementCancelBtn').addEventListener('click', di
 
 const actionTargetBanner = document.getElementById('actionTargetBanner');
 const actionTargetBannerText = document.getElementById('actionTargetBannerText');
-let pendingActionTarget = null; // { sourceTokenId, action } or null while armed
+let pendingActionTarget = null; // { sourceTokenId, action } while a weapon is armed for targeting
 
+// Step 1: arm targeting. Valid targets get a highlight ring (drawn in render()),
+// the banner names the weapon, and the cursor changes - no more silent "click and hope."
 function armActionTargeting(sourceTokenId, action) {
   disarmMarkerPlacement();
   pendingActionTarget = { sourceTokenId, action };
-  actionTargetBannerText.textContent = `Click a token to attack with ${action.name}`;
+  actionTargetBannerText.textContent = `Attacking with ${action.name} — select a target`;
   actionTargetBanner.classList.add('visible');
   canvas.style.cursor = 'crosshair';
+  render(); // draw the valid-target highlight rings
 }
 
 function disarmActionTargeting() {
   pendingActionTarget = null;
   actionTargetBanner.classList.remove('visible');
   canvas.style.cursor = '';
+  render();
 }
 
 document.getElementById('actionTargetCancelBtn').addEventListener('click', disarmActionTargeting);
 
-// Minimal 'XdY+Z' dice roller - the vanilla VTT client has no build step and
-// can't import $lib/rules/dnd5e's rollDiceExpression (SvelteKit-only
-// aliases/imports), so this is a small standalone equivalent covering just
-// the "roll a weapon's damage dice" case the mini-sheet needs.
-function rollDamageDice(damageRolls, damageBonus) {
-  let total = Number(damageBonus) || 0;
-  const rolls = [];
-  for (const term of String(damageRolls || '').split(/\s*\+\s*/)) {
-    const match = term.trim().match(/^(\d*)d(\d+)$/i);
-    if (!match) continue;
-    const count = Math.max(1, Number(match[1]) || 1);
-    const sides = Math.max(1, Number(match[2]) || 1);
-    for (let i = 0; i < count; i++) {
-      const roll = Math.floor(Math.random() * sides) + 1;
-      rolls.push(roll);
-      total += roll;
-    }
+// ---------------------------------------------------------------------------
+// Attack confirm + roll-result modal (Phase 2.5). Clicking a target no longer
+// resolves instantly - it shows an explicit Attack button (confirm step), then
+// rolls via the shared SERVER-SIDE roll (POST /vtt/api/characters/[id]/roll-attack)
+// so the VTT displays the exact same to-hit/damage breakdown the character sheet
+// produces (advantage/disadvantage dice-pool, Bless/extra dice, crit outcomes) -
+// the vanilla client can't import $lib and the token only carries a flattened
+// action, so this is the one place the full roll can actually happen.
+// ---------------------------------------------------------------------------
+const attackModal = document.getElementById('attackModal');
+const attackModalBody = document.getElementById('attackModalBody');
+let pendingAttack = null; // { sourceTokenId, action, targetId, targetName }
+
+function closeAttackModal() {
+  attackModal.classList.remove('visible');
+  attackModalBody.innerHTML = '';
+  if (awaitingAttackResult) {
+    clearTimeout(awaitingAttackResult.timeoutId);
+    awaitingAttackResult = null;
   }
-  return { total: Math.max(0, total), rolls };
+  if (pendingAttack) {
+    send({ type: 'target:clear' });
+    currentTargetTokenIds = [];
+    render();
+  }
+  pendingAttack = null;
+}
+
+// Step 2 -> 3: a target was clicked; show the confirm card with an explicit Attack button.
+// The chosen target gets ringed for everyone (target:select) as immediate visible feedback.
+function openAttackConfirm(sourceTokenId, action, target) {
+  pendingAttack = { sourceTokenId, action, targetId: target.id, targetName: target.name };
+  send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
+  currentTargetTokenIds = [target.id];
+  render();
+
+  attackModalBody.innerHTML = `
+    <h2>Attack</h2>
+    <div class="attack-target-name">Attacking <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
+    <div class="actions">
+      <button type="button" class="secondary" id="attackCancelBtn">Cancel</button>
+      <button type="button" id="attackConfirmBtn">Attack</button>
+    </div>
+  `;
+  attackModal.classList.add('visible');
+  document.getElementById('attackCancelBtn').addEventListener('click', closeAttackModal);
+  document.getElementById('attackConfirmBtn').addEventListener('click', resolveAttack);
+}
+
+function attackModalError(message) {
+  attackModalBody.innerHTML = `<h2>Attack</h2><p style="color:#e57373;font-size:13px;">${escapeHtml(message)}</p><div class="actions"><button type="button" id="attackCloseBtn">Close</button></div>`;
+  document.getElementById('attackCloseBtn').addEventListener('click', closeAttackModal);
+}
+
+// Which token is awaiting a server hit/miss verdict, so the async attack:result
+// message can be matched back to the open modal. { targetId, targetName, result, timeoutId }
+let awaitingAttackResult = null;
+
+// Step 3 -> roll: roll via the shared server endpoint (character attack if the
+// source token is a linked PC, otherwise the DM's manual stat-block attack),
+// show the breakdown, then hand off to the server to decide hit/miss against the
+// target's hidden AC (attack:resolve) - the client never sees enemy AC, so it
+// can't and doesn't decide the verdict itself.
+async function resolveAttack() {
+  if (!pendingAttack) return;
+  const { sourceTokenId, action, targetId, targetName } = pendingAttack;
+  const source = session.tokens[sourceTokenId];
+
+  attackModalBody.innerHTML = `<h2>Attack</h2><p class="attack-subtext">Rolling ${escapeHtml(action.name)}…</p>`;
+  let result;
+  try {
+    const res = source?.characterId
+      ? await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemName: action.name }),
+        })
+      : await fetch('/vtt/api/roll-manual', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: action.name, toHitBonus: action.toHitBonus,
+            damageRolls: action.damageRolls, damageBonus: action.damageBonus,
+          }),
+        });
+    if (!res.ok) throw new Error('roll request failed (' + res.status + ')');
+    result = await res.json();
+  } catch (err) {
+    console.error('[VTT] attack roll failed', err);
+    attackModalError("Couldn't roll the attack: " + String(err.message || err));
+    return;
+  }
+
+  renderAttackBreakdown(targetName, result, '<span class="attack-subtext">Resolving hit/miss…</span>');
+
+  const outcome = (result.outcomes || []).includes('critical_hit') ? 'critical_hit'
+    : (result.outcomes || []).includes('critical_miss') ? 'critical_miss' : null;
+
+  const timeoutId = setTimeout(() => {
+    if (awaitingAttackResult && awaitingAttackResult.targetId === targetId) {
+      setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
+      awaitingAttackResult = null;
+    }
+  }, 5000);
+  awaitingAttackResult = { targetId, targetName, result, timeoutId };
+
+  send({
+    type: 'attack:resolve',
+    targetTokenId: targetId,
+    sourceTokenId,
+    toHit: result.attackTotal,
+    damage: result.damageTotal,
+    outcome,
+  });
+}
+
+// Renders the to-hit + damage breakdown (identical whichever roll source), with
+// a verdict slot filled once the server responds.
+function renderAttackBreakdown(targetName, result, verdictHtml) {
+  attackModalBody.innerHTML = `
+    <h2>${escapeHtml(result.title || 'Attack')}</h2>
+    <div class="attack-target-name">vs <strong>${escapeHtml(targetName)}</strong></div>
+    <div class="attack-roll-block"><h4>To hit</h4>${escapeHtml(result.attack || '')}</div>
+    <div id="attackVerdict">${verdictHtml}</div>
+    <div class="attack-roll-block"><h4>Damage (on a hit)</h4>${escapeHtml((result.damage || []).join('\n'))}</div>
+    <div class="actions">
+      <button type="button" class="secondary" id="attackDoneBtn">Close</button>
+    </div>
+  `;
+  document.getElementById('attackDoneBtn').addEventListener('click', closeAttackModal);
+}
+
+function setAttackVerdict(html) {
+  const el = document.getElementById('attackVerdict');
+  if (el) el.innerHTML = html;
+}
+
+// Server's verdict for the in-flight attack (it decided vs the hidden AC and
+// already applied any damage). We only learn hit/miss + damage dealt, never AC.
+function handleAttackResult(msg) {
+  if (!awaitingAttackResult || msg.targetTokenId !== awaitingAttackResult.targetId) return;
+  clearTimeout(awaitingAttackResult.timeoutId);
+  awaitingAttackResult = null;
+
+  let cls, label;
+  if (msg.fumble) { cls = 'miss'; label = 'Critical miss!'; }
+  else if (msg.critical) { cls = 'crit'; label = `Critical hit! ${msg.damage} damage dealt`; }
+  else if (msg.hit) {
+    cls = 'hit';
+    label = msg.acKnown
+      ? `Hit! ${msg.damage} damage dealt`
+      : `Hit (no AC set) — ${msg.damage} damage dealt`;
+  } else { cls = 'miss'; label = 'Miss'; }
+
+  setAttackVerdict(`<div class="attack-outcome ${cls}">${label}</div>`);
+}
+
+// Yellow highlight ring around every valid target while a weapon is armed (step 1's visible
+// "targeting is on" cue). The attacker's own token is skipped - you can't target yourself.
+function drawArmedTargetHighlights(ctx, tokens, gridSizePx, sourceTokenId) {
+  const radius = gridSizePx * 0.5;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,193,7,0.9)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([]);
+  for (const token of tokens) {
+    if (token.id === sourceTokenId) continue;
+    ctx.beginPath();
+    ctx.arc(token.x, token.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 // Clicking a token you can move drags the token; clicking empty space (or a
@@ -501,13 +668,10 @@ canvas.addEventListener('mousedown', (e) => {
     const target = hitTestToken(x, y);
     const { sourceTokenId, action } = pendingActionTarget;
     disarmActionTargeting();
-    if (!target) return;
-
-    send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
-
-    const { total, rolls } = rollDamageDice(action.damageRolls, action.damageBonus);
-    send({ type: 'token:stat:update', tokenId: target.id, stat: 'hp', delta: -total });
-    alert(`${action.name} hits ${target.name} for ${total} damage (${rolls.join(' + ') || total}).`);
+    // Clicking empty space or your own token cancels targeting instead of resolving.
+    if (!target || target.id === sourceTokenId) return;
+    // Step 2 -> confirm step: no instant resolve, show the Attack button first.
+    openAttackConfirm(sourceTokenId, action, target);
     return;
   }
 
@@ -986,12 +1150,14 @@ async function syncOwnedCharacterTokens() {
 }
 
 function applyCharacterSyncFields(token, snapshot) {
-  // hp, maxHp, speedFt, and all four vision fields are deliberately excluded -
-  // each has an editable control somewhere in the VTT (HP/Max HP/Speed
-  // inputs, the Darkvision checkbox, the Advanced Vision modal) and must stay
-  // session-authoritative once set, the same way hp/spellSlots already are.
+  // hp, maxHp, ac, speedFt, and all four vision fields are deliberately excluded -
+  // each now has an editable control somewhere in the VTT (HP/Max HP/Speed
+  // inputs, the mini-sheet AC input, the Darkvision checkbox, the Advanced
+  // Vision modal) and must stay session-authoritative once set, the same way
+  // hp/spellSlots already are. (ac joined this list when the mini-sheet AC field
+  // became editable - polling it would revert a manual in-session AC change on
+  // the next tick, the same clobber the vision fields hit earlier.)
   const updates = {
-    ac: snapshot.ac,
     saves: snapshot.saves,
     actions: snapshot.actions,
     preparedSpells: snapshot.preparedSpells,
@@ -1202,6 +1368,7 @@ function gmSidebarHtml() {
     <div class="field row">
       <div><label>HP</label><input type="number" id="tokenHpInput" value="10" /></div>
       <div><label>Max HP</label><input type="number" id="tokenMaxHpInput" value="10" /></div>
+      <div><label>AC</label><input type="number" id="tokenAcInput" value="10" /></div>
     </div>
     <div class="field"><label>Speed (ft)</label><input type="number" id="tokenSpeedInput" value="30" /></div>
     <div class="field"><button type="button" id="tokenBrowseLibraryBtn" class="secondary">Browse Token Library…</button></div>
@@ -1280,6 +1447,32 @@ function wireMarkerForm() {
   });
 }
 
+// A GM token's manual stat-block attacks (Phase 2.5 follow-up). Enemies aren't
+// full characters, so the GM enters attacks directly (name + to-hit + damage
+// dice); clicking a row arms the same attack-targeting flow a player's weapon
+// uses, just rolled via /vtt/api/roll-manual instead of a character sheet.
+function gmAttacksHtml(t) {
+  const rows = (t.actions || [])
+    .map((a, idx) => `
+      <div class="mini-sheet-action gm-attack-row" data-action-index="${idx}">
+        <span>${escapeHtml(a.name || 'Attack')}</span>
+        <span style="color:#aaa;">${signedVtt(a.toHitBonus)}${a.damageRolls ? ` · ${escapeHtml(a.damageRolls)}${a.damageBonus ? ' ' + signedVtt(a.damageBonus) : ''}` : ''} <button type="button" class="gm-attack-del" title="Delete attack" data-action-index="${idx}">✕</button></span>
+      </div>
+    `)
+    .join('');
+  return `
+    <label style="font-size:11px;color:#888;">Attacks</label>
+    ${rows || '<p style="color:#666;font-size:11px;margin:2px 0 0;">No attacks yet.</p>'}
+    <div class="gm-attack-add">
+      <input class="atkName" placeholder="Name" />
+      <input class="atkHit" type="number" placeholder="+hit" />
+      <input class="atkDmg" placeholder="1d8" />
+      <input class="atkDmgBonus" type="number" placeholder="+dmg" />
+      <button type="button" class="secondary addAttackBtn">Add attack</button>
+    </div>
+  `;
+}
+
 function gmTokenListHtml() {
   const tokens = Object.values(session.tokens);
   if (!tokens.length) return '<p style="color:#666;font-size:12px;">No tokens yet.</p>';
@@ -1298,7 +1491,9 @@ function gmTokenListHtml() {
           <div class="field row">
             <div><label>HP</label><input type="number" class="hpInput" value="${hp}" /></div>
             <div><label>Max HP</label><input type="number" class="maxHpInput" value="${maxHp}" /></div>
+            <div><label>AC</label><input type="number" class="acInput" value="${t.ac ?? ''}" /></div>
           </div>
+          ${gmAttacksHtml(t)}
           <div class="field"><label>Condition</label>
             <select class="conditionSelect">
               <option value="" ${!t.condition ? 'selected' : ''}>-</option>
@@ -1469,6 +1664,9 @@ function wireGmSidebar() {
       speedFt: Number(document.getElementById('tokenSpeedInput').value) || 0,
       speedRemainingFt: Number(document.getElementById('tokenSpeedInput').value) || 0,
       hidden: document.getElementById('tokenHiddenInput').checked,
+      // Top-level ac (not stats.ac) so the same field works for PCs and enemies;
+      // the server strips it from players for enemy/npc tokens (store.js filter).
+      ac: Number(document.getElementById('tokenAcInput').value) || 0,
       stats: {
         hp: Number(document.getElementById('tokenHpInput').value) || 0,
         maxHp: Number(document.getElementById('tokenMaxHpInput').value) || 0,
@@ -1509,6 +1707,10 @@ function wireGmSidebar() {
       send({ type: 'token:stat:update', tokenId, stat: 'hp', value: Number(e.target.value) });
     } else if (e.target.classList.contains('maxHpInput')) {
       send({ type: 'token:stat:update', tokenId, stat: 'maxHp', value: Number(e.target.value) });
+    } else if (e.target.classList.contains('acInput')) {
+      // Enemy/npc AC is stripped from players by the server filter; the GM sets
+      // the true value here, and players only ever discover the `knownAc` bound.
+      send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
     } else if (e.target.classList.contains('conditionSelect')) {
       send({ type: 'token:stat:update', tokenId, stat: 'condition', value: e.target.value || null });
     } else if (e.target.classList.contains('darkvisionToggle')) {
@@ -1532,6 +1734,34 @@ function wireGmSidebar() {
     const card = e.target.closest('.token-card');
     if (!card) return;
     const tokenId = card.dataset.tokenId;
+    const token = session.tokens[tokenId];
+    // --- Manual stat-block attacks (checked before the row, since the delete
+    // ✕ lives inside a .gm-attack-row) ---
+    if (e.target.classList.contains('gm-attack-del')) {
+      const idx = Number(e.target.dataset.actionIndex);
+      const next = (token?.actions || []).filter((_, i) => i !== idx);
+      send({ type: 'token:stat:update', tokenId, stat: 'actions', value: next });
+      return;
+    }
+    if (e.target.classList.contains('addAttackBtn')) {
+      const box = e.target.closest('.gm-attack-add');
+      const name = box.querySelector('.atkName').value.trim();
+      if (!name) return alert('Give the attack a name.');
+      const action = {
+        name,
+        toHitBonus: Number(box.querySelector('.atkHit').value) || 0,
+        damageRolls: box.querySelector('.atkDmg').value.trim(),
+        damageBonus: Number(box.querySelector('.atkDmgBonus').value) || 0,
+      };
+      send({ type: 'token:stat:update', tokenId, stat: 'actions', value: [...(token?.actions || []), action] });
+      return;
+    }
+    const attackRow = e.target.closest('.gm-attack-row');
+    if (attackRow && token) {
+      const action = (token.actions || [])[Number(attackRow.dataset.actionIndex)];
+      if (action) armActionTargeting(tokenId, action);
+      return;
+    }
     if (e.target.classList.contains('toggleHiddenBtn')) {
       send({ type: 'token:hidden:toggle', tokenId });
     } else if (e.target.classList.contains('removeBtn')) {
@@ -1685,7 +1915,7 @@ function miniSheetHtml(t) {
   return `
     <div class="mini-sheet">
       <div class="field row">
-        <div><label>AC</label><input type="number" value="${t.ac ?? ''}" readonly /></div>
+        <div><label>AC</label><input type="number" class="acInput" value="${t.ac ?? ''}" /></div>
         <div><label>Saves</label><div style="padding-top:4px;">${savesHtml}</div></div>
       </div>
       <label style="font-size:11px;color:#888;">Actions</label>
@@ -1736,6 +1966,8 @@ function wirePlayerSidebar() {
       send({ type: 'token:stat:update', tokenId, stat: 'hp', value: Number(e.target.value) });
     } else if (e.target.classList.contains('maxHpInput')) {
       send({ type: 'token:stat:update', tokenId, stat: 'maxHp', value: Number(e.target.value) });
+    } else if (e.target.classList.contains('acInput')) {
+      send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
     } else if (e.target.classList.contains('speedInput')) {
       const value = Number(e.target.value) || 0;
       send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });

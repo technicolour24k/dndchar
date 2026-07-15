@@ -33,7 +33,19 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
+  // The lowest attack roll that has actually hit this token - server-set only
+  // (attack:resolve), never written directly by a client. Top-level so it
+  // survives filterTokenForPlayer (unlike the real `ac`, which is stripped for
+  // enemy/npc) - it's the deliberately-revealed upper bound players discover.
+  'knownAc',
 ]);
+
+// Top-level fields that are still secret from players on enemy/npc tokens even
+// though they live outside the `stats` bucket. `ac` is the true Armor Class -
+// filterTokenForPlayer strips it from the token object, but a token:stat:update
+// event's raw `value` would otherwise leak it, same class of leak the stats.*
+// fields already guard against below.
+const ENEMY_HIDDEN_TOKEN_FIELDS = new Set(['ac']);
 
 // Fields a player may write on their own token via token:stat:update.
 // hp/maxHp/imageUrl/speedFt are included deliberately - players self-tracking
@@ -198,7 +210,8 @@ function handleTokenEvent(meta, msg, context) {
       // token), and is reachable by players now that a valid-target hp
       // update is allowed - worth being deliberate about, not just trusting
       // the token-level filter to cover it.
-      const isSensitiveStat = (token.type === 'enemy' || token.type === 'npc') && !TOKEN_LEVEL_STAT_FIELDS.has(msg.stat);
+      const isSensitiveStat = (token.type === 'enemy' || token.type === 'npc')
+        && (!TOKEN_LEVEL_STAT_FIELDS.has(msg.stat) || ENEMY_HIDDEN_TOKEN_FIELDS.has(msg.stat));
       broadcastToken(context, meta.sessionId, 'token:stat:update', token, (recipient) => {
         if (recipient.role === 'gm' || !isSensitiveStat) {
           return { tokenId: token.id, stat: msg.stat, value: appliedValue };
@@ -223,6 +236,83 @@ function handleTokenEvent(meta, msg, context) {
           ? { type: 'token:remove', tokenId: token.id }
           : { type: 'token:add', token: filterTokenForPlayer(token) };
       });
+      break;
+    }
+
+    // attack:resolve - the server decides hit/miss against the target's HIDDEN
+    // AC, applies damage on a hit, and (for enemy/npc) reveals only the lowest
+    // roll that has genuinely cleared AC (`knownAc`) - never the AC itself. This
+    // is why hit/miss resolution moved server-side (Phase 2.5 follow-up): a
+    // player attacking an enemy must never receive that enemy's AC to compare
+    // against locally. Both players (target-window gated, like isValidHpTarget)
+    // and the GM (any token, for enemy attacks) use this same path.
+    case 'attack:resolve': {
+      const target = session.tokens[msg.targetTokenId];
+      if (!target) return;
+      const targetWindowOk = meta.lastTargetTokenIds
+        && meta.lastTargetTokenIds.includes(target.id)
+        && Date.now() - (meta.lastTargetAt || 0) < TARGET_WINDOW_MS;
+      if (meta.role !== 'gm' && !targetWindowOk) return;
+
+      const toHit = Number(msg.toHit) || 0;
+      const damage = Math.max(0, Number(msg.damage) || 0);
+      const outcome = msg.outcome || null; // 'critical_hit' | 'critical_miss' | null
+      const ac = typeof target.ac === 'number' ? target.ac
+        : typeof target.stats?.ac === 'number' ? target.stats.ac : null;
+
+      let hit;
+      if (outcome === 'critical_miss') hit = false;
+      else if (outcome === 'critical_hit') hit = true;
+      else if (ac == null) hit = true; // no AC configured -> can't determine a miss, treat as hit
+      else hit = toHit >= ac;
+
+      let damageApplied = 0;
+      let knownAcChanged = false;
+      if (hit) {
+        const currentHp = Number(target.stats?.hp) || 0;
+        const newHp = Math.max(0, currentHp - damage);
+        target.stats = target.stats || {};
+        target.stats.hp = newHp;
+        damageApplied = currentHp - newHp;
+        // AC discovery: reveal the lowest roll that actually *cleared* AC. A crit
+        // that auto-hit below AC must NOT reveal a misleadingly low bound, so gate
+        // this on the real comparison, not on `hit`.
+        if (ac != null && toHit >= ac && (target.knownAc == null || toHit < target.knownAc)) {
+          target.knownAc = toHit;
+          knownAcChanged = true;
+        }
+      }
+
+      // Verdict goes only to the attacker - hit/miss + the damage they rolled,
+      // never the AC. We deliberately report the *rolled* `damage`, not the
+      // capped `damageApplied`: reporting the capped amount would leak an
+      // enemy's exact remaining HP on an overkill hit (roll 20, 5 applied ->
+      // they had 5 left), which defeats the point of hiding enemy stats.
+      meta.ws.send(JSON.stringify({
+        type: 'attack:result',
+        targetTokenId: target.id,
+        hit,
+        critical: outcome === 'critical_hit',
+        fumble: outcome === 'critical_miss',
+        acKnown: ac != null,
+        damage: hit ? damage : 0,
+      }));
+
+      // Broadcast the resulting HP (value stripped for players on enemy/npc, same
+      // rule as a direct stat:update) so everyone's token state stays in sync.
+      if (hit) {
+        broadcastToken(context, meta.sessionId, 'token:stat:update', target, (recipient) => {
+          const sensitive = target.type === 'enemy' || target.type === 'npc';
+          if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
+          return { tokenId: target.id, stat: 'hp' };
+        });
+      }
+      // knownAc is the intentionally-public discovered bound - value goes to all.
+      if (knownAcChanged) {
+        broadcastToken(context, meta.sessionId, 'token:stat:update', target, {
+          tokenId: target.id, stat: 'knownAc', value: target.knownAc,
+        });
+      }
       break;
     }
 
