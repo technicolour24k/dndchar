@@ -51,12 +51,14 @@ export function createSession(id) {
 }
 
 // Strips secret info from a single token for a player-role recipient.
-// Enemy/npc tokens never expose real stats to players - only the GM-set
-// coarse `condition` field, if present. PC tokens are untouched (HP isn't
-// secret between allies).
+// Enemy/npc tokens never expose real stats *or their true AC* to players -
+// only the GM-set coarse `condition` field, if present, and the separately
+// tracked `knownAc` (the lowest attack roll that has actually hit this token -
+// an upper bound players discover through play, never the real AC). PC tokens
+// are untouched (HP/AC aren't secret between allies).
 export function filterTokenForPlayer(token) {
   if (token.type === 'enemy' || token.type === 'npc') {
-    const { stats, ...rest } = token;
+    const { stats, ac, ...rest } = token;
     if (token.condition !== undefined) rest.condition = token.condition;
     return rest;
   }

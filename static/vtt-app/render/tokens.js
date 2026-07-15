@@ -69,8 +69,39 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage, viewerId = null) {
     // the health-condition badge.
     drawConditionsRow(ctx, token, radius);
 
+    drawAcIndicator(ctx, token, radius, viewerId);
+
     ctx.restore();
   }
+}
+
+// AC readout under the token. The GM sees the true AC of any token. A player
+// sees the true AC only for tokens whose AC isn't secret (their own / ally PCs,
+// where the server never strips it); for an enemy, the real AC never reaches
+// the client at all - the player only ever sees `knownAc`, the lowest attack
+// roll that has actually hit it, rendered as an upper bound "AC ≤ X" they
+// tighten through play. Nothing shows until either is known.
+function drawAcIndicator(ctx, token, radius, viewerId) {
+  let text = null;
+  const trueAc = typeof token.ac === 'number' ? token.ac
+    : (token.stats && typeof token.stats.ac === 'number' ? token.stats.ac : null);
+  if (viewerId === null) {
+    if (trueAc != null) text = `AC ${trueAc}`;
+  } else if (typeof token.ac === 'number') {
+    text = `AC ${token.ac}`; // unstripped -> own/ally PC, not secret
+  } else if (typeof token.knownAc === 'number') {
+    text = `AC ≤ ${token.knownAc}`;
+  }
+  if (text == null) return;
+
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#9fc5ff';
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 3;
+  const y = token.y + radius + 26; // just below the name label
+  ctx.strokeText(text, token.x, y);
+  ctx.fillText(text, token.x, y);
 }
 
 function drawHpBar(ctx, token, radius) {

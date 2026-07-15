@@ -198,3 +198,53 @@ body {
 .mini-sheet-action[data-action-name] { cursor: pointer; border-radius: 4px; }
 .mini-sheet-action[data-action-name]:hover { background: #1c1f26; }
 .mini-sheet-slot button { margin-top: 0; font-size: 11px; padding: 2px 6px; }
+
+/* Attack flow modal (confirm + roll result). Reuses .modal shell; these style its inner body. */
+.attack-target-name { font-size: 15px; font-weight: 600; color: #eee; margin: 2px 0 12px; }
+.attack-weapon-name { color: #4a7fff; }
+.attack-roll-block {
+  background: #14161b;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: #ddd;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.attack-roll-block h4 {
+  margin: 0 0 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  font-family: inherit;
+}
+.attack-outcome { font-weight: 700; font-size: 15px; margin: 10px 0 4px; }
+.attack-outcome.hit { color: #66bb6a; }
+.attack-outcome.miss { color: #e57373; }
+.attack-outcome.crit { color: #ffb300; }
+.attack-outcome.unknown { color: #bbb; }
+.attack-subtext { font-size: 11px; color: #888; margin-bottom: 4px; }
+
+/* GM manual stat-block attack editor (per token card) */
+.gm-attack-row { cursor: pointer; border-radius: 4px; }
+.gm-attack-row:hover { background: #1c1f26; }
+.gm-attack-del {
+  border: none;
+  background: none;
+  color: #777;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  margin-left: 4px;
+}
+.gm-attack-del:hover { color: #e57373; }
+.gm-attack-add { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin: 6px 0 2px; }
+.gm-attack-add input { padding: 3px 5px; border-radius: 4px; border: 1px solid #2c2f36; background: #14161b; color: #eee; font-size: 11px; }
+.gm-attack-add .atkName { flex: 1 1 70px; min-width: 60px; }
+.gm-attack-add .atkHit, .gm-attack-add .atkDmgBonus { width: 44px; }
+.gm-attack-add .atkDmg { width: 60px; }
+.gm-attack-add .addAttackBtn { font-size: 11px; padding: 3px 8px; }

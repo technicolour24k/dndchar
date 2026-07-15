@@ -2,7 +2,8 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, modifierTargetMatches, passiveScore, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveDicePool, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, rollD20Pool, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, passiveScore, proficiencyBonus, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -434,49 +435,11 @@
     ];
   }
 
+  // Thin wrapper over the shared, pure rollWithModifiers (src/lib/rules/attackRoll.ts) - the
+  // component just supplies its own reactive modifierSources and RNG. The VTT's server endpoint
+  // calls the exact same function, so saves/skills/attacks can't drift between the two surfaces.
   function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = []) {
-    const relevant = character.modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
-      .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
-
-    // modifier-primacy.md §3.3 - count advantage/disadvantage sources per bucket (don't just
-    // detect presence), net them, and roll a 1+|net|-size d20 pool in the net's direction.
-    const advantageSources = relevant.filter(({ entry }) => entry.modifierType === 'advantage').map(({ effect }) => effect);
-    const disadvantageSources = relevant.filter(({ entry }) => entry.modifierType === 'disadvantage').map(({ effect }) => effect);
-    const pool = resolveDicePool(advantageSources.length, disadvantageSources.length);
-    const { rolls, chosen: d20 } = rollD20Pool(pool.poolSize, pool.direction, rollDie);
-
-    const flat = relevant.reduce((sum, { entry }) => {
-      const value = Number(entry.valueExpression) || 0;
-      return sum + (entry.modifierType === 'bonus' ? value : entry.modifierType === 'penalty' ? -value : 0);
-    }, 0);
-    const extraDice = resolveExtraDiceRolls(character.modifierSources, candidates, {}, rollDie);
-    const extraTotal = extraDice.reduce((sum, die) => sum + die.value, 0);
-    const total = d20 + modifier + flat + extraTotal;
-
-    // Source-attributed audit trail per modifier-primacy.md §2.6: name which effects granted
-    // advantage/disadvantage, show the net and pool size, and show every die actually rolled -
-    // even when sources fully cancel, since "nothing changed" is itself worth showing why.
-    const extras = extraDice.map((die) => `${die.label} ${die.expression} (${die.rolls.join(', ')})`).join(' + ');
-    // §2.6 audit trail - when the caller supplies a labeled breakdown of the flat modifier (e.g.
-    // Proficiency + ability mod), show its components instead of just the summed total.
-    const breakdownText = modifierBreakdown.length ? ` (${modifierBreakdown.map((entry) => `${entry.label} ${entry.value}`).join(' + ')})` : '';
-    const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${breakdownText}${extras ? ` + ${extras}` : ''} = ${total}`;
-
-    let text: string;
-    if (pool.advantageCount === 0 && pool.disadvantageCount === 0) {
-      text = `d20 ${d20}\n${finalLine}`;
-    } else {
-      const directionLabel = pool.direction === 'highest' ? 'Advantage' : pool.direction === 'lowest' ? 'Disadvantage' : 'Normal';
-      const sourceLines = [
-        ...disadvantageSources.map((name) => `Disadvantage (${name})`),
-        ...advantageSources.map((name) => `Advantage (${name})`)
-      ];
-      const rollLine = `Roll 1+${Math.abs(pool.net)} (${pool.advantageCount} Advantage - ${pool.disadvantageCount} Disadvantage) dice = ${pool.poolSize} dice at ${directionLabel}`;
-      const rolledLine = `Rolled: ${rolls.join(', ')} - ${d20} wins`;
-      text = [...sourceLines, '', rollLine, rolledLine, finalLine].join('\n');
-    }
-
-    return { text, natural: d20, total };
+    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie);
   }
 
   function rollAllSavingThrows() {
@@ -621,6 +584,9 @@
     return Math.floor(Math.random() * sides) + 1;
   }
 
+  // Thin wrappers over the shared, pure roll module (src/lib/rules/attackRoll.ts). The component
+  // supplies its own reactive modifierSources / classRows / ability scores / RNG; the identical
+  // functions run server-side for the VTT, so the two surfaces can never disagree on a roll.
   function rollDamageExpression(
     expression: string,
     bonus: number,
@@ -629,120 +595,21 @@
     modifierBonuses: Array<{ label: string; value: number }> = [],
     extraDice: ReturnType<typeof resolveExtraDiceRolls> = []
   ) {
-    const parts = expression
-      .split('+')
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const lines: string[] = [];
-    let total = 0;
-
-    for (const part of parts) {
-      const dice = part.match(/^(\d*)d(\d+)$/i);
-      if (dice) {
-        const count = Math.max(1, Number(dice[1]) || 1);
-        const sides = Math.max(1, Number(dice[2]) || 1);
-        const rolls = Array.from({ length: count }, () => rollDie(sides));
-        const subtotal = rolls.reduce((sum, roll) => sum + roll, 0);
-        total += subtotal;
-        lines.push(`${part}: ${rolls.join(', ')} = ${total}`);
-        continue;
-      }
-
-      const flat = Number(part);
-      if (Number.isFinite(flat)) {
-        total += flat;
-        lines.push(`${flat >= 0 ? '+' : '-'}${Math.abs(flat)} = ${total}`);
-      }
-    }
-
-    // modifier-primacy.md §2.1/§6.3 - a Container's own attached 'extra_die' Modifiers (e.g. its
-    // base weapon damage die, sourced from the Modifier system rather than the legacy flat
-    // expression above) get their own attributed line, same as any other modifier-granted die.
-    for (const die of extraDice) {
-      total += die.value;
-      lines.push(`${die.label}: ${die.expression} (${die.rolls.join(', ')}) = ${total}`);
-    }
-
-    if (bonus) {
-      total += bonus;
-      lines.push(`Weapon: ${signed(bonus)} = ${total}`);
-    }
-
-    if (abilityBonus) {
-      total += abilityBonus;
-      lines.push(`${abilityLabel} Modifier: ${signed(abilityBonus)} = ${total}`);
-    }
-
-    for (const modifierBonus of modifierBonuses) {
-      total += modifierBonus.value;
-      lines.push(`${modifierBonus.label}: ${signed(modifierBonus.value)} = ${total}`);
-    }
-
-    lines.push(`Total: ${total}`);
-
-    return {
-      total,
-      lines: lines.length ? lines : ['No damage dice', 'Total: 0']
-    };
-  }
-
-  function damageCandidatesFor(item: InventoryItem) {
-    const canBeMeleeWeaponAttack = ['weapon', 'shield'].includes(item.category) && item.attackAbility === 'str';
-    return [
-      'damage_roll.all',
-      'damage_roll.weapon',
-      item.attackAbility ? `damage_roll.weapon.${item.attackAbility}` : '',
-      canBeMeleeWeaponAttack ? 'damage_roll.melee_weapon' : '',
-      canBeMeleeWeaponAttack ? `damage_roll.melee_weapon.${item.attackAbility}` : ''
-    ].filter(Boolean);
+    return rollDamage(expression, bonus, abilityBonus, abilityLabel, modifierBonuses, extraDice, rollDie);
   }
 
   function battleDamageBonuses(item: InventoryItem, outcomes: string[] = []) {
-    const candidates = damageCandidatesFor(item);
-    const context = {
-      classes: classRows,
-      attackType: 'melee_weapon',
-      ability: item.attackAbility,
-      outcomes
-    } as const;
-    return [
-      ...resolvedNumericModifiers(character.modifierSources, candidates, ['bonus'], context),
-      ...resolvedNumericModifiers(character.modifierSources, candidates, ['penalty'], context).map((penalty) => ({ ...penalty, value: -penalty.value }))
-    ];
+    return sharedBattleDamageBonuses(character.modifierSources, item, classRows, outcomes);
   }
 
   function rollBattleAction(item: InventoryItem) {
-    const ability = abilityModifier(abilityScores[item.attackAbility]);
-    const attackBreakdown = [
-      ...(item.proficient ? [{ label: 'Proficiency', value: prof }] : []),
-      { label: `${item.attackAbility.toUpperCase()} Mod`, value: ability },
-      ...(Number(item.toHitBonus) ? [{ label: 'Weapon', value: Number(item.toHitBonus) }] : [])
-    ];
-    const attackBonus = attackBreakdown.reduce((sum, entry) => sum + entry.value, 0);
-    const attackCandidates = ['attack_roll.weapon', `attack_roll.weapon.${item.attackAbility}`,
-      item.category === 'weapon' ? 'attack_roll.melee_weapon' : '',
-      item.category === 'weapon' ? `attack_roll.melee_weapon.${item.attackAbility}` : ''].filter(Boolean);
-
-    // Phase 1 (modifier-primacy.md §6.4) - resolve the triggering (to-hit) roll first.
-    const attackRoll = rollText(attackBonus, attackCandidates, attackBreakdown);
-
-    // Phase 1 -> 2 handoff: turn the to-hit result into the named outcomes it satisfied, before
-    // deciding which damage Modifiers (e.g. a crit-only bonus) are active for this roll.
-    const critThreshold = resolveCritThreshold(character.modifierSources, { ability: item.attackAbility, attackType: 'melee_weapon' });
-    const outcomes = resolveD20Outcomes(attackRoll.natural, critThreshold);
-
-    // Phase 2 - resolve the dependent (damage) roll using the now-known outcome set.
-    const damageCandidates = damageCandidatesFor(item);
-    const damageContext = { classes: classRows, attackType: 'melee_weapon', ability: item.attackAbility, outcomes } as const;
-    const extraDice = resolveExtraDiceRolls(character.modifierSources, damageCandidates, damageContext, rollDie);
-    const damage = rollDamageExpression(item.damageRolls, Number(item.damageBonus || 0), ability, item.attackAbility.toUpperCase(), battleDamageBonuses(item, outcomes), extraDice);
-
-    rollResult = {
-      title: item.name || 'Battle Action',
-      attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` - ${outcomes.join(', ')}` : ''}`,
-      damage: damage.lines,
-      effects: item.effects || item.notes || '-'
-    };
+    rollResult = rollAttack(item, {
+      modifierSources: character.modifierSources,
+      abilityScores,
+      proficiencyBonus: prof,
+      classes: classRows,
+      rollDie
+    });
   }
 
   function findInventoryRow(event: MouseEvent) {
