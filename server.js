@@ -4,8 +4,21 @@
 // src/lib/server/realtime.ts already anticipated for a future Socket.IO
 // server ("attach a Socket.IO server around the adapter-node handler").
 import { createServer } from 'node:http';
-import { handler } from './build/handler.js';
 import { attachVttWebSocketServer } from './vtt/server/wsServer.js';
+
+// adapter-node caps every request body at BODY_SIZE_LIMIT (default 512KB) and
+// rejects anything larger BEFORE it reaches a route - which silently blocks VTT
+// map/token image uploads over 512KB, even though the upload route itself
+// allows up to 15MB. (This is a production-only limit; `vite dev` has no such
+// cap, so large maps "work locally" but fail once deployed.) Raise it to
+// comfortably clear the route's own 15MB ceiling. It must be set BEFORE the
+// handler module is imported - adapter-node reads the value once at module load
+// (handler.js: `const body_size_limit = parse_as_bytes(env('BODY_SIZE_LIMIT',
+// '512K'))`) - so the handler is pulled in dynamically below, after this line.
+// An explicit host env var still wins if one is provided.
+process.env.BODY_SIZE_LIMIT = process.env.BODY_SIZE_LIMIT || '20M';
+
+const { handler } = await import('./build/handler.js');
 
 const port = process.env.PORT || 3000;
 
