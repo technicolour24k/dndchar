@@ -4,11 +4,13 @@ import type { ContentType } from '$lib/types/content';
 export type AdminContentRecord={id:string;type:ContentType;name:string;description:string;key:string;sourceKind:string;
   isArchived:boolean;spellLevel:number|null;school:string;castingTime:string;range:string;components:string;duration:string;
   ritual:boolean;concentration:boolean;classes:string[];category:string;equipmentType:string;requiresAttunement:boolean;
-  acBonus:number;toHitBonus:number;damageBonus:number;attackAbility:string;damageRolls:string};
+  acBonus:number;toHitBonus:number;damageBonus:number;attackAbility:string;damageRolls:string;
+  resolutionType:string;damageType:string;baseDice:string;saveAbility:string;saveEffect:string;scaling:any};
 
 export async function loadContentAdmin(types:ContentType[],selectedId=''){
   const content=await query<any>(`SELECT c.*,s.spell_level,s.school,s.casting_time,s.spell_range,s.components,s.duration,
-    s.ritual,s.concentration,s.classes,i.category,i.equipment_type,i.requires_attunement,i.ac_bonus,i.to_hit_bonus,
+    s.ritual,s.concentration,s.classes,s.resolution_type,s.damage_type,s.base_dice,s.save_ability,s.save_effect,s.scaling_json,
+    i.category,i.equipment_type,i.requires_attunement,i.ac_bonus,i.to_hit_bonus,
     i.damage_bonus,i.attack_ability,i.damage_rolls FROM content_definitions c
     LEFT JOIN spell_definitions s ON s.content_id=c.id LEFT JOIN item_definitions i ON i.content_id=c.id
     WHERE c.content_type=ANY($1::text[]) ORDER BY c.is_archived,c.name`,[types]);
@@ -60,10 +62,15 @@ export async function createAdminContent(userId:string,type:ContentType,form:For
 export async function updateAdminContent(form:FormData){const id=String(form.get('contentId')||'');return withTransaction(async(client)=>{
   const current=await client.query<{content_type:ContentType}>('SELECT content_type FROM content_definitions WHERE id=$1',[id]);if(!current.rowCount)throw new Error('Catalogue entry not found.');
   await client.query('UPDATE content_definitions SET name=$2,description=$3,updated_at=now() WHERE id=$1',[id,String(form.get('name')||'').trim(),String(form.get('description')||'')]);
-  if(current.rows[0].content_type==='spell')await client.query(`INSERT INTO spell_definitions(content_id,spell_level,school,casting_time,spell_range,components,duration,ritual,concentration,classes)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(content_id) DO UPDATE SET spell_level=EXCLUDED.spell_level,school=EXCLUDED.school,
+  if(current.rows[0].content_type==='spell')await client.query(`INSERT INTO spell_definitions(content_id,spell_level,school,casting_time,spell_range,components,duration,ritual,concentration,classes,
+    resolution_type,damage_type,base_dice,save_ability,save_effect,scaling_json)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb) ON CONFLICT(content_id) DO UPDATE SET spell_level=EXCLUDED.spell_level,school=EXCLUDED.school,
     casting_time=EXCLUDED.casting_time,spell_range=EXCLUDED.spell_range,components=EXCLUDED.components,duration=EXCLUDED.duration,
-    ritual=EXCLUDED.ritual,concentration=EXCLUDED.concentration,classes=EXCLUDED.classes`,[id,Math.min(9,Math.max(0,Number(form.get('spellLevel'))||0)),String(form.get('school')||''),String(form.get('castingTime')||''),String(form.get('range')||''),String(form.get('components')||''),String(form.get('duration')||''),form.get('ritual')==='on',form.get('concentration')==='on',form.getAll('classes').map(String)]);
+    ritual=EXCLUDED.ritual,concentration=EXCLUDED.concentration,classes=EXCLUDED.classes,resolution_type=EXCLUDED.resolution_type,
+    damage_type=EXCLUDED.damage_type,base_dice=EXCLUDED.base_dice,save_ability=EXCLUDED.save_ability,save_effect=EXCLUDED.save_effect,
+    scaling_json=EXCLUDED.scaling_json`,[id,Math.min(9,Math.max(0,Number(form.get('spellLevel'))||0)),String(form.get('school')||''),String(form.get('castingTime')||''),String(form.get('range')||''),String(form.get('components')||''),String(form.get('duration')||''),form.get('ritual')==='on',form.get('concentration')==='on',form.getAll('classes').map(String),
+    String(form.get('resolutionType')||'attack'),String(form.get('damageType')||''),String(form.get('baseDice')||''),
+    String(form.get('saveAbility')||'dex'),String(form.get('saveEffect')||'half'),JSON.stringify(parseSpellScaling(form))]);
   if(current.rows[0].content_type==='item')await client.query(`INSERT INTO item_definitions(content_id,category,equipment_type,requires_attunement,ac_bonus,to_hit_bonus,damage_bonus,attack_ability,damage_rolls)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(content_id) DO UPDATE SET category=EXCLUDED.category,equipment_type=EXCLUDED.equipment_type,
     requires_attunement=EXCLUDED.requires_attunement,ac_bonus=EXCLUDED.ac_bonus,to_hit_bonus=EXCLUDED.to_hit_bonus,damage_bonus=EXCLUDED.damage_bonus,
@@ -120,6 +127,17 @@ export async function removeSpellAccess(form:FormData){const id=String(form.get(
 
 function groupActions(rows:any[]){const map=new Map<string,any>();for(const row of rows){const action=map.get(row.id)||{id:row.id,linkId:row.link_id,name:row.name,description:row.description,triggerType:row.trigger_type,steps:[]};if(row.step_id)action.steps.push({id:row.step_id,type:row.step_type,operation:row.operation,targetType:row.target_type,targetKey:row.target_key,valueExpression:row.value_expression,effectId:row.effect_id,targetMode:row.target_mode,label:row.label,sortOrder:row.sort_order});map.set(row.id,action);}return[...map.values()];}
 function mapSpellAccess(row:any){return{id:row.id,spellContentId:row.spell_content_id,spellName:row.spell_name,accessType:row.access_type,availabilityType:row.availability_type,resourceDefinitionId:row.resource_definition_id,resourceCostExpression:row.resource_cost_expression,castLevelMode:row.cast_level_mode,fixedCastLevel:row.fixed_cast_level,saveDcMode:row.save_dc_mode,fixedSaveDc:row.fixed_save_dc,spellAttackMode:row.spell_attack_mode,fixedSpellAttackBonus:row.fixed_spell_attack_bonus};}
-function mapContent(row:any):AdminContentRecord{return{id:row.id,type:row.content_type,name:row.name,description:row.description,key:row.content_key,sourceKind:row.source_kind,isArchived:row.is_archived,spellLevel:row.spell_level,school:row.school||'',castingTime:row.casting_time||'',range:row.spell_range||'',components:row.components||'',duration:row.duration||'',ritual:Boolean(row.ritual),concentration:Boolean(row.concentration),classes:row.classes||[],category:row.category||'gear',equipmentType:row.equipment_type||'item',requiresAttunement:Boolean(row.requires_attunement),acBonus:row.ac_bonus||0,toHitBonus:row.to_hit_bonus||0,damageBonus:row.damage_bonus||0,attackAbility:row.attack_ability||'str',damageRolls:row.damage_rolls||''};}
+function mapContent(row:any):AdminContentRecord{return{id:row.id,type:row.content_type,name:row.name,description:row.description,key:row.content_key,sourceKind:row.source_kind,isArchived:row.is_archived,spellLevel:row.spell_level,school:row.school||'',castingTime:row.casting_time||'',range:row.spell_range||'',components:row.components||'',duration:row.duration||'',ritual:Boolean(row.ritual),concentration:Boolean(row.concentration),classes:row.classes||[],category:row.category||'gear',equipmentType:row.equipment_type||'item',requiresAttunement:Boolean(row.requires_attunement),acBonus:row.ac_bonus||0,toHitBonus:row.to_hit_bonus||0,damageBonus:row.damage_bonus||0,attackAbility:row.attack_ability||'str',damageRolls:row.damage_rolls||'',
+  resolutionType:row.resolution_type||'attack',damageType:row.damage_type||'',baseDice:row.base_dice||'',saveAbility:row.save_ability||'dex',saveEffect:row.save_effect||'half',scaling:row.scaling_json||{}};}
+// Builds spell_definitions.scaling_json from the admin form's plain inputs - a
+// "Scales?" kind select gates which pair of fields is read, so authoring a
+// non-scaling spell (most saves/debuffs) just leaves both blank -> {}.
+function parseSpellScaling(form:FormData):Record<string,unknown>{
+  const kind=String(form.get('scalingKind')||'none');
+  if(kind==='cantrip')return{kind,extraDice:String(form.get('scalingExtraDice')||''),
+    tiers:String(form.get('scalingTiers')||'').split(',').map((value)=>Number(value.trim())).filter((value)=>Number.isFinite(value)&&value>0)};
+  if(kind==='leveled')return{kind,extraDicePerSlotLevel:String(form.get('scalingExtraDicePerSlotLevel')||'')||null};
+  return{};
+}
 function validateDice(value:string){const result=value.replace(/\s+/g,'');if(!/^(?:\d*d\d+|\d+)(?:[+-](?:\d*d\d+|\d+))*$/i.test(result))throw new Error('Amount must contain only numbers, dice, +, and -.');return result;}
 function slug(value:string){return value.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'content';}

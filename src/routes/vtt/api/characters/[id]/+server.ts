@@ -57,6 +57,6 @@ export const GET: RequestHandler = async ({ locals, params }) => {
     spellSlots: character.spellSlots,
     preparedSpells: character.content
       .filter((entry) => entry.type === 'spell' && entry.isPrepared)
-      .map((entry) => ({ name: entry.name, spellLevel: entry.spellLevel }))
+      .map((entry) => ({ id: entry.id, name: entry.name, spellLevel: entry.spellLevel }))
   });
 };

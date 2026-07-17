@@ -316,6 +316,53 @@ function handleTokenEvent(meta, msg, context) {
       break;
     }
 
+    // spell:resolve - for save/auto spells only (attack-resolution spells reuse
+    // attack:resolve above unchanged - a spell attack roll vs. AC is mechanically
+    // identical to a weapon attack once you have a to-hit total). Unlike attack:resolve,
+    // there is no hidden value being compared here: a caster's own Spell Save DC isn't
+    // secret from them, so saveSuccess is computed client-side (against the DC the
+    // roll-spell endpoint already returned to the caster) and simply trusted - the
+    // server's job is purely "is this write authorized" (same target-window/GM gate as
+    // every other HP mutation path), not secrecy of a comparison.
+    case 'spell:resolve': {
+      const target = session.tokens[msg.targetTokenId];
+      if (!target) return;
+      const targetWindowOk = meta.lastTargetTokenIds
+        && meta.lastTargetTokenIds.includes(target.id)
+        && Date.now() - (meta.lastTargetAt || 0) < TARGET_WINDOW_MS;
+      if (meta.role !== 'gm' && !targetWindowOk) return;
+
+      const rolledDamage = Math.max(0, Number(msg.damage) || 0);
+      const appliedDamage = msg.resolution === 'save' && msg.saveSuccess
+        ? (msg.saveEffect === 'negate' ? 0 : Math.floor(rolledDamage / 2))
+        : rolledDamage;
+
+      const currentHp = Number(target.stats?.hp) || 0;
+      const newHp = Math.max(0, currentHp - appliedDamage);
+      target.stats = target.stats || {};
+      target.stats.hp = newHp;
+
+      // Verdict goes only to the caster, mirroring attack:result's shape - reports the
+      // intended (pre-cap) damage, not currentHp-newHp, for the same reason attack:resolve
+      // reports rolled rather than capped damage: capped would leak exact remaining HP
+      // on an overkill (e.g. an enemy with 5 hp left would reveal itself via a 20-damage
+      // hit only applying 5).
+      meta.ws.send(JSON.stringify({
+        type: 'spell:result',
+        targetTokenId: target.id,
+        resolution: msg.resolution,
+        saveSuccess: msg.saveSuccess ?? null,
+        damageApplied,
+      }));
+
+      broadcastToken(context, meta.sessionId, 'token:stat:update', target, (recipient) => {
+        const sensitive = target.type === 'enemy' || target.type === 'npc';
+        if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
+        return { tokenId: target.id, stat: 'hp' };
+      });
+      break;
+    }
+
     default:
       break;
   }

@@ -513,4 +513,67 @@ Two separate production-only bugs, both hit while the user tried to live-verify 
 
 Both fixes live in the same `server.js`, committed separately (`1e96fb3`, `d3b17d2`) since they're independent root causes that happened to be diagnosed back-to-back. No VTT feature code changed in either fix.
 
+---
+
+---
+
+# Phase 3 - Magic
+
+Diff against [`.claude/briefs/vtt-phase-3-magic-spec.md`](../.claude/briefs/vtt-phase-3-magic-spec.md), building on Phase 2.5's now-user-confirmed-verified attack flow above.
+
+## 0. Close-out - ✅ confirmed by user before this phase started
+
+Spec's Section 0 asked for a live two-browser click-through of the Phase 2.5 attack flow before any Phase 3 work. User confirmed this had already been done; Phase 3 proceeded directly on top of it.
+
+## Research finding that reshaped the plan - the spell system was already far more built than the spec assumed
+
+Before writing any code, a full audit found `content_definitions`/`spell_definitions`/`character_content_instances`/`character_spell_slots` already real and working, with a complete prepare → know → cast flow (`castCharacterSpell`, `src/lib/server/services/catalogue.ts`) that validates known+prepared, lets the player choose which slot to spend (including upcasting), and runs `on_cast`/`on_use` Action steps. The actual gap was narrow: `spell_definitions` had zero damage/attack fields, and the Action-step `damage` step type only ever applied to the caster's own HP or produced a text-only readout - there was no code path anywhere that applied damage to a *different* character/token. That's the one piece this phase added.
+
+## 1. Spell damage/scaling data model - ✅ built
+
+New migration `022_spell_damage_model.sql` extends `spell_definitions` (not `modifier_targets` - confirmed during research this needed its own structured shape, not a scalar dot-notation target) with `resolution_type` (attack/save/auto), `damage_type`, `base_dice`, `save_ability`, `save_effect` (half/negate), and `scaling_json` (cantrip `{kind, extraDice, tiers}` or leveled `{kind, extraDicePerSlotLevel}`). `src/lib/types/content.ts`'s `ContentDefinition.spell` and `CharacterContentInstance.spellDamage` carry the same shape.
+
+**A structural requirement surfaced mid-planning, not in the original spec**: the user flagged that feats/items modifying spell damage are planned (an item intended to double a specific spell's dice already exists in play). This meant `resolveSpellDamage()` couldn't be a closed calculation over just a spell's own baseline - it had to consult the character's Modifier sources through the same dot-notation mechanism weapon damage already uses. Addressed by layering candidate targets `damage_roll.spell.all` → `damage_roll.spell.<damageType>` → `damage_roll.spell.<name-slug>` (mirroring `damage_roll.weapon` → `damage_roll.weapon.<ability>`), and by giving `modifier_type='multiplier'` a dice-pool-specific interpretation in this resolver ("repeat the resolved dice expression N times") distinct from `speedFt()`'s scalar-multiply use of the same type. Authoring "doubles a spell's dice" needs **no new admin UI** - it's an ordinary Modifier attached via the existing `/admin/rules/hooks` (register the ad-hoc target once) → `/admin/rules/modifiers` → the granting item's own "Attach Modifier" tab flow.
+
+## 2. `resolveSpellDamage()` - ✅ built, unit tested
+
+`src/lib/rules/dnd5e.ts` - pure function alongside `spellSaveDc`/`spellAttackBonus`. Resolves baseline + scaling first (cantrip tiers crossed at character level; leveled spells' extra dice per slot level cast above minimum), then folds in modifier-sourced `extra_die`/`bonus`/`penalty`/`multiplier` Modifiers matching the layered candidate targets. Unit tests in `dnd5e.test.ts` cover cantrip scaling at levels 1/5/11/17, leveled upcast scaling, and the doubling-multiplier case.
+
+## 3. Admin authoring UI - ✅ built
+
+`/admin/magic` (`ContentTypeAdmin.svelte` + `content-admin.ts`) already had a full generic spell editor (level/school/casting time/etc.) reusing the same machinery as items - extended with a Damage sub-section (Resolution/Damage Type/Base Dice, conditional Save Ability+Effect, Scaling kind + its two field pairs), following the exact pattern the item block already used for its own damage fields.
+
+## 4. Server: roll-spell endpoint - ✅ built
+
+`POST /vtt/api/characters/[id]/roll-spell`, modeled on `roll-attack`. Reuses `castCharacterSpell()` **unchanged** for known/prepared validation and slot spend (including upcast choice) - one slot-spend implementation, not two. Layers on: a spell attack roll (for `resolution:'attack'`, via the same two-phase to-hit → outcomes → damage-modifier pattern `rollAttack()` uses for weapons) and `resolveSpellDamage()` for the damage roll, returning a breakdown shaped like `AttackRollResult` plus `resolution`/`damageType`/`saveDc`/`saveAbility`/`saveEffect`.
+
+## 5. Server: applying spell damage - ✅ built
+
+Attack-resolution spells reuse the existing `attack:resolve` WS event **unchanged** - a spell attack roll vs. AC is mechanically identical to a weapon attack once you have a to-hit total, so no server changes were needed for that branch. A new `spell:resolve` event (`vtt/server/handlers/token.js`, registered in `wsServer.js`) handles save/auto spells: same target-window/GM authorization gate as `attack:resolve`, but the pass/fail comparison itself happens client-side (a caster's own Spell Save DC isn't secret, unlike a target's AC) - the server's job here is purely "is this HP write authorized," applying full damage on `auto` or a failed save, half/none on a successful save per the spell's `save_effect`.
+
+## 6. VTT mini-sheet: from display-only to castable - ✅ built
+
+The old flat, inert "Prepared spells" list (`data-spell-name`, no click handler - confirmed dead in the pre-Phase-3 audit) is gone. Per the user's own suggested approach: each spell-slot row (and a new "Cantrips" row) in the mini-sheet is now clickable, opening a spell-picker modal filtered to spells castable at that level. **Which row you click IS the upcast choice** - picking a lower-level spell from a higher slot row casts it upcast at that slot level, with no separate level-selector UI needed. Selecting a spell arms targeting exactly like a weapon action (`armActionTargeting`/`openAttackConfirm`/`resolveAttack` in `main.js` were generalized to branch on `action.kind`, not forked into a parallel pipeline). For save spells, the confirm modal shows the spell's DC (openly, since it's not secret) plus the spec's "lightweight type-in-the-target's-save-result" prompt; for auto spells, a single Apply-Damage confirm. `preparedSpells` gained an `id` field (the `character_content_instances` id) so the client can address a specific prepared spell without relying on name uniqueness - already covered by the existing `PLAYER_EDITABLE_FIELDS`/`TOKEN_LEVEL_STAT_FIELDS` allowlists since it rides on the same whole-array field.
+
+## 7. Character sheet: display + roll, no target - ✅ built
+
+Per the spec, kept deliberately light - the sheet has no token/target concept. Each prepared spell now shows its resolved damage info as plain text (e.g. "Save (DEX) · 8d6 fire") and a "Roll Damage" button that runs `resolveSpellDamage()` + rolls the dice **client-side** (the Svelte component can import `$lib` directly, unlike the vanilla VTT client) for reference - not wired to slot cost or any target. The existing "Cast" button is unchanged.
+
+## 8. Seed data - ✅ built, per the agreed default starter set
+
+New migration `023_seed_starter_spells.sql` seeds 10 spells as global, system-owned SRD content (not the group's real prepared list - agreed default per the planning conversation) covering every resolution/scaling combination: attack cantrips (Fire Bolt, Ray of Frost, Eldritch Blast), a save cantrip (Sacred Flame), an auto-hit leveled spell (Magic Missile), leveled attack spells (Guiding Bolt, Chromatic Orb, Inflict Wounds), and leveled save spells (Burning Hands, Fireball). Noted simplifications: Eldritch Blast/Magic Missile/Chromatic Orb are modeled as a single combined roll rather than their real multi-beam/multi-dart/choose-type mechanics (the damage model supports one attack roll and one damage pool per cast); Fireball/Burning Hands are seeded with their damage profile only, AoE auto-targeting being out of scope for this phase. Pure-healing spells (Cure Wounds etc.) were deliberately not seeded - they don't fit the attack/save/auto model and already work via the existing `on_cast` healing Action-step path.
+
+**Verification - automated and real-endpoint checks passed; live UI click-through still owed, same discipline the Phase 2.5 entry above established.** Passing: `dnd5e.test.ts`'s new cases (30/30 total), `svelte-check` (0 errors across 442 files), both migrations applied cleanly against the live dev database. A temporary test user/character (Wizard 5, prepared Fire Bolt/Sacred Flame/Chromatic Orb, real spell slots) was created, exercised directly against the running dev server's `roll-spell` endpoint, and fully cleaned up afterward (cascaded delete, no leftover rows - confirmed by re-querying):
+- Fire Bolt (cantrip) at character level 5 correctly resolved to `1d10 + 1d10` (crossing the level-5 tier) before any modifiers.
+- A test homebrew item (`multiplier` Modifier targeting `damage_roll.spell.fire-bolt`, attached via `content_modifier_links` exactly as a DM would via the admin UI, equipped in inventory) correctly doubled that to `1d10 + 1d10 + 1d10 + 1d10` when queried through the live `roll-spell` endpoint - the forward-looking Modifier-consultation requirement (Section 1) confirmed working end-to-end, not just in isolated unit tests.
+- Sacred Flame (cantrip, save) correctly returned `resolution:'save'`, no attack roll, and the caster's real Spell Save DC (15, matching a level-5 18 INT wizard).
+- Chromatic Orb (1st-level attack) cast at slot level 2 correctly added one extra `1d8` (upcast scaling) and decremented the *level-2* slot specifically, leaving level-1 slots untouched.
+
+**Not yet exercised live**: the actual mini-sheet click-through (slot-row click → spell picker → arm → click a token → confirm card → Cast → breakdown → hit/miss or save-prompt → HP applied) in a real two-browser session. This needs the same click-through discipline the Phase 2.5 entry above established - handed to the user, not assumed from the endpoint-level checks above.
+
+### 2026-07-15 - Phase 3: magic system implemented (damage model, casting flow, admin authoring, starter spells)
+Implemented [`.claude/briefs/vtt-phase-3-magic-spec.md`](../.claude/briefs/vtt-phase-3-magic-spec.md) - see the Phase 3 section above for the full write-up. Short version: added a structured damage/scaling model to `spell_definitions` (migration `022`), `resolveSpellDamage()` in `dnd5e.ts` (Modifier-aware, per a forward-looking requirement the user flagged mid-planning - future items/feats can modify a specific spell's damage via ordinary Modifiers, no engine changes needed), a `roll-spell` VTT endpoint reusing `castCharacterSpell()` for slot spend, a new `spell:resolve` WS event for save/auto spells (attack-resolution spells reuse the existing `attack:resolve` unchanged), a reworked mini-sheet (clickable slot/cantrip rows + spell-picker modal, replacing the old inert prepared-spells list), admin UI damage fields, a character-sheet damage-info display + reference roll button, and 10 seeded starter spells (migration `023`).
+
+Verified: all `dnd5e.test.ts` cases (30/30), `svelte-check` (0/442), both migrations applied cleanly to the live dev database, and the `roll-spell` endpoint exercised directly against a temporary test character (cantrip tier scaling, leveled upcast scaling, save-DC resolution, and the doubling-Modifier requirement all confirmed correct via real HTTP calls) - test data fully cleaned up afterward. Not yet exercised: the live two-browser UI click-through of the new mini-sheet casting flow, per this doc's own established "data-layer checks aren't UI verification" lesson from the Phase 2.5 entries above.
+
 Known limitation, noted rather than addressed: Exhaustion is 5e's one condition with levels (1-6) rather than being binary - it's tracked here as a simple on/off checkbox like the other 13, not a level counter. Fine for the POC; revisit if exhaustion tracking in practice needs the granularity.

@@ -73,6 +73,25 @@
           <datalist id="duration-options"><option value="Instantaneous"></option><option value="1 round"></option><option value="1 minute"></option><option value="10 minutes"></option><option value="1 hour"></option><option value="8 hours"></option><option value="24 hours"></option><option value="Until dispelled"></option></datalist>
           <label>Classes<select name="classes" multiple size="6">{#each ['Bard','Cleric','Druid','Paladin','Ranger','Sorcerer','Warlock','Wizard'] as className}<option value={className} selected={selected.classes.includes(className)}>{className}</option>{/each}</select></label>
           <div class="actions"><label class="inline"><input name="ritual" type="checkbox" checked={selected.ritual}/> Ritual</label><label class="inline"><input name="concentration" type="checkbox" checked={selected.concentration}/> Concentration</label></div>
+
+          <h3>Damage</h3>
+          <div class="mini-grid">
+            <label>Resolution<select name="resolutionType"><option value="attack" selected={selected.resolutionType==='attack'}>Attack Roll</option><option value="save" selected={selected.resolutionType==='save'}>Saving Throw</option><option value="auto" selected={selected.resolutionType==='auto'}>Automatic (no roll)</option></select></label>
+            <label>Damage Type<input name="damageType" list="damage-type-options" value={selected.damageType}/></label>
+            <label>Base Dice<input name="baseDice" value={selected.baseDice} placeholder="8d6"/></label>
+          </div>
+          <datalist id="damage-type-options">{#each ['acid','bludgeoning','cold','fire','force','lightning','necrotic','piercing','poison','psychic','radiant','slashing','thunder'] as type}<option value={type}></option>{/each}</datalist>
+          <p class="muted">Save Ability/Effect only matter when Resolution is Saving Throw; Scaling fields only matter for the kind selected below - unused fields are ignored, no need to blank them out.</p>
+          <div class="mini-grid">
+            <label>Save Ability<select name="saveAbility">{#each ['str','dex','con','int','wis','cha'] as ability}<option value={ability} selected={selected.saveAbility===ability}>{ability.toUpperCase()}</option>{/each}</select></label>
+            <label>On a Successful Save<select name="saveEffect"><option value="half" selected={selected.saveEffect==='half'}>Half damage</option><option value="negate" selected={selected.saveEffect==='negate'}>No damage</option></select></label>
+          </div>
+          <label>Scaling<select name="scalingKind"><option value="none" selected={!selected.scaling?.kind||selected.scaling.kind==='none'}>None</option><option value="cantrip" selected={selected.scaling?.kind==='cantrip'}>Cantrip (scales with character level)</option><option value="leveled" selected={selected.scaling?.kind==='leveled'}>Leveled (scales with upcast slot)</option></select></label>
+          <div class="mini-grid">
+            <label>Extra Dice per Tier (cantrip)<input name="scalingExtraDice" value={selected.scaling?.extraDice||''} placeholder="1d10"/></label>
+            <label>Tiers - character level (cantrip)<input name="scalingTiers" value={(selected.scaling?.tiers||[5,11,17]).join(',')} placeholder="5,11,17"/></label>
+          </div>
+          <label>Extra Dice per Slot Level Above Minimum (leveled/upcast)<input name="scalingExtraDicePerSlotLevel" value={selected.scaling?.extraDicePerSlotLevel||''} placeholder="1d6"/></label>
         {/if}
         <p class="muted">Key: {selected.key}</p>
         <div class="button-row"><button type="submit">Save Entry</button><button type="submit" formaction="?/archive" class="danger">{selected.isArchived?'Restore':'Archive'}</button></div>

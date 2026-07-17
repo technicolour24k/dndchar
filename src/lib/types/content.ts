@@ -62,6 +62,12 @@ export type ContentDefinition = {
     concentration: boolean;
     classes: string[];
     higherLevel: string;
+    resolutionType: 'attack' | 'save' | 'auto';
+    damageType: string;
+    baseDice: string;
+    saveAbility: AbilityKey;
+    saveEffect: 'half' | 'negate';
+    scaling: SpellDamageScaling;
   };
   item?: {
     category: string;
@@ -88,6 +94,14 @@ export type CharacterContentInstance = {
   isActive: boolean;
   notes: string;
   spellLevel: number | null;
+  spellDamage?: {
+    resolutionType: 'attack' | 'save' | 'auto';
+    damageType: string;
+    baseDice: string;
+    saveAbility: AbilityKey;
+    saveEffect: 'half' | 'negate';
+    scaling: SpellDamageScaling;
+  };
   grantedBy?: string;
   spellAccessId?: string;
   inventoryItemId?: string;
@@ -100,4 +114,12 @@ export type SpellSlot = {
   level: number;
   current: number;
   max: number;
+};
+
+/** spell_definitions.scaling_json - see dnd5e.ts's resolveSpellDamage() for how this is resolved. */
+export type SpellDamageScaling = {
+  kind?: 'cantrip' | 'leveled' | 'none';
+  extraDice?: string;
+  tiers?: number[];
+  extraDicePerSlotLevel?: string | null;
 };

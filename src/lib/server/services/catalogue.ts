@@ -17,6 +17,7 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
     `
       SELECT c.*, s.spell_level, s.school, s.casting_time, s.spell_range, s.components, s.duration,
         s.ritual, s.concentration, s.classes, s.higher_level,
+        s.resolution_type, s.damage_type, s.base_dice, s.save_ability, s.save_effect, s.scaling_json,
         i.category, i.equipment_type, i.requires_attunement, i.ac_bonus, i.to_hit_bonus,
         i.damage_bonus, i.attack_ability, i.damage_rolls
       FROM content_definitions c
@@ -65,7 +66,9 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
     spell: row.content_type === 'spell' ? {
       level: row.spell_level, school: row.school, castingTime: row.casting_time, range: row.spell_range,
       components: row.components, duration: row.duration, ritual: row.ritual, concentration: row.concentration,
-      classes: row.classes || [], higherLevel: row.higher_level
+      classes: row.classes || [], higherLevel: row.higher_level,
+      resolutionType: row.resolution_type || 'attack', damageType: row.damage_type || '', baseDice: row.base_dice || '',
+      saveAbility: row.save_ability || 'dex', saveEffect: row.save_effect || 'half', scaling: row.scaling_json || {}
     } : undefined,
     item: row.content_type === 'item' ? {
       category: row.category, equipmentType: row.equipment_type, requiresAttunement: row.requires_attunement,
@@ -297,6 +300,7 @@ export async function useInventoryResource(userId:string,characterId:string,reso
 
 export async function listCharacterContent(characterId: string): Promise<CharacterContentInstance[]> {
   const result = await query<any>(`SELECT i.*, c.content_type, c.name, c.description, s.spell_level,
+    s.resolution_type, s.damage_type, s.base_dice, s.save_ability, s.save_effect, s.scaling_json,
     EXISTS(SELECT 1 FROM content_action_links action WHERE action.content_id=c.id) AS has_resource_actions
     FROM character_content_instances i JOIN content_definitions c ON c.id = i.content_id
     LEFT JOIN spell_definitions s ON s.content_id = c.id WHERE i.character_id = $1
@@ -308,6 +312,10 @@ export async function listCharacterContent(characterId: string): Promise<Charact
     id: row.id, contentId: row.content_id, type: row.content_type, name: row.custom_name || row.name,
     description: row.description, isKnown: row.is_known, isPrepared: row.is_prepared, isActive: row.is_active,
     notes: row.notes, spellLevel: row.spell_level, hasResourceActions: row.has_resource_actions,
+    spellDamage: row.content_type === 'spell' ? {
+      resolutionType: row.resolution_type, damageType: row.damage_type, baseDice: row.base_dice,
+      saveAbility: row.save_ability, saveEffect: row.save_effect, scaling: row.scaling_json || {}
+    } : undefined,
     resources: resources.rows.filter((resource: any) => resource.character_content_id === row.id).map((resource: any) => ({
       id: resource.id, key: resource.resource_key, label: resource.label, maxValueExpression: resource.max_value_expression,
       rechargePeriod: resource.recharge_period, currentValue: resource.current_value, maxValue: resource.max_value
@@ -366,6 +374,25 @@ export async function castCharacterSpell(userId:string,characterId:string,form:F
     spellId=spell.rows[0].content_id;if(spell.rows[0].spell_level>0)await spendAvailableSlot(client,characterId,spell.rows[0].spell_level,form);
     return executeContentActions(client,characterId,spellId,['on_cast','on_use'],{instanceId});
   });
+}
+
+// Read-only lookup of a prepared spell's own damage/scaling baseline, ownership-scoped
+// the same way castCharacterSpell's own instance lookup is - used by the VTT roll-spell
+// route (src/routes/vtt/api/characters/[id]/roll-spell) to feed dnd5e.ts's resolveSpellDamage().
+export async function getPreparedSpellDamageSource(characterId:string,instanceId:string):Promise<{
+  name:string;spellLevel:number;resolutionType:'attack'|'save'|'auto';damageType:string;baseDice:string;
+  saveAbility:AbilityKey;saveEffect:'half'|'negate';scaling:Record<string,unknown>
+}|null>{
+  const result=await query<any>(`SELECT content.name,definition.spell_level,definition.resolution_type,definition.damage_type,
+      definition.base_dice,definition.save_ability,definition.save_effect,definition.scaling_json
+    FROM character_content_instances instance
+    JOIN content_definitions content ON content.id=instance.content_id
+    JOIN spell_definitions definition ON definition.content_id=instance.content_id
+    WHERE instance.id=$1 AND instance.character_id=$2`,[instanceId,characterId]);
+  if(!result.rowCount)return null;
+  const row=result.rows[0];
+  return{name:row.name,spellLevel:row.spell_level,resolutionType:row.resolution_type,damageType:row.damage_type,
+    baseDice:row.base_dice,saveAbility:row.save_ability,saveEffect:row.save_effect,scaling:row.scaling_json||{}};
 }
 
 async function spendAvailableSlot(client:pg.PoolClient,characterId:string,minimumLevel:number,form:FormData){
