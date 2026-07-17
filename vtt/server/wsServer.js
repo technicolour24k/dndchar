@@ -50,6 +50,7 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:stat:update':
         case 'token:hidden:toggle':
         case 'attack:resolve':
+        case 'spell:resolve':
           handleTokenEvent(meta, msg, context);
           break;
         case 'map:set':

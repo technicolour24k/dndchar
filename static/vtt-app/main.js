@@ -225,6 +225,12 @@ function handleMessage(msg) {
       handleAttackResult(msg);
       break;
 
+    case 'spell:result':
+      // Same idea as attack:result, for a save/auto spell's applied damage -
+      // see handleSpellResult().
+      handleSpellResult(msg);
+      break;
+
     case 'marker:add':
       session.markers[msg.marker.id] = msg.marker;
       render();
@@ -451,24 +457,31 @@ function disarmMarkerPlacement() {
 document.getElementById('markerPlacementCancelBtn').addEventListener('click', disarmMarkerPlacement);
 
 // ---------------------------------------------------------------------------
-// Action targeting (Section 3) - click a weapon/spell action in the mini
-// sheet, then click a token on the map to resolve it against. Same
-// arm/disarm-banner pattern as marker placement. Damage is rolled
-// client-side per the phase-2 spec's explicit recommendation (the character
-// sheet's math engine already runs client-side; porting it server-side is a
-// bigger lift the trust level at this scale doesn't need).
+// Action targeting (Section 3, extended in Phase 3 for spells) - click a
+// weapon or spell action in the mini sheet, then click a token on the map to
+// resolve it against. Same arm/disarm-banner pattern as marker placement.
+// Rolling happens server-side (Phase 2.5/3) - the vanilla client can't import
+// $lib, and only the server has the character's full modifier graph (and,
+// for weapons/attack-resolution spells, the target's hidden AC to compare
+// against), so this file only ever orchestrates the flow, never the math.
 // ---------------------------------------------------------------------------
 
 const actionTargetBanner = document.getElementById('actionTargetBanner');
 const actionTargetBannerText = document.getElementById('actionTargetBannerText');
-let pendingActionTarget = null; // { sourceTokenId, action } while a weapon is armed for targeting
+let pendingActionTarget = null; // { sourceTokenId, action } while an action is armed for targeting
 
 // Step 1: arm targeting. Valid targets get a highlight ring (drawn in render()),
-// the banner names the weapon, and the cursor changes - no more silent "click and hope."
+// the banner names the action, and the cursor changes - no more silent "click and hope."
+// `action` is either a flattened weapon action ({name, toHitBonus, damageRolls, damageBonus})
+// or a spell descriptor ({kind:'spell', instanceId, name, slotLevel}) - action.kind defaults
+// to 'weapon' wherever it's read, so every pre-existing call site (weapon rows, GM manual
+// attacks) needs no change.
 function armActionTargeting(sourceTokenId, action) {
   disarmMarkerPlacement();
   pendingActionTarget = { sourceTokenId, action };
-  actionTargetBannerText.textContent = `Attacking with ${action.name} — select a target`;
+  actionTargetBannerText.textContent = action.kind === 'spell'
+    ? `Casting ${action.name} — select a target`
+    : `Attacking with ${action.name} — select a target`;
   actionTargetBanner.classList.add('visible');
   canvas.style.cursor = 'crosshair';
   render(); // draw the valid-target highlight rings
@@ -484,13 +497,17 @@ function disarmActionTargeting() {
 document.getElementById('actionTargetCancelBtn').addEventListener('click', disarmActionTargeting);
 
 // ---------------------------------------------------------------------------
-// Attack confirm + roll-result modal (Phase 2.5). Clicking a target no longer
-// resolves instantly - it shows an explicit Attack button (confirm step), then
-// rolls via the shared SERVER-SIDE roll (POST /vtt/api/characters/[id]/roll-attack)
-// so the VTT displays the exact same to-hit/damage breakdown the character sheet
-// produces (advantage/disadvantage dice-pool, Bless/extra dice, crit outcomes) -
-// the vanilla client can't import $lib and the token only carries a flattened
-// action, so this is the one place the full roll can actually happen.
+// Attack/spell confirm + roll-result modal (Phase 2.5, extended in Phase 3 for
+// spells). Clicking a target no longer resolves instantly - it shows an
+// explicit Attack/Cast button (confirm step), then rolls via the shared
+// SERVER-SIDE roll (roll-attack / roll-manual / roll-spell) so the VTT
+// displays the exact same breakdown the character sheet produces
+// (advantage/disadvantage dice-pool, Bless/extra dice, crit outcomes,
+// modifier-sourced spell damage) - the vanilla client can't import $lib and
+// the token only carries flattened data, so this is the one place the full
+// roll can actually happen. One modal shell, one flow, branching on
+// `action.kind` only where the mechanics genuinely differ (which endpoint to
+// call, and - for spells - how the result gets applied to the target).
 // ---------------------------------------------------------------------------
 const attackModal = document.getElementById('attackModal');
 const attackModalBody = document.getElementById('attackModalBody');
@@ -503,6 +520,10 @@ function closeAttackModal() {
     clearTimeout(awaitingAttackResult.timeoutId);
     awaitingAttackResult = null;
   }
+  if (awaitingSpellResult) {
+    clearTimeout(awaitingSpellResult.timeoutId);
+    awaitingSpellResult = null;
+  }
   if (pendingAttack) {
     send({ type: 'target:clear' });
     currentTargetTokenIds = [];
@@ -511,20 +532,21 @@ function closeAttackModal() {
   pendingAttack = null;
 }
 
-// Step 2 -> 3: a target was clicked; show the confirm card with an explicit Attack button.
+// Step 2 -> 3: a target was clicked; show the confirm card with an explicit Attack/Cast button.
 // The chosen target gets ringed for everyone (target:select) as immediate visible feedback.
 function openAttackConfirm(sourceTokenId, action, target) {
+  const isSpell = action.kind === 'spell';
   pendingAttack = { sourceTokenId, action, targetId: target.id, targetName: target.name };
   send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
   currentTargetTokenIds = [target.id];
   render();
 
   attackModalBody.innerHTML = `
-    <h2>Attack</h2>
-    <div class="attack-target-name">Attacking <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
+    <h2>${isSpell ? 'Cast Spell' : 'Attack'}</h2>
+    <div class="attack-target-name">${isSpell ? 'Casting' : 'Attacking'} <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
     <div class="actions">
       <button type="button" class="secondary" id="attackCancelBtn">Cancel</button>
-      <button type="button" id="attackConfirmBtn">Attack</button>
+      <button type="button" id="attackConfirmBtn">${isSpell ? 'Cast' : 'Attack'}</button>
     </div>
   `;
   attackModal.classList.add('visible');
@@ -540,72 +562,108 @@ function attackModalError(message) {
 // Which token is awaiting a server hit/miss verdict, so the async attack:result
 // message can be matched back to the open modal. { targetId, targetName, result, timeoutId }
 let awaitingAttackResult = null;
+// Same idea for a save/auto spell awaiting its spell:result verdict. { targetId, timeoutId }
+let awaitingSpellResult = null;
 
-// Step 3 -> roll: roll via the shared server endpoint (character attack if the
-// source token is a linked PC, otherwise the DM's manual stat-block attack),
-// show the breakdown, then hand off to the server to decide hit/miss against the
-// target's hidden AC (attack:resolve) - the client never sees enemy AC, so it
-// can't and doesn't decide the verdict itself.
+// Rolls the armed action via whichever server endpoint applies: a character's
+// equipped weapon, a GM's manual stat-block attack, or (Phase 3) a character's
+// prepared spell.
+async function rollPendingAction(action, source) {
+  if (action.kind === 'spell') {
+    const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-spell', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instanceId: action.instanceId, slotLevel: action.slotLevel }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+    return body;
+  }
+  const res = source?.characterId
+    ? await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemName: action.name }),
+      })
+    : await fetch('/vtt/api/roll-manual', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: action.name, toHitBonus: action.toHitBonus,
+          damageRolls: action.damageRolls, damageBonus: action.damageBonus,
+        }),
+      });
+  if (!res.ok) throw new Error('roll request failed (' + res.status + ')');
+  return res.json();
+}
+
+// Step 3 -> roll, then hand off to the server for anything that mutates a
+// target's HP (attack:resolve for weapons and attack-resolution spells alike -
+// a spell attack roll vs. AC is mechanically identical once you have a to-hit
+// total; spell:resolve for save/auto spells, see renderSpellResolutionControls).
 async function resolveAttack() {
   if (!pendingAttack) return;
   const { sourceTokenId, action, targetId, targetName } = pendingAttack;
   const source = session.tokens[sourceTokenId];
+  const isSpell = action.kind === 'spell';
 
-  attackModalBody.innerHTML = `<h2>Attack</h2><p class="attack-subtext">Rolling ${escapeHtml(action.name)}…</p>`;
+  attackModalBody.innerHTML = `<h2>${isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
   let result;
   try {
-    const res = source?.characterId
-      ? await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ itemName: action.name }),
-        })
-      : await fetch('/vtt/api/roll-manual', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: action.name, toHitBonus: action.toHitBonus,
-            damageRolls: action.damageRolls, damageBonus: action.damageBonus,
-          }),
-        });
-    if (!res.ok) throw new Error('roll request failed (' + res.status + ')');
-    result = await res.json();
+    result = await rollPendingAction(action, source);
   } catch (err) {
-    console.error('[VTT] attack roll failed', err);
-    attackModalError("Couldn't roll the attack: " + String(err.message || err));
+    console.error('[VTT] roll failed', err);
+    attackModalError(`Couldn't ${isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
     return;
   }
 
-  renderAttackBreakdown(targetName, result, '<span class="attack-subtext">Resolving hit/miss…</span>');
+  const usesAttackRoll = !isSpell || result.resolution === 'attack';
+  renderAttackBreakdown(targetName, result, usesAttackRoll
+    ? '<span class="attack-subtext">Resolving hit/miss…</span>'
+    : '<span class="attack-subtext">Loading…</span>');
 
-  const outcome = (result.outcomes || []).includes('critical_hit') ? 'critical_hit'
-    : (result.outcomes || []).includes('critical_miss') ? 'critical_miss' : null;
+  if (usesAttackRoll) {
+    const outcome = (result.outcomes || []).includes('critical_hit') ? 'critical_hit'
+      : (result.outcomes || []).includes('critical_miss') ? 'critical_miss' : null;
 
-  const timeoutId = setTimeout(() => {
-    if (awaitingAttackResult && awaitingAttackResult.targetId === targetId) {
-      setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
-      awaitingAttackResult = null;
-    }
-  }, 5000);
-  awaitingAttackResult = { targetId, targetName, result, timeoutId };
+    const timeoutId = setTimeout(() => {
+      if (awaitingAttackResult && awaitingAttackResult.targetId === targetId) {
+        setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
+        awaitingAttackResult = null;
+      }
+    }, 5000);
+    awaitingAttackResult = { targetId, targetName, result, timeoutId };
 
-  send({
-    type: 'attack:resolve',
-    targetTokenId: targetId,
-    sourceTokenId,
-    toHit: result.attackTotal,
-    damage: result.damageTotal,
-    outcome,
-  });
+    send({
+      type: 'attack:resolve',
+      targetTokenId: targetId,
+      sourceTokenId,
+      toHit: result.attackTotal,
+      damage: result.damageTotal,
+      outcome,
+    });
+    return;
+  }
+
+  // Save/auto spell: no hidden value to compare against (the caster's own Spell
+  // Save DC isn't secret), so the pass/fail check happens here, not on the
+  // server - see renderSpellResolutionControls()/vtt/server/handlers/token.js's
+  // spell:resolve case for why that's a safe simplification.
+  renderSpellResolutionControls(result, sourceTokenId, targetId);
 }
 
-// Renders the to-hit + damage breakdown (identical whichever roll source), with
-// a verdict slot filled once the server responds.
+// Renders the to-hit (if any) + damage breakdown (identical whichever roll
+// source), with a verdict slot filled once the server responds or (for
+// save/auto spells) once renderSpellResolutionControls wires its own prompt.
 function renderAttackBreakdown(targetName, result, verdictHtml) {
+  const hasAttackRoll = Boolean(result.attack);
+  const saveLine = result.resolution === 'save'
+    ? `<div class="attack-roll-block"><h4>Saving Throw</h4>DC ${result.saveDc} ${escapeHtml(String(result.saveAbility || '').toUpperCase())} — ${result.saveEffect === 'negate' ? 'no damage' : 'half damage'} on a success</div>`
+    : '';
   attackModalBody.innerHTML = `
     <h2>${escapeHtml(result.title || 'Attack')}</h2>
     <div class="attack-target-name">vs <strong>${escapeHtml(targetName)}</strong></div>
-    <div class="attack-roll-block"><h4>To hit</h4>${escapeHtml(result.attack || '')}</div>
+    ${hasAttackRoll ? `<div class="attack-roll-block"><h4>To hit</h4>${escapeHtml(result.attack || '')}</div>` : ''}
+    ${saveLine}
     <div id="attackVerdict">${verdictHtml}</div>
-    <div class="attack-roll-block"><h4>Damage (on a hit)</h4>${escapeHtml((result.damage || []).join('\n'))}</div>
+    <div class="attack-roll-block"><h4>Damage${hasAttackRoll ? ' (on a hit)' : ''}</h4>${escapeHtml((result.damage || []).join('\n'))}</div>
     <div class="actions">
       <button type="button" class="secondary" id="attackDoneBtn">Close</button>
     </div>
@@ -616,6 +674,66 @@ function renderAttackBreakdown(targetName, result, verdictHtml) {
 function setAttackVerdict(html) {
   const el = document.getElementById('attackVerdict');
   if (el) el.innerHTML = html;
+}
+
+// Fills the verdict slot with the spec's "lightweight type-in-the-result
+// prompt" for a save spell (DC is already shown above, not secret), or a
+// simple confirm for an auto-hit spell - either way nothing applies to the
+// target's HP until the player explicitly clicks, same discipline as the
+// weapon flow's explicit Attack button.
+function renderSpellResolutionControls(result, sourceTokenId, targetId) {
+  const verdictEl = document.getElementById('attackVerdict');
+  if (!verdictEl) return;
+  if (result.resolution === 'save') {
+    verdictEl.innerHTML = `
+      <div class="spell-save-prompt">
+        <label>Target's save total <input type="number" id="spellSaveResultInput" /></label>
+        <button type="button" id="spellSaveApplyBtn">Apply</button>
+      </div>
+    `;
+    document.getElementById('spellSaveApplyBtn').addEventListener('click', () => {
+      const value = Number(document.getElementById('spellSaveResultInput').value);
+      const saveSuccess = Number.isFinite(value) && value >= result.saveDc;
+      sendSpellResolve(sourceTokenId, targetId, result, saveSuccess);
+    });
+  } else {
+    verdictEl.innerHTML = `<button type="button" id="spellApplyBtn">Apply Damage</button>`;
+    document.getElementById('spellApplyBtn').addEventListener('click', () => sendSpellResolve(sourceTokenId, targetId, result, null));
+  }
+}
+
+function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess) {
+  setAttackVerdict('<span class="attack-subtext">Applying…</span>');
+  const timeoutId = setTimeout(() => {
+    if (awaitingSpellResult && awaitingSpellResult.targetId === targetId) {
+      setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
+      awaitingSpellResult = null;
+    }
+  }, 5000);
+  awaitingSpellResult = { targetId, timeoutId };
+  send({
+    type: 'spell:resolve',
+    targetTokenId: targetId,
+    sourceTokenId,
+    damage: result.damageTotal,
+    resolution: result.resolution,
+    saveSuccess,
+    saveEffect: result.saveEffect,
+  });
+}
+
+// Server's verdict for an applied save/auto spell - mirrors handleAttackResult
+// below, just without a hit/miss/crit concept (no roll was made against a
+// hidden value; the server only confirms the write was authorized and applied).
+function handleSpellResult(msg) {
+  if (!awaitingSpellResult || msg.targetTokenId !== awaitingSpellResult.targetId) return;
+  clearTimeout(awaitingSpellResult.timeoutId);
+  awaitingSpellResult = null;
+
+  const label = msg.resolution === 'save'
+    ? (msg.saveSuccess ? `Saved! ${msg.damageApplied} damage dealt` : `Failed save — ${msg.damageApplied} damage dealt`)
+    : `${msg.damageApplied} damage dealt`;
+  setAttackVerdict(`<div class="attack-outcome ${msg.damageApplied > 0 ? 'hit' : 'miss'}">${label}</div>`);
 }
 
 // Server's verdict for the in-flight attack (it decided vs the hidden AC and
@@ -798,6 +916,116 @@ window.addEventListener('mouseup', (e) => {
   panState = null;
   canvas.classList.remove('dragging');
 });
+
+// ---------------------------------------------------------------------------
+// Touch: #mapWrap is a plain `overflow: auto` div, so on a touchscreen the
+// browser pans it natively before any JS runs - there's no JS pan gesture to
+// out-race for touch the way desktop's mousedown handler above does. Any
+// gesture that's normally a mouse drag (move a token, drag out a cone/cube's
+// facing+length) needs to preventDefault to opt that one touch out of native
+// scrolling and drive it through the same dragState/shapeDrag the mouse path
+// already uses; a touch that misses both is left alone and native scroll
+// keeps panning exactly as it already does. Tap-to-target and tap-to-place
+// (circle/sphere, which place immediately with no drag step) aren't touched
+// here - a simple tap (no scroll) still reaches the mousedown handler above
+// via the browser's synthesized click, which is why those already work.
+// ---------------------------------------------------------------------------
+
+function findTouchById(touchList, id) {
+  for (let i = 0; i < touchList.length; i++) {
+    if (touchList[i].identifier === id) return touchList[i];
+  }
+  return null;
+}
+
+let activeTouch = null; // { id, kind: 'token' | 'shape' } - which touch owns whichever of dragState/shapeDrag is currently live
+
+canvas.addEventListener('touchstart', (e) => {
+  if (pendingActionTarget) return; // tap-to-target has no drag step, synthesized click already handles it
+  if (e.touches.length !== 1) return; // multi-touch - not a drag gesture
+
+  const touch = e.touches[0];
+  const { x, y } = canvasCoords(touch);
+
+  if (pendingMarkerPlacement) {
+    const config = pendingMarkerPlacement;
+    if (config.shape !== 'cone' && config.shape !== 'cube') return; // immediate placement, synthesized click already handles it
+
+    e.preventDefault();
+    shapeDrag = { config, originX: x, originY: y, currentX: x, currentY: y };
+    activeTouch = { id: touch.identifier, kind: 'shape' };
+    canvas.classList.add('dragging');
+    render();
+    return;
+  }
+
+  const token = hitTestToken(x, y);
+  const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
+  if (!canDragToken) return; // miss - let native pan handle it, unchanged
+
+  e.preventDefault(); // now that we know it's a token drag, opt this gesture out of native scroll
+  dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y };
+  activeTouch = { id: touch.identifier, kind: 'token' };
+  canvas.classList.add('dragging');
+}, { passive: false });
+
+window.addEventListener('touchmove', (e) => {
+  if (!activeTouch) return;
+  const touch = findTouchById(e.touches, activeTouch.id);
+  if (!touch) return;
+
+  if (e.touches.length > 1) {
+    // a second finger came down mid-gesture - bail out cleanly rather than
+    // leave a stuck drag fighting whatever that second touch turns out to be
+    if (activeTouch.kind === 'token') dragState = null;
+    else { shapeDrag = null; disarmMarkerPlacement(); }
+    activeTouch = null;
+    canvas.classList.remove('dragging');
+    render();
+    return;
+  }
+
+  e.preventDefault();
+  const { x, y } = canvasCoords(touch);
+  if (activeTouch.kind === 'token') {
+    dragState.x = x;
+    dragState.y = y;
+  } else {
+    shapeDrag.currentX = x;
+    shapeDrag.currentY = y;
+  }
+  render();
+}, { passive: false });
+
+function endTouchDrag(e, commit) {
+  if (!activeTouch) return;
+  const touch = findTouchById(e.changedTouches, activeTouch.id);
+  if (!touch) return;
+
+  if (commit && activeTouch.kind === 'token') {
+    const { x, y } = canvasCoords(touch);
+    const { tokenId } = dragState;
+    send({ type: 'token:move', tokenId, x, y });
+    // dragState itself clears once the server echoes the move back (see
+    // handleMessage's token:move case), same as the mouse path above.
+  } else if (commit && activeTouch.kind === 'shape') {
+    const { x, y } = canvasCoords(touch);
+    shapeDrag.currentX = x;
+    shapeDrag.currentY = y;
+    placeMarker(markerFromShapeDrag(shapeDrag));
+    shapeDrag = null;
+    disarmMarkerPlacement();
+    render();
+  } else {
+    if (activeTouch.kind === 'token') dragState = null;
+    else { shapeDrag = null; disarmMarkerPlacement(); }
+  }
+  activeTouch = null;
+  canvas.classList.remove('dragging');
+}
+
+window.addEventListener('touchend', (e) => endTouchDrag(e, true));
+window.addEventListener('touchcancel', (e) => endTouchDrag(e, false));
 
 // ---------------------------------------------------------------------------
 // Zoom - pure CSS scale of the canvas (backing pixel buffer stays at the
@@ -1894,12 +2122,18 @@ function miniSheetHtml(t) {
         .join('')
     : '<p style="color:#666;font-size:12px;">No equipped weapons.</p>';
 
+  // Slot-level rows double as the spell-casting entry point (Phase 3): clicking
+  // the row's label (not the Use/Reset buttons, which remain the manual-override
+  // path) opens a picker of prepared spells castable at that level - see
+  // openSpellPicker(). Which row you click IS the upcast choice: picking a
+  // lower-level spell from a higher slot row casts it upcast at that slot level,
+  // no separate level selector needed.
   const slotsHtml = (t.spellSlots || []).length
     ? (t.spellSlots || [])
         .map(
           (s) => `
         <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
-          <span>${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
+          <span class="mini-sheet-slot-label">${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
           <button type="button" class="secondary slotUseBtn" ${s.current <= 0 ? 'disabled' : ''}>Use</button>
           <button type="button" class="secondary slotResetBtn">Reset</button>
         </div>
@@ -1908,8 +2142,13 @@ function miniSheetHtml(t) {
         .join('')
     : '';
 
-  const spellsHtml = (t.preparedSpells || []).length
-    ? (t.preparedSpells || []).map((s) => `<div class="mini-sheet-action" data-spell-name="${escapeHtml(s.name)}"><span>${escapeHtml(s.name)}</span><span style="color:#aaa;">Lvl ${s.spellLevel ?? 0}</span></div>`).join('')
+  const cantripCount = (t.preparedSpells || []).filter((s) => (s.spellLevel ?? 0) === 0).length;
+  const cantripsHtml = cantripCount
+    ? `
+      <div class="mini-sheet-slot" data-slot-level="0">
+        <span class="mini-sheet-slot-label">Cantrips (${cantripCount})</span>
+      </div>
+    `
     : '';
 
   return `
@@ -1920,8 +2159,7 @@ function miniSheetHtml(t) {
       </div>
       <label style="font-size:11px;color:#888;">Actions</label>
       ${actionsHtml}
-      ${slotsHtml ? `<label style="font-size:11px;color:#888;">Spell slots</label>${slotsHtml}` : ''}
-      ${spellsHtml ? `<label style="font-size:11px;color:#888;">Prepared spells</label>${spellsHtml}` : ''}
+      ${(cantripsHtml || slotsHtml) ? `<label style="font-size:11px;color:#888;">Spells</label>${cantripsHtml}${slotsHtml}` : ''}
     </div>
   `;
 }
@@ -1951,6 +2189,54 @@ function otherTokenListHtml(tokens) {
       `;
     })
     .join('');
+}
+
+// ---------------------------------------------------------------------------
+// Spell picker (Phase 3) - opened by clicking a slot-level row (or the
+// Cantrips row) in the mini-sheet. Lists prepared spells castable at that
+// level; picking one closes the picker and arms targeting exactly like a
+// weapon action, tagged action.kind='spell' so the shared confirm/roll flow
+// above (openAttackConfirm/resolveAttack) branches correctly.
+// ---------------------------------------------------------------------------
+const spellPickerModal = document.getElementById('spellPickerModal');
+const spellPickerTitle = document.getElementById('spellPickerTitle');
+const spellPickerList = document.getElementById('spellPickerList');
+document.getElementById('spellPickerCancelBtn').addEventListener('click', () => spellPickerModal.classList.remove('visible'));
+
+function openSpellPicker(tokenId, clickedLevel) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  const spells = (token.preparedSpells || []).filter((s) =>
+    clickedLevel === 0 ? (s.spellLevel ?? 0) === 0 : (s.spellLevel ?? 0) > 0 && (s.spellLevel ?? 0) <= clickedLevel
+  );
+
+  spellPickerTitle.textContent = clickedLevel === 0 ? 'Cast a Cantrip' : `Cast a Level ${clickedLevel} Spell`;
+  spellPickerList.innerHTML = spells.length
+    ? spells
+        .map(
+          (s) => `
+        <div class="mini-sheet-action spell-picker-row" data-spell-id="${escapeHtml(s.id)}" data-spell-name="${escapeHtml(s.name)}">
+          <span>${escapeHtml(s.name)}</span>
+          <span style="color:#aaa;">Lvl ${s.spellLevel ?? 0}</span>
+        </div>
+      `
+        )
+        .join('')
+    : '<p style="color:#666;font-size:12px;">No prepared spells at this level.</p>';
+
+  spellPickerList.querySelectorAll('.spell-picker-row').forEach((row) => {
+    row.addEventListener('click', () => {
+      spellPickerModal.classList.remove('visible');
+      armActionTargeting(tokenId, {
+        kind: 'spell',
+        instanceId: row.dataset.spellId,
+        name: row.dataset.spellName,
+        slotLevel: clickedLevel,
+      });
+    });
+  });
+
+  spellPickerModal.classList.add('visible');
 }
 
 function wirePlayerSidebar() {
@@ -2002,6 +2288,9 @@ function wirePlayerSidebar() {
         return { ...s, current: useSlot ? Math.max(0, s.current - 1) : s.max };
       });
       send({ type: 'token:stat:update', tokenId, stat: 'spellSlots', value });
+    } else if (e.target.classList.contains('mini-sheet-slot-label')) {
+      const slotRow = e.target.closest('.mini-sheet-slot');
+      if (slotRow) openSpellPicker(tokenId, Number(slotRow.dataset.slotLevel));
     } else {
       const actionRow = e.target.closest('.mini-sheet-action');
       const token = session.tokens[tokenId];

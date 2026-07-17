@@ -370,6 +370,105 @@ export function spellAttackBonus(score: number, level: number, bonuses: number[]
   return abilityModifier(score) + proficiencyBonus(level) + bonuses.reduce((sum, value) => sum + value, 0);
 }
 
+// Same transform content-admin.ts's private slug() uses for content_key generation -
+// duplicated rather than imported since that module pulls in $lib/server/db and this
+// file must stay importable from both server and client code.
+export function slugifySpellName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'spell';
+}
+
+export type SpellDamageScalingInput = {
+  kind?: 'cantrip' | 'leveled' | 'none';
+  extraDice?: string;
+  tiers?: number[];
+  extraDicePerSlotLevel?: string | null;
+};
+
+export type SpellDamageSource = {
+  name: string;
+  spellLevel: number;
+  resolutionType: 'attack' | 'save' | 'auto';
+  damageType: string;
+  baseDice: string;
+  saveAbility?: AbilityKey;
+  saveEffect?: 'half' | 'negate';
+  scaling: SpellDamageScalingInput;
+};
+
+export type SpellDamageContext = {
+  castAtSlotLevel: number;
+  casterLevel: number;
+  modifierSources: ActiveCharacterEffect[];
+  outcomes?: string[];
+};
+
+export type SpellDamageProfile = {
+  resolution: 'attack' | 'save' | 'auto';
+  damageType: string;
+  diceExpression: string;
+  extraDice: ExtraDieResult[];
+  flatBonuses: ResolvedBonus[];
+  saveAbility?: AbilityKey;
+  saveEffect?: 'half' | 'negate';
+};
+
+function repeatDiceExpression(expression: string, times: number): string {
+  if (times <= 1 || !expression.trim()) return expression;
+  return Array.from({ length: times }, () => expression).join(' + ');
+}
+
+// modifier-primacy.md - spell damage is a Container/spell baseline (base_dice +
+// scaling_json, both on spell_definitions) with ordinary Modifiers layered on top,
+// exactly like weapon damage already works via damageCandidatesFor()/battleDamageBonuses()
+// in attackRoll.ts. This is what lets a homebrew item/feat later attach a ordinary
+// Modifier (extra_die, bonus, or - see below - multiplier) targeting a spell's damage
+// without any further engine changes.
+//
+// Candidate targets are layered general -> specific, same convention as
+// damage_roll.weapon -> damage_roll.melee_weapon.<ability>: damage_roll.spell.all,
+// damage_roll.spell.<damageType>, damage_roll.spell.<name-slug> - the last one is how
+// a modifier can target one specific named spell (e.g. "doubles Sleep's dice").
+export function resolveSpellDamage(spell: SpellDamageSource, ctx: SpellDamageContext): SpellDamageProfile {
+  const scaling = spell.scaling || {};
+  let diceExpression = spell.baseDice;
+
+  if (scaling.kind === 'cantrip' && scaling.extraDice) {
+    const tiersCrossed = (scaling.tiers || []).filter((tier) => ctx.casterLevel >= tier).length;
+    diceExpression = [diceExpression, ...Array(tiersCrossed).fill(scaling.extraDice)].filter(Boolean).join(' + ');
+  } else if (scaling.kind === 'leveled' && scaling.extraDicePerSlotLevel) {
+    const levelsAbove = Math.max(0, ctx.castAtSlotLevel - spell.spellLevel);
+    diceExpression = [diceExpression, ...Array(levelsAbove).fill(scaling.extraDicePerSlotLevel)].filter(Boolean).join(' + ');
+  }
+
+  const candidates = ['damage_roll.spell.all', `damage_roll.spell.${spell.damageType}`, `damage_roll.spell.${slugifySpellName(spell.name)}`]
+    .filter(Boolean);
+  const damageContext: ModifierContext = { attackType: 'spell', outcomes: ctx.outcomes };
+
+  // "Multiplier" against a spell-damage target means "roll the resolved dice pool N
+  // times" (a dice-pool multiplier), not the scalar multiply speedFt() uses the same
+  // modifier_type for - repeat the baseline+scaling expression, before flat bonuses,
+  // so an upcast spell's extra dice get doubled too but a flat item bonus doesn't.
+  const multipliers = resolvedNumericModifiers(ctx.modifierSources, candidates, ['multiplier'], damageContext);
+  for (const multiplier of multipliers) {
+    if (Number.isInteger(multiplier.value) && multiplier.value > 1) {
+      diceExpression = repeatDiceExpression(diceExpression, multiplier.value);
+    }
+  }
+
+  const extraDice = resolveExtraDiceRolls(ctx.modifierSources, candidates, damageContext);
+  const flatBonuses = resolvedAdditiveModifiers(ctx.modifierSources, candidates, damageContext);
+
+  return {
+    resolution: spell.resolutionType,
+    damageType: spell.damageType,
+    diceExpression,
+    extraDice,
+    flatBonuses,
+    saveAbility: spell.saveAbility,
+    saveEffect: spell.saveEffect
+  };
+}
+
 // The following were previously inline $derived formulas in
 // CharacterSheetForm.svelte, only reachable from within that component -
 // extracted so VTT Phase 2's server-side character API can compute the same

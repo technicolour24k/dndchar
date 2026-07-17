@@ -90,10 +90,22 @@
     </div>
   </div>
 
-  <!-- Attack flow: confirm step then roll-result step share one shell, body swapped in JS. -->
+  <!-- Attack flow: confirm step then roll-result step share one shell, body swapped in JS.
+       Also used for spell casting (Phase 3) - same shell, action.kind branches the content. -->
   <div id="attackModal" class="modal-overlay">
     <div class="modal">
       <div id="attackModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Spell picker (Phase 3): opened by clicking a slot-level/Cantrips row in the mini-sheet. -->
+  <div id="spellPickerModal" class="modal-overlay">
+    <div class="modal">
+      <h2 id="spellPickerTitle">Cast a Spell</h2>
+      <div id="spellPickerList"></div>
+      <div class="actions">
+        <button type="button" id="spellPickerCancelBtn" class="secondary">Cancel</button>
+      </div>
     </div>
   </div>
 

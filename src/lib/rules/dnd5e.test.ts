@@ -13,6 +13,7 @@ import {
   resolveExtraDiceRolls,
   resolveModifierNumericValue,
   resolveResourceMaximum,
+  resolveSpellDamage,
   rollD20Pool,
   rollDiceExpression,
   modifierConditionMatches,
@@ -337,5 +338,51 @@ describe('D&D 5e helpers', () => {
     expect(critExtraDice).toEqual([{ label:'Flameheart Greatsword', expression:'1d10', rolls:[7], value:7 }]);
     const critBonuses=resolvedNumericModifiers([weapon],candidates,['bonus'],{outcomes:critOutcomes});
     expect(critBonuses).toEqual([{ label:'Flameheart Greatsword', value:10 }]);
+  });
+
+  it('scales cantrip damage at character levels 5/11/17, per vtt-phase-3-magic-spec.md', () => {
+    const fireBolt = {
+      name: 'Fire Bolt', spellLevel: 0, resolutionType: 'attack' as const, damageType: 'fire', baseDice: '1d10',
+      scaling: { kind: 'cantrip' as const, extraDice: '1d10', tiers: [5, 11, 17] }
+    };
+    const ctx = (casterLevel: number) => ({ castAtSlotLevel: 0, casterLevel, modifierSources: [] });
+    expect(resolveSpellDamage(fireBolt, ctx(1)).diceExpression).toBe('1d10');
+    expect(resolveSpellDamage(fireBolt, ctx(5)).diceExpression).toBe('1d10 + 1d10');
+    expect(resolveSpellDamage(fireBolt, ctx(11)).diceExpression).toBe('1d10 + 1d10 + 1d10');
+    expect(resolveSpellDamage(fireBolt, ctx(17)).diceExpression).toBe('1d10 + 1d10 + 1d10 + 1d10');
+  });
+
+  it('scales a leveled spell by slot levels cast above its minimum (upcasting), per vtt-phase-3-magic-spec.md', () => {
+    const fireball = {
+      name: 'Fireball', spellLevel: 3, resolutionType: 'save' as const, damageType: 'fire', baseDice: '8d6',
+      saveAbility: 'dex' as const, saveEffect: 'half' as const,
+      scaling: { kind: 'leveled' as const, extraDicePerSlotLevel: '1d6' }
+    };
+    const ctx = (castAtSlotLevel: number) => ({ castAtSlotLevel, casterLevel: 5, modifierSources: [] });
+    expect(resolveSpellDamage(fireball, ctx(3)).diceExpression).toBe('8d6');
+    expect(resolveSpellDamage(fireball, ctx(5)).diceExpression).toBe('8d6 + 1d6 + 1d6');
+    expect(resolveSpellDamage(fireball, ctx(3)).saveAbility).toBe('dex');
+    expect(resolveSpellDamage(fireball, ctx(3)).saveEffect).toBe('half');
+  });
+
+  it('doubles a spell\'s resolved dice pool via a "multiplier" Modifier targeting damage_roll.spell.<slug>, without touching flat bonuses', () => {
+    const sleep = {
+      name: 'Sleep', spellLevel: 1, resolutionType: 'auto' as const, damageType: '', baseDice: '5d8',
+      scaling: { kind: 'none' as const }
+    };
+    const doublingItem: ActiveCharacterEffect = {
+      id: 'active-sleep-doubler', effectId: 'sleep-doubler', effectKey: 'sleep-doubler', name: 'Somnolent Rod',
+      sourceType: 'item', sourceName: 'Somnolent Rod', description: '', durationType: 'while_applicable',
+      requiresConcentration: false, isCondition: false, isSelectable: false, remainingRounds: null,
+      modifiers: [
+        { target: 'damage_roll.spell.sleep', modifierType: 'multiplier', label: '', valueExpression: '2',
+          defaultValueExpression: '2', valueOverrideExpression: '', conditionExpression: '', priority: 0 },
+        { target: 'damage_roll.spell.sleep', modifierType: 'bonus', label: '', valueExpression: '3',
+          defaultValueExpression: '3', valueOverrideExpression: '', conditionExpression: '', priority: 1 }
+      ]
+    };
+    const profile = resolveSpellDamage(sleep, { castAtSlotLevel: 1, casterLevel: 5, modifierSources: [doublingItem] });
+    expect(profile.diceExpression).toBe('5d8 + 5d8');
+    expect(profile.flatBonuses).toEqual([{ label: 'Somnolent Rod', value: 3 }]);
   });
 });

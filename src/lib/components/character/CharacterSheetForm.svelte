@@ -2,10 +2,10 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
-  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, passiveScore, proficiencyBonus, resolveExtraDiceRolls, resolvedAdditiveModifiers, resolvedNumericModifiers, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, passiveScore, proficiencyBonus, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
-  import type { ContentDefinition, ContentType } from '$lib/types/content';
+  import type { CharacterContentInstance, ContentDefinition, ContentType } from '$lib/types/content';
 
   let {
     character,
@@ -612,6 +612,34 @@
     });
   }
 
+  // Per vtt-phase-3-magic-spec.md: the character sheet just displays what a spell resolves
+  // to and rolls it for reference - no target/application concept here (that's the VTT's
+  // job). Runs resolveSpellDamage() client-side (unlike the VTT's vanilla client, this
+  // component can import $lib directly) - same function, same Modifier-aware damage the
+  // VTT's roll-spell endpoint produces.
+  function rollSpellDamage(spell: { name: string; spellLevel: number | null; spellDamage?: NonNullable<CharacterContentInstance['spellDamage']> }) {
+    const damage = spell.spellDamage;
+    if (!damage || !damage.baseDice) return;
+    const profile = resolveSpellDamage(
+      { name: spell.name, spellLevel: spell.spellLevel ?? 0, resolutionType: damage.resolutionType, damageType: damage.damageType,
+        baseDice: damage.baseDice, saveAbility: damage.saveAbility, saveEffect: damage.saveEffect, scaling: damage.scaling },
+      { castAtSlotLevel: spell.spellLevel ?? 0, casterLevel: level, modifierSources: character.modifierSources }
+    );
+    const rolled = rollDamage(profile.diceExpression, 0, 0, '', profile.flatBonuses, profile.extraDice, rollDie);
+    const resolutionText = profile.resolution === 'save'
+      ? `Save (${(profile.saveAbility || '').toUpperCase()}, ${profile.saveEffect === 'negate' ? 'negate' : 'half'} on success)`
+      : profile.resolution === 'attack' ? 'Spell Attack' : 'Automatic';
+    rollResult = { title: spell.name, attack: '', damage: rolled.lines, effects: `${resolutionText}${profile.damageType ? ` · ${profile.damageType}` : ''}` };
+  }
+
+  function spellDamageSummary(spell: CharacterContentInstance): string {
+    const damage = spell.spellDamage;
+    if (!damage || !damage.baseDice) return '';
+    const resolutionLabel = damage.resolutionType === 'save' ? `Save (${damage.saveAbility.toUpperCase()})`
+      : damage.resolutionType === 'attack' ? 'Attack' : 'Auto';
+    return `${resolutionLabel} · ${damage.baseDice}${damage.damageType ? ` ${damage.damageType}` : ''}`;
+  }
+
   function findInventoryRow(event: MouseEvent) {
     return (event.currentTarget as HTMLElement).closest<HTMLElement>('.inventory-row, .new-item-grid');
   }
@@ -1044,7 +1072,7 @@
             <div class="catalogue-add-row"><select bind:value={selectedCatalogue.spell}><option value="">Add a spell...</option>{#each catalogue.filter((entry) => entry.type === 'spell') as entry}<option value={entry.id}>{entry.name} (level {entry.spell?.level ?? 0})</option>{/each}</select><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
-                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}</span></div><div class="actions"><button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
+                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>Roll Damage</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
               {/each}
             </div>
           </div>
@@ -1656,10 +1684,12 @@
           <button type="button" class="text-button" onclick={() => (rollResult = null)}>Close</button>
         </div>
         <div class="roll-result">
-          <div>
-            <span>To Hit</span>
-            <strong>{rollResult.attack}</strong>
-          </div>
+          {#if rollResult.attack}
+            <div>
+              <span>To Hit</span>
+              <strong>{rollResult.attack}</strong>
+            </div>
+          {/if}
           <div>
             <span>Damage</span>
             <div class="damage-lines">
