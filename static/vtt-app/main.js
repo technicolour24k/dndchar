@@ -76,6 +76,144 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+// ---------------------------------------------------------------------------
+// Ambient music - a map can carry a musicUrl (bundled library track or a
+// custom upload/URL, same choice as map/token images), synced to everyone
+// via the existing map:set/state:full path since it just lives on
+// session.map. Playback itself is local: browsers block un-gestured
+// autoplay-with-sound, and forcing music on players who haven't opted in
+// would be rude regardless, so a track change only takes over the (global,
+// looping) <audio> element live if the player already had it going -
+// otherwise they see the bar update and press play themselves. The bar/audio
+// element live outside #sidebar/#mapWrap's re-rendered innerHTML so playback
+// survives every unrelated renderSidebar()/render() call.
+// ---------------------------------------------------------------------------
+
+const musicBar = document.getElementById('musicBar');
+const musicToggleBtn = document.getElementById('musicToggleBtn');
+const musicTrackName = document.getElementById('musicTrackName');
+const musicVolumeInput = document.getElementById('musicVolumeInput');
+const ambientAudio = document.getElementById('ambientAudio');
+
+let musicLibraryIndex = []; // fetched once, cached for the session
+
+async function ensureMusicLibraryIndex() {
+  if (musicLibraryIndex.length) return musicLibraryIndex;
+  try {
+    const res = await fetch('/vtt/api/music-library');
+    const data = await res.json();
+    musicLibraryIndex = data.tracks || [];
+  } catch {
+    musicLibraryIndex = [];
+  }
+  return musicLibraryIndex;
+}
+
+function musicLibraryUrl(track) {
+  return '/vtt/api/music-library/' + encodeURIComponent(track.filename);
+}
+
+function musicTrackLabel(url) {
+  const match = musicLibraryIndex.find((t) => musicLibraryUrl(t) === url);
+  return match ? match.friendlyName : 'Custom track';
+}
+
+ambientAudio.volume = musicVolumeInput.value / 100;
+musicVolumeInput.addEventListener('input', () => {
+  ambientAudio.volume = musicVolumeInput.value / 100;
+});
+musicToggleBtn.addEventListener('click', () => {
+  if (ambientAudio.paused) ambientAudio.play().catch(() => {});
+  else ambientAudio.pause();
+});
+ambientAudio.addEventListener('play', () => {
+  musicToggleBtn.textContent = '⏸';
+  musicToggleBtn.title = 'Pause ambient music';
+});
+ambientAudio.addEventListener('pause', () => {
+  musicToggleBtn.textContent = '▶';
+  musicToggleBtn.title = 'Play ambient music';
+});
+
+function updateAmbientMusic() {
+  const musicUrl = session?.map?.musicUrl || null;
+  if (!musicUrl) {
+    musicBar.style.display = 'none';
+    ambientAudio.pause();
+    ambientAudio.removeAttribute('src');
+    return;
+  }
+
+  musicBar.style.display = '';
+  musicTrackName.textContent = musicTrackLabel(musicUrl);
+
+  const resolvedUrl = new URL(musicUrl, location.href).href;
+  if (ambientAudio.src !== resolvedUrl) {
+    const wasPlaying = !ambientAudio.paused;
+    ambientAudio.src = musicUrl;
+    if (wasPlaying) ambientAudio.play().catch(() => {});
+  }
+}
+
+ensureMusicLibraryIndex().then(() => {
+  if (session) {
+    renderSidebar();
+    updateAmbientMusic();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Attack/spell hit-sound effects - one bundled clip per damage type under
+// assets/effects/, played table-wide (see the server's fx:play broadcast in
+// vtt/server/handlers/token.js) whenever an attack lands or a spell deals
+// damage. Spells already carry a real SRD damage type (fire/necrotic/force/
+// etc, entered on the spell's content definition and returned by roll-spell
+// as result.damageType - see ContentTypeAdmin.svelte's Damage Type field) -
+// the three physical ones map to their matching clip, everything else (no
+// per-element clip exists) falls back to the generic 'magic' one. Weapon
+// items have no equivalent damageType field yet, so those fall back further
+// to a best-effort guess from the action's name against common 5e SRD
+// weapon/monster-attack words - unmatched names (homebrew weapons, "Slam"/
+// "Bite" if not listed, etc.) just play nothing rather than guess wrong.
+// ---------------------------------------------------------------------------
+
+const EFFECT_DAMAGE_TYPES = new Set(['bludgeoning', 'piercing', 'slashing', 'magic']);
+const PHYSICAL_DAMAGE_TYPES = new Set(['bludgeoning', 'piercing', 'slashing']);
+const SLASHING_ACTION_WORDS = ['sword', 'axe', 'scimitar', 'glaive', 'halberd', 'whip', 'sickle', 'claw', 'talon', 'rake'];
+const PIERCING_ACTION_WORDS = ['dagger', 'spear', 'javelin', 'trident', 'rapier', 'dart', 'pike', 'lance', 'bow', 'crossbow', 'arrow', 'bolt', 'bite', 'fang', 'tusk', 'horn', 'gore', 'sting'];
+const BLUDGEONING_ACTION_WORDS = ['mace', 'club', 'hammer', 'maul', 'quarterstaff', 'staff', 'flail', 'sling', 'slam', 'smash', 'stomp', 'tail', 'fist', 'pummel'];
+
+// Maps a real SRD damage type (from a spell's content definition) to one of
+// our four clips - the physical three pass through as-is, any energy/other
+// type (fire, cold, necrotic, force, ...) collapses to 'magic' since there's
+// no per-element clip.
+function mapSrdDamageTypeToEffect(damageType) {
+  if (!damageType) return null;
+  const normalized = String(damageType).toLowerCase().trim();
+  if (PHYSICAL_DAMAGE_TYPES.has(normalized)) return normalized;
+  return 'magic';
+}
+
+function inferDamageType(action, result) {
+  const fromDamageType = mapSrdDamageTypeToEffect(result?.damageType);
+  if (fromDamageType) return fromDamageType;
+  if (action?.kind === 'spell') return 'magic'; // spell with an empty/unset damage type (e.g. a save-only debuff) - still magical
+  const name = (action?.name || '').toLowerCase();
+  if (SLASHING_ACTION_WORDS.some((w) => name.includes(w))) return 'slashing';
+  if (PIERCING_ACTION_WORDS.some((w) => name.includes(w))) return 'piercing';
+  if (BLUDGEONING_ACTION_WORDS.some((w) => name.includes(w))) return 'bludgeoning';
+  return null;
+}
+
+function playEffectSound(damageType) {
+  if (!EFFECT_DAMAGE_TYPES.has(damageType)) return;
+  // A one-shot clip, not the persistent ambientAudio element - fire-and-forget
+  // Audio() instances are fine here since nothing needs to interrupt/replace
+  // them, and overlapping hits (e.g. two attacks in quick succession) should
+  // just layer rather than cut each other off.
+  new Audio(`/vtt/api/effects/${damageType}`).play().catch(() => {});
+}
+
 function getPersistentPlayerId() {
   if (accountPlayerId) return accountPlayerId;
   let id = localStorage.getItem('vtt_playerId');
@@ -127,6 +265,7 @@ function handleMessage(msg) {
       // until the next unrelated event happened to re-render.
       render();
       renderSidebar();
+      updateAmbientMusic();
       if (role === 'player') startCharacterSync();
       break;
 
@@ -153,6 +292,7 @@ function handleMessage(msg) {
       session.map = msg.map;
       render();
       renderSidebar();
+      updateAmbientMusic();
       break;
 
     case 'token:add':
@@ -229,6 +369,12 @@ function handleMessage(msg) {
       // Same idea as attack:result, for a save/auto spell's applied damage -
       // see handleSpellResult().
       handleSpellResult(msg);
+      break;
+
+    case 'fx:play':
+      // Table-wide hit-sound cue (everyone, not just the attacker) - see
+      // playEffectSound().
+      playEffectSound(msg.damageType);
       break;
 
     case 'marker:add':
@@ -638,6 +784,7 @@ async function resolveAttack() {
       toHit: result.attackTotal,
       damage: result.damageTotal,
       outcome,
+      damageType: inferDamageType(action, result),
     });
     return;
   }
@@ -719,6 +866,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess) {
     resolution: result.resolution,
     saveSuccess,
     saveEffect: result.saveEffect,
+    damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic', // this path is only ever reached for a spell (see resolveAttack)
   });
 }
 
@@ -1539,6 +1687,13 @@ function roomInfoHtml(roleLabel) {
 
 function gmSidebarHtml() {
   const map = session.map || {};
+  const isCustomMusic = !!map.musicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.musicUrl);
+  const musicOptions = musicLibraryIndex
+    .map((t) => {
+      const url = musicLibraryUrl(t);
+      return `<option value="${escapeHtml(url)}" ${map.musicUrl === url ? 'selected' : ''}>${escapeHtml(t.friendlyName)}</option>`;
+    })
+    .join('');
   const ownerOptions = Object.values(session.players)
     .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`)
     .join('');
@@ -1569,6 +1724,19 @@ function gmSidebarHtml() {
           <option value="dark" ${(!map.brightness || map.brightness === 'dark') ? 'selected' : ''}>Dark</option>
         </select>
       </div>
+    </div>
+    <div class="field">
+      <label>Ambient music</label>
+      <select id="mapMusicSelect">
+        <option value="">No music</option>
+        ${musicOptions}
+        <option value="__custom__" ${isCustomMusic ? 'selected' : ''}>Custom track…</option>
+      </select>
+    </div>
+    <div class="field" id="mapMusicCustomField" style="${isCustomMusic ? '' : 'display:none;'}">
+      <label>Upload or paste a track URL</label>
+      <input type="file" id="mapMusicFileInput" accept="audio/*" />
+      <input type="text" id="mapMusicUrlInput" value="${escapeHtml(isCustomMusic ? map.musicUrl : '')}" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
     </div>
     <button id="setMapBtn">Set map</button>
 
@@ -1836,9 +2004,34 @@ function wireGmSidebar() {
     document.getElementById('mapGridSizeInput').value = 96;
   });
 
+  const mapMusicSelect = document.getElementById('mapMusicSelect');
+  const mapMusicCustomField = document.getElementById('mapMusicCustomField');
+  const mapMusicFileInput = document.getElementById('mapMusicFileInput');
+  const mapMusicUrlInput = document.getElementById('mapMusicUrlInput');
+
+  mapMusicSelect.addEventListener('change', () => {
+    mapMusicCustomField.style.display = mapMusicSelect.value === '__custom__' ? '' : 'none';
+  });
+
+  mapMusicFileInput.addEventListener('change', async () => {
+    const file = mapMusicFileInput.files[0];
+    if (!file) return;
+    try {
+      const formData = new FormData();
+      formData.append('audio', file);
+      const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('upload_failed');
+      const data = await res.json();
+      mapMusicUrlInput.value = data.url;
+    } catch {
+      alert('Music track upload failed.');
+    }
+  });
+
   document.getElementById('setMapBtn').addEventListener('click', () => {
     const imageUrl = mapImageUrlInput.value.trim();
     if (!imageUrl) return alert('Upload or enter a map image URL first.');
+    const musicUrl = mapMusicSelect.value === '__custom__' ? mapMusicUrlInput.value.trim() || null : mapMusicSelect.value || null;
     send({
       type: 'map:set',
       map: {
@@ -1847,6 +2040,7 @@ function wireGmSidebar() {
         heightPx: Number(mapHeightInput.value) || 1200,
         gridSizePx: Number(document.getElementById('mapGridSizeInput').value) || 50,
         brightness: document.getElementById('mapBrightnessSelect').value,
+        musicUrl,
       },
     });
   });

@@ -313,6 +313,16 @@ function handleTokenEvent(meta, msg, context) {
           tokenId: target.id, stat: 'knownAc', value: target.knownAc,
         });
       }
+      // Hit-sound cue, everyone at the table - unlike attack:result (attacker
+      // only, since it carries the rolled damage), this leaks nothing secret,
+      // just "an attack landed, play its damage-type sound." damageType is
+      // client-derived - a spell's real SRD damage type where one exists, a
+      // best-effort guess from the weapon's name otherwise (see
+      // inferDamageType in main.js) - trusted as-is, same posture as the rest
+      // of a GM/attacker-authored message like map:set's map object.
+      if (hit) {
+        context.broadcast(meta.sessionId, () => ({ type: 'fx:play', damageType: msg.damageType || null }));
+      }
       break;
     }
 
@@ -360,6 +370,11 @@ function handleTokenEvent(meta, msg, context) {
         if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
         return { tokenId: target.id, stat: 'hp' };
       });
+      // Same hit-sound cue as attack:resolve, gated on actual damage rather
+      // than "resolved" - a negated save deals nothing, so nothing to hear.
+      if (appliedDamage > 0) {
+        context.broadcast(meta.sessionId, () => ({ type: 'fx:play', damageType: msg.damageType || 'magic' }));
+      }
       break;
     }
 
