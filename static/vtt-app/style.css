@@ -88,6 +88,33 @@ body {
 #zoomControls button:hover { background: #3a3d44; }
 #zoomResetBtn { min-width: 52px; font-size: 12px; color: #aaa; }
 
+.music-bar {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #1c1e24;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  padding: 6px 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  z-index: 10;
+}
+.music-bar button {
+  padding: 4px 8px;
+  border: none;
+  border-radius: 4px;
+  background: #2a2d34;
+  color: #eee;
+  cursor: pointer;
+  font-size: 12px;
+}
+.music-bar button:hover { background: #3a3d44; }
+.music-bar span { font-size: 12px; color: #ccc; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.music-bar input[type="range"] { width: 80px; }
+
 .marker-placement-banner {
   display: none;
   position: fixed;

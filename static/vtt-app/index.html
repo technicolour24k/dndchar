@@ -38,6 +38,14 @@
     <div id="sidebar"></div>
     <div id="mapWrap">
       <canvas id="canvas" width="800" height="600"></canvas>
+      <!-- Persistent regardless of map/sidebar re-renders (renderSidebar() replaces
+           #sidebar's innerHTML wholesale, which would otherwise restart playback). -->
+      <div id="musicBar" class="music-bar" style="display:none;">
+        <button type="button" id="musicToggleBtn" title="Play ambient music">&#9654;</button>
+        <span id="musicTrackName"></span>
+        <input type="range" id="musicVolumeInput" min="0" max="100" value="40" title="Music volume" />
+      </div>
+      <audio id="ambientAudio" loop></audio>
       <div id="zoomControls">
         <button id="zoomOutBtn" title="Zoom out">&minus;</button>
         <button id="zoomResetBtn" title="Reset zoom">100%</button>
