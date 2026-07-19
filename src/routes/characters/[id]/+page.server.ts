@@ -4,9 +4,9 @@ import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
-import { getActiveEncounterForCharacter, joinEncounterAsCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
-import { getCharacterVttSessionId, logRoll } from '$lib/server/services/rollLog';
-import { getActiveGameSessionForUser, joinGameSession, logSessionNote } from '$lib/server/services/gameSessions';
+import { getActiveEncounterForCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
+import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
+import { getRoomGameSessionId, listGameSessionsForUser, logSessionNote } from '$lib/server/services/gameSessions';
 import { sessions } from '$vtt/store.js';
 
 export async function load({ params, locals }) {
@@ -18,12 +18,24 @@ export async function load({ params, locals }) {
     itemCategories: await listItemCategories(),
     catalogue: await listCatalogue(locals.user!.id),
     versions: await listVersions(locals.user!.id, params.id),
+    // All three - activeVttSessionId (the one thing a player joins),
+    // activeEncounterId, activeGameSessionId - are user-scoped, not
+    // character-scoped: a player joins a room once, and every character sheet
+    // they open reflects it. Combat/session activity is derived live from
+    // that room's in-memory state, not a separate join per feature.
+    activeVttSessionId: await getUserVttSessionId(locals.user!.id),
     activeEncounterId: await getActiveEncounterForCharacter(params.id),
-    activeVttSessionId: await getCharacterVttSessionId(params.id),
+    // Pure room-derivation (getRoomGameSessionId), not the fallback-chained
+    // getActiveGameSessionForUser - the character sheet must only ever
+    // reflect/post to what's active in the room the player is actually
+    // connected to, never a stale session joined ages ago via a different
+    // flow (that fallback is scoped to SessionNotesModal's own join check).
+    activeGameSessionId: await getRoomGameSessionId(locals.user!.id),
     encounterHistory: await listEncountersForCharacter(params.id),
-    // User-scoped, not character-scoped (Session Notes are attributed to the
-    // signed-in player, not whichever character sheet happens to be open).
-    activeGameSessionId: await getActiveGameSessionForUser(locals.user!.id)
+    // Session Notes history is user-scoped too (see above) - shown in the
+    // Session Notes tab the same way Past Encounters is shown in the Combat
+    // tab, rather than needing its own separate /sessions list page.
+    gameSessionHistory: await listGameSessionsForUser(locals.user!.id)
   };
 }
 
@@ -149,31 +161,28 @@ export const actions = {
     const itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
   },
-  joinCombat: async ({ request, params, locals }) => {
+  // The one join a player needs, covering combat, rolls, and session notes at
+  // once - see encounters.ts's getActiveEncounterForCharacter and
+  // gameSessions.ts's getActiveGameSessionForUser for how the other two derive
+  // themselves from this same room join instead of requiring their own.
+  joinRoom: async ({ request, locals }) => {
     const form = await request.formData();
-    const encounterId = String(form.get('encounterId') || '').trim();
-    if (!encounterId) return fail(400, { joinCombatError: 'Enter an encounter ID.' });
-    try {
-      await joinEncounterAsCharacter(locals.user!.id, encounterId, params.id);
-    } catch {
-      return fail(400, { joinCombatError: 'That encounter ID was not found or is not active.' });
-    }
-    return { joinedCombat: true };
-  },
-  joinSession: async ({ request, params, locals }) => {
-    const form = await request.formData();
-    const sessionId = String(form.get('sessionId') || '').trim().toUpperCase();
-    if (!sessionId) return fail(400, { joinSessionError: 'Enter a room code.' });
+    const roomId = String(form.get('roomId') || '').trim().toUpperCase();
+    if (!roomId) return fail(400, { joinRoomError: 'Enter a room code.' });
     // VTT rooms are in-memory only (vtt/server/store.js) - validate against the
     // live sessions Map directly rather than any DB table, same supported
     // SvelteKit-into-vtt/server import already used by the combat start/stop route.
-    if (!sessions.has(sessionId)) return fail(400, { joinSessionError: 'That room code was not found.' });
-    const result = await query(
-      'UPDATE characters SET active_vtt_session_id = $1 WHERE id = $2 AND owner_user_id = $3',
-      [sessionId, params.id, locals.user!.id]
-    );
-    if (!result.rowCount) return fail(404, { joinSessionError: 'Character not found.' });
-    return { joinedSession: true };
+    if (!sessions.has(roomId)) return fail(400, { joinRoomError: 'That room code was not found.' });
+    await query('UPDATE users SET active_vtt_session_id = $1 WHERE id = $2', [roomId, locals.user!.id]);
+    return { joinedRoom: true };
+  },
+  // Explicit opt-out - the room join is plain persisted account state (it
+  // survives logout/login on purpose, so a player reconnecting mid-game
+  // doesn't have to re-join), so it needs a deliberate way to clear it rather
+  // than relying on it expiring on its own.
+  leaveRoom: async ({ locals }) => {
+    await leaveRoom(locals.user!.id);
+    return { leftRoom: true };
   },
   logRoll: async ({ request, params, locals }) => {
     const form = await request.formData();
@@ -183,8 +192,8 @@ export const actions = {
     const natural = Number(form.get('natural'));
     if (!label || !Number.isFinite(total)) return fail(400, { logRollError: 'Invalid roll.' });
 
-    const sessionId = await getCharacterVttSessionId(params.id);
-    if (!sessionId) return { loggedRoll: false }; // not in a session - nothing to log, not an error
+    const sessionId = await getUserVttSessionId(locals.user!.id);
+    if (!sessionId) return { loggedRoll: false }; // not in a room - nothing to log, not an error
 
     const nameRow = await query<{ name: string }>(
       'SELECT name FROM characters WHERE id = $1 AND owner_user_id = $2',
@@ -194,23 +203,12 @@ export const actions = {
     await logRoll(sessionId, `${name} rolled a ${total} on ${label}.`, { label, total, breakdown, natural });
     return { loggedRoll: true };
   },
-  joinGameSession: async ({ request, locals }) => {
-    const form = await request.formData();
-    const gameSessionId = String(form.get('gameSessionId') || '').trim();
-    if (!gameSessionId) return fail(400, { joinGameSessionError: 'Enter a session ID.' });
-    try {
-      await joinGameSession(locals.user!.id, gameSessionId);
-    } catch {
-      return fail(400, { joinGameSessionError: 'That session ID was not found or is not active.' });
-    }
-    return { joinedGameSession: true };
-  },
   postSessionNote: async ({ request, locals }) => {
     const form = await request.formData();
     const message = String(form.get('message') || '').trim();
     if (!message) return fail(400, { postSessionNoteError: 'Nothing to post.' });
 
-    const gameSessionId = await getActiveGameSessionForUser(locals.user!.id);
+    const gameSessionId = await getRoomGameSessionId(locals.user!.id);
     if (!gameSessionId) return fail(400, { postSessionNoteError: 'Join a session first.' });
 
     try {

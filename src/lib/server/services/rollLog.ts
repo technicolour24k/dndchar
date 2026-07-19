@@ -36,14 +36,27 @@ export async function logRoll(
   return entry;
 }
 
-// "Which room is this character currently reporting rolls into" - set by the
-// character sheet's "Join Session" action, read by its roll-logging action.
-export async function getCharacterVttSessionId(characterId: string): Promise<string | null> {
+// "Which room is this player currently in" - user-scoped (not per-character:
+// a player joins a room once, and every character sheet they open reflects
+// it), set by the character sheet's single "Join Room" action. Combat/session
+// activity for that room is derived live from this same value - see
+// encounters.ts's getActiveEncounterForCharacter and gameSessions.ts's
+// getActiveGameSessionForUser.
+export async function getUserVttSessionId(userId: string): Promise<string | null> {
   const result = await query<{ active_vtt_session_id: string | null }>(
-    'SELECT active_vtt_session_id FROM characters WHERE id = $1',
-    [characterId]
+    'SELECT active_vtt_session_id FROM users WHERE id = $1',
+    [userId]
   );
   return result.rows[0]?.active_vtt_session_id ?? null;
+}
+
+// The room join is plain persisted account state - it survives a logout/login
+// (deliberately, so a player reconnecting mid-game doesn't have to re-join),
+// and never expires on its own even if the room itself is long gone (VTT rooms
+// are in-memory only, wiped on restart). This is the explicit "Leave Room"
+// action for clearing it on purpose.
+export async function leaveRoom(userId: string): Promise<void> {
+  await query('UPDATE users SET active_vtt_session_id = NULL WHERE id = $1', [userId]);
 }
 
 export async function listRollLogEntries(sessionId: string, afterId?: string): Promise<RollLogEntry[]> {

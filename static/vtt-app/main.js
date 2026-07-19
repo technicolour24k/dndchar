@@ -1775,19 +1775,19 @@ function roomInfoHtml(roleLabel) {
     ${sessionNotesHtml()}`;
 }
 
-// Encounter ID is shown to every role, not just the GM - a player needs it to
-// paste into their character sheet's "Join Combat" box. Only the GM gets the
-// Start/Stop buttons themselves.
+// Combat/session-notes activity is derived automatically from room membership
+// now (see docs/vtt-current-state.md's room-join-unification write-up) - a
+// player only ever needs the Room Code, already visible in the sidebar header,
+// to get pulled into whichever of these the GM has started. No Encounter ID to
+// copy anymore, just status text. Only the GM gets the Start/Stop buttons.
 function combatControlHtml() {
   const active = !!session.encounterId;
-  const idLine = active
-    ? `<div class="combat-encounter-id">Encounter ID (enter on your character sheet's "Join Combat"): <code>${escapeHtml(session.encounterId)}</code></div>`
-    : '';
+  const statusLine = active ? `<div class="combat-encounter-id">Combat is active in this room.</div>` : '';
   const gmButton = role !== 'gm' ? '' : active
     ? `<button type="button" id="stopCombatBtn" class="secondary">Stop Combat</button>`
     : `<button type="button" id="startCombatBtn">Start Combat</button>`;
-  if (!gmButton && !idLine) return '';
-  return `<div class="field" id="combatControl">${gmButton}${idLine}</div>`;
+  if (!gmButton && !statusLine) return '';
+  return `<div class="field" id="combatControl">${gmButton}${statusLine}</div>`;
 }
 
 function combatLogHtml() {
@@ -1813,19 +1813,19 @@ function rollLogHtml() {
 
 // Session Notes is independent of Start/Stop Combat - a Game Session (a real,
 // persisted, reviewable record - see /sessions) is meant to span the whole
-// night, not just a fight. Game Session ID is shown to every role, same reason
-// the encounter ID is - a player pastes it into their own sheet's "Join
-// Session Notes" box (or their /sessions page) to start posting.
+// night, not just a fight. Like combat, a player is pulled in automatically by
+// room membership - no Game Session ID to copy, just status text plus a direct
+// link to the full reviewable log.
 function sessionNotesControlHtml() {
   const active = !!session.gameSessionId;
-  const idLine = active
-    ? `<div class="combat-encounter-id">Session ID (enter on your character sheet's "Join Session Notes", or open <a href="/sessions/${escapeHtml(session.gameSessionId)}" target="_blank">the full log</a>): <code>${escapeHtml(session.gameSessionId)}</code></div>`
+  const statusLine = active
+    ? `<div class="combat-encounter-id">Session notes are active - <a href="/sessions/${escapeHtml(session.gameSessionId)}" target="_blank">open the full log</a>.</div>`
     : '';
   const gmButton = role !== 'gm' ? '' : active
     ? `<button type="button" id="endGameSessionBtn" class="secondary">End Session</button>`
     : `<button type="button" id="startGameSessionBtn">Start Session</button>`;
-  if (!gmButton && !idLine) return '';
-  return `<div class="field" id="gameSessionControl">${gmButton}${idLine}</div>`;
+  if (!gmButton && !statusLine) return '';
+  return `<div class="field" id="gameSessionControl">${gmButton}${statusLine}</div>`;
 }
 
 function sessionNotesHtml() {

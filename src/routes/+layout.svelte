@@ -26,7 +26,6 @@
         <a href="/catalogue">Catalogue</a>
         <a href="/campaigns">Campaigns</a>
         <a href="/encounters">Encounters</a>
-        <a href="/sessions">Sessions</a>
         <a href="/vtt">VTT</a>
         {#if data.user.role === 'admin'}
           <a href="/admin/settings">Admin</a>

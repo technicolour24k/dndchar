@@ -1,4 +1,5 @@
 import { query, withTransaction } from '$lib/server/db';
+import { sessions } from '$vtt/store.js';
 
 export type EncounterDetail = {
   id: string; name: string; roundNumber: number; currentTurnIndex: number; isActive: boolean;
@@ -21,22 +22,6 @@ export async function createEncounter(userId: string, name: string): Promise<str
   return result.rows[0].id;
 }
 
-// Unlike addEncounterParticipant (which requires the same user to own both the
-// encounter and the character - fine for a GM building their own initiative
-// order), joining combat from the character sheet is inherently cross-user:
-// the GM owns the encounter, the player owns the character. Only character
-// ownership is checked here; the encounter just has to exist and be active.
-export async function joinEncounterAsCharacter(userId: string, encounterId: string, characterId: string): Promise<void> {
-  const result = await query(
-    `INSERT INTO encounter_participants (encounter_id, character_id, name, initiative)
-     SELECT e.id, c.id, c.name, 0 FROM characters c JOIN encounters e ON e.id = $1
-     WHERE c.id = $2 AND c.owner_user_id = $3 AND e.is_active = true
-     ON CONFLICT (encounter_id, character_id) DO NOTHING`,
-    [encounterId, characterId, userId]
-  );
-  if (!result.rowCount) throw new Error('Encounter not found, not active, or character not yours.');
-}
-
 export async function closeEncounter(userId: string, encounterId: string): Promise<void> {
   await query('UPDATE encounters SET is_active=false, updated_at=now() WHERE id=$1 AND owner_user_id=$2', [encounterId, userId]);
 }
@@ -49,18 +34,37 @@ export async function isEncounterActive(encounterId: string): Promise<boolean> {
   return result.rows[0]?.is_active ?? false;
 }
 
-// A character may be a participant in more than one past encounter; only the
-// most recently updated *active* one counts as "currently in combat" for
-// combat-log purposes.
+// Derived from room membership, not a separate "Join Combat" click: which room
+// is this character's player currently in (users.active_vtt_session_id), and
+// does that room's live in-memory state (vtt/server/store.js) currently have
+// an active encounter? This can never go stale the way an explicit join could
+// (join before combat starts, and the old design needed a re-click) - it's
+// just "is combat happening right now in the room I'm in."
+//
+// Combat History still needs a real encounter_participants row to list a
+// character's past encounters, so the first time this resolves a live
+// encounter for a character, it lazily upserts that row - the same end state
+// the old explicit join produced, just triggered automatically.
 export async function getActiveEncounterForCharacter(characterId: string): Promise<string | null> {
-  const result = await query<{ id: string }>(
-    `SELECT e.id FROM encounters e
-     JOIN encounter_participants p ON p.encounter_id = e.id
-     WHERE p.character_id = $1 AND e.is_active = true
-     ORDER BY e.updated_at DESC LIMIT 1`,
+  const roomRow = await query<{ active_vtt_session_id: string | null }>(
+    `SELECT u.active_vtt_session_id FROM users u
+     JOIN characters c ON c.owner_user_id = u.id
+     WHERE c.id = $1`,
     [characterId]
   );
-  return result.rows[0]?.id ?? null;
+  const roomId = roomRow.rows[0]?.active_vtt_session_id;
+  if (!roomId) return null;
+
+  const encounterId = sessions.get(roomId)?.encounterId ?? null;
+  if (!encounterId) return null;
+
+  await query(
+    `INSERT INTO encounter_participants (encounter_id, character_id, name, initiative)
+     SELECT $1, c.id, c.name, 0 FROM characters c WHERE c.id = $2
+     ON CONFLICT (encounter_id, character_id) DO NOTHING`,
+    [encounterId, characterId]
+  );
+  return encounterId;
 }
 
 export type EncounterHistoryItem = { id: string; name: string; isActive: boolean; createdAt: string };

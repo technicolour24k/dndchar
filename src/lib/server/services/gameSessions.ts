@@ -17,7 +17,10 @@ export async function endGameSession(userId: string, gameSessionId: string): Pro
 }
 
 // Any signed-in user may join, not just the owner - matches this app's existing
-// "no ownership locks" posture (same as joinEncounterAsCharacter).
+// "no ownership locks" posture. Only used by /sessions and /sessions/[id]'s own
+// join actions now - the character sheet no longer calls this directly, it
+// derives an active game session from room membership instead (see
+// getActiveGameSessionForUser below).
 export async function joinGameSession(userId: string, gameSessionId: string): Promise<void> {
   const result = await query(
     'UPDATE users SET active_game_session_id = $1 WHERE id = $2 AND EXISTS (SELECT 1 FROM game_sessions WHERE id = $1 AND is_active = true)',
@@ -26,8 +29,36 @@ export async function joinGameSession(userId: string, gameSessionId: string): Pr
   if (!result.rowCount) throw new Error('Session not found or not active.');
 }
 
+// Pure room-derivation, no fallback - "is there a live game session happening
+// right now in the room this user is currently connected to." This is what
+// the character sheet must use (both to display state and to decide where a
+// posted note goes) - it must never show or post to a session the user
+// happens to have joined ages ago through a completely different flow (see
+// getActiveGameSessionForUser below for where that's still wanted).
+export async function getRoomGameSessionId(userId: string): Promise<string | null> {
+  const result = await query<{ active_vtt_session_id: string | null }>(
+    'SELECT active_vtt_session_id FROM users WHERE id = $1',
+    [userId]
+  );
+  const roomId = result.rows[0]?.active_vtt_session_id;
+  return roomId ? (sessions.get(roomId)?.gameSessionId ?? null) : null;
+}
+
+// Fallback chain, deliberately: prefer the room-derived session above, fall
+// back to the older explicit users.active_game_session_id column (set by
+// joinGameSession). Scoped narrowly to SessionNotesModal's own "have I joined
+// THIS specific session" check (GET /vtt/api/game-sessions/[id]) - posting to
+// a named Game Session from that modal without being connected to any VTT
+// room at all (reviewing/posting after the fact) still needs this fallback.
+// The character sheet's own view of "what's active in my room" intentionally
+// does NOT use this - see getRoomGameSessionId.
 export async function getActiveGameSessionForUser(userId: string): Promise<string | null> {
-  const result = await query<{ active_game_session_id: string | null }>('SELECT active_game_session_id FROM users WHERE id = $1', [userId]);
+  const roomDerived = await getRoomGameSessionId(userId);
+  if (roomDerived) return roomDerived;
+  const result = await query<{ active_game_session_id: string | null }>(
+    'SELECT active_game_session_id FROM users WHERE id = $1',
+    [userId]
+  );
   return result.rows[0]?.active_game_session_id ?? null;
 }
 

@@ -15,10 +15,17 @@ const WS_PATH = '/vtt-ws';
 // instead. Both dev (vite.config.ts) and prod (server.js) pass the *real*
 // listening httpServer into attachVttWebSocketServer, so reading its bound port
 // here works in both without a separate PORT env var to keep in sync.
+//
+// Uses the `localhost` hostname, not the literal 127.0.0.1 - on some Windows
+// setups Node's http.Server ends up bound only to the IPv6 loopback (::1),
+// which a browser reaches fine via `localhost` (its resolver tries both) but a
+// hardcoded IPv4 literal cannot reach at all (ECONNREFUSED even though the
+// server is genuinely listening). `localhost` lets Node's own resolution do
+// the same dual-stack fallback the browser already relies on.
 function internalApiBaseUrl(httpServer) {
   const addr = httpServer.address();
   const port = addr && typeof addr === 'object' ? addr.port : (process.env.PORT || 3000);
-  return `http://127.0.0.1:${port}`;
+  return `http://localhost:${port}`;
 }
 
 let wss = null;
