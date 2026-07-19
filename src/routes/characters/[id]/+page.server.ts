@@ -6,6 +6,7 @@ import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { getActiveEncounterForCharacter, joinEncounterAsCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
 import { getCharacterVttSessionId, logRoll } from '$lib/server/services/rollLog';
+import { getActiveGameSessionForUser, joinGameSession, logSessionNote } from '$lib/server/services/gameSessions';
 import { sessions } from '$vtt/store.js';
 
 export async function load({ params, locals }) {
@@ -19,7 +20,10 @@ export async function load({ params, locals }) {
     versions: await listVersions(locals.user!.id, params.id),
     activeEncounterId: await getActiveEncounterForCharacter(params.id),
     activeVttSessionId: await getCharacterVttSessionId(params.id),
-    encounterHistory: await listEncountersForCharacter(params.id)
+    encounterHistory: await listEncountersForCharacter(params.id),
+    // User-scoped, not character-scoped (Session Notes are attributed to the
+    // signed-in player, not whichever character sheet happens to be open).
+    activeGameSessionId: await getActiveGameSessionForUser(locals.user!.id)
   };
 }
 
@@ -189,6 +193,32 @@ export const actions = {
     const name = nameRow.rows[0]?.name || 'A character';
     await logRoll(sessionId, `${name} rolled a ${total} on ${label}.`, { label, total, breakdown, natural });
     return { loggedRoll: true };
+  },
+  joinGameSession: async ({ request, locals }) => {
+    const form = await request.formData();
+    const gameSessionId = String(form.get('gameSessionId') || '').trim();
+    if (!gameSessionId) return fail(400, { joinGameSessionError: 'Enter a session ID.' });
+    try {
+      await joinGameSession(locals.user!.id, gameSessionId);
+    } catch {
+      return fail(400, { joinGameSessionError: 'That session ID was not found or is not active.' });
+    }
+    return { joinedGameSession: true };
+  },
+  postSessionNote: async ({ request, locals }) => {
+    const form = await request.formData();
+    const message = String(form.get('message') || '').trim();
+    if (!message) return fail(400, { postSessionNoteError: 'Nothing to post.' });
+
+    const gameSessionId = await getActiveGameSessionForUser(locals.user!.id);
+    if (!gameSessionId) return fail(400, { postSessionNoteError: 'Join a session first.' });
+
+    try {
+      await logSessionNote(gameSessionId, locals.user!.id, message);
+    } catch {
+      return fail(400, { postSessionNoteError: 'That session is no longer active.' });
+    }
+    return { postedSessionNote: true };
   },
   spendHitDice: async ({ request, params, locals }) => {
     const form = await request.formData();

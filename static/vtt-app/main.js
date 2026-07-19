@@ -57,6 +57,7 @@ let shapeDrag = null; // { config, originX, originY, currentX, currentY } while 
 let showMovementRanges = true; // GM-only declutter toggle - purely a local view preference, not synced to session
 let combatLogLines = []; // rendered combat-log text, newest last - backfilled on join/reconnect, appended live via combat:log
 let rollLogLines = []; // { message, details } - separate from combatLogLines, scoped to this room rather than an encounter
+let sessionNoteLines = []; // { id, displayName, message, createdAt } - Session Notes, scoped to a persisted game_sessions row
 
 const imageCache = new Map();
 
@@ -275,6 +276,9 @@ function handleMessage(msg) {
       // Roll log has no "combat active" gate - it's scoped to this room, which
       // is already known the moment we're connected, so always backfill it.
       loadRollLogBacklog();
+      // Session Notes, like combat, only has history to backfill once a Game
+      // Session has actually been started for this room.
+      if (session.gameSessionId) loadSessionNotesBacklog(session.gameSessionId);
       break;
 
     case 'player:joined':
@@ -422,6 +426,18 @@ function handleMessage(msg) {
       renderSidebar();
       break;
 
+    case 'game_session:state':
+      session.gameSessionId = msg.gameSessionId;
+      if (msg.active) sessionNoteLines = []; // a freshly-started session has no history yet
+      renderSidebar();
+      break;
+
+    case 'game_session:note':
+      sessionNoteLines.push(msg.note);
+      if (sessionNoteLines.length > 200) sessionNoteLines.shift();
+      renderSidebar();
+      break;
+
     default:
       break;
   }
@@ -449,6 +465,21 @@ async function loadRollLogBacklog() {
     if (!res.ok) return;
     const data = await res.json();
     rollLogLines = (data.entries || []).map((e) => ({ message: e.message, details: e.details || {} }));
+    renderSidebar();
+  } catch {
+    // ignore
+  }
+}
+
+// Session Notes is scoped to a persisted game_sessions row (session.gameSessionId),
+// not the room itself - unlike the roll log, there's genuinely no history until
+// a GM has clicked Start Session for this room.
+async function loadSessionNotesBacklog(gameSessionId) {
+  try {
+    const res = await fetch(`/vtt/api/session-notes?gameSessionId=${encodeURIComponent(gameSessionId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    sessionNoteLines = data.notes || [];
     renderSidebar();
   } catch {
     // ignore
@@ -1739,7 +1770,9 @@ function roomInfoHtml(roleLabel) {
   return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
     ${combatControlHtml()}
     ${combatLogHtml()}
-    ${rollLogHtml()}`;
+    ${rollLogHtml()}
+    ${sessionNotesControlHtml()}
+    ${sessionNotesHtml()}`;
 }
 
 // Encounter ID is shown to every role, not just the GM - a player needs it to
@@ -1776,6 +1809,89 @@ function rollLogHtml() {
       : `<div class="combat-log-line">${escapeHtml(entry.message)}</div>`;
   }).join('');
   return `<h2>Roll Log</h2><div id="rollLog" class="combat-log">${lines}</div>`;
+}
+
+// Session Notes is independent of Start/Stop Combat - a Game Session (a real,
+// persisted, reviewable record - see /sessions) is meant to span the whole
+// night, not just a fight. Game Session ID is shown to every role, same reason
+// the encounter ID is - a player pastes it into their own sheet's "Join
+// Session Notes" box (or their /sessions page) to start posting.
+function sessionNotesControlHtml() {
+  const active = !!session.gameSessionId;
+  const idLine = active
+    ? `<div class="combat-encounter-id">Session ID (enter on your character sheet's "Join Session Notes", or open <a href="/sessions/${escapeHtml(session.gameSessionId)}" target="_blank">the full log</a>): <code>${escapeHtml(session.gameSessionId)}</code></div>`
+    : '';
+  const gmButton = role !== 'gm' ? '' : active
+    ? `<button type="button" id="endGameSessionBtn" class="secondary">End Session</button>`
+    : `<button type="button" id="startGameSessionBtn">Start Session</button>`;
+  if (!gmButton && !idLine) return '';
+  return `<div class="field" id="gameSessionControl">${gmButton}${idLine}</div>`;
+}
+
+function sessionNotesHtml() {
+  if (!session.gameSessionId) return '';
+  const lines = sessionNoteLines
+    .map((note) => `<div class="combat-log-line"><strong>${escapeHtml(note.displayName)}:</strong> ${escapeHtml(note.message)}</div>`)
+    .join('') || '<span style="color:#666;">No notes yet.</span>';
+  return `
+    <h2>Session Notes</h2>
+    <div id="sessionNotes" class="combat-log">${lines}</div>
+    <div class="field row">
+      <input type="text" id="sessionNoteInput" placeholder="Type a note and press Enter..." autocomplete="off" />
+      <button type="button" id="postSessionNoteBtn" class="secondary">Post</button>
+    </div>
+  `;
+}
+
+async function startGameSession() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/game-session`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }),
+    });
+    if (!res.ok) throw new Error('start_failed');
+  } catch {
+    alert('Could not start session.');
+  }
+}
+
+async function endGameSession() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/game-session`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }),
+    });
+    if (!res.ok) throw new Error('stop_failed');
+  } catch {
+    alert('Could not end session.');
+  }
+}
+
+async function postSessionNoteFromVtt() {
+  const input = document.getElementById('sessionNoteInput');
+  const message = input?.value.trim();
+  if (!message || !session.gameSessionId) return;
+  input.value = '';
+  try {
+    await fetch('/vtt/api/session-notes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gameSessionId: session.gameSessionId, message }),
+    });
+    // No local append here - the server's game_session:note broadcast (sent to
+    // the whole room, including us) is what actually appends and re-renders.
+  } catch {
+    alert('Could not post note.');
+  }
+}
+
+function wireSessionNotesControls() {
+  document.getElementById('startGameSessionBtn')?.addEventListener('click', startGameSession);
+  document.getElementById('endGameSessionBtn')?.addEventListener('click', endGameSession);
+  document.getElementById('postSessionNoteBtn')?.addEventListener('click', postSessionNoteFromVtt);
+  document.getElementById('sessionNoteInput')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      postSessionNoteFromVtt();
+    }
+  });
 }
 
 async function startCombat() {
@@ -2092,6 +2208,7 @@ function markerListHtml(isGm) {
 function wireGmSidebar() {
   document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
   document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+  wireSessionNotesControls();
 
   document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
     showMovementRanges = e.target.checked;
@@ -2558,6 +2675,7 @@ function openSpellPicker(tokenId, clickedLevel) {
 
 function wirePlayerSidebar() {
   document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
+  wireSessionNotesControls();
 
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;

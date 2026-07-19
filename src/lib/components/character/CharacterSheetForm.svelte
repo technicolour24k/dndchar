@@ -15,8 +15,9 @@
     isAdmin = false,
     activeEncounterId = null,
     activeVttSessionId = null,
-    onVersionHistory,
-    onEncounterHistory
+    activeGameSessionId = null,
+    encounterHistory = [],
+    onVersionHistory
   }: {
     character: CharacterDetail;
     catalogue?: ContentDefinition[];
@@ -25,8 +26,9 @@
     isAdmin?: boolean;
     activeEncounterId?: string | null;
     activeVttSessionId?: string | null;
+    activeGameSessionId?: string | null;
+    encounterHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
     onVersionHistory?: () => void;
-    onEncounterHistory?: () => void;
   } = $props();
 
   let classRows = $state(untrack(() => character.classes.map((row) => ({ ...row }))));
@@ -108,6 +110,8 @@
   let savingThrowsOpen = $state(false);
   let skillChecksOpen = $state(false);
   let playerModificationsOpen = $state(false);
+  let activityLogOpen = $state(false);
+  let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
   let selectedEffectKeys = $state<string[]>([]);
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
@@ -681,6 +685,80 @@
     };
   }
 
+  // Session Notes - unlike Join Combat/Join Session (character-scoped), this is
+  // attributed to the signed-in player, so joining/posting doesn't need this
+  // character's id at all, just the user's own session cookie.
+  let joinGameSessionIdInput = $state('');
+  let joinGameSessionBusy = $state(false);
+  let joinGameSessionError = $state<string | null>(null);
+
+  async function joinGameSession() {
+    const gameSessionId = joinGameSessionIdInput.trim();
+    if (!gameSessionId) return;
+    joinGameSessionBusy = true;
+    joinGameSessionError = null;
+    const body = new FormData();
+    body.set('gameSessionId', gameSessionId);
+    const response = await fetch('?/joinGameSession', { method: 'POST', body });
+    joinGameSessionBusy = false;
+    if (response.ok) {
+      joinGameSessionIdInput = '';
+      await invalidateAll();
+    } else {
+      const actionResult = deserialize(await response.text()) as { data?: { joinGameSessionError?: string } };
+      joinGameSessionError = actionResult.data?.joinGameSessionError || 'Could not join session.';
+    }
+  }
+
+  let sessionNoteInput = $state('');
+  let sessionNoteBusy = $state(false);
+
+  async function postSessionNote() {
+    const message = sessionNoteInput.trim();
+    if (!message) return;
+    sessionNoteBusy = true;
+    const body = new FormData();
+    body.set('message', message);
+    const response = await fetch('?/postSessionNote', { method: 'POST', body });
+    sessionNoteBusy = false;
+    if (response.ok) sessionNoteInput = '';
+  }
+
+  // Same polling shape as the combat/roll log panels - this panel only shows
+  // the most recent handful; the full log lives at /sessions/[id].
+  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string }>>([]);
+  $effect(() => {
+    if (!activeGameSessionId) {
+      sessionNoteEntries = [];
+      return;
+    }
+    let cancelled = false;
+    let lastId: string | undefined;
+    async function poll() {
+      if (cancelled) return;
+      const qs = new URLSearchParams({ gameSessionId: activeGameSessionId! });
+      if (lastId) qs.set('afterId', lastId);
+      try {
+        const res = await fetch(`/vtt/api/session-notes?${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.notes?.length) {
+            sessionNoteEntries = [...sessionNoteEntries, ...data.notes].slice(-20);
+            lastId = data.notes[data.notes.length - 1].id;
+          }
+        }
+      } catch {
+        // best-effort - a missed poll tick just means the panel lags one interval behind
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
+
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
     contentBusy = true;
     const body = new FormData();
@@ -928,6 +1006,7 @@
     if (newItemOpen) { newItemOpen = false; return; }
     if (formulaHelp) { formulaHelp = null; return; }
     if (playerModificationsOpen) { playerModificationsOpen = false; return; }
+    if (activityLogOpen) { activityLogOpen = false; return; }
     if (skillChecksOpen) { skillChecksOpen = false; return; }
     if (savingThrowsOpen) { savingThrowsOpen = false; return; }
   }
@@ -972,12 +1051,12 @@
       <div class="save-cluster">
         <div class="save-command-row">
           <button type="submit">Save</button>
-          {#if onVersionHistory}
-            <button type="button" class="text-button" onclick={onVersionHistory}>Version History</button>
-          {/if}
-          {#if onEncounterHistory}
-            <button type="button" class="text-button" onclick={onEncounterHistory}>Combat History</button>
-          {/if}
+          <div class="history-links">
+            {#if onVersionHistory}
+              <button type="button" class="text-button" onclick={onVersionHistory}>Character History</button>
+            {/if}
+            <button type="button" class="text-button" onclick={() => (activityLogOpen = true)}>Activity Log</button>
+          </div>
         </div>
         <div class="save-status-row">
           <span class="save-state">{autosaveStatus}</span>
@@ -1018,55 +1097,6 @@
               <button type="button" class="compact-use-button" disabled={(classHitDice[hitDiceClassIndex]?.remaining ?? 0) <= 0} onclick={useHitDie}>Use</button>
             </span>
           </label>
-
-          {#if activeEncounterId}
-            <div class="combat-log-panel">
-              <span class="field-label-with-help">In combat - Encounter <code>{activeEncounterId}</code></span>
-              <div class="combat-log-entries">
-                {#each combatLogEntries as entry (entry.id)}
-                  <div class="combat-log-line">{entry.message}</div>
-                {:else}
-                  <span class="combat-log-empty">No combat activity yet.</span>
-                {/each}
-              </div>
-            </div>
-          {:else}
-            <label class="join-combat-label">
-              Join Combat
-              <span class="summary-input-roll">
-                <input type="text" placeholder="Encounter ID" bind:value={joinEncounterIdInput} disabled={joinCombatBusy} />
-                <button type="button" class="compact-use-button" disabled={joinCombatBusy || !joinEncounterIdInput.trim()} onclick={joinCombat}>Join</button>
-              </span>
-            </label>
-            {#if joinCombatError}<p class="combat-log-empty" style="color:#e57373;">{joinCombatError}</p>{/if}
-          {/if}
-
-          {#if activeVttSessionId}
-            <div class="combat-log-panel">
-              <span class="field-label-with-help">In VTT session <code>{activeVttSessionId}</code></span>
-              <div class="combat-log-entries">
-                {#each rollLogEntries as entry (entry.id)}
-                  <div class="combat-log-line">
-                    {entry.message}
-                    {#if entry.details?.breakdown}
-                      <button type="button" class="formula-help-button" aria-label="Roll breakdown" onclick={() => showRollLogBreakdown(entry)}>?</button>
-                    {/if}
-                  </div>
-                {:else}
-                  <span class="combat-log-empty">No rolls yet.</span>
-                {/each}
-              </div>
-            </div>
-          {:else}
-            <label class="join-combat-label">
-              Join Session
-              <span class="summary-input-roll">
-                <input type="text" placeholder="Room code" bind:value={joinSessionIdInput} disabled={joinSessionBusy} />
-                <button type="button" class="compact-use-button" disabled={joinSessionBusy || !joinSessionIdInput.trim()} onclick={joinSession}>Join</button>
-              </span>
-            </label>
-            {#if joinSessionError}<p class="combat-log-empty" style="color:#e57373;">{joinSessionError}</p>{/if}
-          {/if}
         </section>
 
         <section class="panel stack compact-panel">
@@ -1912,6 +1942,128 @@
             <strong>{rollResult.effects}</strong>
           </div>
         </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if activityLogOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (activityLogOpen = false)}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="activity-log-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <div>
+            <h2 id="activity-log-title">Activity Log</h2>
+            <p class="muted">Combat, rolls, and table talk for this character.</p>
+          </div>
+          <button type="button" class="text-button" onclick={() => (activityLogOpen = false)}>Close</button>
+        </div>
+
+        <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
+          <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
+          <button type="button" class:active={activityLogTab === 'rolls'} onclick={() => (activityLogTab = 'rolls')}>Rolls</button>
+          <button type="button" class:active={activityLogTab === 'notes'} onclick={() => (activityLogTab = 'notes')}>Session Notes</button>
+        </div>
+
+        {#if activityLogTab === 'combat'}
+          <section class="stack">
+            {#if activeEncounterId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">In combat - Encounter <code>{activeEncounterId}</code></span>
+                <div class="combat-log-entries">
+                  {#each combatLogEntries as entry (entry.id)}
+                    <div class="combat-log-line">{entry.message}</div>
+                  {:else}
+                    <span class="combat-log-empty">No combat activity yet.</span>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <label class="join-combat-label">
+                Join Combat
+                <span class="summary-input-roll">
+                  <input type="text" placeholder="Encounter ID" bind:value={joinEncounterIdInput} disabled={joinCombatBusy} />
+                  <button type="button" class="compact-use-button" disabled={joinCombatBusy || !joinEncounterIdInput.trim()} onclick={joinCombat}>Join</button>
+                </span>
+              </label>
+              {#if joinCombatError}<p class="combat-log-empty" style="color:#e57373;">{joinCombatError}</p>{/if}
+            {/if}
+
+            <h3>Past Encounters</h3>
+            <div class="stack version-list">
+              {#each encounterHistory as encounter}
+                <article class="version-row with-actions">
+                  <div>
+                    <strong>{encounter.name}</strong>
+                    <span>{new Date(encounter.createdAt).toLocaleString()} - {encounter.isActive ? 'Active' : 'Ended'}</span>
+                  </div>
+                  <a class="button-link" href="/characters/{character.id}/encounters/{encounter.id}">View</a>
+                </article>
+              {:else}
+                <p class="muted">No combat encounters yet.</p>
+              {/each}
+            </div>
+          </section>
+        {:else if activityLogTab === 'rolls'}
+          <section class="stack">
+            {#if activeVttSessionId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">In VTT session <code>{activeVttSessionId}</code></span>
+                <div class="combat-log-entries">
+                  {#each rollLogEntries as entry (entry.id)}
+                    <div class="combat-log-line">
+                      {entry.message}
+                      {#if entry.details?.breakdown}
+                        <button type="button" class="formula-help-button" aria-label="Roll breakdown" onclick={() => showRollLogBreakdown(entry)}>?</button>
+                      {/if}
+                    </div>
+                  {:else}
+                    <span class="combat-log-empty">No rolls yet.</span>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <label class="join-combat-label">
+                Join Session
+                <span class="summary-input-roll">
+                  <input type="text" placeholder="Room code" bind:value={joinSessionIdInput} disabled={joinSessionBusy} />
+                  <button type="button" class="compact-use-button" disabled={joinSessionBusy || !joinSessionIdInput.trim()} onclick={joinSession}>Join</button>
+                </span>
+              </label>
+              {#if joinSessionError}<p class="combat-log-empty" style="color:#e57373;">{joinSessionError}</p>{/if}
+            {/if}
+          </section>
+        {:else}
+          <section class="stack">
+            {#if activeGameSessionId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">
+                  Session Notes
+                  <a href="/sessions/{activeGameSessionId}" class="formula-help-button" style="text-decoration:none;">Full log</a>
+                </span>
+                <div class="combat-log-entries">
+                  {#each sessionNoteEntries as entry (entry.id)}
+                    <div class="combat-log-line"><strong>{entry.displayName}:</strong> {entry.message}</div>
+                  {:else}
+                    <span class="combat-log-empty">No notes yet.</span>
+                  {/each}
+                </div>
+                <span class="summary-input-roll">
+                  <input type="text" placeholder="Type a note and press Enter..." bind:value={sessionNoteInput} disabled={sessionNoteBusy}
+                    onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); postSessionNote(); } }} />
+                  <button type="button" class="compact-use-button" disabled={sessionNoteBusy || !sessionNoteInput.trim()} onclick={postSessionNote}>Post</button>
+                </span>
+              </div>
+            {:else}
+              <label class="join-combat-label">
+                Join Session Notes
+                <span class="summary-input-roll">
+                  <input type="text" placeholder="Session ID" bind:value={joinGameSessionIdInput} disabled={joinGameSessionBusy} />
+                  <button type="button" class="compact-use-button" disabled={joinGameSessionBusy || !joinGameSessionIdInput.trim()} onclick={joinGameSession}>Join</button>
+                </span>
+              </label>
+              {#if joinGameSessionError}<p class="combat-log-empty" style="color:#e57373;">{joinGameSessionError}</p>{/if}
+            {/if}
+          </section>
+        {/if}
       </div>
     </div>
   {/if}

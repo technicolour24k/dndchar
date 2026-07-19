@@ -1555,6 +1555,12 @@ button.death-save-icon.failure.active {
   align-items: center;
 }
 
+.history-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 .save-status-row {
   min-height: 18px;
   font-size: 12px;
