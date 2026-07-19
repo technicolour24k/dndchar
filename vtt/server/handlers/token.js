@@ -23,6 +23,33 @@ function logCombatLine(context, session, message, details) {
   }).catch((err) => console.error('[VTT] combat log write failed', err));
 }
 
+// Flavor-text pools for the combat log, picked at random each time so it
+// doesn't read as a flat, repetitive damage ticker. {attacker}/{target} are
+// always token names; {damage}/{damageType} only apply to the critical-hit
+// pool (a miss deals no damage, so there's nothing to interpolate there).
+// damageType already carries its own trailing space when present (see
+// damageTypeText below) so "{damageType}damage" reads correctly either way.
+const MISS_PHRASES = [
+  '{attacker} attacks {target}, but is parried!',
+  '{target} dodges an attack from {attacker}.',
+  "{attacker}'s attack glances off {target}'s armour.",
+  '{target} narrowly avoids a strike from {attacker}!',
+  '{attacker} swings at {target} and misses completely.',
+  "{target} deflects {attacker}'s attack at the last moment.",
+];
+
+const CRITICAL_HIT_PHRASES = [
+  "[Critical] {attacker}'s attack strikes true! Dealing {damage} {damageType}damage!",
+  "[Critical] {attacker} strikes just between the folds of {target}'s armour, dealing {damage} {damageType}damage!",
+  '[Critical] A devastating blow from {attacker} tears into {target} for {damage} {damageType}damage!',
+  '[Critical] {attacker} finds the perfect opening, striking {target} for a brutal {damage} {damageType}damage!',
+];
+
+function pickLine(pool, vars) {
+  const template = pool[Math.floor(Math.random() * pool.length)];
+  return template.replace(/\{(\w+)\}/g, (_, key) => vars[key] ?? '');
+}
+
 function canEditToken(meta, token) {
   if (meta.role === 'gm') return true;
   return token.ownerId === meta.playerId;
@@ -346,17 +373,39 @@ function handleTokenEvent(meta, msg, context) {
       }
 
       // Log line, combat-log only (not the attack:result/token:stat:update
-      // broadcasts above) - a miss/fumble deals no damage, so nothing worth
-      // logging. sourceTokenId already rides on the incoming message (client
-      // sends it to build attack:resolve/spell:resolve payloads); resolving it
-      // to a token name here (rather than meta.playerName) means this also
-      // works for a GM-controlled monster's attack, which has no playerName.
-      if (hit && damageApplied > 0) {
+      // broadcasts above). sourceTokenId already rides on the incoming
+      // message (client sends it to build attack:resolve/spell:resolve
+      // payloads); resolving it to a token name here (rather than
+      // meta.playerName) means this also works for a GM-controlled monster's
+      // attack, which has no playerName. Misses get logged too (flavor text
+      // only - no damage to report), and a critical hit gets its own "epic"
+      // phrasing instead of the plain hit line.
+      //
+      // Reports the *rolled* `damage`, not the capped `damageApplied` - same
+      // reason attack:result above does: this is broadcast to the whole
+      // table, and showing the capped amount would leak an enemy's exact
+      // remaining HP whenever overkill trims the number down (roll 10,
+      // 3 applied -> "hits for 3" tells everyone only 3 HP was left). A hit
+      // is logged unconditionally now too (not gated on damageApplied>0) for
+      // the same reason - a hit landing is worth announcing regardless of how
+      // much HP was actually left to remove.
+      {
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
+        const targetName = target.name || 'something';
         const damageTypeText = msg.damageType ? `${msg.damageType} ` : '';
-        logCombatLine(context, session,
-          `${attackerName} hits ${target.name || 'something'} for ${damageApplied} ${damageTypeText}damage.`,
-          { kind: 'attack', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: damageApplied, damageType: msg.damageType || null, title: msg.title || null });
+        if (!hit) {
+          logCombatLine(context, session,
+            pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName }),
+            { kind: 'attack', outcome: 'miss', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
+        } else if (outcome === 'critical_hit') {
+          logCombatLine(context, session,
+            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText }),
+            { kind: 'attack', outcome: 'critical', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageType || null, title: msg.title || null });
+        } else {
+          logCombatLine(context, session,
+            `${attackerName} hits ${targetName} for ${damage} ${damageTypeText}damage.`,
+            { kind: 'attack', outcome: 'hit', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageType || null, title: msg.title || null });
+        }
       }
       break;
     }
