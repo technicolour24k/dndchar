@@ -4,6 +4,8 @@ import { abilityKeys, clampResource } from '$lib/rules/dnd5e';
 import { getCombatClock, listCharacterContent, listSpellSlots, syncCharacterSpellSlots } from '$lib/server/services/catalogue';
 import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
 import { applyCharacterEffect } from '$lib/server/services/effects';
+import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
+import { logCombatEvent } from '$lib/server/services/combatLog';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -268,9 +270,24 @@ export async function listItemCategories(): Promise<ItemCategory[]> {
 }
 
 export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<void> {
+  const resources = parseResources(form);
+  const newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
+  let previousHp: number | null = null;
+  let characterName = '';
+
   await withTransaction(async (client) => {
     const owned = await client.query('SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2', [characterId, userId]);
     if (!owned.rowCount) throw new Error('Character not found.');
+
+    // Read the pre-update HP before replaceResources overwrites it, so a
+    // change can be reported as a delta ("takes 12 damage") rather than just
+    // an absolute overwrite - see the combat-log write below.
+    const prevHpRow = await client.query<{ current_value: number }>(
+      `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'hp'`,
+      [characterId]
+    );
+    previousHp = prevHpRow.rows[0]?.current_value ?? null;
+    characterName = String(form.get('name') || '').trim() || 'A character';
 
     await client.query(
       `
@@ -283,7 +300,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
         WHERE id = $5
       `,
       [
-        String(form.get('name') || '').trim() || 'Unnamed Character',
+        characterName,
         String(form.get('ancestry') || '').trim(),
         String(form.get('background') || '').trim(),
         JSON.stringify(parseMetadata(form)),
@@ -293,7 +310,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
 
     await replaceClasses(client, characterId, parseClasses(form));
     await replaceAbilities(client, characterId, parseAbilities(form));
-    await replaceResources(client, characterId, parseResources(form));
+    await replaceResources(client, characterId, resources);
     await replaceInventory(client, characterId, parseInventory(form));
     await replaceAttacks(client, characterId, parseAttacks(form));
     await replaceNotes(client, characterId, parseNotes(form));
@@ -303,6 +320,19 @@ export async function updateCharacter(userId: string, characterId: string, form:
     await createVersionWithClient(client, characterId, userId, summary);
   });
   await syncCharacterSpellSlots(userId, characterId);
+
+  // Combat-log write for a plain sheet HP edit - only fires if the character
+  // has joined an active encounter (see getActiveEncounterForCharacter); an
+  // untouched HP value or no active encounter means nothing to log, which
+  // keeps autosave ticks silent by construction.
+  if (previousHp !== null && newHp !== null && previousHp !== newHp) {
+    const delta = previousHp - newHp;
+    const encounterId = await getActiveEncounterForCharacter(characterId);
+    if (encounterId) {
+      const message = delta > 0 ? `${characterName} takes ${delta} damage.` : `${characterName} heals ${-delta} HP.`;
+      await logCombatEvent(encounterId, message, { type: 'sheet_hp_change', delta });
+    }
+  }
 }
 
 export async function listVersions(userId: string, characterId: string): Promise<CharacterVersion[]> {

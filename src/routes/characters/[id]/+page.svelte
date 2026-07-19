@@ -13,7 +13,7 @@
 </script>
 
 <section class="sheet-grid single">
-  <CharacterSheetForm character={data.character} catalogue={data.catalogue} itemCategories={data.itemCategories} result={form ?? undefined} isAdmin={data.user?.role === 'admin'} onVersionHistory={() => (versionHistoryOpen = true)} />
+  <CharacterSheetForm character={data.character} catalogue={data.catalogue} itemCategories={data.itemCategories} result={form ?? undefined} isAdmin={data.user?.role === 'admin'} activeEncounterId={data.activeEncounterId} activeVttSessionId={data.activeVttSessionId} activeGameSessionId={data.activeGameSessionId} encounterHistory={data.encounterHistory} gameSessionHistory={data.gameSessionHistory} onVersionHistory={() => (versionHistoryOpen = true)} />
 </section>
 
 <VersionList versions={data.versions} open={versionHistoryOpen} onClose={() => (versionHistoryOpen = false)} />

@@ -53,7 +53,8 @@ button,
   cursor: pointer;
 }
 
-button.text-button {
+button.text-button,
+a.text-button {
   padding: 0;
   background: transparent;
   color: var(--muted);
@@ -63,9 +64,16 @@ button.text-button {
   text-underline-offset: 3px;
 }
 
-button.text-button:hover {
+button.text-button:hover,
+a.text-button:hover {
   background: transparent;
   color: var(--text);
+}
+
+button.text-button:disabled {
+  color: var(--muted);
+  opacity: 0.5;
+  cursor: default;
 }
 
 button.compact-button,
@@ -1113,6 +1121,63 @@ button.equipment-toggle .item-kind-icon {
   align-self: start;
 }
 
+.join-combat-label {
+  align-self: start;
+  margin-top: 10px;
+}
+
+.combat-encounter-id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.combat-encounter-id code {
+  color: var(--text);
+  background: var(--panel-dark);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+
+/* Room/session codes are short, fixed-length strings (6 characters) - a
+   full-width text input for them just wastes space and looks broken. */
+.room-code-input {
+  width: 10ch;
+  flex: 0 0 auto;
+}
+
+.combat-log-panel {
+  margin-top: 10px;
+}
+
+.combat-log-entries {
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--panel-border, #3a3d44);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.combat-log-line {
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+}
+
+.combat-log-line:last-child {
+  border-bottom: none;
+}
+
+.combat-log-empty {
+  font-size: 12px;
+  color: #888;
+}
+
 .hit-dice-label input {
   width: 92px;
 }
@@ -1520,6 +1585,12 @@ button.death-save-icon.failure.active {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+.history-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .save-status-row {

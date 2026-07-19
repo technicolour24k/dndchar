@@ -2,6 +2,27 @@
 import { filterTokenForPlayer } from '../store.js';
 import { TARGET_WINDOW_MS } from './target.js';
 
+// Must match the fallback in src/routes/vtt/api/log/+server.ts - see that
+// file's comment for why this is a shared-secret header rather than a normal
+// authenticated request.
+const INTERNAL_API_SECRET = process.env.VTT_INTERNAL_SECRET || 'vtt-internal-dev-secret';
+
+// Persists one combat-log line (if combat has been started for this session).
+// The live broadcast to connected clients now happens server-side inside
+// logCombatEvent itself (src/lib/server/services/combatLog.ts), which scans
+// for any session with a matching encounterId - doing it here too would
+// double-broadcast every line. Fire-and-forget by design - a dropped log
+// write shouldn't ever block or fail the attack/spell resolution that
+// triggered it.
+function logCombatLine(context, session, message, details) {
+  if (!session.encounterId || !message) return;
+  fetch(`${context.internalApiBaseUrl()}/vtt/api/log`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-vtt-internal-secret': INTERNAL_API_SECRET },
+    body: JSON.stringify({ encounterId: session.encounterId, message, details }),
+  }).catch((err) => console.error('[VTT] combat log write failed', err));
+}
+
 function canEditToken(meta, token) {
   if (meta.role === 'gm') return true;
   return token.ownerId === meta.playerId;
@@ -323,6 +344,20 @@ function handleTokenEvent(meta, msg, context) {
       if (hit) {
         context.broadcast(meta.sessionId, () => ({ type: 'fx:play', damageType: msg.damageType || null }));
       }
+
+      // Log line, combat-log only (not the attack:result/token:stat:update
+      // broadcasts above) - a miss/fumble deals no damage, so nothing worth
+      // logging. sourceTokenId already rides on the incoming message (client
+      // sends it to build attack:resolve/spell:resolve payloads); resolving it
+      // to a token name here (rather than meta.playerName) means this also
+      // works for a GM-controlled monster's attack, which has no playerName.
+      if (hit && damageApplied > 0) {
+        const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
+        const damageTypeText = msg.damageType ? `${msg.damageType} ` : '';
+        logCombatLine(context, session,
+          `${attackerName} hits ${target.name || 'something'} for ${damageApplied} ${damageTypeText}damage.`,
+          { kind: 'attack', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: damageApplied, damageType: msg.damageType || null, title: msg.title || null });
+      }
       break;
     }
 
@@ -374,6 +409,13 @@ function handleTokenEvent(meta, msg, context) {
       // than "resolved" - a negated save deals nothing, so nothing to hear.
       if (appliedDamage > 0) {
         context.broadcast(meta.sessionId, () => ({ type: 'fx:play', damageType: msg.damageType || 'magic' }));
+
+        const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
+        const spellTitle = msg.title || 'a spell';
+        const damageTypeText = msg.damageType ? `${msg.damageType} ` : '';
+        logCombatLine(context, session,
+          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage.`,
+          { kind: 'spell', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageType || null, title: msg.title || null });
       }
       break;
     }

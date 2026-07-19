@@ -47,6 +47,17 @@ export function createSession(id) {
     tokens: {},
     players: {},
     markers: {},
+    // Set by POST /vtt/api/session/[id]/combat ("Start Combat"), cleared by the
+    // same route's "Stop Combat" - the DB-backed `encounters.id` that attack/
+    // spell resolution (token.js) logs against. null means combat hasn't been
+    // started, so damage resolution skips combat-log writes entirely.
+    encounterId: null,
+    // Set by POST /vtt/api/session/[id]/game-session ("Start Session"), cleared
+    // by its "End Session" - the DB-backed `game_sessions.id` that Session Notes
+    // posted from any surface get live-pushed to (see gameSessions.ts's
+    // broadcastToMatchingSession). Independent of encounterId/combat state -
+    // notes are meant to span a whole game night, not just fights.
+    gameSessionId: null,
   };
 }
 

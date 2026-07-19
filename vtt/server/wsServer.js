@@ -8,7 +8,25 @@ import handleMarkerEvent from './handlers/marker.js';
 import handleTargetEvent from './handlers/target.js';
 
 const WS_PATH = '/vtt-ws';
-const context = { sessions, socketsBySession, broadcast };
+
+// token.js needs to persist combat-log rows via POST /vtt/api/log, but it can't
+// import $lib/server/services/combatLog.ts directly (see that route's own
+// comment for why) - it calls back into this same process over loopback HTTP
+// instead. Both dev (vite.config.ts) and prod (server.js) pass the *real*
+// listening httpServer into attachVttWebSocketServer, so reading its bound port
+// here works in both without a separate PORT env var to keep in sync.
+//
+// Uses the `localhost` hostname, not the literal 127.0.0.1 - on some Windows
+// setups Node's http.Server ends up bound only to the IPv6 loopback (::1),
+// which a browser reaches fine via `localhost` (its resolver tries both) but a
+// hardcoded IPv4 literal cannot reach at all (ECONNREFUSED even though the
+// server is genuinely listening). `localhost` lets Node's own resolution do
+// the same dual-stack fallback the browser already relies on.
+function internalApiBaseUrl(httpServer) {
+  const addr = httpServer.address();
+  const port = addr && typeof addr === 'object' ? addr.port : (process.env.PORT || 3000);
+  return `http://localhost:${port}`;
+}
 
 let wss = null;
 
@@ -20,6 +38,13 @@ let wss = null;
 export function attachVttWebSocketServer(httpServer) {
   if (wss) return wss;
   wss = new WebSocketServer({ noServer: true });
+
+  const context = {
+    sessions,
+    socketsBySession,
+    broadcast,
+    internalApiBaseUrl: () => internalApiBaseUrl(httpServer),
+  };
 
   httpServer.on('upgrade', (request, socket, head) => {
     const { pathname } = new URL(request.url ?? '', 'http://localhost');

@@ -55,6 +55,9 @@ let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer sta
 let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
 let shapeDrag = null; // { config, originX, originY, currentX, currentY } while dragging a cone/cube's direction+length
 let showMovementRanges = true; // GM-only declutter toggle - purely a local view preference, not synced to session
+let combatLogLines = []; // rendered combat-log text, newest last - backfilled on join/reconnect, appended live via combat:log
+let rollLogLines = []; // { message, details } - separate from combatLogLines, scoped to this room rather than an encounter
+let sessionNoteLines = []; // { id, displayName, message, createdAt } - Session Notes, scoped to a persisted game_sessions row
 
 const imageCache = new Map();
 
@@ -267,6 +270,15 @@ function handleMessage(msg) {
       renderSidebar();
       updateAmbientMusic();
       if (role === 'player') startCharacterSync();
+      // Reconnecting mid-combat: combat:log only carries entries seen live from
+      // here on, so pull the backlog for whatever encounter is already active.
+      if (session.encounterId) loadCombatLogBacklog(session.encounterId);
+      // Roll log has no "combat active" gate - it's scoped to this room, which
+      // is already known the moment we're connected, so always backfill it.
+      loadRollLogBacklog();
+      // Session Notes, like combat, only has history to backfill once a Game
+      // Session has actually been started for this room.
+      if (session.gameSessionId) loadSessionNotesBacklog(session.gameSessionId);
       break;
 
     case 'player:joined':
@@ -396,8 +408,81 @@ function handleMessage(msg) {
       break;
     }
 
+    case 'combat:state':
+      session.encounterId = msg.encounterId;
+      if (msg.active) combatLogLines = []; // a freshly-started encounter has no history yet
+      renderSidebar();
+      break;
+
+    case 'combat:log':
+      combatLogLines.push(msg.message);
+      if (combatLogLines.length > 200) combatLogLines.shift();
+      renderSidebar();
+      break;
+
+    case 'roll:log':
+      rollLogLines.push({ message: msg.message, details: msg.details || {} });
+      if (rollLogLines.length > 200) rollLogLines.shift();
+      renderSidebar();
+      break;
+
+    case 'game_session:state':
+      session.gameSessionId = msg.gameSessionId;
+      if (msg.active) sessionNoteLines = []; // a freshly-started session has no history yet
+      renderSidebar();
+      break;
+
+    case 'game_session:note':
+      sessionNoteLines.push(msg.note);
+      if (sessionNoteLines.length > 200) sessionNoteLines.shift();
+      renderSidebar();
+      break;
+
     default:
       break;
+  }
+}
+
+// Best-effort - a failed fetch just means the log panel starts empty instead
+// of backfilled; the live combat:log broadcasts still work either way.
+async function loadCombatLogBacklog(encounterId) {
+  try {
+    const res = await fetch(`/vtt/api/log?encounterId=${encodeURIComponent(encounterId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    combatLogLines = (data.entries || []).map((e) => e.message);
+    renderSidebar();
+  } catch {
+    // ignore
+  }
+}
+
+// Roll log is scoped to this room (sessionId), not an encounter - see
+// docs/vtt-current-state.md's roll-log section for why.
+async function loadRollLogBacklog() {
+  try {
+    const res = await fetch(`/vtt/api/roll-log?sessionId=${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    rollLogLines = (data.entries || []).map((e) => ({ message: e.message, details: e.details || {} }));
+    renderSidebar();
+  } catch {
+    // ignore
+  }
+}
+
+// Session Notes is scoped to a persisted game_sessions row (session.gameSessionId),
+// not the room itself - unlike the roll log, there's genuinely no history until
+// a GM has clicked Start Session for this room.
+async function loadSessionNotesBacklog(gameSessionId) {
+  try {
+    const res = await fetch(`/vtt/api/session-notes?gameSessionId=${encodeURIComponent(gameSessionId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    sessionNoteLines = data.notes || [];
+    renderSidebar();
+  } catch {
+    // ignore
   }
 }
 
@@ -785,6 +870,7 @@ async function resolveAttack() {
       damage: result.damageTotal,
       outcome,
       damageType: inferDamageType(action, result),
+      title: result.title || action.name || null,
     });
     return;
   }
@@ -867,6 +953,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess) {
     saveSuccess,
     saveEffect: result.saveEffect,
     damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic', // this path is only ever reached for a spell (see resolveAttack)
+    title: result.title || null,
   });
 }
 
@@ -1680,7 +1767,156 @@ function playerListHtml() {
 }
 
 function roomInfoHtml(roleLabel) {
-  return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>`;
+  return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+    ${combatControlHtml()}
+    ${combatLogHtml()}
+    ${rollLogHtml()}
+    ${sessionNotesControlHtml()}
+    ${sessionNotesHtml()}`;
+}
+
+// Combat/session-notes activity is derived automatically from room membership
+// now (see docs/vtt-current-state.md's room-join-unification write-up) - a
+// player only ever needs the Room Code, already visible in the sidebar header,
+// to get pulled into whichever of these the GM has started. No Encounter ID to
+// copy anymore, just status text. Only the GM gets the Start/Stop buttons.
+function combatControlHtml() {
+  const active = !!session.encounterId;
+  const statusLine = active ? `<div class="combat-encounter-id">Combat is active in this room.</div>` : '';
+  const gmButton = role !== 'gm' ? '' : active
+    ? `<button type="button" id="stopCombatBtn" class="secondary">Stop Combat</button>`
+    : `<button type="button" id="startCombatBtn">Start Combat</button>`;
+  if (!gmButton && !statusLine) return '';
+  return `<div class="field" id="combatControl">${gmButton}${statusLine}</div>`;
+}
+
+function combatLogHtml() {
+  if (!session.encounterId && !combatLogLines.length) return '';
+  const lines = combatLogLines.map((line) => `<div class="combat-log-line">${escapeHtml(line)}</div>`).join('')
+    || '<span style="color:#666;">No combat activity yet.</span>';
+  return `<h2>Combat Log</h2><div id="combatLog" class="combat-log">${lines}</div>`;
+}
+
+// Separate from the Combat Log - scoped to this room rather than an encounter,
+// so it has entries whether or not combat has ever been started. Roll entries
+// get a native <details>/<summary> for a free, no-JS expand/collapse "[?]".
+function rollLogHtml() {
+  if (!rollLogLines.length) return '';
+  const lines = rollLogLines.map((entry) => {
+    const breakdown = entry.details?.breakdown;
+    return breakdown
+      ? `<details class="combat-log-line"><summary>${escapeHtml(entry.message)}</summary><pre>${escapeHtml(String(breakdown))}</pre></details>`
+      : `<div class="combat-log-line">${escapeHtml(entry.message)}</div>`;
+  }).join('');
+  return `<h2>Roll Log</h2><div id="rollLog" class="combat-log">${lines}</div>`;
+}
+
+// Session Notes is independent of Start/Stop Combat - a Game Session (a real,
+// persisted, reviewable record - see /sessions) is meant to span the whole
+// night, not just a fight. Like combat, a player is pulled in automatically by
+// room membership - no Game Session ID to copy, just status text plus a direct
+// link to the full reviewable log.
+function sessionNotesControlHtml() {
+  const active = !!session.gameSessionId;
+  const statusLine = active
+    ? `<div class="combat-encounter-id">Session notes are active - <a href="/sessions/${escapeHtml(session.gameSessionId)}" target="_blank">open the full log</a>.</div>`
+    : '';
+  const gmButton = role !== 'gm' ? '' : active
+    ? `<button type="button" id="endGameSessionBtn" class="secondary">End Session</button>`
+    : `<button type="button" id="startGameSessionBtn">Start Session</button>`;
+  if (!gmButton && !statusLine) return '';
+  return `<div class="field" id="gameSessionControl">${gmButton}${statusLine}</div>`;
+}
+
+function sessionNotesHtml() {
+  if (!session.gameSessionId) return '';
+  const lines = sessionNoteLines
+    .map((note) => `<div class="combat-log-line"><strong>${escapeHtml(note.displayName)}:</strong> ${escapeHtml(note.message)}</div>`)
+    .join('') || '<span style="color:#666;">No notes yet.</span>';
+  return `
+    <h2>Session Notes</h2>
+    <div id="sessionNotes" class="combat-log">${lines}</div>
+    <div class="field row">
+      <input type="text" id="sessionNoteInput" placeholder="Type a note and press Enter..." autocomplete="off" />
+      <button type="button" id="postSessionNoteBtn" class="secondary">Post</button>
+    </div>
+  `;
+}
+
+async function startGameSession() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/game-session`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }),
+    });
+    if (!res.ok) throw new Error('start_failed');
+  } catch {
+    alert('Could not start session.');
+  }
+}
+
+async function endGameSession() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/game-session`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }),
+    });
+    if (!res.ok) throw new Error('stop_failed');
+  } catch {
+    alert('Could not end session.');
+  }
+}
+
+async function postSessionNoteFromVtt() {
+  const input = document.getElementById('sessionNoteInput');
+  const message = input?.value.trim();
+  if (!message || !session.gameSessionId) return;
+  input.value = '';
+  try {
+    await fetch('/vtt/api/session-notes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gameSessionId: session.gameSessionId, message }),
+    });
+    // No local append here - the server's game_session:note broadcast (sent to
+    // the whole room, including us) is what actually appends and re-renders.
+  } catch {
+    alert('Could not post note.');
+  }
+}
+
+function wireSessionNotesControls() {
+  document.getElementById('startGameSessionBtn')?.addEventListener('click', startGameSession);
+  document.getElementById('endGameSessionBtn')?.addEventListener('click', endGameSession);
+  document.getElementById('postSessionNoteBtn')?.addEventListener('click', postSessionNoteFromVtt);
+  document.getElementById('sessionNoteInput')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      postSessionNoteFromVtt();
+    }
+  });
+}
+
+async function startCombat() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/combat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }),
+    });
+    if (!res.ok) throw new Error('start_failed');
+    // The server's combat:state broadcast (sent to the whole session, including
+    // us) is what actually updates session.encounterId and re-renders - no
+    // local mutation here avoids a race with that broadcast.
+  } catch {
+    alert('Could not start combat.');
+  }
+}
+
+async function stopCombat() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/combat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }),
+    });
+    if (!res.ok) throw new Error('stop_failed');
+  } catch {
+    alert('Could not stop combat.');
+  }
 }
 
 // --- GM sidebar --------------------------------------------------------
@@ -1970,6 +2206,10 @@ function markerListHtml(isGm) {
 }
 
 function wireGmSidebar() {
+  document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
+  document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+  wireSessionNotesControls();
+
   document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
     showMovementRanges = e.target.checked;
     render(); // a view preference only - doesn't touch session state, no renderSidebar() needed
@@ -2435,6 +2675,7 @@ function openSpellPicker(tokenId, clickedLevel) {
 
 function wirePlayerSidebar() {
   document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
+  wireSessionNotesControls();
 
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;

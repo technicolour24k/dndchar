@@ -2,6 +2,7 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
+  import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, passiveScore, proficiencyBonus, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
   import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -13,6 +14,11 @@
     itemCategories = [],
     result,
     isAdmin = false,
+    activeEncounterId = null,
+    activeVttSessionId = null,
+    activeGameSessionId = null,
+    encounterHistory = [],
+    gameSessionHistory = [],
     onVersionHistory
   }: {
     character: CharacterDetail;
@@ -20,6 +26,11 @@
     itemCategories?: ItemCategory[];
     result?: Record<string, unknown>;
     isAdmin?: boolean;
+    activeEncounterId?: string | null;
+    activeVttSessionId?: string | null;
+    activeGameSessionId?: string | null;
+    encounterHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
+    gameSessionHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -102,6 +113,9 @@
   let savingThrowsOpen = $state(false);
   let skillChecksOpen = $state(false);
   let playerModificationsOpen = $state(false);
+  let activityLogOpen = $state(false);
+  let sessionNotesModalId = $state<string | null>(null);
+  let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
   let selectedEffectKeys = $state<string[]>([]);
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
@@ -457,7 +471,10 @@
   }
 
   function rollSingleSavingThrow(key: AbilityKey) {
-    simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`]) }] };
+    const label = `${key.toUpperCase()} Save`;
+    const result = rollText(savingThrowTotal(key), [`saving_throw.${key}`]);
+    simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label, ...result }] };
+    void logRoll(label, result);
   }
 
   function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
@@ -469,19 +486,26 @@
     const passiveNote = skill.key in passiveScores
       ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
       : undefined;
+    const result = rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]);
     simpleRollResult = {
       title: skill.name,
-      lines: [{ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }],
+      lines: [{ label: skill.name, ...result }],
       passiveNote
     };
+    void logRoll(skill.name, result);
   }
 
   function rollAbilityCheck(key: AbilityKey) {
-    simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label: `${key.toUpperCase()} Check`, ...rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]) }] };
+    const label = `${key.toUpperCase()} Check`;
+    const result = rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]);
+    simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label, ...result }] };
+    void logRoll(label, result);
   }
 
   function rollInitiative() {
-    simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...rollText(computedInitiative, ['initiative']) }] };
+    const result = rollText(computedInitiative, ['initiative']);
+    simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...result }] };
+    void logRoll('Initiative', result);
   }
 
   async function useHitDie() {
@@ -523,6 +547,228 @@
     }
     await invalidateAll();
   }
+
+  // activeEncounterId/activeGameSessionId only ever reflect the load()-time
+  // snapshot otherwise - if a GM starts combat or a game session *after* this
+  // page was already open, nothing would pick that up without a full reload.
+  // These local copies get refreshed by a background poll below so the
+  // Activity Log modal reflects what's actually live right now.
+  let liveEncounterId = $state<string | null>(null);
+  let liveGameSessionId = $state<string | null>(null);
+  $effect(() => {
+    liveEncounterId = activeEncounterId;
+  });
+  $effect(() => {
+    liveGameSessionId = activeGameSessionId;
+  });
+  $effect(() => {
+    let cancelled = false;
+    async function poll() {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`/vtt/api/characters/${character.id}/activity-status`);
+        if (res.ok) {
+          const data = await res.json();
+          liveEncounterId = data.encounterId;
+          liveGameSessionId = data.gameSessionId;
+        }
+      } catch {
+        // best-effort - a missed tick just means the modal lags one interval behind
+      }
+    }
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
+
+  // Polls the same combat-log endpoint the VTT's live panel writes to (see
+  // src/routes/vtt/api/log/+server.ts) - the sheet has no live transport of its
+  // own (Socket.IO is stubbed, the raw ws server only serves the VTT client),
+  // so a plain sheet HP edit shows up here within one polling interval instead
+  // of instantly. Only (re)starts when liveEncounterId itself changes -
+  // combatLogEntries is written from the async poll callback, not read
+  // synchronously here, so appending to it doesn't re-trigger this effect.
+  let combatLogEntries = $state<Array<{ id: string; message: string }>>([]);
+  $effect(() => {
+    if (!liveEncounterId) {
+      combatLogEntries = [];
+      return;
+    }
+    let cancelled = false;
+    let lastId: string | undefined;
+    async function poll() {
+      if (cancelled) return;
+      const qs = new URLSearchParams({ encounterId: liveEncounterId! });
+      if (lastId) qs.set('afterId', lastId);
+      try {
+        const res = await fetch(`/vtt/api/log?${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.entries?.length) {
+            combatLogEntries = [...combatLogEntries, ...data.entries].slice(-200);
+            lastId = data.entries[data.entries.length - 1].id;
+          }
+        }
+      } catch {
+        // best-effort - a missed poll tick just means the log lags one interval behind
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
+
+  // The one join a player needs - covers combat, rolls, and session notes at
+  // once (see docs/vtt-current-state.md's room-join-unification write-up).
+  // Moved to the top of the Activity Log modal so it's visible regardless of
+  // which tab is open.
+  let joinRoomIdInput = $state('');
+  let joinRoomBusy = $state(false);
+  let joinRoomError = $state<string | null>(null);
+
+  async function joinRoom() {
+    const roomId = joinRoomIdInput.trim();
+    if (!roomId) return;
+    joinRoomBusy = true;
+    joinRoomError = null;
+    const body = new FormData();
+    body.set('roomId', roomId);
+    const response = await fetch('?/joinRoom', { method: 'POST', body });
+    joinRoomBusy = false;
+    if (response.ok) {
+      joinRoomIdInput = '';
+      await invalidateAll();
+    } else {
+      const actionResult = deserialize(await response.text()) as { data?: { joinRoomError?: string } };
+      joinRoomError = actionResult.data?.joinRoomError || 'Could not join room.';
+    }
+  }
+
+  let leaveRoomBusy = $state(false);
+
+  async function leaveRoom() {
+    leaveRoomBusy = true;
+    // SvelteKit's action invocation rejects a POST with no body/Content-Type
+    // ("Unsupported Media Type") before the action code even runs - needs a
+    // real (even empty) FormData body, same as every other action call here.
+    await fetch('?/leaveRoom', { method: 'POST', body: new FormData() });
+    leaveRoomBusy = false;
+    await invalidateAll();
+  }
+
+  // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
+  // itself. Skipped entirely when the character hasn't joined a VTT room, same
+  // "nothing to log against" gate the server action itself also applies.
+  async function logRoll(label: string, result: { text: string; natural: number; total: number }) {
+    if (!activeVttSessionId) return;
+    const body = new FormData();
+    body.set('label', label);
+    body.set('total', String(result.total));
+    body.set('breakdown', result.text);
+    body.set('natural', String(result.natural));
+    await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
+  }
+
+  // Same polling shape as the combat-log effect above, against the separate
+  // roll-log table/endpoint (see docs on why rolls are scoped to the VTT room
+  // rather than an encounter - most rolls happen with no combat active).
+  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown> }>>([]);
+  $effect(() => {
+    if (!activeVttSessionId) {
+      rollLogEntries = [];
+      return;
+    }
+    let cancelled = false;
+    let lastId: string | undefined;
+    async function poll() {
+      if (cancelled) return;
+      const qs = new URLSearchParams({ sessionId: activeVttSessionId! });
+      if (lastId) qs.set('afterId', lastId);
+      try {
+        const res = await fetch(`/vtt/api/roll-log?${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.entries?.length) {
+            rollLogEntries = [...rollLogEntries, ...data.entries].slice(-200);
+            lastId = data.entries[data.entries.length - 1].id;
+          }
+        }
+      } catch {
+        // best-effort - a missed poll tick just means the log lags one interval behind
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
+
+  function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
+    const label = String(entry.details.label ?? 'Roll');
+    simpleRollResult = {
+      title: label,
+      lines: [{ label, text: String(entry.details.breakdown ?? ''), natural: Number(entry.details.natural) || 0 }]
+    };
+  }
+
+  // Session Notes - attributed to the signed-in player, not this character;
+  // joining is covered by the top-level "Join Room" action above (see
+  // gameSessions.ts's getActiveGameSessionForUser for how this is derived).
+  let sessionNoteInput = $state('');
+  let sessionNoteBusy = $state(false);
+
+  async function postSessionNote() {
+    const message = sessionNoteInput.trim();
+    if (!message) return;
+    sessionNoteBusy = true;
+    const body = new FormData();
+    body.set('message', message);
+    const response = await fetch('?/postSessionNote', { method: 'POST', body });
+    sessionNoteBusy = false;
+    if (response.ok) sessionNoteInput = '';
+  }
+
+  // Same polling shape as the combat/roll log panels - this panel only shows
+  // the most recent handful; the full log lives at /sessions/[id].
+  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string }>>([]);
+  $effect(() => {
+    if (!liveGameSessionId) {
+      sessionNoteEntries = [];
+      return;
+    }
+    let cancelled = false;
+    let lastId: string | undefined;
+    async function poll() {
+      if (cancelled) return;
+      const qs = new URLSearchParams({ gameSessionId: liveGameSessionId! });
+      if (lastId) qs.set('afterId', lastId);
+      try {
+        const res = await fetch(`/vtt/api/session-notes?${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.notes?.length) {
+            sessionNoteEntries = [...sessionNoteEntries, ...data.notes].slice(-20);
+            lastId = data.notes[data.notes.length - 1].id;
+          }
+        }
+      } catch {
+        // best-effort - a missed poll tick just means the panel lags one interval behind
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
 
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
     contentBusy = true;
@@ -771,6 +1017,7 @@
     if (newItemOpen) { newItemOpen = false; return; }
     if (formulaHelp) { formulaHelp = null; return; }
     if (playerModificationsOpen) { playerModificationsOpen = false; return; }
+    if (activityLogOpen) { activityLogOpen = false; return; }
     if (skillChecksOpen) { skillChecksOpen = false; return; }
     if (savingThrowsOpen) { savingThrowsOpen = false; return; }
   }
@@ -815,9 +1062,12 @@
       <div class="save-cluster">
         <div class="save-command-row">
           <button type="submit">Save</button>
-          {#if onVersionHistory}
-            <button type="button" class="text-button" onclick={onVersionHistory}>Version History</button>
-          {/if}
+          <div class="history-links">
+            {#if onVersionHistory}
+              <button type="button" class="text-button" onclick={onVersionHistory}>Character History</button>
+            {/if}
+            <button type="button" class="text-button" onclick={() => (activityLogOpen = true)}>Activity Log</button>
+          </div>
         </div>
         <div class="save-status-row">
           <span class="save-state">{autosaveStatus}</span>
@@ -1707,6 +1957,136 @@
     </div>
   {/if}
 
+  {#if activityLogOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={() => (activityLogOpen = false)}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="activity-log-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <div>
+            <h2 id="activity-log-title">Activity Log</h2>
+            <p class="muted">Combat, rolls, and table talk for this character.</p>
+          </div>
+          <button type="button" class="text-button" onclick={() => (activityLogOpen = false)}>Close</button>
+        </div>
+
+        {#if activeVttSessionId}
+          <div class="combat-encounter-id">
+            <span>Room <code>{activeVttSessionId}</code></span>
+            <button type="button" class="text-button" disabled={leaveRoomBusy} onclick={leaveRoom}>Leave Room</button>
+          </div>
+        {/if}
+        <label class="join-combat-label">
+          {activeVttSessionId ? 'Switch Room' : 'Join Room'}
+          <span class="summary-input-roll">
+            <input type="text" class="room-code-input" placeholder="Room code" bind:value={joinRoomIdInput} disabled={joinRoomBusy} />
+            <button type="button" class="compact-use-button" disabled={joinRoomBusy || !joinRoomIdInput.trim()} onclick={joinRoom}>Join</button>
+          </span>
+        </label>
+        {#if joinRoomError}<p class="combat-log-empty" style="color:#e57373;">{joinRoomError}</p>{/if}
+
+        <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
+          <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
+          <button type="button" class:active={activityLogTab === 'rolls'} onclick={() => (activityLogTab = 'rolls')}>Rolls</button>
+          <button type="button" class:active={activityLogTab === 'notes'} onclick={() => (activityLogTab = 'notes')}>Session Notes</button>
+        </div>
+
+        {#if activityLogTab === 'combat'}
+          <section class="stack">
+            {#if liveEncounterId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">Combat is active in this room</span>
+                <div class="combat-log-entries">
+                  {#each combatLogEntries as entry (entry.id)}
+                    <div class="combat-log-line">{entry.message}</div>
+                  {:else}
+                    <span class="combat-log-empty">No combat activity yet.</span>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <p class="muted">No active combat in this room right now.</p>
+            {/if}
+
+            <h3>Past Encounters</h3>
+            <div class="stack version-list">
+              {#each encounterHistory as encounter}
+                <article class="version-row with-actions">
+                  <div>
+                    <strong>{encounter.name}</strong>
+                    <span>{new Date(encounter.createdAt).toLocaleString()} - {encounter.isActive ? 'Active' : 'Ended'}</span>
+                  </div>
+                  <a class="button-link" href="/characters/{character.id}/encounters/{encounter.id}">View</a>
+                </article>
+              {:else}
+                <p class="muted">No combat encounters yet.</p>
+              {/each}
+            </div>
+          </section>
+        {:else if activityLogTab === 'rolls'}
+          <section class="stack">
+            {#if activeVttSessionId}
+              <div class="combat-log-panel">
+                <div class="combat-log-entries">
+                  {#each rollLogEntries as entry (entry.id)}
+                    <div class="combat-log-line">
+                      {entry.message}
+                      {#if entry.details?.breakdown}
+                        <button type="button" class="formula-help-button" aria-label="Roll breakdown" onclick={() => showRollLogBreakdown(entry)}>?</button>
+                      {/if}
+                    </div>
+                  {:else}
+                    <span class="combat-log-empty">No rolls yet.</span>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <p class="muted">Join a room above to log rolls.</p>
+            {/if}
+          </section>
+        {:else}
+          <section class="stack">
+            {#if liveGameSessionId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">
+                  Session notes are active
+                  <button type="button" class="text-button" onclick={() => (sessionNotesModalId = liveGameSessionId)}>Full log</button>
+                </span>
+                <div class="combat-log-entries">
+                  {#each sessionNoteEntries as entry (entry.id)}
+                    <div class="combat-log-line"><strong>{entry.displayName}:</strong> {entry.message}</div>
+                  {:else}
+                    <span class="combat-log-empty">No notes yet.</span>
+                  {/each}
+                </div>
+                <span class="summary-input-roll">
+                  <input type="text" placeholder="Type a note and press Enter..." bind:value={sessionNoteInput} disabled={sessionNoteBusy}
+                    onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); postSessionNote(); } }} />
+                  <button type="button" class="compact-use-button" disabled={sessionNoteBusy || !sessionNoteInput.trim()} onclick={postSessionNote}>Post</button>
+                </span>
+              </div>
+            {:else}
+              <p class="muted">No active session notes for this room right now.</p>
+            {/if}
+
+            <h3>Past Sessions</h3>
+            <div class="stack version-list">
+              {#each gameSessionHistory as gameSession}
+                <article class="version-row with-actions">
+                  <div>
+                    <strong>{gameSession.name}</strong>
+                    <span>{new Date(gameSession.createdAt).toLocaleString()} - {gameSession.isActive ? 'Active' : 'Ended'}</span>
+                  </div>
+                  <button type="button" class="button-link" onclick={() => (sessionNotesModalId = gameSession.id)}>View</button>
+                </article>
+              {:else}
+                <p class="muted">No session notes yet.</p>
+              {/each}
+            </div>
+          </section>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   {#if simpleRollResult}
     <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleRollResult = null)}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
@@ -1839,3 +2219,5 @@
     </div>
   {/if}
 </form>
+
+<SessionNotesModal gameSessionId={sessionNotesModalId} open={sessionNotesModalId !== null} onClose={() => (sessionNotesModalId = null)} />
