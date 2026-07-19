@@ -47,6 +47,14 @@ body {
 #sidebar .row { display: flex; gap: 6px; align-items: center; }
 #sidebar .row > * { flex: 1; }
 
+.combat-encounter-id { font-size: 11px; color: #999; margin-top: 6px; }
+.combat-encounter-id code { color: #eee; background: #14161b; padding: 1px 4px; border-radius: 3px; }
+.combat-log { max-height: 220px; overflow-y: auto; background: #14161b; border: 1px solid #2c2f36; border-radius: 4px; padding: 6px 8px; font-size: 12px; }
+.combat-log-line { padding: 3px 0; border-bottom: 1px solid #24272e; color: #ccc; }
+.combat-log-line:last-child { border-bottom: none; }
+.combat-log-line summary { cursor: pointer; }
+.combat-log-line pre { white-space: pre-wrap; color: #9dd7a5; font-size: 11px; margin: 4px 0 0; }
+
 #roomInfo { font-size: 13px; color: #ccc; margin-bottom: 12px; padding: 8px; background: #14161b; border-radius: 4px; }
 #roomInfo strong { color: #4a7fff; font-size: 16px; letter-spacing: 1px; }
 

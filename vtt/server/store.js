@@ -47,6 +47,11 @@ export function createSession(id) {
     tokens: {},
     players: {},
     markers: {},
+    // Set by POST /vtt/api/session/[id]/combat ("Start Combat"), cleared by the
+    // same route's "Stop Combat" - the DB-backed `encounters.id` that attack/
+    // spell resolution (token.js) logs against. null means combat hasn't been
+    // started, so damage resolution skips combat-log writes entirely.
+    encounterId: null,
   };
 }
 

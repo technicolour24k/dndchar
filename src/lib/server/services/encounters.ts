@@ -21,6 +21,78 @@ export async function createEncounter(userId: string, name: string): Promise<str
   return result.rows[0].id;
 }
 
+// Unlike addEncounterParticipant (which requires the same user to own both the
+// encounter and the character - fine for a GM building their own initiative
+// order), joining combat from the character sheet is inherently cross-user:
+// the GM owns the encounter, the player owns the character. Only character
+// ownership is checked here; the encounter just has to exist and be active.
+export async function joinEncounterAsCharacter(userId: string, encounterId: string, characterId: string): Promise<void> {
+  const result = await query(
+    `INSERT INTO encounter_participants (encounter_id, character_id, name, initiative)
+     SELECT e.id, c.id, c.name, 0 FROM characters c JOIN encounters e ON e.id = $1
+     WHERE c.id = $2 AND c.owner_user_id = $3 AND e.is_active = true
+     ON CONFLICT (encounter_id, character_id) DO NOTHING`,
+    [encounterId, characterId, userId]
+  );
+  if (!result.rowCount) throw new Error('Encounter not found, not active, or character not yours.');
+}
+
+export async function closeEncounter(userId: string, encounterId: string): Promise<void> {
+  await query('UPDATE encounters SET is_active=false, updated_at=now() WHERE id=$1 AND owner_user_id=$2', [encounterId, userId]);
+}
+
+// Combat-log write paths (VTT attack resolution, character-sheet HP edits) need to
+// know "is this encounter still running" without going through the owning GM's
+// session - is_active is enough on its own, no ownership check.
+export async function isEncounterActive(encounterId: string): Promise<boolean> {
+  const result = await query<{ is_active: boolean }>('SELECT is_active FROM encounters WHERE id=$1', [encounterId]);
+  return result.rows[0]?.is_active ?? false;
+}
+
+// A character may be a participant in more than one past encounter; only the
+// most recently updated *active* one counts as "currently in combat" for
+// combat-log purposes.
+export async function getActiveEncounterForCharacter(characterId: string): Promise<string | null> {
+  const result = await query<{ id: string }>(
+    `SELECT e.id FROM encounters e
+     JOIN encounter_participants p ON p.encounter_id = e.id
+     WHERE p.character_id = $1 AND e.is_active = true
+     ORDER BY e.updated_at DESC LIMIT 1`,
+    [characterId]
+  );
+  return result.rows[0]?.id ?? null;
+}
+
+export type EncounterHistoryItem = { id: string; name: string; isActive: boolean; createdAt: string };
+
+// Every encounter a character has ever joined, most recent first - unlike
+// getActiveEncounterForCharacter, this deliberately includes stopped/ended
+// encounters too (it backs the "Combat History" list, not the live combat-log gate).
+export async function listEncountersForCharacter(characterId: string): Promise<EncounterHistoryItem[]> {
+  const result = await query<any>(
+    `SELECT e.id, e.name, e.is_active, e.created_at
+     FROM encounters e JOIN encounter_participants p ON p.encounter_id = e.id
+     WHERE p.character_id = $1
+     ORDER BY e.created_at DESC`,
+    [characterId]
+  );
+  return result.rows.map((row) => ({ id: row.id, name: row.name, isActive: row.is_active, createdAt: row.created_at }));
+}
+
+export async function isCharacterInEncounter(characterId: string, encounterId: string): Promise<boolean> {
+  const result = await query(
+    'SELECT 1 FROM encounter_participants WHERE character_id = $1 AND encounter_id = $2',
+    [characterId, encounterId]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+export async function getEncounter(encounterId: string): Promise<{ id: string; name: string; isActive: boolean; createdAt: string } | null> {
+  const result = await query<any>('SELECT id, name, is_active, created_at FROM encounters WHERE id = $1', [encounterId]);
+  const row = result.rows[0];
+  return row ? { id: row.id, name: row.name, isActive: row.is_active, createdAt: row.created_at } : null;
+}
+
 export async function addEncounterParticipant(userId: string, encounterId: string, characterId: string, initiative: number): Promise<void> {
   await query(`INSERT INTO encounter_participants (encounter_id, character_id, name, initiative)
     SELECT $1, c.id, c.name, $3 FROM characters c JOIN encounters e ON e.id=$1

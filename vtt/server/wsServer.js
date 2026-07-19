@@ -8,7 +8,18 @@ import handleMarkerEvent from './handlers/marker.js';
 import handleTargetEvent from './handlers/target.js';
 
 const WS_PATH = '/vtt-ws';
-const context = { sessions, socketsBySession, broadcast };
+
+// token.js needs to persist combat-log rows via POST /vtt/api/log, but it can't
+// import $lib/server/services/combatLog.ts directly (see that route's own
+// comment for why) - it calls back into this same process over loopback HTTP
+// instead. Both dev (vite.config.ts) and prod (server.js) pass the *real*
+// listening httpServer into attachVttWebSocketServer, so reading its bound port
+// here works in both without a separate PORT env var to keep in sync.
+function internalApiBaseUrl(httpServer) {
+  const addr = httpServer.address();
+  const port = addr && typeof addr === 'object' ? addr.port : (process.env.PORT || 3000);
+  return `http://127.0.0.1:${port}`;
+}
 
 let wss = null;
 
@@ -20,6 +31,13 @@ let wss = null;
 export function attachVttWebSocketServer(httpServer) {
   if (wss) return wss;
   wss = new WebSocketServer({ noServer: true });
+
+  const context = {
+    sessions,
+    socketsBySession,
+    broadcast,
+    internalApiBaseUrl: () => internalApiBaseUrl(httpServer),
+  };
 
   httpServer.on('upgrade', (request, socket, head) => {
     const { pathname } = new URL(request.url ?? '', 'http://localhost');

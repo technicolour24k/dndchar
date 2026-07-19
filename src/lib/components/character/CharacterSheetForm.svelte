@@ -13,14 +13,20 @@
     itemCategories = [],
     result,
     isAdmin = false,
-    onVersionHistory
+    activeEncounterId = null,
+    activeVttSessionId = null,
+    onVersionHistory,
+    onEncounterHistory
   }: {
     character: CharacterDetail;
     catalogue?: ContentDefinition[];
     itemCategories?: ItemCategory[];
     result?: Record<string, unknown>;
     isAdmin?: boolean;
+    activeEncounterId?: string | null;
+    activeVttSessionId?: string | null;
     onVersionHistory?: () => void;
+    onEncounterHistory?: () => void;
   } = $props();
 
   let classRows = $state(untrack(() => character.classes.map((row) => ({ ...row }))));
@@ -457,7 +463,10 @@
   }
 
   function rollSingleSavingThrow(key: AbilityKey) {
-    simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`]) }] };
+    const label = `${key.toUpperCase()} Save`;
+    const result = rollText(savingThrowTotal(key), [`saving_throw.${key}`]);
+    simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label, ...result }] };
+    void logRoll(label, result);
   }
 
   function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
@@ -469,19 +478,26 @@
     const passiveNote = skill.key in passiveScores
       ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
       : undefined;
+    const result = rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]);
     simpleRollResult = {
       title: skill.name,
-      lines: [{ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }],
+      lines: [{ label: skill.name, ...result }],
       passiveNote
     };
+    void logRoll(skill.name, result);
   }
 
   function rollAbilityCheck(key: AbilityKey) {
-    simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label: `${key.toUpperCase()} Check`, ...rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]) }] };
+    const label = `${key.toUpperCase()} Check`;
+    const result = rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]);
+    simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label, ...result }] };
+    void logRoll(label, result);
   }
 
   function rollInitiative() {
-    simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...rollText(computedInitiative, ['initiative']) }] };
+    const result = rollText(computedInitiative, ['initiative']);
+    simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...result }] };
+    void logRoll('Initiative', result);
   }
 
   async function useHitDie() {
@@ -522,6 +538,147 @@
       return;
     }
     await invalidateAll();
+  }
+
+  let joinEncounterIdInput = $state('');
+  let joinCombatBusy = $state(false);
+  let joinCombatError = $state<string | null>(null);
+
+  async function joinCombat() {
+    const encounterId = joinEncounterIdInput.trim();
+    if (!encounterId) return;
+    joinCombatBusy = true;
+    joinCombatError = null;
+    const body = new FormData();
+    body.set('encounterId', encounterId);
+    const response = await fetch('?/joinCombat', { method: 'POST', body });
+    joinCombatBusy = false;
+    if (response.ok) {
+      joinEncounterIdInput = '';
+      await invalidateAll();
+    } else {
+      const actionResult = deserialize(await response.text()) as { data?: { joinCombatError?: string } };
+      joinCombatError = actionResult.data?.joinCombatError || 'Could not join combat.';
+    }
+  }
+
+  // Polls the same combat-log endpoint the VTT's live panel writes to (see
+  // src/routes/vtt/api/log/+server.ts) - the sheet has no live transport of its
+  // own (Socket.IO is stubbed, the raw ws server only serves the VTT client),
+  // so a plain sheet HP edit shows up here within one polling interval instead
+  // of instantly. Only (re)starts when activeEncounterId itself changes -
+  // combatLogEntries is written from the async poll callback, not read
+  // synchronously here, so appending to it doesn't re-trigger this effect.
+  let combatLogEntries = $state<Array<{ id: string; message: string }>>([]);
+  $effect(() => {
+    if (!activeEncounterId) {
+      combatLogEntries = [];
+      return;
+    }
+    let cancelled = false;
+    let lastId: string | undefined;
+    async function poll() {
+      if (cancelled) return;
+      const qs = new URLSearchParams({ encounterId: activeEncounterId! });
+      if (lastId) qs.set('afterId', lastId);
+      try {
+        const res = await fetch(`/vtt/api/log?${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.entries?.length) {
+            combatLogEntries = [...combatLogEntries, ...data.entries].slice(-200);
+            lastId = data.entries[data.entries.length - 1].id;
+          }
+        }
+      } catch {
+        // best-effort - a missed poll tick just means the log lags one interval behind
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
+
+  let joinSessionIdInput = $state('');
+  let joinSessionBusy = $state(false);
+  let joinSessionError = $state<string | null>(null);
+
+  async function joinSession() {
+    const sessionId = joinSessionIdInput.trim();
+    if (!sessionId) return;
+    joinSessionBusy = true;
+    joinSessionError = null;
+    const body = new FormData();
+    body.set('sessionId', sessionId);
+    const response = await fetch('?/joinSession', { method: 'POST', body });
+    joinSessionBusy = false;
+    if (response.ok) {
+      joinSessionIdInput = '';
+      await invalidateAll();
+    } else {
+      const actionResult = deserialize(await response.text()) as { data?: { joinSessionError?: string } };
+      joinSessionError = actionResult.data?.joinSessionError || 'Could not join session.';
+    }
+  }
+
+  // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
+  // itself. Skipped entirely when the character hasn't joined a VTT room, same
+  // "nothing to log against" gate the server action itself also applies.
+  async function logRoll(label: string, result: { text: string; natural: number; total: number }) {
+    if (!activeVttSessionId) return;
+    const body = new FormData();
+    body.set('label', label);
+    body.set('total', String(result.total));
+    body.set('breakdown', result.text);
+    body.set('natural', String(result.natural));
+    await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
+  }
+
+  // Same polling shape as the combat-log effect above, against the separate
+  // roll-log table/endpoint (see docs on why rolls are scoped to the VTT room
+  // rather than an encounter - most rolls happen with no combat active).
+  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown> }>>([]);
+  $effect(() => {
+    if (!activeVttSessionId) {
+      rollLogEntries = [];
+      return;
+    }
+    let cancelled = false;
+    let lastId: string | undefined;
+    async function poll() {
+      if (cancelled) return;
+      const qs = new URLSearchParams({ sessionId: activeVttSessionId! });
+      if (lastId) qs.set('afterId', lastId);
+      try {
+        const res = await fetch(`/vtt/api/roll-log?${qs}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.entries?.length) {
+            rollLogEntries = [...rollLogEntries, ...data.entries].slice(-200);
+            lastId = data.entries[data.entries.length - 1].id;
+          }
+        }
+      } catch {
+        // best-effort - a missed poll tick just means the log lags one interval behind
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  });
+
+  function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
+    const label = String(entry.details.label ?? 'Roll');
+    simpleRollResult = {
+      title: label,
+      lines: [{ label, text: String(entry.details.breakdown ?? ''), natural: Number(entry.details.natural) || 0 }]
+    };
   }
 
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
@@ -818,6 +975,9 @@
           {#if onVersionHistory}
             <button type="button" class="text-button" onclick={onVersionHistory}>Version History</button>
           {/if}
+          {#if onEncounterHistory}
+            <button type="button" class="text-button" onclick={onEncounterHistory}>Combat History</button>
+          {/if}
         </div>
         <div class="save-status-row">
           <span class="save-state">{autosaveStatus}</span>
@@ -858,6 +1018,55 @@
               <button type="button" class="compact-use-button" disabled={(classHitDice[hitDiceClassIndex]?.remaining ?? 0) <= 0} onclick={useHitDie}>Use</button>
             </span>
           </label>
+
+          {#if activeEncounterId}
+            <div class="combat-log-panel">
+              <span class="field-label-with-help">In combat - Encounter <code>{activeEncounterId}</code></span>
+              <div class="combat-log-entries">
+                {#each combatLogEntries as entry (entry.id)}
+                  <div class="combat-log-line">{entry.message}</div>
+                {:else}
+                  <span class="combat-log-empty">No combat activity yet.</span>
+                {/each}
+              </div>
+            </div>
+          {:else}
+            <label class="join-combat-label">
+              Join Combat
+              <span class="summary-input-roll">
+                <input type="text" placeholder="Encounter ID" bind:value={joinEncounterIdInput} disabled={joinCombatBusy} />
+                <button type="button" class="compact-use-button" disabled={joinCombatBusy || !joinEncounterIdInput.trim()} onclick={joinCombat}>Join</button>
+              </span>
+            </label>
+            {#if joinCombatError}<p class="combat-log-empty" style="color:#e57373;">{joinCombatError}</p>{/if}
+          {/if}
+
+          {#if activeVttSessionId}
+            <div class="combat-log-panel">
+              <span class="field-label-with-help">In VTT session <code>{activeVttSessionId}</code></span>
+              <div class="combat-log-entries">
+                {#each rollLogEntries as entry (entry.id)}
+                  <div class="combat-log-line">
+                    {entry.message}
+                    {#if entry.details?.breakdown}
+                      <button type="button" class="formula-help-button" aria-label="Roll breakdown" onclick={() => showRollLogBreakdown(entry)}>?</button>
+                    {/if}
+                  </div>
+                {:else}
+                  <span class="combat-log-empty">No rolls yet.</span>
+                {/each}
+              </div>
+            </div>
+          {:else}
+            <label class="join-combat-label">
+              Join Session
+              <span class="summary-input-roll">
+                <input type="text" placeholder="Room code" bind:value={joinSessionIdInput} disabled={joinSessionBusy} />
+                <button type="button" class="compact-use-button" disabled={joinSessionBusy || !joinSessionIdInput.trim()} onclick={joinSession}>Join</button>
+              </span>
+            </label>
+            {#if joinSessionError}<p class="combat-log-empty" style="color:#e57373;">{joinSessionError}</p>{/if}
+          {/if}
         </section>
 
         <section class="panel stack compact-panel">

@@ -55,6 +55,8 @@ let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer sta
 let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
 let shapeDrag = null; // { config, originX, originY, currentX, currentY } while dragging a cone/cube's direction+length
 let showMovementRanges = true; // GM-only declutter toggle - purely a local view preference, not synced to session
+let combatLogLines = []; // rendered combat-log text, newest last - backfilled on join/reconnect, appended live via combat:log
+let rollLogLines = []; // { message, details } - separate from combatLogLines, scoped to this room rather than an encounter
 
 const imageCache = new Map();
 
@@ -267,6 +269,12 @@ function handleMessage(msg) {
       renderSidebar();
       updateAmbientMusic();
       if (role === 'player') startCharacterSync();
+      // Reconnecting mid-combat: combat:log only carries entries seen live from
+      // here on, so pull the backlog for whatever encounter is already active.
+      if (session.encounterId) loadCombatLogBacklog(session.encounterId);
+      // Roll log has no "combat active" gate - it's scoped to this room, which
+      // is already known the moment we're connected, so always backfill it.
+      loadRollLogBacklog();
       break;
 
     case 'player:joined':
@@ -396,8 +404,54 @@ function handleMessage(msg) {
       break;
     }
 
+    case 'combat:state':
+      session.encounterId = msg.encounterId;
+      if (msg.active) combatLogLines = []; // a freshly-started encounter has no history yet
+      renderSidebar();
+      break;
+
+    case 'combat:log':
+      combatLogLines.push(msg.message);
+      if (combatLogLines.length > 200) combatLogLines.shift();
+      renderSidebar();
+      break;
+
+    case 'roll:log':
+      rollLogLines.push({ message: msg.message, details: msg.details || {} });
+      if (rollLogLines.length > 200) rollLogLines.shift();
+      renderSidebar();
+      break;
+
     default:
       break;
+  }
+}
+
+// Best-effort - a failed fetch just means the log panel starts empty instead
+// of backfilled; the live combat:log broadcasts still work either way.
+async function loadCombatLogBacklog(encounterId) {
+  try {
+    const res = await fetch(`/vtt/api/log?encounterId=${encodeURIComponent(encounterId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    combatLogLines = (data.entries || []).map((e) => e.message);
+    renderSidebar();
+  } catch {
+    // ignore
+  }
+}
+
+// Roll log is scoped to this room (sessionId), not an encounter - see
+// docs/vtt-current-state.md's roll-log section for why.
+async function loadRollLogBacklog() {
+  try {
+    const res = await fetch(`/vtt/api/roll-log?sessionId=${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    rollLogLines = (data.entries || []).map((e) => ({ message: e.message, details: e.details || {} }));
+    renderSidebar();
+  } catch {
+    // ignore
   }
 }
 
@@ -785,6 +839,7 @@ async function resolveAttack() {
       damage: result.damageTotal,
       outcome,
       damageType: inferDamageType(action, result),
+      title: result.title || action.name || null,
     });
     return;
   }
@@ -867,6 +922,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess) {
     saveSuccess,
     saveEffect: result.saveEffect,
     damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic', // this path is only ever reached for a spell (see resolveAttack)
+    title: result.title || null,
   });
 }
 
@@ -1680,7 +1736,71 @@ function playerListHtml() {
 }
 
 function roomInfoHtml(roleLabel) {
-  return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>`;
+  return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+    ${combatControlHtml()}
+    ${combatLogHtml()}
+    ${rollLogHtml()}`;
+}
+
+// Encounter ID is shown to every role, not just the GM - a player needs it to
+// paste into their character sheet's "Join Combat" box. Only the GM gets the
+// Start/Stop buttons themselves.
+function combatControlHtml() {
+  const active = !!session.encounterId;
+  const idLine = active
+    ? `<div class="combat-encounter-id">Encounter ID (enter on your character sheet's "Join Combat"): <code>${escapeHtml(session.encounterId)}</code></div>`
+    : '';
+  const gmButton = role !== 'gm' ? '' : active
+    ? `<button type="button" id="stopCombatBtn" class="secondary">Stop Combat</button>`
+    : `<button type="button" id="startCombatBtn">Start Combat</button>`;
+  if (!gmButton && !idLine) return '';
+  return `<div class="field" id="combatControl">${gmButton}${idLine}</div>`;
+}
+
+function combatLogHtml() {
+  if (!session.encounterId && !combatLogLines.length) return '';
+  const lines = combatLogLines.map((line) => `<div class="combat-log-line">${escapeHtml(line)}</div>`).join('')
+    || '<span style="color:#666;">No combat activity yet.</span>';
+  return `<h2>Combat Log</h2><div id="combatLog" class="combat-log">${lines}</div>`;
+}
+
+// Separate from the Combat Log - scoped to this room rather than an encounter,
+// so it has entries whether or not combat has ever been started. Roll entries
+// get a native <details>/<summary> for a free, no-JS expand/collapse "[?]".
+function rollLogHtml() {
+  if (!rollLogLines.length) return '';
+  const lines = rollLogLines.map((entry) => {
+    const breakdown = entry.details?.breakdown;
+    return breakdown
+      ? `<details class="combat-log-line"><summary>${escapeHtml(entry.message)}</summary><pre>${escapeHtml(String(breakdown))}</pre></details>`
+      : `<div class="combat-log-line">${escapeHtml(entry.message)}</div>`;
+  }).join('');
+  return `<h2>Roll Log</h2><div id="rollLog" class="combat-log">${lines}</div>`;
+}
+
+async function startCombat() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/combat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'start' }),
+    });
+    if (!res.ok) throw new Error('start_failed');
+    // The server's combat:state broadcast (sent to the whole session, including
+    // us) is what actually updates session.encounterId and re-renders - no
+    // local mutation here avoids a race with that broadcast.
+  } catch {
+    alert('Could not start combat.');
+  }
+}
+
+async function stopCombat() {
+  try {
+    const res = await fetch(`/vtt/api/session/${sessionId}/combat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'stop' }),
+    });
+    if (!res.ok) throw new Error('stop_failed');
+  } catch {
+    alert('Could not stop combat.');
+  }
 }
 
 // --- GM sidebar --------------------------------------------------------
@@ -1970,6 +2090,9 @@ function markerListHtml(isGm) {
 }
 
 function wireGmSidebar() {
+  document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
+  document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+
   document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
     showMovementRanges = e.target.checked;
     render(); // a view preference only - doesn't touch session state, no renderSidebar() needed

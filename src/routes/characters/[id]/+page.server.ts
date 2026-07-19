@@ -4,6 +4,9 @@ import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { getActiveEncounterForCharacter, joinEncounterAsCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
+import { getCharacterVttSessionId, logRoll } from '$lib/server/services/rollLog';
+import { sessions } from '$vtt/store.js';
 
 export async function load({ params, locals }) {
   const character = await getCharacter(locals.user!.id, params.id);
@@ -13,7 +16,10 @@ export async function load({ params, locals }) {
     character,
     itemCategories: await listItemCategories(),
     catalogue: await listCatalogue(locals.user!.id),
-    versions: await listVersions(locals.user!.id, params.id)
+    versions: await listVersions(locals.user!.id, params.id),
+    activeEncounterId: await getActiveEncounterForCharacter(params.id),
+    activeVttSessionId: await getCharacterVttSessionId(params.id),
+    encounterHistory: await listEncountersForCharacter(params.id)
   };
 }
 
@@ -138,6 +144,51 @@ export const actions = {
   castSpell:async({request,params,locals})=>{
     const itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
+  },
+  joinCombat: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const encounterId = String(form.get('encounterId') || '').trim();
+    if (!encounterId) return fail(400, { joinCombatError: 'Enter an encounter ID.' });
+    try {
+      await joinEncounterAsCharacter(locals.user!.id, encounterId, params.id);
+    } catch {
+      return fail(400, { joinCombatError: 'That encounter ID was not found or is not active.' });
+    }
+    return { joinedCombat: true };
+  },
+  joinSession: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const sessionId = String(form.get('sessionId') || '').trim().toUpperCase();
+    if (!sessionId) return fail(400, { joinSessionError: 'Enter a room code.' });
+    // VTT rooms are in-memory only (vtt/server/store.js) - validate against the
+    // live sessions Map directly rather than any DB table, same supported
+    // SvelteKit-into-vtt/server import already used by the combat start/stop route.
+    if (!sessions.has(sessionId)) return fail(400, { joinSessionError: 'That room code was not found.' });
+    const result = await query(
+      'UPDATE characters SET active_vtt_session_id = $1 WHERE id = $2 AND owner_user_id = $3',
+      [sessionId, params.id, locals.user!.id]
+    );
+    if (!result.rowCount) return fail(404, { joinSessionError: 'Character not found.' });
+    return { joinedSession: true };
+  },
+  logRoll: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const label = String(form.get('label') || '').trim();
+    const total = Number(form.get('total'));
+    const breakdown = String(form.get('breakdown') || '');
+    const natural = Number(form.get('natural'));
+    if (!label || !Number.isFinite(total)) return fail(400, { logRollError: 'Invalid roll.' });
+
+    const sessionId = await getCharacterVttSessionId(params.id);
+    if (!sessionId) return { loggedRoll: false }; // not in a session - nothing to log, not an error
+
+    const nameRow = await query<{ name: string }>(
+      'SELECT name FROM characters WHERE id = $1 AND owner_user_id = $2',
+      [params.id, locals.user!.id]
+    );
+    const name = nameRow.rows[0]?.name || 'A character';
+    await logRoll(sessionId, `${name} rolled a ${total} on ${label}.`, { label, total, breakdown, natural });
+    return { loggedRoll: true };
   },
   spendHitDice: async ({ request, params, locals }) => {
     const form = await request.formData();
