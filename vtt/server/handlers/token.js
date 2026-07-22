@@ -1,6 +1,7 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { filterTokenForPlayer } from '../store.js';
 import { TARGET_WINDOW_MS } from './target.js';
+import { pickRandomCreatureSoundFile, creatureSoundUrl } from '../creatureSoundLibrary.js';
 
 // Must match the fallback in src/routes/vtt/api/log/+server.ts - see that
 // file's comment for why this is a shared-secret header rather than a normal
@@ -72,6 +73,11 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'visionDevilFt',
   'speedFt',
   'speedRemainingFt',
+  // GM-set on enemy/npc tokens (Add Token form / token card) - which
+  // assets/creature-sounds/ folder to pull a random clip from whenever this
+  // token attacks. Not secret info, but GM-only to edit (absent from
+  // PLAYER_EDITABLE_FIELDS below).
+  'soundFolder',
   // Character-sheet pull-through fields (Section 1) - populated once at
   // token:add time from the source character, not otherwise mutated except
   // spellSlots (consumed during play via the mini-sheet, Section 2).
@@ -168,6 +174,23 @@ function broadcastToken(context, sessionId, eventType, token, extra = {}) {
     if (token.hidden) return null;
     return { type: eventType, ...extraFor(recipient), token: filterTokenForPlayer(token) };
   });
+}
+
+// Random per-attack flavor cue (e.g. a dragon's roar), keyed off the
+// attacker's soundFolder (see TOKEN_LEVEL_STAT_FIELDS above) - distinct from
+// the hit-only damage-type cue below since this should play whenever the
+// creature attacks at all, hit or miss, same as a roar accompanying a claw
+// swipe regardless of whether it connects. The server picks the random file
+// (rather than the client) so every listener hears the same clip.
+function broadcastCreatureSound(context, session, sessionId, sourceTokenId) {
+  const folder = session.tokens[sourceTokenId]?.soundFolder;
+  if (!folder) return;
+  const filename = pickRandomCreatureSoundFile(folder);
+  if (!filename) return;
+  context.broadcast(sessionId, () => ({
+    type: 'fx:play',
+    creatureSoundUrl: creatureSoundUrl(folder, filename),
+  }));
 }
 
 function handleTokenEvent(meta, msg, context) {
@@ -371,6 +394,9 @@ function handleTokenEvent(meta, msg, context) {
       if (hit) {
         context.broadcast(meta.sessionId, () => ({ type: 'fx:play', damageType: msg.damageType || null }));
       }
+      // Creature attack cue - fires on the attack itself (hit or miss), not
+      // gated on `hit` like the damage-type cue above.
+      broadcastCreatureSound(context, session, meta.sessionId, msg.sourceTokenId);
 
       // Log line, combat-log only (not the attack:result/token:stat:update
       // broadcasts above). sourceTokenId already rides on the incoming
@@ -466,6 +492,10 @@ function handleTokenEvent(meta, msg, context) {
           `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage.`,
           { kind: 'spell', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageType || null, title: msg.title || null });
       }
+      // Creature attack cue - casting the spell is the attack, so this fires
+      // regardless of whether the save negated all damage (same rationale as
+      // attack:resolve's version not being gated on `hit`).
+      broadcastCreatureSound(context, session, meta.sessionId, msg.sourceTokenId);
       break;
     }
 

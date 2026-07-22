@@ -19,6 +19,7 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'visionDevilFt',
   'speedFt',
   'speedRemainingFt',
+  'soundFolder',
   'characterId',
   'ac',
   'knownAc',
@@ -96,7 +97,17 @@ const musicBar = document.getElementById('musicBar');
 const musicToggleBtn = document.getElementById('musicToggleBtn');
 const musicTrackName = document.getElementById('musicTrackName');
 const musicVolumeInput = document.getElementById('musicVolumeInput');
-const ambientAudio = document.getElementById('ambientAudio');
+const musicVolumeNumberInput = document.getElementById('musicVolumeNumberInput');
+
+// Two <audio> elements so a track swap can crossfade - the outgoing track
+// fading out while the incoming one fades in over the same window, rather
+// than a fade-to-silence-then-fade-back-in with a silent gap in the middle.
+// activeAmbientAudio always points at whichever one is currently "the"
+// track; the two ping-pong roles on every crossfade (see crossfadeAmbientMusic).
+const ambientAudioA = document.getElementById('ambientAudioA');
+const ambientAudioB = document.getElementById('ambientAudioB');
+let activeAmbientAudio = ambientAudioA;
+let inactiveAmbientAudio = ambientAudioB;
 
 let musicLibraryIndex = []; // fetched once, cached for the session
 
@@ -121,29 +132,184 @@ function musicTrackLabel(url) {
   return match ? match.friendlyName : 'Custom track';
 }
 
-ambientAudio.volume = musicVolumeInput.value / 100;
-musicVolumeInput.addEventListener('input', () => {
-  ambientAudio.volume = musicVolumeInput.value / 100;
-});
-musicToggleBtn.addEventListener('click', () => {
-  if (ambientAudio.paused) ambientAudio.play().catch(() => {});
-  else ambientAudio.pause();
-});
-ambientAudio.addEventListener('play', () => {
-  musicToggleBtn.textContent = '⏸';
-  musicToggleBtn.title = 'Pause ambient music';
-});
-ambientAudio.addEventListener('pause', () => {
-  musicToggleBtn.textContent = '▶';
-  musicToggleBtn.title = 'Play ambient music';
-});
+// Fade engine behind fadeOutActive/crossfadeAmbientMusic below. Runs on
+// requestAnimationFrame, which browsers throttle (sometimes to a full stop)
+// while the tab is backgrounded - previously this drove a token counter that
+// a newer fade would bump to invalidate an old rAF loop, but that only takes
+// effect the next time the OLD loop actually ticks. If that tab was
+// backgrounded and the loop never ticked again, the token was never
+// checked - the old track kept playing forever, and (via an earlier attempt
+// at fixing that by queuing every update behind the previous one's promise)
+// every future update got stuck waiting on a promise that could now never
+// resolve, which is why Set Map stopped working entirely after that "fix".
+// activeFadeCancel fixes this at the root: it's cancelAnimationFrame'd and
+// resolved directly and synchronously the instant a new fade starts,
+// regardless of whether the old rAF loop is still ticking at all.
+const MUSIC_FADE_MS = 600;
+let activeFadeCancel = null;
 
-function updateAmbientMusic() {
-  const musicUrl = session?.map?.musicUrl || null;
+function cancelActiveFade() {
+  if (!activeFadeCancel) return;
+  const cancel = activeFadeCancel;
+  activeFadeCancel = null;
+  cancel();
+}
+
+// Drives `stepFn(t)` from t=0 to t=1 over `ms`, resolving `true` on natural
+// completion or `false` if cancelActiveFade() preempted it early - callers
+// that swap element roles on completion (crossfadeAmbientMusic) need that
+// distinction so a cancelled fade doesn't finish the role-swap a *newer*
+// fade has since taken over.
+function runFade(stepFn, ms) {
+  return new Promise((resolve) => {
+    let rafId = null;
+    const start = performance.now();
+    activeFadeCancel = () => {
+      cancelAnimationFrame(rafId);
+      activeFadeCancel = null;
+      resolve(false);
+    };
+    function step(now) {
+      // Clamped on both ends - the timestamp rAF hands the callback can
+      // occasionally read as slightly *before* `start` on the very first
+      // frame (sub-ms clock quirk), which without the lower clamp drove t
+      // negative and threw a volume-out-of-range error that killed the
+      // whole fade loop permanently (see crossfadeAmbientMusic/fadeOutActive).
+      const t = Math.max(0, Math.min(1, (now - start) / ms));
+      stepFn(t);
+      if (t < 1) {
+        rafId = requestAnimationFrame(step);
+      } else {
+        activeFadeCancel = null;
+        resolve(true);
+      }
+    }
+    rafId = requestAnimationFrame(step);
+  });
+}
+
+// HTMLMediaElement.volume throws if set outside [0, 1] - belt-and-braces
+// against any future source of a slightly-out-of-range value (float
+// accumulation across repeated interrupted fades, etc.), on top of runFade
+// already clamping t itself.
+function clampVolume(v) {
+  return Math.max(0, Math.min(1, v));
+}
+
+// Fades activeAmbientAudio alone (nothing incoming) - used when music stops
+// entirely (effectiveMusicUrl() goes null), not for a track-to-track swap.
+// Caller unconditionally pauses/clears the element right after awaiting
+// this, so there's no completed-vs-cancelled distinction to make here.
+function fadeOutActive(ms) {
+  cancelActiveFade();
+  const from = activeAmbientAudio.volume;
+  return runFade((t) => {
+    activeAmbientAudio.volume = clampVolume(from * (1 - t));
+  }, ms);
+}
+
+// True crossfade: starts newSrc on the currently-inactive element at volume
+// 0 and plays it immediately, then fades the outgoing element down to 0 and
+// the incoming one up to targetVolume in the same loop, so they overlap
+// rather than leaving a silent gap. Once done, the outgoing element is
+// paused/cleared and the two swap active/inactive roles - but only on
+// natural completion; if a newer transition preempted this one, that newer
+// call already owns activeAmbientAudio/inactiveAmbientAudio and re-reads
+// whatever volume this one left outgoing/incoming at, so this just backs
+// off rather than clobbering it.
+async function crossfadeAmbientMusic(newSrc, targetVolume, ms) {
+  cancelActiveFade();
+  const outgoing = activeAmbientAudio;
+  const incoming = inactiveAmbientAudio;
+  const outgoingFrom = outgoing.volume;
+
+  incoming.src = newSrc;
+  incoming.volume = 0;
+  incoming.play().catch(() => {});
+
+  const completed = await runFade((t) => {
+    outgoing.volume = clampVolume(outgoingFrom * (1 - t));
+    incoming.volume = clampVolume(targetVolume * t);
+  }, ms);
+  if (!completed) return;
+
+  outgoing.pause();
+  outgoing.removeAttribute('src');
+  activeAmbientAudio = incoming;
+  inactiveAmbientAudio = outgoing;
+}
+
+// Slider and number field mirror each other - whichever one the user just
+// touched drives the active track's volume, and its value is copied onto
+// the other. Only ever targets activeAmbientAudio - mid-crossfade this is a
+// rare, brief edge case not worth extra complexity for (see
+// crossfadeAmbientMusic's comment).
+function setMusicVolumePercent(percent) {
+  const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+  musicVolumeInput.value = clamped;
+  musicVolumeNumberInput.value = clamped;
+  cancelActiveFade(); // a manual volume change wins over any in-progress fade
+  activeAmbientAudio.volume = clamped / 100;
+}
+
+// One-shot sound effects (hit-sound cues, creature attack roars, soundboard
+// clips - see playEffectSound and the fx:play handler below) share this same
+// slider rather than always playing at full volume, so the GM only has one
+// dial to manage instead of the music being quiet while every attack roars
+// at 100%.
+function oneShotEffectVolume() {
+  return Math.max(0, Math.min(100, Number(musicVolumeInput.value) || 0)) / 100;
+}
+
+setMusicVolumePercent(musicVolumeInput.value);
+musicVolumeInput.addEventListener('input', () => setMusicVolumePercent(musicVolumeInput.value));
+musicVolumeNumberInput.addEventListener('input', () => setMusicVolumePercent(musicVolumeNumberInput.value));
+musicToggleBtn.addEventListener('click', () => {
+  if (activeAmbientAudio.paused) activeAmbientAudio.play().catch(() => {});
+  else activeAmbientAudio.pause();
+});
+// Bound to both elements - each checks it's still the active one before
+// touching the button, since a crossfade briefly has both elements playing
+// (the incoming track fires 'play' immediately, before the fade/role-swap
+// finishes) and only the truly-active one's state should drive the icon.
+for (const el of [ambientAudioA, ambientAudioB]) {
+  el.addEventListener('play', () => {
+    if (el !== activeAmbientAudio) return;
+    musicToggleBtn.textContent = '⏸';
+    musicToggleBtn.title = 'Pause ambient music';
+  });
+  el.addEventListener('pause', () => {
+    if (el !== activeAmbientAudio) return;
+    musicToggleBtn.textContent = '▶';
+    musicToggleBtn.title = 'Play ambient music';
+  });
+}
+
+// While combat is active (session.encounterId set) and the map has a
+// battleMusicUrl configured, that track takes over from the regular ambient
+// one - swapping back the moment combat ends (or if no battle track was set,
+// the ambient track just keeps playing through combat, unchanged). Called
+// from both updateAmbientMusic's normal triggers (state:full/map:set) and
+// the 'combat:state' handler below, so the swap happens the instant Start/
+// Stop Combat fires, not just on the next unrelated map update.
+function effectiveMusicUrl() {
+  const map = session?.map || {};
+  if (session?.encounterId && map.battleMusicUrl) return map.battleMusicUrl;
+  return map.musicUrl || null;
+}
+
+// Fire-and-forget from every call site (state:full/map:set/combat:state) -
+// safe to call again before a previous call's fade has finished, since
+// fadeOutActive/crossfadeAmbientMusic each start by synchronously preempting
+// whatever fade is already running (see cancelActiveFade) rather than
+// waiting for or invalidating-but-ignoring it.
+async function updateAmbientMusic() {
+  const musicUrl = effectiveMusicUrl();
   if (!musicUrl) {
+    if (!activeAmbientAudio.paused) await fadeOutActive(MUSIC_FADE_MS);
     musicBar.style.display = 'none';
-    ambientAudio.pause();
-    ambientAudio.removeAttribute('src');
+    activeAmbientAudio.pause();
+    activeAmbientAudio.removeAttribute('src');
     return;
   }
 
@@ -151,10 +317,18 @@ function updateAmbientMusic() {
   musicTrackName.textContent = musicTrackLabel(musicUrl);
 
   const resolvedUrl = new URL(musicUrl, location.href).href;
-  if (ambientAudio.src !== resolvedUrl) {
-    const wasPlaying = !ambientAudio.paused;
-    ambientAudio.src = musicUrl;
-    if (wasPlaying) ambientAudio.play().catch(() => {});
+  if (activeAmbientAudio.src !== resolvedUrl) {
+    const wasPlaying = !activeAmbientAudio.paused;
+    // Only crossfade if there's actually something audible to fade against -
+    // a first-ever track pick (nothing playing yet) just sets src directly
+    // on the active element, same as before, since the GM still has to
+    // press play.
+    if (wasPlaying) {
+      const targetVolume = Number(musicVolumeInput.value) / 100;
+      await crossfadeAmbientMusic(musicUrl, targetVolume, MUSIC_FADE_MS);
+    } else {
+      activeAmbientAudio.src = musicUrl;
+    }
   }
 }
 
@@ -164,6 +338,93 @@ ensureMusicLibraryIndex().then(() => {
     updateAmbientMusic();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Creature sound folders (assets/creature-sounds/<folder>/*) - each folder
+// name doubles as the "creature type" value stored on a token's soundFolder
+// field (Add Token form + per-token card, see gmSidebarHtml/gmTokenListHtml)
+// and as a soundboard button the GM can trigger on demand. Fetched once and
+// cached for the session, same pattern as musicLibraryIndex above.
+// ---------------------------------------------------------------------------
+
+let creatureSoundFolders = [];
+
+async function ensureCreatureSoundFolders() {
+  if (creatureSoundFolders.length) return creatureSoundFolders;
+  try {
+    const res = await fetch('/vtt/api/creature-sounds');
+    const data = await res.json();
+    creatureSoundFolders = data.folders || [];
+  } catch {
+    creatureSoundFolders = [];
+  }
+  return creatureSoundFolders;
+}
+
+ensureCreatureSoundFolders().then(() => {
+  if (session && role === 'gm') renderSidebar();
+});
+
+// ---------------------------------------------------------------------------
+// Creature templates ("save this goblin, spawn it again next session without
+// rebuilding it by hand") - a reusable snapshot of a token's non-instance
+// fields (type/ac/stats/vision/speed/imageUrl/soundFolder/actions - never
+// id/x/y/hidden/ownerId), scoped to the saving GM's own account so it
+// persists across sessions/restarts (see
+// src/lib/server/services/creatureTemplates.ts). Unlike musicLibraryIndex/
+// creatureSoundFolders (fixed bundled files), this list changes at runtime
+// (save/delete), so it's refetched rather than cached forever.
+// ---------------------------------------------------------------------------
+
+let creatureTemplates = [];
+
+async function refreshCreatureTemplates() {
+  try {
+    const res = await fetch('/vtt/api/creature-templates');
+    const data = await res.json();
+    creatureTemplates = data.templates || [];
+  } catch {
+    creatureTemplates = [];
+  }
+  return creatureTemplates;
+}
+
+refreshCreatureTemplates().then(() => {
+  if (session && role === 'gm') renderSidebar();
+});
+
+// Snapshots the reusable subset of a token's fields - never id/x/y/hidden/
+// ownerId, which are per-instance placement details, not part of what makes
+// a "goblin" a goblin. Prompts for a name (defaulting to the token's current
+// one) rather than a full modal - a rare, GM-only action, not worth more UI.
+async function saveTokenAsTemplate(token) {
+  if (!token) return;
+  const name = prompt('Save this creature as a template named:', token.name || '');
+  if (!name || !name.trim()) return;
+  const tokenJson = {
+    type: token.type,
+    ac: token.ac ?? null,
+    stats: { hp: token.stats?.hp ?? null, maxHp: token.stats?.maxHp ?? null },
+    visionNormalFt: token.visionNormalFt ?? 30,
+    visionDarkFt: token.visionDarkFt ?? 0,
+    speedFt: token.speedFt ?? 30,
+    imageUrl: token.imageUrl || null,
+    soundFolder: token.soundFolder || null,
+    actions: token.actions || [],
+  };
+  try {
+    const res = await fetch('/vtt/api/creature-templates', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name.trim(), tokenJson }),
+    });
+    if (!res.ok) throw new Error('save_failed');
+    await refreshCreatureTemplates();
+    renderSidebar();
+  } catch {
+    alert('Could not save template.');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Attack/spell hit-sound effects - one bundled clip per damage type under
@@ -210,11 +471,13 @@ function inferDamageType(action, result) {
 
 function playEffectSound(damageType) {
   if (!EFFECT_DAMAGE_TYPES.has(damageType)) return;
-  // A one-shot clip, not the persistent ambientAudio element - fire-and-forget
+  // A one-shot clip, not one of the persistent ambient-music elements - fire-and-forget
   // Audio() instances are fine here since nothing needs to interrupt/replace
   // them, and overlapping hits (e.g. two attacks in quick succession) should
   // just layer rather than cut each other off.
-  new Audio(`/vtt/api/effects/${damageType}`).play().catch(() => {});
+  const audio = new Audio(`/vtt/api/effects/${damageType}`);
+  audio.volume = oneShotEffectVolume();
+  audio.play().catch(() => {});
 }
 
 function getPersistentPlayerId() {
@@ -387,6 +650,14 @@ function handleMessage(msg) {
       // Table-wide hit-sound cue (everyone, not just the attacker) - see
       // playEffectSound().
       playEffectSound(msg.damageType);
+      // Random per-attack creature cue (e.g. a dragon's roar) or a manual
+      // soundboard trigger - the server already resolved which clip to play,
+      // this is just a fire-and-forget one-shot like playEffectSound.
+      if (msg.creatureSoundUrl) {
+        const audio = new Audio(msg.creatureSoundUrl);
+        audio.volume = oneShotEffectVolume();
+        audio.play().catch(() => {});
+      }
       break;
 
     case 'marker:add':
@@ -412,6 +683,7 @@ function handleMessage(msg) {
       session.encounterId = msg.encounterId;
       if (msg.active) combatLogLines = []; // a freshly-started encounter has no history yet
       renderSidebar();
+      updateAmbientMusic(); // swap to/from the map's battle track, see effectiveMusicUrl()
       break;
 
     case 'combat:log':
@@ -1729,6 +2001,86 @@ conditionsModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Soundboard modal - GM-only manual trigger, one button per
+// assets/creature-sounds/ folder. Wired once here (top-level, like every
+// other modal) since the modal itself lives outside #sidebar's re-rendered
+// innerHTML; only the button that opens it (openSoundboardBtn) is inside the
+// sidebar and gets re-wired on every renderSidebar(), same as
+// tokenBrowseLibraryBtn opening imagePickerModal.
+// ---------------------------------------------------------------------------
+
+const soundboardModal = document.getElementById('soundboardModal');
+const soundboardModalList = document.getElementById('soundboardModalList');
+
+function openSoundboardModal() {
+  soundboardModalList.innerHTML = soundboardHtml();
+  soundboardModal.classList.add('visible');
+}
+
+function closeSoundboardModal() {
+  soundboardModal.classList.remove('visible');
+}
+
+soundboardModalList.addEventListener('click', (e) => {
+  if (!e.target.classList.contains('soundboardBtn')) return;
+  send({ type: 'soundboard:play', folder: e.target.dataset.folder });
+});
+document.getElementById('soundboardModalCloseBtn').addEventListener('click', closeSoundboardModal);
+soundboardModal.addEventListener('click', (e) => {
+  if (e.target === soundboardModal) closeSoundboardModal();
+});
+
+// ---------------------------------------------------------------------------
+// Creature Library modal - GM-only saved-creature picker (see
+// saveTokenAsTemplate). Same callback shape as openImagePicker: the caller
+// (openCreatureLibraryBtn's click handler in wireGmSidebar) decides what
+// "picked a template" means - filling the Add Token form, in this case.
+// ---------------------------------------------------------------------------
+
+const creatureLibraryModal = document.getElementById('creatureLibraryModal');
+const creatureLibraryModalList = document.getElementById('creatureLibraryModalList');
+let creatureLibraryOnSelect = null;
+
+function renderCreatureLibraryModalList() {
+  creatureLibraryModalList.innerHTML = creatureLibraryModalListHtml();
+}
+
+function openCreatureLibraryModal(onSelect) {
+  creatureLibraryOnSelect = onSelect;
+  renderCreatureLibraryModalList();
+  creatureLibraryModal.classList.add('visible');
+}
+
+function closeCreatureLibraryModal() {
+  creatureLibraryModal.classList.remove('visible');
+  creatureLibraryOnSelect = null;
+}
+
+creatureLibraryModalList.addEventListener('click', async (e) => {
+  const card = e.target.closest('.token-card');
+  if (!card) return;
+  const templateId = card.dataset.templateId;
+
+  if (e.target.classList.contains('deleteTemplateBtn')) {
+    const template = creatureTemplates.find((t) => t.id === templateId);
+    if (!template || !confirm(`Delete the "${template.name}" template? This can't be undone.`)) return;
+    await fetch(`/vtt/api/creature-templates/${encodeURIComponent(templateId)}`, { method: 'DELETE' });
+    await refreshCreatureTemplates();
+    renderCreatureLibraryModalList(); // stays open, list just shrinks
+    return;
+  }
+
+  const template = creatureTemplates.find((t) => t.id === templateId);
+  const onSelect = creatureLibraryOnSelect;
+  closeCreatureLibraryModal();
+  if (template && onSelect) onSelect(template);
+});
+document.getElementById('creatureLibraryModalCloseBtn').addEventListener('click', closeCreatureLibraryModal);
+creatureLibraryModal.addEventListener('click', (e) => {
+  if (e.target === creatureLibraryModal) closeCreatureLibraryModal();
+});
+
+// ---------------------------------------------------------------------------
 // Movement quick-adjust - shared between the GM's card for any token and a
 // player's card for their own token (Section 3: same event, different sender).
 // ---------------------------------------------------------------------------
@@ -1921,21 +2273,73 @@ async function stopCombat() {
 
 // --- GM sidebar --------------------------------------------------------
 
+// Shared by the Add Token form and each token card's edit row - folder names
+// from assets/creature-sounds/ double as both the option value and label
+// (see creatureSoundLibrary.js), so there's no separate friendly-name lookup
+// the way musicLibraryIndex needs one.
+// Creature Library modal content - one clickable card per saved template
+// (click anywhere but Delete to load it into the Add Token form and close
+// the modal, see openCreatureLibraryModal). Kept as a modal rather than an
+// inline sidebar dropdown since this list only grows over time.
+function creatureLibraryModalListHtml() {
+  if (!creatureTemplates.length) {
+    return '<p style="color:#666;font-size:12px;">No saved creatures yet - build a token, then use its "Save as Template…" button.</p>';
+  }
+  return creatureTemplates
+    .map((t) => `
+      <div class="token-card clickable" data-template-id="${escapeHtml(t.id)}">
+        <div class="title"><span>${escapeHtml(t.name)}</span></div>
+        <div class="actions"><button type="button" class="danger deleteTemplateBtn">Delete</button></div>
+      </div>
+    `)
+    .join('');
+}
+
+function soundFolderOptionsHtml(selected) {
+  const options = creatureSoundFolders
+    .map((folder) => `<option value="${escapeHtml(folder)}" ${selected === folder ? 'selected' : ''}>${escapeHtml(folder)}</option>`)
+    .join('');
+  return `<option value="">- none -</option>${options}`;
+}
+
+// GM-only manual trigger, one button per assets/creature-sounds/ folder - each
+// click sends soundboard:play and the server broadcasts a random clip from
+// that folder table-wide (see fx:play/creatureSoundUrl), same mechanism as
+// the automatic per-attack cue.
+function soundboardHtml() {
+  if (!creatureSoundFolders.length) {
+    return '<p style="color:#666;font-size:12px;">No creature-sound folders bundled yet - add some under assets/creature-sounds/&lt;folder&gt;/.</p>';
+  }
+  return creatureSoundFolders
+    .map((folder) => `<button type="button" class="secondary soundboardBtn" data-folder="${escapeHtml(folder)}">${escapeHtml(folder)}</button>`)
+    .join('');
+}
+
+// Shared by the ambient-music and battle-music dropdowns - same bundled
+// library (assets/music/), just a different selected track per dropdown.
+function musicOptionsHtml(selectedUrl) {
+  return musicLibraryIndex
+    .map((t) => {
+      const url = musicLibraryUrl(t);
+      return `<option value="${escapeHtml(url)}" ${selectedUrl === url ? 'selected' : ''}>${escapeHtml(t.friendlyName)}</option>`;
+    })
+    .join('');
+}
+
 function gmSidebarHtml() {
   const map = session.map || {};
   const isCustomMusic = !!map.musicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.musicUrl);
-  const musicOptions = musicLibraryIndex
-    .map((t) => {
-      const url = musicLibraryUrl(t);
-      return `<option value="${escapeHtml(url)}" ${map.musicUrl === url ? 'selected' : ''}>${escapeHtml(t.friendlyName)}</option>`;
-    })
-    .join('');
+  const musicOptions = musicOptionsHtml(map.musicUrl || null);
+  const isCustomBattleMusic = !!map.battleMusicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.battleMusicUrl);
+  const battleMusicOptions = musicOptionsHtml(map.battleMusicUrl || null);
   const ownerOptions = Object.values(session.players)
     .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`)
     .join('');
 
   return `
     ${roomInfoHtml('GM')}
+
+    <div class="field"><button type="button" id="openSoundboardBtn" class="secondary">Soundboard…</button></div>
 
     <h2>Map</h2>
     <div class="field"><label>Upload map image</label><input type="file" id="mapFileInput" accept="image/*" /></div>
@@ -1974,9 +2378,26 @@ function gmSidebarHtml() {
       <input type="file" id="mapMusicFileInput" accept="audio/*" />
       <input type="text" id="mapMusicUrlInput" value="${escapeHtml(isCustomMusic ? map.musicUrl : '')}" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
     </div>
+    <div class="field">
+      <label>Battle music (plays instead, while combat is active)</label>
+      <select id="mapBattleMusicSelect">
+        <option value="">Same as ambient</option>
+        ${battleMusicOptions}
+        <option value="__custom__" ${isCustomBattleMusic ? 'selected' : ''}>Custom track…</option>
+      </select>
+    </div>
+    <div class="field" id="mapBattleMusicCustomField" style="${isCustomBattleMusic ? '' : 'display:none;'}">
+      <label>Upload or paste a track URL</label>
+      <input type="file" id="mapBattleMusicFileInput" accept="audio/*" />
+      <input type="text" id="mapBattleMusicUrlInput" value="${escapeHtml(isCustomBattleMusic ? map.battleMusicUrl : '')}" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
+    </div>
     <button id="setMapBtn">Set map</button>
 
     <h2>Add token</h2>
+    <div class="field row">
+      <div><button type="button" id="openCreatureLibraryBtn" class="secondary">Load from Creature Library…</button></div>
+      <div id="creatureLibraryLoadedLabel" style="align-self:center;font-size:12px;color:#888;"></div>
+    </div>
     <div class="field row">
       <div><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
       <div><label>Quantity</label><input type="number" id="tokenQuantityInput" value="1" min="1" max="50" /></div>
@@ -1992,6 +2413,9 @@ function gmSidebarHtml() {
       <div><label>Owner (for PCs)</label>
         <select id="tokenOwnerSelect"><option value="">- none -</option>${ownerOptions}</select>
       </div>
+    </div>
+    <div class="field"><label>Sound folder (attack cue)</label>
+      <select id="tokenSoundFolderSelect">${soundFolderOptionsHtml(null)}</select>
     </div>
     <div class="field row">
       <div><label>Normal vision (ft)</label><input type="number" id="tokenVisionNormalInput" value="30" /></div>
@@ -2134,6 +2558,9 @@ function gmTokenListHtml() {
               <option value="critical" ${t.condition === 'critical' ? 'selected' : ''}>Critical</option>
             </select>
           </div>
+          <div class="field"><label>Sound folder (attack cue)</label>
+            <select class="soundFolderSelect">${soundFolderOptionsHtml(t.soundFolder || null)}</select>
+          </div>
           <div class="field"><label><input type="checkbox" class="darkvisionToggle" ${(t.visionDarkFt || 0) > 0 ? 'checked' : ''} /> Darkvision</label></div>
           <div class="field row">
             <div><label>Speed (ft)</label><input type="number" class="speedInput" value="${speed}" /></div>
@@ -2149,6 +2576,7 @@ function gmTokenListHtml() {
             <button class="secondary changeImageBtn">Change Image…</button>
             <button class="secondary advancedVisionBtn">Advanced Vision…</button>
             <button class="secondary conditionsBtn">Conditions…</button>
+            <button class="secondary saveTemplateBtn">Save as Template…</button>
             <button class="secondary toggleHiddenBtn">${t.hidden ? 'Unhide' : 'Hide'}</button>
             <button class="danger removeBtn">Remove</button>
           </div>
@@ -2210,6 +2638,8 @@ function wireGmSidebar() {
   document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
   wireSessionNotesControls();
 
+  document.getElementById('openSoundboardBtn').addEventListener('click', openSoundboardModal);
+
   document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
     showMovementRanges = e.target.checked;
     render(); // a view preference only - doesn't touch session state, no renderSidebar() needed
@@ -2268,10 +2698,35 @@ function wireGmSidebar() {
     }
   });
 
+  const mapBattleMusicSelect = document.getElementById('mapBattleMusicSelect');
+  const mapBattleMusicCustomField = document.getElementById('mapBattleMusicCustomField');
+  const mapBattleMusicFileInput = document.getElementById('mapBattleMusicFileInput');
+  const mapBattleMusicUrlInput = document.getElementById('mapBattleMusicUrlInput');
+
+  mapBattleMusicSelect.addEventListener('change', () => {
+    mapBattleMusicCustomField.style.display = mapBattleMusicSelect.value === '__custom__' ? '' : 'none';
+  });
+
+  mapBattleMusicFileInput.addEventListener('change', async () => {
+    const file = mapBattleMusicFileInput.files[0];
+    if (!file) return;
+    try {
+      const formData = new FormData();
+      formData.append('audio', file);
+      const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('upload_failed');
+      const data = await res.json();
+      mapBattleMusicUrlInput.value = data.url;
+    } catch {
+      alert('Battle music upload failed.');
+    }
+  });
+
   document.getElementById('setMapBtn').addEventListener('click', () => {
     const imageUrl = mapImageUrlInput.value.trim();
     if (!imageUrl) return alert('Upload or enter a map image URL first.');
     const musicUrl = mapMusicSelect.value === '__custom__' ? mapMusicUrlInput.value.trim() || null : mapMusicSelect.value || null;
+    const battleMusicUrl = mapBattleMusicSelect.value === '__custom__' ? mapBattleMusicUrlInput.value.trim() || null : mapBattleMusicSelect.value || null;
     send({
       type: 'map:set',
       map: {
@@ -2281,6 +2736,7 @@ function wireGmSidebar() {
         gridSizePx: Number(document.getElementById('mapGridSizeInput').value) || 50,
         brightness: document.getElementById('mapBrightnessSelect').value,
         musicUrl,
+        battleMusicUrl,
       },
     });
   });
@@ -2310,6 +2766,35 @@ function wireGmSidebar() {
     });
   });
 
+  const creatureLibraryLoadedLabel = document.getElementById('creatureLibraryLoadedLabel');
+  // Attacks/actions have no field on the Add Token form (they're only
+  // editable once a token already exists, via gmAttacksHtml) - a template's
+  // actions are snapshotted here at load time instead, and carried into
+  // baseToken.actions below. A snapshot (not a re-lookup by id at
+  // addTokenBtn time) so deleting the template afterward can't silently
+  // drop the attacks that were already loaded into the form.
+  let pendingTemplateActions = [];
+
+  document.getElementById('openCreatureLibraryBtn').addEventListener('click', () => {
+    openCreatureLibraryModal((template) => {
+      const t = template.tokenJson || {};
+      pendingTemplateActions = t.actions || [];
+      creatureLibraryLoadedLabel.textContent = `Loaded: ${template.name}`;
+      document.getElementById('tokenNameInput').value = template.name;
+      document.getElementById('tokenTypeSelect').value = t.type || 'enemy';
+      document.getElementById('tokenSoundFolderSelect').value = t.soundFolder || '';
+      document.getElementById('tokenVisionNormalInput').value = t.visionNormalFt ?? 30;
+      document.getElementById('tokenVisionDarkInput').value = t.visionDarkFt ?? 0;
+      document.getElementById('tokenHpInput').value = t.stats?.hp ?? '';
+      document.getElementById('tokenMaxHpInput').value = t.stats?.maxHp ?? '';
+      document.getElementById('tokenAcInput').value = t.ac ?? '';
+      document.getElementById('tokenSpeedInput').value = t.speedFt ?? 30;
+      tokenImageUrlInput.value = t.imageUrl || '';
+      tokenThumb.src = t.imageUrl || '';
+      tokenThumb.classList.toggle('visible', !!t.imageUrl);
+    });
+  });
+
   document.getElementById('addTokenBtn').addEventListener('click', () => {
     const name = document.getElementById('tokenNameInput').value.trim();
     if (!name) return alert('Give the token a name.');
@@ -2318,6 +2803,7 @@ function wireGmSidebar() {
     const baseToken = {
       type: document.getElementById('tokenTypeSelect').value,
       ownerId: document.getElementById('tokenOwnerSelect').value || null,
+      soundFolder: document.getElementById('tokenSoundFolderSelect').value || null,
       imageUrl: tokenImageUrlInput.value.trim() || null,
       visionNormalFt: Number(document.getElementById('tokenVisionNormalInput').value) || 0,
       visionDarkFt: Number(document.getElementById('tokenVisionDarkInput').value) || 0,
@@ -2333,6 +2819,10 @@ function wireGmSidebar() {
         hp: Number(document.getElementById('tokenHpInput').value) || 0,
         maxHp: Number(document.getElementById('tokenMaxHpInput').value) || 0,
       },
+      // Not a form field (attacks are only editable once a token exists,
+      // via gmAttacksHtml) - carried over directly from the selected
+      // Creature Library template, if any.
+      actions: pendingTemplateActions,
     };
 
     // Quantity > 1 spawns a small grid of tokens centered on the map, named
@@ -2375,6 +2865,8 @@ function wireGmSidebar() {
       send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
     } else if (e.target.classList.contains('conditionSelect')) {
       send({ type: 'token:stat:update', tokenId, stat: 'condition', value: e.target.value || null });
+    } else if (e.target.classList.contains('soundFolderSelect')) {
+      send({ type: 'token:stat:update', tokenId, stat: 'soundFolder', value: e.target.value || null });
     } else if (e.target.classList.contains('darkvisionToggle')) {
       // Quick on/off for the common 60ft case; Advanced Vision… below lets
       // the GM dial in a non-standard range without losing the checkbox's
@@ -2434,6 +2926,8 @@ function wireGmSidebar() {
       openConditionsModal(tokenId);
     } else if (e.target.classList.contains('changeImageBtn')) {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
+    } else if (e.target.classList.contains('saveTemplateBtn')) {
+      saveTokenAsTemplate(token);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {
