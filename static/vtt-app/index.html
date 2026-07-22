@@ -43,9 +43,15 @@
       <div id="musicBar" class="music-bar" style="display:none;">
         <button type="button" id="musicToggleBtn" title="Play ambient music">&#9654;</button>
         <span id="musicTrackName"></span>
-        <input type="range" id="musicVolumeInput" min="0" max="100" value="40" title="Music volume" />
+        <input type="range" id="musicVolumeInput" min="0" max="100" value="5" title="Music volume" />
+        <input type="number" id="musicVolumeNumberInput" min="0" max="100" value="5" title="Music volume (%)" class="music-volume-number" />
       </div>
-      <audio id="ambientAudio" loop></audio>
+      <!-- Two elements so a track swap can crossfade (old fading out while new
+           fades in simultaneously) rather than a fade-out-then-fade-in gap -
+           see activeAmbientAudio/crossfadeAmbientMusic in main.js, which ping-
+           pongs which one is "active" on every swap. -->
+      <audio id="ambientAudioA" loop></audio>
+      <audio id="ambientAudioB" loop></audio>
       <div id="zoomControls">
         <button id="zoomOutBtn" title="Zoom out">&minus;</button>
         <button id="zoomResetBtn" title="Reset zoom">100%</button>
@@ -155,6 +161,33 @@
 
       <div class="actions">
         <button type="button" id="pickerCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GM-only manual sound trigger, folders under assets/creature-sounds/ -
+       kept as a modal rather than an inline sidebar section since the folder
+       list will keep growing. -->
+  <div id="soundboardModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Soundboard</h2>
+      <div id="soundboardModalList" class="actions scrollable-list" style="flex-wrap:wrap;"></div>
+      <div class="actions">
+        <button type="button" id="soundboardModalCloseBtn" class="secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GM-only saved-creature picker (see saveTokenAsTemplate/openCreatureLibraryModal
+       in main.js) - a modal for the same reason as soundboardModal: this list
+       only grows. Picking a card fills the Add Token form; each card also
+       has its own Delete. -->
+  <div id="creatureLibraryModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Creature Library</h2>
+      <div id="creatureLibraryModalList" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" id="creatureLibraryModalCloseBtn" class="secondary">Close</button>
       </div>
     </div>
   </div>

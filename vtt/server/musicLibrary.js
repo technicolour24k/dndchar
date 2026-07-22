@@ -44,9 +44,14 @@ export function getMusicLibraryIndex() {
 }
 
 // Resolves a client-supplied filename to an on-disk file, rejecting anything
-// that isn't a bare filename in MUSIC_ROOT (blocks path traversal).
+// that isn't a bare filename in MUSIC_ROOT (blocks path traversal). Real
+// track titles routinely contain spaces/commas/parens/brackets (see
+// toFriendlyName above), so the traversal guard has to be the resolved-path
+// prefix check below, not a restrictive character allowlist - a strict
+// regex here previously 400'd legitimate filenames like "Battle Against
+// Unseen Forces (Calm Ver).ogg".
 export function resolveMusicLibraryPath(filename) {
-  if (!/^[A-Za-z0-9._-]+$/.test(filename)) return null;
+  if (!filename || filename.includes('/') || filename.includes('\\')) return null;
   const resolved = path.resolve(MUSIC_ROOT, filename);
   const rootWithSep = MUSIC_ROOT + path.sep;
   if (!resolved.startsWith(rootWithSep)) return null;
