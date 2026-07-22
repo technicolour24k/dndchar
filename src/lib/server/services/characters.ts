@@ -215,17 +215,8 @@ export async function createCharacter(userId: string, name: string): Promise<str
   return id;
 }
 
-export async function getCharacter(userId: string, characterId: string): Promise<CharacterDetail | null> {
-  const result = await query<CharacterRow>(
-    `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE id = $1 AND owner_user_id = $2
-    `,
-    [characterId, userId]
-  );
-  const row = result.rows[0];
-  if (!row) return null;
+async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> {
+  const characterId = row.id;
   const resolvedModifiers = await resolveCharacterModifierSources(characterId);
 
   return mapCharacterRow(row, {
@@ -245,6 +236,43 @@ export async function getCharacter(userId: string, characterId: string): Promise
     spellSlots: await listSpellSlots(characterId),
     combatClock: await getCombatClock(characterId)
   });
+}
+
+export async function getCharacter(userId: string, characterId: string): Promise<CharacterDetail | null> {
+  const result = await query<CharacterRow>(
+    `
+      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
+      FROM characters
+      WHERE id = $1 AND owner_user_id = $2
+    `,
+    [characterId, userId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return loadCharacterDetail(row);
+}
+
+// Same computed character detail as getCharacter, but without the owner
+// check - for VTT combat rolls only, never the main character sheet or
+// anything that mutates state (spell-slot spend etc. stays gated behind
+// assertCharacterOwner, a separate and deliberately stricter check). A GM
+// rolling a weapon attack for a player's token - e.g. the player stepped
+// away - is a pure dice-roll read, and per this app's product philosophy
+// ("campaign members can view/interact with all campaign sheets, no
+// ownership locks") shouldn't 404 just because the roll happens under the
+// GM's own login rather than the character's owner_user_id.
+export async function getCharacterForRoll(characterId: string): Promise<CharacterDetail | null> {
+  const result = await query<CharacterRow>(
+    `
+      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
+      FROM characters
+      WHERE id = $1
+    `,
+    [characterId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return loadCharacterDetail(row);
 }
 
 export async function listItemCategories(): Promise<ItemCategory[]> {

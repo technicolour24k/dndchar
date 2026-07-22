@@ -591,7 +591,13 @@ function handleMessage(msg) {
       // the player sidebar's "other tokens in view" list - this was
       // previously missing, so that list only ever updated on unrelated
       // events (a stat change, a new token) rather than on the move itself.
-      renderSidebar();
+      // Deliberately NOT a full renderSidebar() - every other player's move
+      // broadcasts here too, and wholesale-replacing the sidebar's innerHTML
+      // on every single one of those was destroying/resetting whatever the
+      // viewer was mid-interaction with elsewhere in that same sidebar (the
+      // marker color picker being the reported case) - see
+      // updateOtherTokensInViewList.
+      updateOtherTokensInViewList();
       break;
     }
 
@@ -925,6 +931,25 @@ function canvasCoords(e) {
   return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
 }
 
+// A token's x/y is the center of its drag circle - clamping a drag/drop
+// position to the map's actual pixel bounds stops a token from ending up
+// somewhere the canvas won't render it. Before this, a fast drag past the
+// map's edge (easy to do while zoomed out, since the drag tracks the mouse
+// at window level - see the mousemove/touchmove listeners below) could
+// commit a position outside [0, widthPx]x[0, heightPx]; the token would
+// then render off-canvas and become permanently unreachable, since your
+// cursor can only ever map back to in-bounds canvas coordinates to hit-test
+// it again. Only applied to token drags, not marker/shape placement -
+// markers stay reachable via their sidebar list regardless of position.
+function clampToMapBounds(x, y) {
+  const map = session?.map;
+  if (!map) return { x, y };
+  return {
+    x: Math.max(0, Math.min(map.widthPx, x)),
+    y: Math.max(0, Math.min(map.heightPx, y)),
+  };
+}
+
 function hitTestToken(x, y) {
   if (!session || !session.map) return null;
   const radius = session.map.gridSizePx * 0.4;
@@ -1071,6 +1096,19 @@ let awaitingSpellResult = null;
 // Rolls the armed action via whichever server endpoint applies: a character's
 // equipped weapon, a GM's manual stat-block attack, or (Phase 3) a character's
 // prepared spell.
+async function rollManualAction(action) {
+  const res = await fetch('/vtt/api/roll-manual', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: action.name, toHitBonus: action.toHitBonus,
+      damageRolls: action.damageRolls, damageBonus: action.damageBonus,
+    }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+  return body;
+}
+
 async function rollPendingAction(action, source) {
   if (action.kind === 'spell') {
     const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-spell', {
@@ -1081,20 +1119,29 @@ async function rollPendingAction(action, source) {
     if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
     return body;
   }
-  const res = source?.characterId
-    ? await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ itemName: action.name }),
-      })
-    : await fetch('/vtt/api/roll-manual', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: action.name, toHitBonus: action.toHitBonus,
-          damageRolls: action.damageRolls, damageBonus: action.damageBonus,
-        }),
-      });
-  if (!res.ok) throw new Error('roll request failed (' + res.status + ')');
-  return res.json();
+
+  if (!source?.characterId) return rollManualAction(action); // enemy/npc stat-block attack
+
+  const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemName: action.name }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (res.ok) return body;
+
+  // item_not_found means this action was added directly on the token (the
+  // GM's "Add attack" form on a PC token) rather than being a real equipped
+  // item on the character's sheet - roll-attack always re-derives from the
+  // live sheet, so there's nothing there for it to match. Rather than a
+  // dead end, fall back to a flat roll-manual using the numbers already
+  // stored on the action itself (same as an enemy/npc attack) - loses the
+  // sheet's rich advantage/disadvantage-aware roll, but a homebrew extra
+  // attack was never going to have that anyway.
+  if (body.error === 'item_not_found') return rollManualAction(action);
+
+  // Any other reason (not_found, missing_item) is a real failure - surface
+  // the server's actual reason rather than just a bare status code.
+  throw new Error(body.error || ('roll request failed (' + res.status + ')'));
 }
 
 // Step 3 -> roll, then hand off to the server for anything that mutates a
@@ -1354,7 +1401,8 @@ window.addEventListener('mousemove', (e) => {
     shapeDrag.currentY = y;
     render();
   } else if (dragState) {
-    const { x, y } = canvasCoords(e);
+    const raw = canvasCoords(e);
+    const { x, y } = clampToMapBounds(raw.x, raw.y);
     dragState.x = x;
     dragState.y = y;
     render();
@@ -1413,7 +1461,8 @@ window.addEventListener('mouseup', (e) => {
     return;
   }
   if (dragState) {
-    const { x, y } = canvasCoords(e);
+    const raw = canvasCoords(e);
+    const { x, y } = clampToMapBounds(raw.x, raw.y);
     const { tokenId } = dragState;
     send({ type: 'token:move', tokenId, x, y });
     // dragState itself is cleared once the server echoes the move back (see
@@ -1493,13 +1542,14 @@ window.addEventListener('touchmove', (e) => {
   }
 
   e.preventDefault();
-  const { x, y } = canvasCoords(touch);
+  const raw = canvasCoords(touch);
   if (activeTouch.kind === 'token') {
+    const { x, y } = clampToMapBounds(raw.x, raw.y);
     dragState.x = x;
     dragState.y = y;
   } else {
-    shapeDrag.currentX = x;
-    shapeDrag.currentY = y;
+    shapeDrag.currentX = raw.x;
+    shapeDrag.currentY = raw.y;
   }
   render();
 }, { passive: false });
@@ -1510,7 +1560,8 @@ function endTouchDrag(e, commit) {
   if (!touch) return;
 
   if (commit && activeTouch.kind === 'token') {
-    const { x, y } = canvasCoords(touch);
+    const raw = canvasCoords(touch);
+    const { x, y } = clampToMapBounds(raw.x, raw.y);
     const { tokenId } = dragState;
     send({ type: 'token:move', tokenId, x, y });
     // dragState itself clears once the server echoes the move back (see
@@ -2099,6 +2150,18 @@ function resetTokenSpeedRemaining(tokenId) {
   send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: token.speedFt || 0 });
 }
 
+// Rescue for a token dragged somewhere unreachable (see clampToMapBounds's
+// comment) - a plain token:move to the map's center, same as any other
+// drag-drop, so a token stuck from before that fix shipped (or however else
+// it might end up off-canvas) can be recovered with a click instead of
+// needing a database edit.
+function recenterToken(tokenId) {
+  const token = session.tokens[tokenId];
+  const map = session?.map;
+  if (!token || !map) return;
+  send({ type: 'token:move', tokenId, x: map.widthPx / 2, y: map.heightPx / 2 });
+}
+
 // ---------------------------------------------------------------------------
 // Sidebar
 // ---------------------------------------------------------------------------
@@ -2577,6 +2640,7 @@ function gmTokenListHtml() {
             <button class="secondary advancedVisionBtn">Advanced Vision…</button>
             <button class="secondary conditionsBtn">Conditions…</button>
             <button class="secondary saveTemplateBtn">Save as Template…</button>
+            <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if a token ever gets dragged somewhere unreachable">Recenter on Map</button>
             <button class="secondary toggleHiddenBtn">${t.hidden ? 'Unhide' : 'Hide'}</button>
             <button class="danger removeBtn">Remove</button>
           </div>
@@ -2928,6 +2992,8 @@ function wireGmSidebar() {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
     } else if (e.target.classList.contains('saveTemplateBtn')) {
       saveTokenAsTemplate(token);
+    } else if (e.target.classList.contains('recenterTokenBtn')) {
+      recenterToken(tokenId);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {
@@ -2959,6 +3025,20 @@ function wireGmSidebar() {
 }
 
 // --- Player sidebar ------------------------------------------------------
+
+// Refreshes just the #otherTokenList div (see playerSidebarHtml) rather than
+// the whole sidebar - otherTokenListHtml's markup is pure display (no
+// buttons/inputs), so there's nothing to re-wire, and doing only this avoids
+// the token:move handler's full renderSidebar() nuking whatever else the
+// player had open in the sidebar (a marker color picker, mid-edit) every
+// time some other player's token moved anywhere on the map.
+function updateOtherTokensInViewList() {
+  if (role !== 'player') return; // GM's sidebar has no position-dependent list to refresh
+  const list = document.getElementById('otherTokenList');
+  if (!list) return; // sidebar not showing this yet (e.g. still on the login screen)
+  const otherTokens = currentRenderedTokens.filter((t) => t.ownerId !== playerId);
+  list.innerHTML = otherTokenListHtml(otherTokens);
+}
 
 function playerSidebarHtml() {
   const allTokens = Object.values(session.tokens);
@@ -3014,6 +3094,7 @@ function ownTokenListHtml(tokens) {
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
             <button class="secondary conditionsBtn">Conditions…</button>
+            <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if your token ever gets dragged somewhere unreachable">Recenter on Map</button>
           </div>
           ${miniSheetHtml(t)}
         </div>
@@ -3199,6 +3280,8 @@ function wirePlayerSidebar() {
       openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
     } else if (e.target.classList.contains('conditionsBtn')) {
       openConditionsModal(tokenId);
+    } else if (e.target.classList.contains('recenterTokenBtn')) {
+      recenterToken(tokenId);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {

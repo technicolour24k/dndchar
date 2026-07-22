@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { getCharacter } from '$lib/server/services/characters';
+import { getCharacterForRoll } from '$lib/server/services/characters';
 import { abilityMap, equippedAttackItems, proficiencyBonus, totalLevel } from '$lib/rules/dnd5e';
 import { rollAttack } from '$lib/rules/attackRoll';
 
@@ -10,10 +10,13 @@ import { rollAttack } from '$lib/rules/attackRoll';
 // dice-pool, Bless/extra dice, crit outcomes). So the roll runs here, against the LIVE character,
 // using the exact same rollAttack() the character sheet uses. One roll implementation, two callers.
 //
-// Ownership-scoped exactly like getCharacter() (a player can only roll for their own character),
-// same posture as the sibling GET route.
-export const POST: RequestHandler = async ({ locals, params, request }) => {
-  const character = await getCharacter(locals.user!.id, params.id!);
+// Deliberately NOT owner-scoped (getCharacterForRoll, not getCharacter) - a GM rolling a weapon
+// attack for a player's token (e.g. the player stepped away) is a pure dice-roll read with no
+// state mutation, and this app's product philosophy is campaign members can interact with all
+// campaign sheets. GM-only enforcement of *who* may trigger a given token's attack in the first
+// place already lives in the VTT socket layer (attack:resolve), not here.
+export const POST: RequestHandler = async ({ params, request }) => {
+  const character = await getCharacterForRoll(params.id!);
   if (!character) return json({ error: 'not_found' }, { status: 404 });
 
   const body = await request.json().catch(() => ({}));
