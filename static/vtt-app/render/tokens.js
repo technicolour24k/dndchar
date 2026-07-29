@@ -12,13 +12,12 @@ function colorForType(type) {
 // cue for "this one's hidden," at a glance, without opening its card.
 const HIDDEN_TOKEN_OPACITY = 0.5;
 
-// viewerId is null for the GM (always sees every token's real HP bar) or the
-// viewing player's own id (sees a real bar only for tokens they own - other
-// tokens fall back to the coarse condition badge, or nothing, same rule
-// already applied to enemy/npc stats now applied uniformly regardless of
-// type). PC stats aren't stripped server-side - allies' HP isn't secret at
-// the protocol level, per the original spec - so this is a client-side
-// display choice layered on top of that, not a security boundary.
+// viewerId is null for the GM; used below only for the AC indicator, which
+// still distinguishes true AC from the coarse "AC <= known" bound for
+// enemies. HP bars aren't gated on viewerId - PC stats aren't stripped
+// server-side (allies' HP isn't secret), so any token with stats gets a real
+// bar; enemy/npc tokens have stats stripped server-side and fall back to the
+// condition badge.
 export function drawTokens(ctx, tokens, gridSizePx, getImage, viewerId = null) {
   const radius = gridSizePx * 0.4;
 
@@ -56,8 +55,7 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage, viewerId = null) {
     ctx.strokeText(token.name || '', token.x, token.y + radius + 14);
     ctx.fillText(token.name || '', token.x, token.y + radius + 14);
 
-    const canSeeRealHp = viewerId === null || token.ownerId === viewerId;
-    if (canSeeRealHp && token.stats && typeof token.stats.hp === 'number' && typeof token.stats.maxHp === 'number') {
+    if (token.stats && typeof token.stats.hp === 'number' && typeof token.stats.maxHp === 'number') {
       drawHpBar(ctx, token, radius);
     } else if (token.condition) {
       drawConditionBadge(ctx, token, radius);

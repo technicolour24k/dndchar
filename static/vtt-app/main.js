@@ -3182,13 +3182,15 @@ function otherTokenListHtml(tokens) {
   if (!tokens.length) return '<p style="color:#666;font-size:12px;">None visible right now.</p>';
   return tokens
     .map((t) => {
-      // Never show a raw HP number for a token that isn't the viewer's own -
-      // condition (if the GM has set one) or nothing, same rule already
-      // applied to enemy/npc, now applied uniformly regardless of type. PC
-      // stats aren't stripped server-side (allies' HP isn't secret at the
-      // protocol level, per the original spec), so this is a client-side
-      // display choice on top of that, not a security boundary.
-      const detail = t.condition ? `Condition: ${escapeHtml(t.condition)}` : 'No status known';
+      // Other players' real HP is visible (allies' HP isn't secret) - only
+      // enemy/npc tokens are stripped of stats server-side, so hasStats is
+      // effectively a type check already, but we check the data directly.
+      const hasStats = t.stats && typeof t.stats.hp === 'number';
+      const detail = hasStats
+        ? `HP ${t.stats.hp}/${t.stats.maxHp}`
+        : t.condition
+          ? `Condition: ${escapeHtml(t.condition)}`
+          : 'No status known';
       return `
         <div class="token-card">
           <div class="title"><span>${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>

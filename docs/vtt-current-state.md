@@ -135,7 +135,7 @@ export function filterTokenForPlayer(token) {
 
 **How to verify**: same steps as Section 3's hidden-token check, plus: set HP on an enemy token as GM, confirm the player's WS frames never carry a `stats` key for that token, only `condition` if one's been set.
 
-**🔁 Extension beyond spec (client-side, not protocol-level)**: PC tokens' `stats` are still sent over the wire unfiltered to all players (unchanged, matches the spec's "HP isn't secret between allies" stance) - but as of a later user request, the client itself now only *displays* a token's real HP bar/number if the viewer owns that token, falling back to the coarse `condition` badge for everything else regardless of type. This closes an inconsistency (players could see exact HP for other players' PCs but not enemies) without changing what the server actually sends - see the "Raw HP no longer shown for any non-owned token" changelog entry below.
+**As designed, matching spec's original intent**: PC tokens' `stats` are sent over the wire unfiltered to all players (matches the spec's "HP isn't secret between allies" stance), and the client displays that real HP bar/number for any `pc` token regardless of owner - enemy/npc tokens fall back to the coarse `condition` badge since `stats` was never sent for them in the first place. A 2026-07-14 change briefly made the client hide non-owned PC HP too (uniform "no raw HP unless you own it" rule); that was reverted 2026-07-29 as a deliberate policy call, back to this original type-based split - see the "Raw HP no longer shown..." and "Revert: PC HP visible to all players again" changelog entries below.
 
 ---
 
@@ -866,3 +866,12 @@ See Phase 7 Section 3. A GM rolling an attack for a token they don't own was hit
 
 ### 2026-07-29 - Token art library expanded with a second bundled pack
 `assets/images/tokens/TooManyTokens_Tokens/` added (16,022 images, two commits: `b96ad761`, `b2e6b2a2`) - purely an asset addition, no code changes, since `tokenLibrary.js`'s existing folder-scan already auto-discovers any top-level folder under `assets/images/tokens/` as its own browsable "source" pack. Bundled token art across both packs is now 17,458 images.
+
+### 2026-07-29 - Revert: PC HP visible to all players again (2026-07-14's "no raw HP for non-owned tokens" undone)
+See `.claude/briefs/vtt-fix-restore-pc-hp-visibility.md`. **Deliberate policy reversal, not a bug fix**: 2026-07-14's "Raw HP no longer shown for any non-owned token" simplified to one rule (no raw HP for anything you don't own), but the wanted policy is back to the original split - players always see other players' real HP; enemy/npc HP stays hidden, unchanged. Both call sites from that entry reverted to branching on token type again:
+- `otherTokenListHtml()` in `main.js` - restored the `hasStats` branch (`t.stats && typeof t.stats.hp === 'number'`) showing real `HP x/y` when present, falling back to `condition`/"No status known" otherwise. Since the server only ever sends `stats` for `pc` tokens (enemy/npc still stripped by `filterTokenForPlayer`), this is effectively "real HP for any pc token, condition-badge-only for enemy/npc."
+- `drawTokens()` in `render/tokens.js` - dropped the `canSeeRealHp`/`viewerId === null || token.ownerId === viewerId` gate entirely; the on-canvas HP bar now renders whenever `token.stats.hp`/`maxHp` are present, same type-driven effect as above. `viewerId` is retained on the function signature/call sites since `drawAcIndicator()` still needs it.
+
+No server-side change - `filterTokenForPlayer` was never touched by either the 07-14 change or this revert; both were purely client-side display choices on top of data the server always sent for PCs.
+
+Also updates Phase 8's spec (`.claude/briefs/vtt-phase-8-combat-actions-modal-spec.md` Section 3): with PC HP visible again, reporting exact overheal for another player's token is no longer a leak - the narrower scope (suppress only for enemy/npc targets) is already reflected in that doc.
