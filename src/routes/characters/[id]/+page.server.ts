@@ -3,7 +3,7 @@ import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { getActiveEncounterForCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
 import { getRoomGameSessionId, listGameSessionsForUser, logSessionNote } from '$lib/server/services/gameSessions';
@@ -142,6 +142,11 @@ export const actions = {
   },
   advanceTurn: async ({ params, locals }) => {
     await advanceCharacterTurn(locals.user!.id, params.id);
+    emitRealtimeEvent('round:advanced', { characterId: params.id });
+    return { contentUpdated: true };
+  },
+  newBattle: async ({ params, locals }) => {
+    await newBattle(locals.user!.id, params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },

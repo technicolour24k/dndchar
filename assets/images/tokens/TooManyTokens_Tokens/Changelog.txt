@@ -1,0 +1,77 @@
+Version 1.1.1
+	- Fixed some namings
+	- Hopefully fixed the macros not appearing for Linux users
+
+Version 1.1.0
+	- Added macro for changing selected tokens to any creature, regardless of name
+	- Added option to also change actor portrait when applying wildcard
+	- Added preview link to macros
+	- Some improvements to macros
+	- Removed folder "token"
+	- Remade Images
+		- Clay Golem
+	- Fixed naming for:
+		- Cloud Giants
+		- Barbed Devil
+		
+Version 1.0.8
+	- Remade images
+		- Hobgoblin Warlord
+		- Hook Horror
+		- Chimera
+		- Hippogriff
+		- Guardian Naga
+		- Drow
+		- Drow Elite Warrior
+		- Yuan-Ti Malison Type 1 and 3
+		- Acolyte
+		
+	- Improved Macro
+
+Version 1.0.7
+	- Remade images
+		- Cambion
+		- Goblin Boss
+		- Hobgoblin
+	- Made images
+		- Hobgoblin Captain
+	- Removed system dependency from macros
+
+Version 1.0.6
+	- Remade images
+		- Goblin
+		- Added Macro for ease of Wildcard-Assigning
+		- Fixed typo for CommonerElfArcticMale-Files
+
+Version 1.0.5
+	- Made images
+		- Beholder Zombie
+	- Fixed Borders of
+		- Abominable Yeti
+		- Beholder Zombie
+		
+Version 1.0.4
+	- Remade images
+		- Bandit
+		- Bandit Captain
+
+Version 1.0.3
+	- Remade images
+		- Bulette
+		- Centaur
+		- Githyanki Warrior
+		- Githyanki Knight
+		- Cyclop
+		- Bearded Devil
+		- Flumph
+		- Aarakocra
+		- Drider
+		- Commoner
+		- Abominable Yeti
+		- Yeti
+	- Fixed Borders of
+		- Vrock
+		- Yuan-Ti Abomination
+		- Wyvern
+	- Made images
+		- Glabrezu

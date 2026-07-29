@@ -651,7 +651,16 @@ label.compact-check {
 
 .sheet-header.compact {
   display: grid;
-  grid-template-columns: minmax(210px, .75fr) minmax(360px, 1.4fr) max-content;
+  /* Name column previously used an .75fr share, which on a wide screen soaks
+     up nearly all the leftover space (the name/class line never needs more
+     than ~280px) - capped instead of left open-ended. Tabs column only needs
+     to fit 2 tabs per row now (see .sheet-tabs' 2-column grid), not 4 in a
+     row, so its minimum dropped too. The freed space becomes an explicit 1fr
+     spacer track (3rd column, no content of its own) between the tabs and
+     the combat-clock/save cluster - see .sheet-header-actions placing itself
+     in the 4th column - instead of the two sitting flush against each other.
+   */
+  grid-template-columns: minmax(210px, 280px) minmax(200px, .6fr) minmax(24px, 1fr) max-content;
   align-items: center;
 }
 
@@ -668,7 +677,7 @@ label.compact-check {
 
 .sheet-tabs {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   border-radius: 8px;
   background: var(--panel);
@@ -1572,7 +1581,9 @@ button.death-save-icon.failure.active {
 }
 
 .sheet-header-actions {
+  grid-column: 4;
   justify-content: end;
+  gap: 24px;
 }
 
 .save-cluster {
@@ -1580,22 +1591,51 @@ button.death-save-icon.failure.active {
   gap: 4px;
 }
 
-.save-command-row,
-.save-status-row {
+/* New Battle spans both columns on its own row; Next Turn/Next Round and
+   Short Rest/Long Rest each fill one row of two - every button in here goes
+   through .compact-button, so they're all the same height (see button,
+   button.compact-button in this file) and stretch to fill their grid cell
+   rather than sizing to their own text. */
+.combat-clock {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.combat-clock-status {
+  grid-column: 1 / -1;
+  text-align: center;
+}
+
+.combat-clock-full {
+  grid-column: 1 / -1;
+}
+
+.combat-clock button {
+  width: 100%;
+}
+
+.save-command-row {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+/* Save button + its Ready/Autosaving/Saved status stacked and centered as a
+   pair, so the status text reads as belonging to Save specifically rather
+   than sitting flush against the history links next to it. */
+.save-button-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
 }
 
 .history-links {
   display: flex;
   flex-direction: column;
   gap: 2px;
-}
-
-.save-status-row {
-  min-height: 18px;
-  font-size: 12px;
 }
 
 .version-row {

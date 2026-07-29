@@ -499,6 +499,30 @@ export async function advanceCharacterTurn(userId: string, characterId: string):
   });
 }
 
+// Resets the combat clock to Round 1 / Turn 1 and recharges anything scoped
+// to 'encounter' (the one recharge_period nothing else ever recharges -
+// short_rest/long_rest go through restCharacter, 'round' goes through
+// advanceCharacterRound) - for starting a fresh fight rather than just
+// continuing to advance turns from whatever the previous encounter left off
+// at. Deliberately doesn't touch active_character_effects - there's no
+// "encounter_end" expiry boundary (only turn_start/turn_end/round_end/manual),
+// so a buff with a real-time duration shouldn't be silently wiped just
+// because a new battle starts.
+export async function newBattle(userId: string, characterId: string): Promise<void> {
+  await withTransaction(async (client) => {
+    await assertCharacterOwner(client, userId, characterId);
+    await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 1, 1)
+      ON CONFLICT (character_id) DO UPDATE SET round_number = 1, turn_number = 1, updated_at = now()`, [characterId]);
+    await client.query(`UPDATE character_content_resources r SET current_value = max_value
+      FROM content_resource_definitions d, character_content_instances i WHERE r.resource_definition_id = d.id
+      AND r.character_content_id = i.id AND i.character_id = $1 AND d.recharge_period = 'encounter'`, [characterId]);
+    await client.query(`UPDATE character_inventory_resources resource SET current_value=resource.max_value
+      FROM content_resource_definitions definition, character_inventory_items inventory
+      WHERE resource.resource_definition_id=definition.id AND resource.inventory_item_id=inventory.id
+        AND inventory.character_id=$1 AND definition.recharge_period='encounter'`, [characterId]);
+  });
+}
+
 async function assertCharacterOwner(client: pg.PoolClient, userId: string, characterId: string): Promise<void> {
   const owned = await client.query('SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2', [characterId, userId]);
   if (!owned.rowCount) throw new Error('Character not found.');
