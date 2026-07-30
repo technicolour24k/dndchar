@@ -80,11 +80,11 @@ return token.hidden
 
 ---
 
-## 4. Vision & Blackout Rendering - ✅ As designed, 🔁 extended
+## 4. Vision & Blackout Rendering - ✅ As designed, 🔁 extended, 🔁 **rearchitected 2026-07-30**
 
-Implemented client-side in `static/vtt-app/render/vision.js`, computed per-player (unioned across owned tokens), never on the server - matches spec's core architectural call.
+Still computed client-side per-player (unioned across owned tokens), never on the server - matches spec's core architectural call. But the *rendering* of the mask moved off the canvas entirely (per `.claude/briefs/vtt-map-rendering-rearchitecture-spec.md`, to support video/animated map backgrounds): the map is now layered DOM elements (`<img>`/`<video>`) behind a transparent canvas, composited by the browser - black backdrop, grayscale-filtered map layer clipped to the union of gray-band circles (SVG `<clipPath>`, one `<circle>` per owned token), full-color map layer clipped to the color-band union on top. See `static/vtt-app/render/mapLayers.js` and the 2026-07-30 changelog entry.
 
-`computeVisionRadii(ownedTokens, map)` derives `colorRadius`/`grayRadius` per token; `renderVisionMaskedMap` draws all gray-band circles first (grayscale-filtered map, clipped), then all color-band circles on top (full-color map, clipped) - as two full passes across *all* tokens rather than one pass per token, so multi-token union is correct regardless of draw order (spec milestone 9).
+`computeVisionRadii(ownedTokens, map)` (unchanged, still in `vision.js`) derives `colorRadius`/`grayRadius` per token; those radii now feed SVG clip-circle geometry instead of canvas draw passes. Multi-circle union correctness comes from the SVG spec (multiple shapes in one `<clipPath>` union automatically) rather than draw-pass ordering (spec milestone 9 still holds).
 
 `map.brightness` handling matches the three spec-defined modes, **corrected post-launch** (see changelog) to follow 5e RAW's darkvision text more faithfully - darkvision sees dim light as if it were bright light (full color), and true darkness as if it were dim light but explicitly without color (grayscale only):
 
@@ -179,9 +179,10 @@ static/vtt-app/                          the actual client - served as static fi
   index.html, style.css
   main.js                                  WS connection, join flow, sidebar UI, canvas drag, zoom/pan, image/token pickers, character picker, mini-sheet, action targeting, shape-drag placement (Phase 2)
   render/
-    map.js                                 base map + grid
+    map.js                                 grid overlay only (GM view) - map image/video itself moved to mapLayers.js, 2026-07-30
+    mapLayers.js                           DOM/SVG layered map rendering (img/video + clip-path vision mask) - NEW, 2026-07-30
     tokens.js                              token sprites, HP bars, condition badges
-    vision.js                              per-player radius vision mask
+    vision.js                              per-player vision *math* (radii/point-reveal) - mask rendering moved to mapLayers.js, 2026-07-30
     movement.js                            remaining-movement radius overlay  - NOT in spec
     markers.js                             AoE/point marker rendering, cone/cube/sphere dispatch (Phase 2 Section 4)
     targeting.js                           target-ring overlay  - NEW, Phase 2 Section 3a
@@ -875,3 +876,29 @@ See `.claude/briefs/vtt-fix-restore-pc-hp-visibility.md`. **Deliberate policy re
 No server-side change - `filterTokenForPlayer` was never touched by either the 07-14 change or this revert; both were purely client-side display choices on top of data the server always sent for PCs.
 
 Also updates Phase 8's spec (`.claude/briefs/vtt-phase-8-combat-actions-modal-spec.md` Section 3): with PC HP visible again, reporting exact overheal for another player's token is no longer a leak - the narrower scope (suppress only for enemy/npc targets) is already reflected in that doc.
+
+### 2026-07-30 - Map rendering rearchitected to layered DOM/SVG; video/animated map backgrounds
+
+Implements [`.claude/briefs/vtt-map-rendering-rearchitecture-spec.md`](../.claude/briefs/vtt-map-rendering-rearchitecture-spec.md) in full. The map is no longer drawn into the canvas at all - it's a stack of DOM layers behind a now-transparent canvas, which keeps everything interactive (tokens, markers, drag ghosts, rings, all pointer handling) exactly as before.
+
+**Spec Section 0 audit findings** (all six confirmed against code before any rendering change):
+1. Canvas drawers besides the map: movement ranges, markers, tokens, target rings, armed-target highlights, shape-drag preview, token-drag ghost + distance line, and the no-map placeholder text - all still canvas-drawn, unchanged.
+2. GM manual fog painting: does not exist anywhere (`fog:reveal`/`fog:hide` were never built - confirmed again), so no fog layer decision was needed.
+3. Pan/zoom: zoom was applied to the canvas element directly (`canvas.style.width/height`), pan is `#mapWrap` scroll - *not* a shared transformed wrapper. Resolved by adding `#mapStage` (position: relative, sized by the in-flow canvas) so absolutely-positioned layers track the canvas, with `#mapLayers` carrying zoom as `transform: scale()` at the map's native size. Critically, `setZoom()` already calls `render()`, so one `updateMapLayers()` call per render keeps canvas and layers in lockstep with no separate zoom hook.
+4. Canvas is the sole pointer surface (all mouse/touch handlers bind to it) - every new layer is `pointer-events: none`, canvas lifted above them via `position: relative; z-index: 1`.
+5. Map-switch lifecycle: `getImage()`'s never-evicting Image cache stays for *token* art only; the map now goes through `ensureMedia()` in `mapLayers.js` - swap-on-URL-change only (an unchanged map never restarts a playing video), and outgoing videos are explicitly paused + src-cleared + removed, since a detached or display:none video keeps decoding (the slow-leak the spec called out).
+6. SVG clip-path support on the actual tablets: cannot be confirmed from code - explicitly part of the owed live verification below.
+
+**What was built**:
+- `render/mapLayers.js` (NEW): black backdrop / grayscale layer (CSS `filter`, clipped to `#vttGrayClip`) / color layer (clipped to `#vttColorClip`) / render-nothing SVG defs, all behind the canvas inside the new `#mapStage`. Clip circles are one SVG `<circle>` per owned token per band, reusing existing circle elements on update (a token move is attribute writes, not element churn). Union-of-circles comes free from the SVG spec. All brightness/darkvision/truesight logic stays in `getTokenVisionRadii()` untouched - by the time radii reach the layer manager, "bright" mode is just `grayRadius === colorRadius`, so the gray layer drops out (and is torn down, not hidden, to avoid double video decode). GM: single unclipped color layer, no gray layer, no clip geometry; `#222` backdrop preserves the old no-image fallback fill.
+- Video maps: inferred from URL extension (`.mp4`/`.webm`/`.m4v`/`.ogv` - `isVideoUrl()`), no new map field; `map.imageUrl` stays a plain string. Videos are always `muted` (deliberate policy: any embedded audio is inert by design - sidesteps both the un-gestured-autoplay block and the fact that the ambient-music system has zero awareness of other audio sources), `loop`, `playsInline`. Image and video maps share one code path differing only in created element.
+- `render/map.js` reduced to `drawGrid()` (GM-only grid overlay, still canvas); `renderVisionMaskedMap()` deleted from `vision.js` (the vision *math* - `computeVisionRadii`/`isPointRevealed` - is unchanged and still drives token visibility filtering, the sidebar list, and now the clip geometry).
+- Upload endpoint: new `video` form field, `.mp4/.webm/.m4v/.ogv` allowlist, 50MB cap; a video with an unrecognized extension is rejected outright (400) rather than saved extensionless, since extension drives both `isVideoUrl()` and the GET route's content-type. GM map form accepts image or video, pulls dimensions from `videoWidth/videoHeight` via a throwaway muted element, and skips the `<img>` thumb for videos.
+- Serving route: rewritten from whole-file `fs.readFile` buffering to streaming (`createReadStream` → web stream) with single-range HTTP Range/206 support (`bytes=a-b`, `bytes=a-`, `bytes=-n`; malformed/multi-range deliberately falls through to a full 200 per RFC 9110; out-of-bounds → 416) plus `accept-ranges` - `<video>` seeking/progressive playback needs this. Images unchanged in behavior, now streamed too.
+- `server.js`: `BODY_SIZE_LIMIT` default 20M → 60M, clearing the new 50MB video cap **and** fixing the pre-existing mismatch where audio's advertised 25MB cap silently failed between 20-25MB (flagged in the pre-work investigation).
+
+**Perf rationale** (why this, not "extend the canvas draw"): the old player render drew the full map image once per vision circle per pass (N tokens → up to 2N full-map `drawImage`s with a grayscale filter) at native map resolution - tolerable event-driven, unaffordable per-frame once maps animate. Now the browser compositor does all per-frame work (a video map animates with zero JS render loop; the event-driven `render()` cadence is unchanged), and layer count is constant regardless of token count.
+
+**Verification: automated only - live click-through owed, especially on the tablets.** `node --check` on all touched vanilla JS, `svelte-check` 485 files / 0 errors, and a live dev-server HTTP pass against the real routes (throwaway account + uploads, cleaned up after): video upload 200 → full GET 200 with `accept-ranges` and byte-exact body → `bytes=100-299` 206 with correct `content-range`/body → open-ended and suffix ranges 206 → out-of-bounds 416 → bad-extension video 400 → image upload/serve regression-checked. **Not yet exercised**: any actual browser rendering of the new layers (vision bands, union, pan/zoom lockstep, video playback/loop/switch-away cleanup, late-join autoplay, GM view, and all of it on the XPPen + other tablet per the spec's Section 6/verification list - SVG clip-path on those devices is explicitly unconfirmed). Per this doc's own established discipline, treat the rendering half as unverified until that click-through happens; the upload/serving half has real HTTP-level verification behind it.
+
+**Known deliberate tradeoffs**: two `<video>` elements decode the same file when a gray band exists (player with darkvision) - independent decodes, not frame-locked; ambient loops don't need tight sync (same stance as the spec's reconnect ruling), but battery cost on tablets is real and part of what live verification should watch. A gray band reappearing after being absent restarts its video from 0 mid-loop for the same reason. Extensionless external video URLs won't be detected as video (`isVideoUrl` is extension-based); in-app uploads always keep their extension.

@@ -37,7 +37,28 @@
   <div id="app">
     <div id="sidebar"></div>
     <div id="mapWrap">
-      <canvas id="canvas" width="800" height="600"></canvas>
+      <!-- Layered map rendering (see render/mapLayers.js): the map itself is
+           DOM layers (img/video + SVG clip-path vision mask) sitting BEHIND
+           the transparent canvas, which keeps all tokens/markers/interaction.
+           #mapStage exists so the absolutely-positioned layers track the
+           in-flow canvas's position/size; everything under #mapLayers is
+           pointer-events: none - the canvas stays the only hit-test surface. -->
+      <div id="mapStage">
+        <div id="mapLayers" aria-hidden="true" style="display:none;">
+          <div id="mapBackdrop"></div>
+          <div id="mapLayerGray" class="map-media-layer"></div>
+          <div id="mapLayerColor" class="map-media-layer"></div>
+          <!-- Renders nothing - only supplies the vision-circle clip geometry.
+               Circle children are managed by mapLayers.js. -->
+          <svg id="visionClipSvg" width="0" height="0">
+            <defs>
+              <clipPath id="vttGrayClip"></clipPath>
+              <clipPath id="vttColorClip"></clipPath>
+            </defs>
+          </svg>
+        </div>
+        <canvas id="canvas" width="800" height="600"></canvas>
+      </div>
       <!-- Persistent regardless of map/sidebar re-renders (renderSidebar() replaces
            #sidebar's innerHTML wholesale, which would otherwise restart playback). -->
       <div id="musicBar" class="music-bar" style="display:none;">

@@ -1,6 +1,7 @@
-import { drawMap } from './render/map.js';
+import { drawGrid } from './render/map.js';
 import { drawTokens } from './render/tokens.js';
-import { computeVisionRadii, isPointRevealed, renderVisionMaskedMap } from './render/vision.js';
+import { computeVisionRadii, isPointRevealed } from './render/vision.js';
+import { updateMapLayers, hideMapLayers, isVideoUrl } from './render/mapLayers.js';
 import { drawMovementRange } from './render/movement.js';
 import { drawMarkers } from './render/markers.js';
 import { drawTargetRings } from './render/targeting.js';
@@ -824,6 +825,7 @@ document.getElementById('joinRoomBtn').addEventListener('click', () => {
 
 function render() {
   if (!session || !session.map) {
+    hideMapLayers();
     canvas.style.width = '';
     canvas.style.height = '';
     canvas.width = 800;
@@ -847,8 +849,12 @@ function render() {
   canvas.height = map.heightPx;
   canvas.style.width = `${map.widthPx * zoomLevel}px`;
   canvas.style.height = `${map.heightPx * zoomLevel}px`;
-  const mapImage = getImage(map.imageUrl);
   const allTokens = Object.values(session.tokens);
+
+  // The map itself (and the player's vision mask) is DOM layers behind this
+  // canvas now - see render/mapLayers.js. The canvas is transparent where the
+  // map used to be drawn (assigning canvas.width above already cleared it)
+  // and keeps everything interactive: tokens, markers, drag ghosts, rings.
 
   // session.markers is already server-filtered to whatever this client is
   // allowed to see (own markers + anything the GM has toggled visible-to-all)
@@ -856,7 +862,8 @@ function render() {
   const visibleMarkers = Object.values(session.markers || {});
 
   if (role === 'gm') {
-    drawMap(ctx, mapImage, map);
+    updateMapLayers({ map, role, radii: null, zoomLevel });
+    drawGrid(ctx, map);
     if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage, null);
@@ -865,7 +872,7 @@ function render() {
   } else {
     const ownedTokens = allTokens.filter((t) => t.ownerId === playerId);
     const radii = computeVisionRadii(ownedTokens, map);
-    renderVisionMaskedMap(ctx, mapImage, radii, map);
+    updateMapLayers({ map, role, radii, zoomLevel });
     const visibleTokens = allTokens.filter((t) => isPointRevealed(t.x, t.y, radii));
     // Only the player's own tokens' remaining-movement circle is shown - how
     // far an enemy or another player's token can still move is tactical
@@ -1634,16 +1641,21 @@ mapWrap.addEventListener(
 );
 
 // ---------------------------------------------------------------------------
-// Image upload (map + token art) - POST /upload, returns a URL to use
+// Media upload (map image/video + token art + music) - POST /upload with the
+// form field naming the media kind (the server applies per-kind size caps).
 // ---------------------------------------------------------------------------
 
-async function uploadImage(file) {
+async function uploadMedia(file, field) {
   const formData = new FormData();
-  formData.append('image', file);
+  formData.append(field, file);
   const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
   if (!res.ok) throw new Error('upload_failed');
   const data = await res.json();
   return data.url;
+}
+
+async function uploadImage(file) {
+  return uploadMedia(file, 'image');
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,9 +2417,9 @@ function gmSidebarHtml() {
     <div class="field"><button type="button" id="openSoundboardBtn" class="secondary">Soundboard…</button></div>
 
     <h2>Map</h2>
-    <div class="field"><label>Upload map image</label><input type="file" id="mapFileInput" accept="image/*" /></div>
-    <img id="mapThumb" class="thumb ${map.imageUrl ? 'visible' : ''}" src="${map.imageUrl || ''}" />
-    <div class="field"><label>Image URL</label><input type="text" id="mapImageUrlInput" value="${escapeHtml(map.imageUrl || '')}" placeholder="/uploads/... or paste a URL" /></div>
+    <div class="field"><label>Upload map (image or video)</label><input type="file" id="mapFileInput" accept="image/*,video/mp4,video/webm,.mp4,.webm,.m4v,.ogv" /></div>
+    <img id="mapThumb" class="thumb ${map.imageUrl && !isVideoUrl(map.imageUrl) ? 'visible' : ''}" src="${map.imageUrl && !isVideoUrl(map.imageUrl) ? map.imageUrl : ''}" />
+    <div class="field"><label>Image/video URL</label><input type="text" id="mapImageUrlInput" value="${escapeHtml(map.imageUrl || '')}" placeholder="/uploads/... or paste a URL" /></div>
     <div class="field row">
       <div><label>Width (px)</label><input type="number" id="mapWidthInput" value="${map.widthPx || 1600}" /></div>
       <div><label>Height (px)</label><input type="number" id="mapHeightInput" value="${map.heightPx || 1200}" /></div>
@@ -2718,19 +2730,36 @@ function wireGmSidebar() {
   mapFileInput.addEventListener('change', async () => {
     const file = mapFileInput.files[0];
     if (!file) return;
+    const isVideo = file.type.startsWith('video/');
     try {
-      const url = await uploadImage(file);
+      const url = await uploadMedia(file, isVideo ? 'video' : 'image');
       mapImageUrlInput.value = url;
-      const img = new Image();
-      img.onload = () => {
-        mapWidthInput.value = img.naturalWidth;
-        mapHeightInput.value = img.naturalHeight;
-        mapThumb.src = url;
-        mapThumb.classList.add('visible');
-      };
-      img.src = url;
+      if (isVideo) {
+        // The <img> thumb can't preview a video - just clear it and pull the
+        // natural dimensions from a throwaway (muted, never-played) element.
+        mapThumb.removeAttribute('src');
+        mapThumb.classList.remove('visible');
+        const probe = document.createElement('video');
+        probe.muted = true;
+        probe.onloadedmetadata = () => {
+          mapWidthInput.value = probe.videoWidth;
+          mapHeightInput.value = probe.videoHeight;
+          probe.removeAttribute('src');
+          probe.load();
+        };
+        probe.src = url;
+      } else {
+        const img = new Image();
+        img.onload = () => {
+          mapWidthInput.value = img.naturalWidth;
+          mapHeightInput.value = img.naturalHeight;
+          mapThumb.src = url;
+          mapThumb.classList.add('visible');
+        };
+        img.src = url;
+      }
     } catch {
-      alert('Map image upload failed.');
+      alert('Map upload failed.');
     }
   });
 

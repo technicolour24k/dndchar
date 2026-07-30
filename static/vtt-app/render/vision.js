@@ -78,45 +78,10 @@ export function isPointRevealed(x, y, radii) {
   });
 }
 
-// Renders the vision-masked map for a player: black canvas, with each owned
-// token's gray-band circle drawn first (grayscale map clipped to that
-// circle), then each token's color-band circle drawn on top (full-color map
-// clipped to the smaller circle). Doing this in two full passes across all
-// tokens - rather than per-token - is what makes multi-token union correct:
-// a pixel ends up in color if ANY token's color radius covers it, regardless
-// of draw order or overlap with another token's gray radius.
-export function renderVisionMaskedMap(ctx, mapImage, radii, map) {
-  const { widthPx, heightPx } = map;
-
-  ctx.save();
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, widthPx, heightPx);
-
-  if (!mapImage || !mapImage.complete || !mapImage.naturalWidth) {
-    ctx.restore();
-    return;
-  }
-
-  for (const { token, grayRadius } of radii) {
-    if (grayRadius <= 0) continue;
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(token.x, token.y, grayRadius, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.filter = 'grayscale(1)';
-    ctx.drawImage(mapImage, 0, 0, widthPx, heightPx);
-    ctx.restore();
-  }
-
-  for (const { token, colorRadius } of radii) {
-    if (colorRadius <= 0) continue;
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(token.x, token.y, colorRadius, 0, Math.PI * 2);
-    ctx.clip();
-    ctx.drawImage(mapImage, 0, 0, widthPx, heightPx);
-    ctx.restore();
-  }
-
-  ctx.restore();
-}
+// The vision mask itself is no longer rendered here. The old
+// renderVisionMaskedMap() drew the full map image once per vision circle
+// (grayscale pass + color pass) into the canvas - replaced by DOM layers
+// with SVG clip-paths (see render/mapLayers.js), which consume the radii
+// computed above unchanged. This module keeps the vision *math*: radii and
+// point-reveal tests are still used for token visibility filtering, the
+// sidebar's "other tokens in view" list, and the clip-circle geometry.

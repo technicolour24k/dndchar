@@ -68,8 +68,37 @@ body {
 .marker-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
 
 #mapWrap { overflow: auto; position: relative; background: #0c0d10; }
-#canvas { display: block; cursor: grab; }
+/* The in-flow canvas defines #mapStage's size (and the scroll extents);
+   position/z-index lift it above the absolutely-positioned map layers so it
+   stays the sole pointer-event/hit-test surface. */
+#mapStage { position: relative; }
+#canvas { display: block; cursor: grab; position: relative; z-index: 1; }
 #canvas.dragging { cursor: grabbing; }
+
+/* Layered map rendering (render/mapLayers.js). #mapLayers is laid out at the
+   map's NATIVE pixel size and carries the zoom as transform: scale() -
+   clip-path applies pre-transform, so vision-circle coordinates stay in plain
+   map pixels. The canvas above it carries its zoom via style.width/height
+   (unchanged from before); both derive from the same zoomLevel every render,
+   so they can't drift. */
+#mapLayers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+}
+#mapBackdrop { position: absolute; inset: 0; background: #000; }
+.map-media-layer { position: absolute; inset: 0; }
+/* Stretch to the map's declared dimensions, exactly as ctx.drawImage(img, 0,
+   0, widthPx, heightPx) did - the GM's width/height inputs win over the
+   file's natural size. */
+.map-media-layer img,
+.map-media-layer video { display: block; width: 100%; height: 100%; object-fit: fill; }
+#mapLayerGray { filter: grayscale(1); clip-path: url(#vttGrayClip); }
+#mapLayerColor { clip-path: url(#vttColorClip); }
 
 #zoomControls {
   position: fixed;
