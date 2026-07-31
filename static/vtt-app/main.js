@@ -885,7 +885,7 @@ function render() {
   }
 
   if (pendingActionTarget) {
-    drawArmedTargetHighlights(ctx, currentRenderedTokens, map.gridSizePx, pendingActionTarget.sourceTokenId);
+    drawArmedTargetHighlights(ctx, currentRenderedTokens, map.gridSizePx, pendingActionTarget.sourceTokenId, pendingActionTarget.intent);
   }
 
   if (shapeDrag) {
@@ -1003,20 +1003,27 @@ document.getElementById('markerPlacementCancelBtn').addEventListener('click', di
 
 const actionTargetBanner = document.getElementById('actionTargetBanner');
 const actionTargetBannerText = document.getElementById('actionTargetBannerText');
-let pendingActionTarget = null; // { sourceTokenId, action } while an action is armed for targeting
+let pendingActionTarget = null; // { sourceTokenId, action, intent } while an action is armed for targeting
 
 // Step 1: arm targeting. Valid targets get a highlight ring (drawn in render()),
 // the banner names the action, and the cursor changes - no more silent "click and hope."
-// `action` is either a flattened weapon action ({name, toHitBonus, damageRolls, damageBonus})
-// or a spell descriptor ({kind:'spell', instanceId, name, slotLevel}) - action.kind defaults
-// to 'weapon' wherever it's read, so every pre-existing call site (weapon rows, GM manual
-// attacks) needs no change.
-function armActionTargeting(sourceTokenId, action) {
+// `action` is a flattened weapon action ({name, toHitBonus, damageRolls, damageBonus}), a
+// spell descriptor ({kind:'spell', instanceId, name, slotLevel}), or (Phase 8) an item
+// descriptor ({kind:'item', inventoryId, name}) - action.kind defaults to 'weapon' wherever
+// it's read, so every pre-existing call site (weapon rows, GM manual attacks) needs no change.
+// `intent` ('attack' | 'heal', Phase 8) is which Combat Actions tab the action was picked
+// from - it's the [Attack]/[Heal] choice, not a property of the action itself (the same
+// weapon/spell/item can go down either tab).
+function armActionTargeting(sourceTokenId, action, intent = 'attack') {
   disarmMarkerPlacement();
-  pendingActionTarget = { sourceTokenId, action };
-  actionTargetBannerText.textContent = action.kind === 'spell'
-    ? `Casting ${action.name} — select a target`
-    : `Attacking with ${action.name} — select a target`;
+  combatActionsModal.classList.remove('visible');
+  spellPickerModal.classList.remove('visible');
+  pendingActionTarget = { sourceTokenId, action, intent };
+  actionTargetBannerText.textContent = intent === 'heal'
+    ? `Healing with ${action.name} — select a target`
+    : action.kind === 'spell'
+      ? `Casting ${action.name} — select a target`
+      : `Attacking with ${action.name} — select a target`;
   actionTargetBanner.classList.add('visible');
   canvas.style.cursor = 'crosshair';
   render(); // draw the valid-target highlight rings
@@ -1046,7 +1053,7 @@ document.getElementById('actionTargetCancelBtn').addEventListener('click', disar
 // ---------------------------------------------------------------------------
 const attackModal = document.getElementById('attackModal');
 const attackModalBody = document.getElementById('attackModalBody');
-let pendingAttack = null; // { sourceTokenId, action, targetId, targetName }
+let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName }
 
 function closeAttackModal() {
   attackModal.classList.remove('visible');
@@ -1069,19 +1076,21 @@ function closeAttackModal() {
 
 // Step 2 -> 3: a target was clicked; show the confirm card with an explicit Attack/Cast button.
 // The chosen target gets ringed for everyone (target:select) as immediate visible feedback.
-function openAttackConfirm(sourceTokenId, action, target) {
+function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   const isSpell = action.kind === 'spell';
-  pendingAttack = { sourceTokenId, action, targetId: target.id, targetName: target.name };
+  const isHeal = intent === 'heal';
+  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name };
   send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
   currentTargetTokenIds = [target.id];
   render();
 
+  const verb = isHeal ? 'Heal' : isSpell ? 'Cast' : 'Attack';
   attackModalBody.innerHTML = `
-    <h2>${isSpell ? 'Cast Spell' : 'Attack'}</h2>
-    <div class="attack-target-name">${isSpell ? 'Casting' : 'Attacking'} <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
+    <h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2>
+    <div class="attack-target-name">${isHeal ? 'Healing' : isSpell ? 'Casting' : 'Attacking'} <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
     <div class="actions">
       <button type="button" class="secondary" id="attackCancelBtn">Cancel</button>
-      <button type="button" id="attackConfirmBtn">${isSpell ? 'Cast' : 'Attack'}</button>
+      <button type="button" id="attackConfirmBtn">${verb}</button>
     </div>
   `;
   attackModal.classList.add('visible');
@@ -1127,6 +1136,16 @@ async function rollPendingAction(action, source) {
     return body;
   }
 
+  if (action.kind === 'item') {
+    const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-item', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inventoryId: action.inventoryId }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+    return body;
+  }
+
   if (!source?.characterId) return rollManualAction(action); // enemy/npc stat-block attack
 
   const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
@@ -1151,27 +1170,57 @@ async function rollPendingAction(action, source) {
   throw new Error(body.error || ('roll request failed (' + res.status + ')'));
 }
 
+// Mirrors a real cast's slot spend (already applied server-side inside
+// roll-spell/castCharacterSpell) onto the token's own displayed slot count, via
+// the same token:stat:update broadcast the manual Use button already sends -
+// deliberately not mutated locally first, so every client (including this one)
+// picks up the new count the same way, off the server echo.
+function deductLocalSpellSlot(tokenId, level) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  const slots = token.spellSlots || [];
+  // The roll-spell request doesn't specify slot type, so the server's own
+  // preference (spendAvailableSlot in catalogue.ts: standard before pact at the
+  // same level) is mirrored here to pick the same slot the DB actually spent.
+  const candidates = slots.filter((s) => s.level === level && s.current > 0);
+  const match = candidates.find((s) => s.type !== 'pact') || candidates[0];
+  if (!match) return;
+  const value = slots.map((s) => (s === match ? { ...s, current: Math.max(0, s.current - 1) } : s));
+  send({ type: 'token:stat:update', tokenId, stat: 'spellSlots', value });
+}
+
 // Step 3 -> roll, then hand off to the server for anything that mutates a
 // target's HP (attack:resolve for weapons and attack-resolution spells alike -
 // a spell attack roll vs. AC is mechanically identical once you have a to-hit
 // total; spell:resolve for save/auto spells, see renderSpellResolutionControls).
 async function resolveAttack() {
   if (!pendingAttack) return;
-  const { sourceTokenId, action, targetId, targetName } = pendingAttack;
+  const { sourceTokenId, action, intent, targetId, targetName } = pendingAttack;
   const source = session.tokens[sourceTokenId];
   const isSpell = action.kind === 'spell';
+  const isHeal = intent === 'heal';
 
-  attackModalBody.innerHTML = `<h2>${isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
+  attackModalBody.innerHTML = `<h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isHeal ? 'Healing with' : isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
   let result;
   try {
     result = await rollPendingAction(action, source);
   } catch (err) {
     console.error('[VTT] roll failed', err);
-    attackModalError(`Couldn't ${isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
+    attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
     return;
   }
 
-  const usesAttackRoll = !isSpell || result.resolution === 'attack';
+  // roll-spell already spent the slot server-side (castCharacterSpell, regardless
+  // of what happens next - a miss still costs the slot in 5e) - the VTT token's
+  // own displayed slot count is a separate, client-tracked snapshot that only the
+  // manual Use/Reset buttons used to touch, so a real cast never showed up there
+  // until now. Sync it here, once the slot spend is confirmed to have happened.
+  if (isSpell && action.slotLevel) deductLocalSpellSlot(sourceTokenId, action.slotLevel);
+
+  // Heal always lands (no to-hit/save layer, per the brief's Section 3) and items have
+  // no attack-roll concept in this simple model - both skip straight to the no-hidden-
+  // value branch below, same as a save/auto spell already did.
+  const usesAttackRoll = !isHeal && action.kind !== 'item' && (!isSpell || result.resolution === 'attack');
   renderAttackBreakdown(targetName, result, usesAttackRoll
     ? '<span class="attack-subtext">Resolving hit/miss…</span>'
     : '<span class="attack-subtext">Loading…</span>');
@@ -1201,11 +1250,11 @@ async function resolveAttack() {
     return;
   }
 
-  // Save/auto spell: no hidden value to compare against (the caster's own Spell
-  // Save DC isn't secret), so the pass/fail check happens here, not on the
-  // server - see renderSpellResolutionControls()/vtt/server/handlers/token.js's
-  // spell:resolve case for why that's a safe simplification.
-  renderSpellResolutionControls(result, sourceTokenId, targetId);
+  // Heal (any action kind), item (any intent), or save/auto spell under Attack intent:
+  // no hidden value to compare against, so the pass/fail (or "heal always lands") check
+  // happens here, not on the server - see renderSpellResolutionControls()/
+  // vtt/server/handlers/token.js's spell:resolve case for why that's a safe simplification.
+  renderSpellResolutionControls(result, sourceTokenId, targetId, intent);
 }
 
 // Renders the to-hit (if any) + damage breakdown (identical whichever roll
@@ -1240,10 +1289,13 @@ function setAttackVerdict(html) {
 // simple confirm for an auto-hit spell - either way nothing applies to the
 // target's HP until the player explicitly clicks, same discipline as the
 // weapon flow's explicit Attack button.
-function renderSpellResolutionControls(result, sourceTokenId, targetId) {
+function renderSpellResolutionControls(result, sourceTokenId, targetId, intent = 'attack') {
   const verdictEl = document.getElementById('attackVerdict');
   if (!verdictEl) return;
-  if (result.resolution === 'save') {
+  // Heal always lands regardless of the underlying spell's own resolution_type (a save/auto
+  // distinction only matters for Attack intent) - always the flat Apply button, never the
+  // save-throw prompt.
+  if (intent !== 'heal' && result.resolution === 'save') {
     verdictEl.innerHTML = `
       <div class="spell-save-prompt">
         <label>Target's save total <input type="number" id="spellSaveResultInput" /></label>
@@ -1253,15 +1305,15 @@ function renderSpellResolutionControls(result, sourceTokenId, targetId) {
     document.getElementById('spellSaveApplyBtn').addEventListener('click', () => {
       const value = Number(document.getElementById('spellSaveResultInput').value);
       const saveSuccess = Number.isFinite(value) && value >= result.saveDc;
-      sendSpellResolve(sourceTokenId, targetId, result, saveSuccess);
+      sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent);
     });
   } else {
-    verdictEl.innerHTML = `<button type="button" id="spellApplyBtn">Apply Damage</button>`;
-    document.getElementById('spellApplyBtn').addEventListener('click', () => sendSpellResolve(sourceTokenId, targetId, result, null));
+    verdictEl.innerHTML = `<button type="button" id="spellApplyBtn">${intent === 'heal' ? 'Apply Heal' : 'Apply Damage'}</button>`;
+    document.getElementById('spellApplyBtn').addEventListener('click', () => sendSpellResolve(sourceTokenId, targetId, result, null, intent));
   }
 }
 
-function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess) {
+function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent = 'attack') {
   setAttackVerdict('<span class="attack-subtext">Applying…</span>');
   const timeoutId = setTimeout(() => {
     if (awaitingSpellResult && awaitingSpellResult.targetId === targetId) {
@@ -1275,26 +1327,32 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess) {
     targetTokenId: targetId,
     sourceTokenId,
     damage: result.damageTotal,
-    resolution: result.resolution,
+    // Heal overrides whatever the source's own resolution was (save/auto spell, or a
+    // weapon/item with no resolution field at all) - the server only needs to know
+    // whether to add or subtract, see token.js's spell:resolve case.
+    resolution: intent === 'heal' ? 'heal' : result.resolution,
     saveSuccess,
     saveEffect: result.saveEffect,
-    damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic', // this path is only ever reached for a spell (see resolveAttack)
+    damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic',
     title: result.title || null,
   });
 }
 
-// Server's verdict for an applied save/auto spell - mirrors handleAttackResult
-// below, just without a hit/miss/crit concept (no roll was made against a
-// hidden value; the server only confirms the write was authorized and applied).
+// Server's verdict for an applied save/auto spell, item, or heal - mirrors
+// handleAttackResult below, just without a hit/miss/crit concept (no roll was made
+// against a hidden value; the server only confirms the write was authorized and applied).
 function handleSpellResult(msg) {
   if (!awaitingSpellResult || msg.targetTokenId !== awaitingSpellResult.targetId) return;
   clearTimeout(awaitingSpellResult.timeoutId);
   awaitingSpellResult = null;
 
-  const label = msg.resolution === 'save'
-    ? (msg.saveSuccess ? `Saved! ${msg.damageApplied} damage dealt` : `Failed save — ${msg.damageApplied} damage dealt`)
-    : `${msg.damageApplied} damage dealt`;
-  setAttackVerdict(`<div class="attack-outcome ${msg.damageApplied > 0 ? 'hit' : 'miss'}">${label}</div>`);
+  const label = msg.resolution === 'heal'
+    ? `Healed for ${msg.damageApplied} HP`
+    : msg.resolution === 'save'
+      ? (msg.saveSuccess ? `Saved! ${msg.damageApplied} damage dealt` : `Failed save — ${msg.damageApplied} damage dealt`)
+      : `${msg.damageApplied} damage dealt`;
+  const cls = msg.resolution === 'heal' ? 'hit' : (msg.damageApplied > 0 ? 'hit' : 'miss');
+  setAttackVerdict(`<div class="attack-outcome ${cls}">${label}</div>`);
 }
 
 // Server's verdict for the in-flight attack (it decided vs the hidden AC and
@@ -1317,16 +1375,17 @@ function handleAttackResult(msg) {
   setAttackVerdict(`<div class="attack-outcome ${cls}">${label}</div>`);
 }
 
-// Yellow highlight ring around every valid target while a weapon is armed (step 1's visible
-// "targeting is on" cue). The attacker's own token is skipped - you can't target yourself.
-function drawArmedTargetHighlights(ctx, tokens, gridSizePx, sourceTokenId) {
+// Yellow highlight ring around every valid target while an action is armed (step 1's visible
+// "targeting is on" cue). The attacker's own token is skipped for Attack intent (you can't
+// attack yourself) but included for Heal intent (Phase 8) - self-healing is normal.
+function drawArmedTargetHighlights(ctx, tokens, gridSizePx, sourceTokenId, intent = 'attack') {
   const radius = gridSizePx * 0.5;
   ctx.save();
   ctx.strokeStyle = 'rgba(255,193,7,0.9)';
   ctx.lineWidth = 3;
   ctx.setLineDash([]);
   for (const token of tokens) {
-    if (token.id === sourceTokenId) continue;
+    if (token.id === sourceTokenId && intent !== 'heal') continue;
     ctx.beginPath();
     ctx.arc(token.x, token.y, radius, 0, Math.PI * 2);
     ctx.stroke();
@@ -1345,12 +1404,14 @@ canvas.addEventListener('mousedown', (e) => {
   if (pendingActionTarget) {
     const { x, y } = canvasCoords(e);
     const target = hitTestToken(x, y);
-    const { sourceTokenId, action } = pendingActionTarget;
+    const { sourceTokenId, action, intent } = pendingActionTarget;
     disarmActionTargeting();
-    // Clicking empty space or your own token cancels targeting instead of resolving.
-    if (!target || target.id === sourceTokenId) return;
-    // Step 2 -> confirm step: no instant resolve, show the Attack button first.
-    openAttackConfirm(sourceTokenId, action, target);
+    // Clicking empty space cancels targeting instead of resolving. Clicking your own
+    // token also cancels for Attack intent (you can't attack yourself) but is a valid
+    // self-target for Heal intent (Phase 8) - self-healing is normal.
+    if (!target || (target.id === sourceTokenId && intent !== 'heal')) return;
+    // Step 2 -> confirm step: no instant resolve, show the Attack/Heal button first.
+    openAttackConfirm(sourceTokenId, action, target, intent);
     return;
   }
 
@@ -2182,6 +2243,7 @@ function renderSidebar() {
   if (!session) return;
   sidebarEl.innerHTML = role === 'gm' ? gmSidebarHtml() : playerSidebarHtml();
   role === 'gm' ? wireGmSidebar() : wirePlayerSidebar();
+  refreshCombatActionsModal();
 }
 
 function playerListHtml() {
@@ -3147,57 +3209,19 @@ function miniSheetHtml(t) {
     .map(([key, value]) => `<span class="tag">${key.toUpperCase()} ${signedVtt(value)}</span>`)
     .join(' ') || '<span style="color:#666;">None</span>';
 
-  const actionsHtml = (t.actions || []).length
-    ? (t.actions || [])
-        .map(
-          (a) => `
-        <div class="mini-sheet-action" data-action-name="${escapeHtml(a.name)}">
-          <span>${escapeHtml(a.name)}</span>
-          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${a.damageRolls || ''}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
-        </div>
-      `
-        )
-        .join('')
-    : '<p style="color:#666;font-size:12px;">No equipped weapons.</p>';
-
-  // Slot-level rows double as the spell-casting entry point (Phase 3): clicking
-  // the row's label (not the Use/Reset buttons, which remain the manual-override
-  // path) opens a picker of prepared spells castable at that level - see
-  // openSpellPicker(). Which row you click IS the upcast choice: picking a
-  // lower-level spell from a higher slot row casts it upcast at that slot level,
-  // no separate level selector needed.
-  const slotsHtml = (t.spellSlots || []).length
-    ? (t.spellSlots || [])
-        .map(
-          (s) => `
-        <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
-          <span class="mini-sheet-slot-label">${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
-          <button type="button" class="secondary slotUseBtn" ${s.current <= 0 ? 'disabled' : ''}>Use</button>
-          <button type="button" class="secondary slotResetBtn">Reset</button>
-        </div>
-      `
-        )
-        .join('')
-    : '';
-
-  const cantripCount = (t.preparedSpells || []).filter((s) => (s.spellLevel ?? 0) === 0).length;
-  const cantripsHtml = cantripCount
-    ? `
-      <div class="mini-sheet-slot" data-slot-level="0">
-        <span class="mini-sheet-slot-label">Cantrips (${cantripCount})</span>
-      </div>
-    `
-    : '';
-
+  // Weapon/spell/item action rows used to render inline here (Phase 2/3) - they now
+  // live in the Combat Actions modal (Phase 8), built on demand from the same token
+  // data by renderCombatActionsBody(), so the sidebar doesn't carry an ever-growing
+  // flat list.
   return `
     <div class="mini-sheet">
       <div class="field row">
         <div><label>AC</label><input type="number" class="acInput" value="${t.ac ?? ''}" /></div>
         <div><label>Saves</label><div style="padding-top:4px;">${savesHtml}</div></div>
       </div>
-      <label style="font-size:11px;color:#888;">Actions</label>
-      ${actionsHtml}
-      ${(cantripsHtml || slotsHtml) ? `<label style="font-size:11px;color:#888;">Spells</label>${cantripsHtml}${slotsHtml}` : ''}
+      <div class="actions">
+        <button type="button" class="secondary combatActionsBtn">Combat Actions…</button>
+      </div>
     </div>
   `;
 }
@@ -3243,7 +3267,7 @@ const spellPickerTitle = document.getElementById('spellPickerTitle');
 const spellPickerList = document.getElementById('spellPickerList');
 document.getElementById('spellPickerCancelBtn').addEventListener('click', () => spellPickerModal.classList.remove('visible'));
 
-function openSpellPicker(tokenId, clickedLevel) {
+function openSpellPicker(tokenId, clickedLevel, intent = 'attack') {
   const token = session.tokens[tokenId];
   if (!token) return;
   const spells = (token.preparedSpells || []).filter((s) =>
@@ -3253,14 +3277,23 @@ function openSpellPicker(tokenId, clickedLevel) {
   spellPickerTitle.textContent = clickedLevel === 0 ? 'Cast a Cantrip' : `Cast a Level ${clickedLevel} Spell`;
   spellPickerList.innerHTML = spells.length
     ? spells
-        .map(
-          (s) => `
+        .map((s) => {
+          const baseLevel = s.spellLevel ?? 0;
+          // Clicking a higher slot row than the spell's own level IS the upcast
+          // choice (no separate level selector) - make that visible here rather
+          // than showing the same "Lvl 1" a non-upcast spell would, which reads
+          // as though nothing special is about to happen.
+          const isUpcast = clickedLevel > 0 && baseLevel > 0 && baseLevel < clickedLevel;
+          const levelHtml = isUpcast
+            ? `Lvl ${baseLevel} <span class="spell-picker-upcast">→ ${clickedLevel}</span>`
+            : `Lvl ${baseLevel}`;
+          return `
         <div class="mini-sheet-action spell-picker-row" data-spell-id="${escapeHtml(s.id)}" data-spell-name="${escapeHtml(s.name)}">
           <span>${escapeHtml(s.name)}</span>
-          <span style="color:#aaa;">Lvl ${s.spellLevel ?? 0}</span>
+          <span style="color:#aaa;">${levelHtml}</span>
         </div>
-      `
-        )
+      `;
+        })
         .join('')
     : '<p style="color:#666;font-size:12px;">No prepared spells at this level.</p>';
 
@@ -3272,12 +3305,163 @@ function openSpellPicker(tokenId, clickedLevel) {
         instanceId: row.dataset.spellId,
         name: row.dataset.spellName,
         slotLevel: clickedLevel,
-      });
+      }, intent);
     });
   });
 
   spellPickerModal.classList.add('visible');
 }
+
+// ---------------------------------------------------------------------------
+// Combat Actions modal (Phase 8) - single entry point replacing the mini-sheet's
+// old inline weapon/spell-slot/cantrip rows. Tab bar (Attack/Heal) picks intent;
+// both tabs render the identical action set (weapons + synthetic Unarmed Strike,
+// spell slots/cantrips, usable items) - see armActionTargeting's intent param
+// for why no per-action attack/heal taxonomy is needed. Slot Use/Reset bookkeeping
+// is tab-agnostic (a slot doesn't know in advance what it'll be spent on), so it's
+// shown identically in both tabs.
+// ---------------------------------------------------------------------------
+const combatActionsModal = document.getElementById('combatActionsModal');
+const combatActionsBody = document.getElementById('combatActionsBody');
+let combatActionsState = null; // { tokenId, tab }
+
+function openCombatActionsModal(tokenId, tab = 'attack') {
+  combatActionsState = { tokenId, tab };
+  combatActionsModal.querySelectorAll('[data-combat-tab]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.combatTab === tab);
+  });
+  renderCombatActionsBody();
+  combatActionsModal.classList.add('visible');
+}
+
+// Re-renders the modal body in place if it's currently open, so slot-count/item-
+// quantity changes broadcast in from the server (or from this same modal's own
+// Use/Reset buttons) show up without having to close and reopen. Called from
+// renderSidebar() - the same place the old inline mini-sheet relied on to refresh.
+function refreshCombatActionsModal() {
+  if (combatActionsState && combatActionsModal.classList.contains('visible')) renderCombatActionsBody();
+}
+
+function renderCombatActionsBody() {
+  if (!combatActionsState) return;
+  const { tokenId, tab } = combatActionsState;
+  const token = session.tokens[tokenId];
+  if (!token) return;
+
+  const actionsHtml = (token.actions || []).length
+    ? (token.actions || [])
+        .map(
+          (a) => `
+        <div class="mini-sheet-action" data-action-name="${escapeHtml(a.name)}">
+          <span>${escapeHtml(a.name)}</span>
+          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${a.damageRolls || ''}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
+          <span class="row-chevron">›</span>
+        </div>
+      `
+        )
+        .join('')
+    : '<p style="color:#666;font-size:12px;">No equipped weapons.</p>';
+
+  // Slot-level rows carry the spell-casting entry point (Phase 3): the explicit
+  // Cast… button (not the Use/Reset buttons, which remain the manual-override
+  // path) opens a picker of prepared spells castable at that level - see
+  // openSpellPicker(). Which row's Cast… you click IS the upcast choice: picking
+  // a lower-level spell from a higher slot row casts it upcast at that slot
+  // level, no separate level selector needed. The label itself stays clickable
+  // too (harmless redundancy), but Cast… is the discoverable affordance - a
+  // plain label sitting next to Use/Reset buttons was easy to miss entirely.
+  const slotsHtml = (token.spellSlots || []).length
+    ? (token.spellSlots || [])
+        .map(
+          (s) => `
+        <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
+          <span class="mini-sheet-slot-label">${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
+          <div class="mini-sheet-slot-actions">
+            <button type="button" class="slotCastBtn" ${s.current <= 0 ? 'disabled' : ''}>Cast…</button>
+            <button type="button" class="secondary slotUseBtn" ${s.current <= 0 ? 'disabled' : ''}>Use</button>
+            <button type="button" class="secondary slotResetBtn">Reset</button>
+          </div>
+        </div>
+      `
+        )
+        .join('')
+    : '';
+
+  const cantripCount = (token.preparedSpells || []).filter((s) => (s.spellLevel ?? 0) === 0).length;
+  const cantripsHtml = cantripCount
+    ? `
+      <div class="mini-sheet-slot" data-slot-level="0">
+        <span class="mini-sheet-slot-label">Cantrips (${cantripCount})</span>
+        <div class="mini-sheet-slot-actions">
+          <button type="button" class="slotCastBtn">Cast…</button>
+        </div>
+      </div>
+    `
+    : '';
+
+  const itemsHtml = (token.items || []).length
+    ? (token.items || [])
+        .map(
+          (item) => `
+        <div class="mini-sheet-action" data-item-id="${escapeHtml(item.id)}" data-item-name="${escapeHtml(item.name)}">
+          <span>${escapeHtml(item.name)} <span style="color:#666;">×${item.quantity}</span></span>
+          <span style="color:#aaa;">${escapeHtml(item.damageRolls || '')}</span>
+          <span class="row-chevron">›</span>
+        </div>
+      `
+        )
+        .join('')
+    : '';
+
+  combatActionsBody.innerHTML = `
+    <label class="combat-actions-heading">Weapons</label>
+    ${actionsHtml}
+    ${(cantripsHtml || slotsHtml) ? `<label class="combat-actions-heading">Spells</label>${cantripsHtml}${slotsHtml}` : ''}
+    ${itemsHtml ? `<label class="combat-actions-heading">Items</label>${itemsHtml}` : ''}
+  `;
+
+  combatActionsBody.querySelectorAll('.mini-sheet-action[data-action-name]').forEach((row) => {
+    row.addEventListener('click', () => {
+      const action = (token.actions || []).find((a) => a.name === row.dataset.actionName);
+      if (action) armActionTargeting(tokenId, action, tab);
+    });
+  });
+  combatActionsBody.querySelectorAll('.mini-sheet-action[data-item-id]').forEach((row) => {
+    row.addEventListener('click', () => {
+      armActionTargeting(tokenId, { kind: 'item', inventoryId: row.dataset.itemId, name: row.dataset.itemName }, tab);
+    });
+  });
+  combatActionsBody.querySelectorAll('.slotUseBtn, .slotResetBtn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const slotRow = btn.closest('.mini-sheet-slot');
+      if (!slotRow) return;
+      const type = slotRow.dataset.slotType;
+      const level = Number(slotRow.dataset.slotLevel);
+      const useSlot = btn.classList.contains('slotUseBtn');
+      const value = (token.spellSlots || []).map((s) => {
+        if (s.type !== type || s.level !== level) return s;
+        return { ...s, current: useSlot ? Math.max(0, s.current - 1) : s.max };
+      });
+      send({ type: 'token:stat:update', tokenId, stat: 'spellSlots', value });
+    });
+  });
+  combatActionsBody.querySelectorAll('.slotCastBtn, .mini-sheet-slot-label').forEach((el) => {
+    el.addEventListener('click', () => {
+      const slotRow = el.closest('.mini-sheet-slot');
+      if (slotRow) openSpellPicker(tokenId, Number(slotRow.dataset.slotLevel), tab);
+    });
+  });
+}
+
+combatActionsModal.querySelectorAll('[data-combat-tab]').forEach((tabBtn) => {
+  tabBtn.addEventListener('click', () => {
+    if (!combatActionsState) return;
+    combatActionsState.tab = tabBtn.dataset.combatTab;
+    combatActionsModal.querySelectorAll('[data-combat-tab]').forEach((b) => b.classList.toggle('active', b === tabBtn));
+    renderCombatActionsBody();
+  });
+});
+document.getElementById('combatActionsCancelBtn').addEventListener('click', () => combatActionsModal.classList.remove('visible'));
 
 function wirePlayerSidebar() {
   document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
@@ -3319,28 +3503,8 @@ function wirePlayerSidebar() {
       adjustTokenSpeedRemaining(tokenId, 5);
     } else if (e.target.classList.contains('speedResetBtn')) {
       resetTokenSpeedRemaining(tokenId);
-    } else if (e.target.classList.contains('slotUseBtn') || e.target.classList.contains('slotResetBtn')) {
-      const slotRow = e.target.closest('.mini-sheet-slot');
-      const token = session.tokens[tokenId];
-      if (!slotRow || !token) return;
-      const type = slotRow.dataset.slotType;
-      const level = Number(slotRow.dataset.slotLevel);
-      const useSlot = e.target.classList.contains('slotUseBtn');
-      const value = (token.spellSlots || []).map((s) => {
-        if (s.type !== type || s.level !== level) return s;
-        return { ...s, current: useSlot ? Math.max(0, s.current - 1) : s.max };
-      });
-      send({ type: 'token:stat:update', tokenId, stat: 'spellSlots', value });
-    } else if (e.target.classList.contains('mini-sheet-slot-label')) {
-      const slotRow = e.target.closest('.mini-sheet-slot');
-      if (slotRow) openSpellPicker(tokenId, Number(slotRow.dataset.slotLevel));
-    } else {
-      const actionRow = e.target.closest('.mini-sheet-action');
-      const token = session.tokens[tokenId];
-      if (actionRow && token && actionRow.dataset.actionName) {
-        const action = (token.actions || []).find((a) => a.name === actionRow.dataset.actionName);
-        if (action) armActionTargeting(tokenId, action);
-      }
+    } else if (e.target.classList.contains('combatActionsBtn')) {
+      openCombatActionsModal(tokenId);
     }
   });
 

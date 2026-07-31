@@ -430,7 +430,12 @@ export async function useInventoryCatalogueItem(userId: string, characterId: str
     const item = await client.query<any>(`SELECT source_content_id,quantity FROM character_inventory_items
       WHERE id=$1 AND character_id=$2 AND quantity>0 FOR UPDATE`, [inventoryId, characterId]);
     if (!item.rowCount) throw new Error('Inventory item is unavailable.');
-    if (!item.rows[0].source_content_id) return [];
+    if (!item.rows[0].source_content_id) {
+      // Freeform item (no catalogue link, e.g. a player-authored potion) - there's no
+      // on_use action to run, but using it still consumes one, same as a catalogue item.
+      await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1', [inventoryId]);
+      return [];
+    }
     const hasSpendStep=await client.query(`SELECT 1 FROM content_action_links link JOIN action_steps step ON step.action_id=link.action_id
       WHERE link.content_id=$1 AND link.trigger_type='on_use' AND step.step_type='spend_item' LIMIT 1`,[item.rows[0].source_content_id]);
     if(!hasSpendStep.rowCount)await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1',[inventoryId]);

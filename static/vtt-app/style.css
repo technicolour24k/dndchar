@@ -228,6 +228,7 @@ body {
   border-bottom: 2px solid transparent;
 }
 .picker-tabs .picker-tab.active { color: #eee; border-bottom-color: #4a7fff; }
+.picker-tabs .picker-tab:disabled { color: #555; cursor: not-allowed; }
 
 .picker-status { font-size: 12px; color: #888; margin: 8px 0; min-height: 16px; }
 
@@ -274,11 +275,57 @@ body {
   font-size: 12px;
   padding: 3px 0;
 }
-.mini-sheet-action[data-action-name], .spell-picker-row { cursor: pointer; border-radius: 4px; }
-.mini-sheet-action[data-action-name]:hover, .spell-picker-row:hover { background: #1c1f26; }
+
+/* Combat Actions modal (Phase 8) section headings - was an inline-styled <label>
+   easy to miss next to the list items below it; now a real heading with a rule
+   under it so "Weapons"/"Spells"/"Items" reads as a section break, not filler text. */
+.combat-actions-heading {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: #ddd;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 16px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #3a3d44;
+}
+.combat-actions-heading:first-child { margin-top: 0; }
+
+/* Clickable action rows (weapon/item rows in the Combat Actions modal, spell
+   picker rows) - persistent card look + trailing chevron so "you can click
+   this" doesn't rely on noticing a hover-only cue, which testing showed people
+   were missing entirely. [data-item-id] included alongside [data-action-name]
+   so item rows get the same treatment (they were missing it before). */
+.mini-sheet-action[data-action-name], .mini-sheet-action[data-item-id], .spell-picker-row {
+  cursor: pointer;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  background: #14161b;
+}
+.mini-sheet-action[data-action-name]:hover, .mini-sheet-action[data-item-id]:hover, .spell-picker-row:hover {
+  border-color: #4a7fff;
+  background: #1c1f26;
+}
+.mini-sheet-action .row-chevron { color: #4a7fff; font-size: 15px; font-weight: 700; flex-shrink: 0; }
+
+/* Upcast indicator in the spell picker (a lower-level spell shown under a
+   higher slot row) - the spell's own level fades into #aaa like normal, the
+   arrow+target level is the accent color so the upcast reads as a deliberate
+   highlight, not just another number next to the name. */
+.spell-picker-upcast { color: #4a7fff; font-weight: 700; }
+
 .mini-sheet-slot button { margin-top: 0; font-size: 11px; padding: 2px 6px; }
-.mini-sheet-slot-label { cursor: pointer; border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }
-.mini-sheet-slot-label:hover { background: #1c1f26; }
+.mini-sheet-slot-label { border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }
+.mini-sheet-slot-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+/* The obvious, explicit "you can cast from here" affordance (Phase 8 follow-up) -
+   Use/Reset are plain secondary buttons for bookkeeping; Cast is the one that
+   actually opens the spell picker, so it gets the same accent color as other
+   primary actions in this app rather than looking like a third bookkeeping button. */
+.slotCastBtn { background: #4a7fff; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-top: 0; font-size: 11px; padding: 2px 8px; }
+.slotCastBtn:disabled { background: #3a3d44; color: #888; cursor: not-allowed; }
 
 /* Spell casting (Phase 3) - save-throw result prompt in the roll modal. */
 .spell-save-prompt { display: flex; align-items: center; gap: 8px; margin: 6px 0; }

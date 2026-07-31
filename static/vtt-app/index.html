@@ -133,6 +133,28 @@
     </div>
   </div>
 
+  <!-- Combat Actions modal (Phase 8): single entry point replacing the mini-sheet's
+       old inline action rows. Tab bar picks intent (Attack/Heal) - both tabs list
+       the same underlying action set (weapons, spells, items); which tab is active
+       when a row is clicked IS the Attack/Heal choice, threaded into
+       armActionTargeting. Buff/Support and Utility are visual placeholders only,
+       no content yet (Phase 8 Section 4 - explicitly not this phase). -->
+  <div id="combatActionsModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Combat Actions</h2>
+      <div class="picker-tabs">
+        <button type="button" class="picker-tab active" data-combat-tab="attack">Attack</button>
+        <button type="button" class="picker-tab" data-combat-tab="heal">Heal</button>
+        <button type="button" class="picker-tab" disabled title="Coming soon">Buff/Support</button>
+        <button type="button" class="picker-tab" disabled title="Coming soon">Utility</button>
+      </div>
+      <div id="combatActionsBody" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="combatActionsCancelBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Spell picker (Phase 3): opened by clicking a slot-level/Cantrips row in the mini-sheet. -->
   <div id="spellPickerModal" class="modal-overlay">
     <div class="modal">
