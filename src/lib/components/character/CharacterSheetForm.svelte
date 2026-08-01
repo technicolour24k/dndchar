@@ -1051,29 +1051,34 @@
     </div>
     <nav class="sheet-tabs in-header" aria-label="Character sheet sections">
       <button type="button" class:active={activeTab === 'battle'} onclick={() => (activeTab = 'battle')}>Battle</button>
-      <button type="button" class:active={activeTab === 'traits'} onclick={() => (activeTab = 'traits')}>Traits</button>
       <button type="button" class:active={activeTab === 'inventory'} onclick={() => (activeTab = 'inventory')}>Inventory</button>
+      <button type="button" class:active={activeTab === 'traits'} onclick={() => (activeTab = 'traits')}>Traits</button>
       <button type="button" class:active={activeTab === 'character'} onclick={() => (activeTab = 'character')}>Character</button>
     </nav>
     <div class="actions sheet-header-actions">
-      <span class="save-state">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
-      <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
-      <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceRound')}>Next Round</button>
+      <div class="combat-clock">
+        <span class="save-state combat-clock-status">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
+        <button type="button" class="compact-button combat-clock-full" disabled={contentBusy} onclick={() => runContentAction('newBattle')}>New Battle</button>
+        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
+        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceRound')}>Next Round</button>
+        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button>
+        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button>
+      </div>
       <div class="save-cluster">
         <div class="save-command-row">
-          <button type="submit">Save</button>
+          <div class="save-button-col">
+            <button type="submit" class="compact-button">Save</button>
+            <span class="save-state">{autosaveStatus}</span>
+            {#if result?.saved}
+              <span class="save-state good">Saved</span>
+            {/if}
+          </div>
           <div class="history-links">
             {#if onVersionHistory}
               <button type="button" class="text-button" onclick={onVersionHistory}>Character History</button>
             {/if}
             <button type="button" class="text-button" onclick={() => (activityLogOpen = true)}>Activity Log</button>
           </div>
-        </div>
-        <div class="save-status-row">
-          <span class="save-state">{autosaveStatus}</span>
-          {#if result?.saved}
-            <span class="save-state good">Saved</span>
-          {/if}
         </div>
       </div>
     </div>

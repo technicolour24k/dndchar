@@ -37,7 +37,28 @@
   <div id="app">
     <div id="sidebar"></div>
     <div id="mapWrap">
-      <canvas id="canvas" width="800" height="600"></canvas>
+      <!-- Layered map rendering (see render/mapLayers.js): the map itself is
+           DOM layers (img/video + SVG clip-path vision mask) sitting BEHIND
+           the transparent canvas, which keeps all tokens/markers/interaction.
+           #mapStage exists so the absolutely-positioned layers track the
+           in-flow canvas's position/size; everything under #mapLayers is
+           pointer-events: none - the canvas stays the only hit-test surface. -->
+      <div id="mapStage">
+        <div id="mapLayers" aria-hidden="true" style="display:none;">
+          <div id="mapBackdrop"></div>
+          <div id="mapLayerGray" class="map-media-layer"></div>
+          <div id="mapLayerColor" class="map-media-layer"></div>
+          <!-- Renders nothing - only supplies the vision-circle clip geometry.
+               Circle children are managed by mapLayers.js. -->
+          <svg id="visionClipSvg" width="0" height="0">
+            <defs>
+              <clipPath id="vttGrayClip"></clipPath>
+              <clipPath id="vttColorClip"></clipPath>
+            </defs>
+          </svg>
+        </div>
+        <canvas id="canvas" width="800" height="600"></canvas>
+      </div>
       <!-- Persistent regardless of map/sidebar re-renders (renderSidebar() replaces
            #sidebar's innerHTML wholesale, which would otherwise restart playback). -->
       <div id="musicBar" class="music-bar" style="display:none;">
@@ -109,6 +130,28 @@
   <div id="attackModal" class="modal-overlay">
     <div class="modal">
       <div id="attackModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Combat Actions modal (Phase 8): single entry point replacing the mini-sheet's
+       old inline action rows. Tab bar picks intent (Attack/Heal) - both tabs list
+       the same underlying action set (weapons, spells, items); which tab is active
+       when a row is clicked IS the Attack/Heal choice, threaded into
+       armActionTargeting. Buff/Support and Utility are visual placeholders only,
+       no content yet (Phase 8 Section 4 - explicitly not this phase). -->
+  <div id="combatActionsModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Combat Actions</h2>
+      <div class="picker-tabs">
+        <button type="button" class="picker-tab active" data-combat-tab="attack">Attack</button>
+        <button type="button" class="picker-tab" data-combat-tab="heal">Heal</button>
+        <button type="button" class="picker-tab" disabled title="Coming soon">Buff/Support</button>
+        <button type="button" class="picker-tab" disabled title="Coming soon">Utility</button>
+      </div>
+      <div id="combatActionsBody" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="combatActionsCancelBtn">Close</button>
+      </div>
     </div>
   </div>
 

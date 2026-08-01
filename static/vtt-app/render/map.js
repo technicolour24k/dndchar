@@ -1,15 +1,7 @@
-export function drawMap(ctx, mapImage, map) {
-  ctx.clearRect(0, 0, map.widthPx, map.heightPx);
-  if (mapImage && mapImage.complete && mapImage.naturalWidth) {
-    ctx.drawImage(mapImage, 0, 0, map.widthPx, map.heightPx);
-  } else {
-    ctx.fillStyle = '#222';
-    ctx.fillRect(0, 0, map.widthPx, map.heightPx);
-  }
-  drawGrid(ctx, map);
-}
-
-function drawGrid(ctx, map) {
+// The map image itself is no longer drawn here - it lives in DOM layers
+// behind the canvas (see render/mapLayers.js). All that's left on the canvas
+// from the old drawMap() is the grid overlay, GM-only as before.
+export function drawGrid(ctx, map) {
   ctx.save();
   ctx.strokeStyle = 'rgba(255,255,255,0.15)';
   ctx.lineWidth = 1;

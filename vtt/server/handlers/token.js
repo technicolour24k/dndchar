@@ -436,13 +436,17 @@ function handleTokenEvent(meta, msg, context) {
       break;
     }
 
-    // spell:resolve - for save/auto spells only (attack-resolution spells reuse
+    // spell:resolve - for save/auto spells (attack-resolution spells reuse
     // attack:resolve above unchanged - a spell attack roll vs. AC is mechanically
-    // identical to a weapon attack once you have a to-hit total). Unlike attack:resolve,
-    // there is no hidden value being compared here: a caster's own Spell Save DC isn't
-    // secret from them, so saveSuccess is computed client-side (against the DC the
-    // roll-spell endpoint already returned to the caster) and simply trusted - the
-    // server's job is purely "is this write authorized" (same target-window/GM gate as
+    // identical to a weapon attack once you have a to-hit total), plus (Phase 8)
+    // ALL heal traffic regardless of source kind (weapon/spell/item) and all item
+    // rolls under Attack intent, since items have no attack-roll concept either -
+    // this is generically "apply a pre-rolled amount, no hidden gate", not spell-
+    // specific despite the message name. Unlike attack:resolve, there is no hidden
+    // value being compared here: a caster's own Spell Save DC isn't secret from
+    // them, so saveSuccess is computed client-side (against the DC the roll-spell
+    // endpoint already returned to the caster) and simply trusted - the server's
+    // job is purely "is this write authorized" (same target-window/GM gate as
     // every other HP mutation path), not secrecy of a comparison.
     case 'spell:resolve': {
       const target = session.tokens[msg.targetTokenId];
@@ -451,6 +455,45 @@ function handleTokenEvent(meta, msg, context) {
         && meta.lastTargetTokenIds.includes(target.id)
         && Date.now() - (meta.lastTargetAt || 0) < TARGET_WINDOW_MS;
       if (meta.role !== 'gm' && !targetWindowOk) return;
+
+      // Heal (Phase 8) - always lands (no save/attack layer), adds instead of
+      // subtracts, and caps at maxHp instead of flooring at 0. Mirrors the
+      // damage-side enemy/npc leak discipline below (report the rolled, not the
+      // capped, amount) - PC targets already have visible HP (see
+      // vtt-fix-restore-pc-hp-visibility), so the real capped amount is not a
+      // leak there.
+      if (msg.resolution === 'heal') {
+        const rolled = Math.max(0, Number(msg.damage) || 0);
+        const currentHp = Number(target.stats?.hp) || 0;
+        const maxHp = Number(target.stats?.maxHp) || currentHp;
+        const newHp = Math.min(maxHp, currentHp + rolled);
+        target.stats = target.stats || {};
+        target.stats.hp = newHp;
+        const healApplied = newHp - currentHp;
+        const sensitive = target.type === 'enemy' || target.type === 'npc';
+        const reportedAmount = sensitive ? rolled : healApplied;
+
+        meta.ws.send(JSON.stringify({
+          type: 'spell:result',
+          targetTokenId: target.id,
+          resolution: 'heal',
+          saveSuccess: null,
+          damageApplied: reportedAmount,
+        }));
+
+        broadcastToken(context, meta.sessionId, 'token:stat:update', target, (recipient) => {
+          if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
+          return { tokenId: target.id, stat: 'hp' };
+        });
+
+        const healerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
+        logCombatLine(context, session,
+          `${healerName} uses ${msg.title || 'a heal'} — ${target.name || 'something'} recovers ${reportedAmount} HP.`,
+          { kind: 'heal', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: reportedAmount, title: msg.title || null });
+
+        broadcastCreatureSound(context, session, meta.sessionId, msg.sourceTokenId);
+        break;
+      }
 
       const rolledDamage = Math.max(0, Number(msg.damage) || 0);
       const appliedDamage = msg.resolution === 'save' && msg.saveSuccess

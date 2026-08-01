@@ -430,7 +430,12 @@ export async function useInventoryCatalogueItem(userId: string, characterId: str
     const item = await client.query<any>(`SELECT source_content_id,quantity FROM character_inventory_items
       WHERE id=$1 AND character_id=$2 AND quantity>0 FOR UPDATE`, [inventoryId, characterId]);
     if (!item.rowCount) throw new Error('Inventory item is unavailable.');
-    if (!item.rows[0].source_content_id) return [];
+    if (!item.rows[0].source_content_id) {
+      // Freeform item (no catalogue link, e.g. a player-authored potion) - there's no
+      // on_use action to run, but using it still consumes one, same as a catalogue item.
+      await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1', [inventoryId]);
+      return [];
+    }
     const hasSpendStep=await client.query(`SELECT 1 FROM content_action_links link JOIN action_steps step ON step.action_id=link.action_id
       WHERE link.content_id=$1 AND link.trigger_type='on_use' AND step.step_type='spend_item' LIMIT 1`,[item.rows[0].source_content_id]);
     if(!hasSpendStep.rowCount)await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1',[inventoryId]);
@@ -496,6 +501,30 @@ export async function advanceCharacterTurn(userId: string, characterId: string):
     await client.query(`UPDATE active_character_effects SET remaining_rounds=GREATEST(0,remaining_rounds-1)
       WHERE character_id=$1 AND remaining_rounds IS NOT NULL AND expiry_boundary IN ('turn_start','turn_end')`, [characterId]);
     await client.query('DELETE FROM active_character_effects WHERE character_id=$1 AND remaining_rounds=0', [characterId]);
+  });
+}
+
+// Resets the combat clock to Round 1 / Turn 1 and recharges anything scoped
+// to 'encounter' (the one recharge_period nothing else ever recharges -
+// short_rest/long_rest go through restCharacter, 'round' goes through
+// advanceCharacterRound) - for starting a fresh fight rather than just
+// continuing to advance turns from whatever the previous encounter left off
+// at. Deliberately doesn't touch active_character_effects - there's no
+// "encounter_end" expiry boundary (only turn_start/turn_end/round_end/manual),
+// so a buff with a real-time duration shouldn't be silently wiped just
+// because a new battle starts.
+export async function newBattle(userId: string, characterId: string): Promise<void> {
+  await withTransaction(async (client) => {
+    await assertCharacterOwner(client, userId, characterId);
+    await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 1, 1)
+      ON CONFLICT (character_id) DO UPDATE SET round_number = 1, turn_number = 1, updated_at = now()`, [characterId]);
+    await client.query(`UPDATE character_content_resources r SET current_value = max_value
+      FROM content_resource_definitions d, character_content_instances i WHERE r.resource_definition_id = d.id
+      AND r.character_content_id = i.id AND i.character_id = $1 AND d.recharge_period = 'encounter'`, [characterId]);
+    await client.query(`UPDATE character_inventory_resources resource SET current_value=resource.max_value
+      FROM content_resource_definitions definition, character_inventory_items inventory
+      WHERE resource.resource_definition_id=definition.id AND resource.inventory_item_id=inventory.id
+        AND inventory.character_id=$1 AND definition.recharge_period='encounter'`, [characterId]);
   });
 }
 

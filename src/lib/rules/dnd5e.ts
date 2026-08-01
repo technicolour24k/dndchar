@@ -566,6 +566,14 @@ export function equippedAttackItems(inventory: InventoryItem[]): InventoryItem[]
   );
 }
 
+// Consumables (potions etc.) usable from the VTT Combat Actions modal (Attack/Heal
+// tabs) - deliberately independent of location/equipped, unlike equippedAttackItems
+// above: a potion sits in the backpack, not "equipped", but should still show up as
+// a usable action as long as it has dice behind it and at least one is left.
+export function usableConsumableItems(inventory: InventoryItem[]): InventoryItem[] {
+  return inventory.filter((item) => item.category === 'consumable' && item.damageRolls && item.quantity > 0);
+}
+
 export function resolveResourceMaximum(expression: string, context: { level?: number; proficiencyBonus?: number; abilityModifier?: number } = {}): number {
   const normalized = expression.trim().toLowerCase();
   if (/^\d+$/.test(normalized)) return Number(normalized);

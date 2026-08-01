@@ -3,6 +3,7 @@ import type { RequestHandler } from './$types';
 import { getCharacter } from '$lib/server/services/characters';
 import {
   abilityMap,
+  abilityModifier,
   armorClass,
   equippedAttackItems,
   equippedItems,
@@ -10,6 +11,7 @@ import {
   savingThrowModifier,
   speedFt,
   totalLevel,
+  usableConsumableItems,
   visionRadii
 } from '$lib/rules/dnd5e';
 import type { AbilityKey } from '$lib/types/character';
@@ -48,15 +50,34 @@ export const GET: RequestHandler = async ({ locals, params }) => {
     vision: visionRadii(character.modifierSources, context),
     ac: armorClass(abilities.dex, equippedAcBonus, character.modifierSources, context),
     saves,
-    actions: attackItems.map((item) => ({
-      name: item.name,
-      toHitBonus: item.toHitBonus,
-      damageBonus: item.damageBonus,
-      damageRolls: item.damageRolls
-    })),
+    actions: [
+      ...attackItems.map((item) => ({
+        name: item.name,
+        toHitBonus: item.toHitBonus,
+        damageBonus: item.damageBonus,
+        damageRolls: item.damageRolls
+      })),
+      // Always-available synthetic action (Phase 8) - 1 bludgeoning + STR modifier,
+      // the 5e baseline. Not a real inventory row, so roll-attack's item lookup by
+      // name will miss it - the client's existing item_not_found fallback
+      // (rollManualAction, already built for GM homebrew token actions) picks it
+      // up automatically using the flat numbers computed here.
+      {
+        name: 'Unarmed Strike',
+        toHitBonus: prof + abilityModifier(abilities.str),
+        damageBonus: abilityModifier(abilities.str),
+        damageRolls: '1'
+      }
+    ],
     spellSlots: character.spellSlots,
     preparedSpells: character.content
       .filter((entry) => entry.type === 'spell' && entry.isPrepared)
-      .map((entry) => ({ id: entry.id, name: entry.name, spellLevel: entry.spellLevel }))
+      .map((entry) => ({ id: entry.id, name: entry.name, spellLevel: entry.spellLevel })),
+    items: usableConsumableItems(character.inventory).map((item) => ({
+      id: item.id,
+      name: item.name,
+      damageRolls: item.damageRolls,
+      quantity: item.quantity
+    }))
   });
 };
