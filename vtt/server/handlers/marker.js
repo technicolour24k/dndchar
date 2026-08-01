@@ -14,11 +14,14 @@ function canEditMarker(meta, marker) {
 }
 
 // Same shape as broadcastToken in token.js: GM always gets the raw marker,
-// players only if they own it or the GM has flipped visibleToAll.
-function broadcastMarker(context, sessionId, eventType, marker, extra = {}) {
+// players only if they own it or the GM has flipped visibleToAll - and, as of
+// Phase 10, not at all while the map itself is unrevealed (same hard-gate
+// rule as tokens: nothing map-related reaches players until the GM reveals).
+function broadcastMarker(context, session, sessionId, eventType, marker, extra = {}) {
+  const mapHidden = session.map && !session.map.revealed;
   context.broadcast(sessionId, (recipient) => {
     if (recipient.role === 'gm') return { type: eventType, ...extra, marker };
-    if (!shouldPlayerSeeMarker(marker, recipient.playerId)) return null;
+    if (mapHidden || !shouldPlayerSeeMarker(marker, recipient.playerId)) return null;
     return { type: eventType, ...extra, marker };
   });
 }
@@ -56,7 +59,7 @@ function handleMarkerEvent(meta, msg, context) {
       };
 
       session.markers[marker.id] = marker;
-      broadcastMarker(context, meta.sessionId, 'marker:add', marker);
+      broadcastMarker(context, session, meta.sessionId, 'marker:add', marker);
       break;
     }
 
@@ -78,6 +81,7 @@ function handleMarkerEvent(meta, msg, context) {
       const marker = session.markers[msg.markerId];
       if (!marker) return;
       marker.visibleToAll = !marker.visibleToAll;
+      const mapHidden = session.map && !session.map.revealed;
 
       context.broadcast(meta.sessionId, (recipient) => {
         if (recipient.role === 'gm') {
@@ -85,6 +89,7 @@ function handleMarkerEvent(meta, msg, context) {
         }
         const isOwner = marker.ownerId === recipient.playerId;
         if (isOwner) return null; // the owner could already see it either way
+        if (mapHidden) return null; // nothing to gain/lose - player has no markers while unrevealed
         // Non-owners are gaining or losing visibility of a marker they may
         // never have received before - that's an add/remove, not an update.
         return marker.visibleToAll

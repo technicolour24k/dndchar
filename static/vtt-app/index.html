@@ -262,6 +262,152 @@
     </div>
   </div>
 
+  <!-- Map Settings (Phase 10): the map upload/dimensions/grid-size/brightness/
+       music fields, formerly inline in the GM sidebar. Reveal/Hide is
+       deliberately NOT here - it's a plain button next to "Map Settings…" in
+       the sidebar itself (see gmSidebarHtml in main.js) - since it's used far
+       more often than these "set once per map" fields. Field values are
+       populated at open time by openMapSettingsModal() in main.js, same
+       pattern as visionModal. -->
+  <div id="mapSettingsModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Map Settings</h2>
+      <div class="field"><label>Upload map (image or video)</label><input type="file" id="mapFileInput" accept="image/*,video/mp4,video/webm,.mp4,.webm,.m4v,.ogv" /></div>
+      <img id="mapThumb" class="thumb" />
+      <div class="field"><label>Image/video URL</label><input type="text" id="mapImageUrlInput" placeholder="/uploads/... or paste a URL" /></div>
+      <div class="field row">
+        <div><label>Width (px)</label><input type="number" id="mapWidthInput" /></div>
+        <div><label>Height (px)</label><input type="number" id="mapHeightInput" /></div>
+      </div>
+      <div class="field row">
+        <div>
+          <label>Grid size (px/square)</label>
+          <div class="row">
+            <input type="number" id="mapGridSizeInput" />
+            <button type="button" id="gridSizeStandardBtn" class="secondary" title="Standard tabletop scale: 1 inch = 5ft, using the web's 96px-per-inch reference. Exact on-screen size can vary slightly by monitor/browser zoom.">1in=5ft</button>
+          </div>
+        </div>
+        <div><label>Ambient light</label>
+          <select id="mapBrightnessSelect">
+            <option value="bright">Bright</option>
+            <option value="dim">Dim</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Ambient music</label>
+        <select id="mapMusicSelect"><option value="">No music</option></select>
+      </div>
+      <div class="field" id="mapMusicCustomField" style="display:none;">
+        <label>Upload or paste a track URL</label>
+        <input type="file" id="mapMusicFileInput" accept="audio/*" />
+        <input type="text" id="mapMusicUrlInput" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
+      </div>
+      <div class="field">
+        <label>Battle music (plays instead, while combat is active)</label>
+        <select id="mapBattleMusicSelect"><option value="">Same as ambient</option></select>
+      </div>
+      <div class="field" id="mapBattleMusicCustomField" style="display:none;">
+        <label>Upload or paste a track URL</label>
+        <input type="file" id="mapBattleMusicFileInput" accept="audio/*" />
+        <input type="text" id="mapBattleMusicUrlInput" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
+      </div>
+      <div class="actions">
+        <button type="button" id="mapSettingsCancelBtn" class="secondary">Cancel</button>
+        <button type="button" id="setMapBtn">Set map</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Token (Phase 10, 2b): formerly inline in the GM sidebar, now a modal
+       serving both create (from the sidebar's "Add Token…" button or Token
+       Manager's "+ Add Token") and edit (clicking a row in Token Manager)
+       modes from the same form - see tokenFormState/openAddTokenModal in
+       main.js. Field visibility is type-conditional (syncFieldVisibilityForType
+       in main.js) so a future `prop` type (Phase 12) is a hook to extend, not
+       a rewrite. -->
+  <div id="addTokenModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2 id="addTokenModalTitle">Add Token</h2>
+      <div class="field row" id="addTokenCreatureLibraryField">
+        <div><button type="button" id="openCreatureLibraryBtn" class="secondary">Load from Creature Library…</button></div>
+        <div id="creatureLibraryLoadedLabel" style="align-self:center;font-size:12px;color:#888;"></div>
+      </div>
+      <div class="field row">
+        <div><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
+        <div id="tokenQuantityField"><label>Quantity</label><input type="number" id="tokenQuantityInput" value="1" min="1" max="50" /></div>
+      </div>
+      <div class="field row">
+        <div><label>Type</label>
+          <select id="tokenTypeSelect">
+            <option value="pc">PC</option>
+            <option value="npc">NPC</option>
+            <option value="enemy">Enemy</option>
+          </select>
+        </div>
+        <div id="tokenOwnerField"><label>Owner (for PCs)</label>
+          <select id="tokenOwnerSelect"><option value="">- none -</option></select>
+        </div>
+      </div>
+      <div class="field row">
+        <div id="tokenSoundFolderField"><label>Sound folder (attack cue)</label>
+          <select id="tokenSoundFolderSelect"></select>
+        </div>
+        <div id="tokenSpeedField"><label>Speed (ft)</label><input type="number" id="tokenSpeedInput" value="30" /></div>
+      </div>
+      <div class="field row" id="tokenVisionField">
+        <div><label>Normal vision (ft)</label><input type="number" id="tokenVisionNormalInput" value="30" /></div>
+        <div><label>Darkvision (ft)</label><input type="number" id="tokenVisionDarkInput" value="0" /></div>
+      </div>
+      <div class="field row" id="tokenStatsField">
+        <div><label>HP</label><input type="number" id="tokenHpInput" value="10" /></div>
+        <div><label>Max HP</label><input type="number" id="tokenMaxHpInput" value="10" /></div>
+        <div><label>AC</label><input type="number" id="tokenAcInput" value="10" /></div>
+      </div>
+      <div class="field row">
+        <div><button type="button" id="tokenBrowseLibraryBtn" class="secondary">Browse Token Library…</button></div>
+        <div><label>Or upload a custom image</label><input type="file" id="tokenFileInput" accept="image/*" /></div>
+      </div>
+      <div class="field row">
+        <div><label>Image URL</label><input type="text" id="tokenImageUrlInput" placeholder="/uploads/... or paste a URL" /></div>
+        <div style="flex: 0 0 120px;"><img id="tokenThumb" class="thumb" style="width: 120px;" /></div>
+      </div>
+      <div class="field"><label><input type="checkbox" id="tokenHiddenInput" /> Hidden from players</label></div>
+      <div class="actions">
+        <button type="button" id="addTokenCancelBtn" class="secondary">Cancel</button>
+        <button type="button" id="tokenSaveToCatalogBtn" class="secondary" style="display:none;">Save to catalog…</button>
+        <button type="button" id="addTokenBtn">Add token</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Token Manager (Phase 10, Section 3): replaces the old per-token sidebar
+       cards (gmTokenListHtml) with one searchable/filterable list. Rows reuse
+       .token-card styling; clicking a row opens addTokenModal in edit mode. -->
+  <div id="tokenManagerModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Token Manager</h2>
+      <div class="field row">
+        <div><label>Search</label><input type="text" id="tokenManagerSearchInput" placeholder="Name…" /></div>
+        <div><label>Type</label>
+          <select id="tokenManagerTypeFilter">
+            <option value="">All types</option>
+            <option value="pc">PC</option>
+            <option value="npc">NPC</option>
+            <option value="enemy">Enemy</option>
+          </select>
+        </div>
+      </div>
+      <div id="tokenManagerList" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" id="tokenManagerCloseBtn" class="secondary">Close</button>
+        <button type="button" id="tokenManagerRemoveSelectedBtn" class="danger">Remove selected</button>
+        <button type="button" id="tokenManagerAddBtn">+ Add Token</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="/vtt-app/main.js"></script>
 </body>
 </html>

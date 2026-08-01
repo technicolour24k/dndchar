@@ -1,5 +1,5 @@
 import { drawGrid } from './render/map.js';
-import { drawTokens } from './render/tokens.js';
+import { drawTokens, TYPE_COLOR, CONDITION_COLOR } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed } from './render/vision.js';
 import { updateMapLayers, hideMapLayers, isVideoUrl } from './render/mapLayers.js';
 import { drawMovementRange } from './render/movement.js';
@@ -79,6 +79,18 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str ?? '';
   return div.innerHTML;
+}
+
+// Every .modal-overlay shares the same CSS z-index, so when one modal opens
+// another (Token Manager -> Add Token, Add Token -> Creature Library/Image
+// Picker, a Token Manager row -> Advanced Vision/Conditions), whichever one
+// happens to sit later in index.html wins the stacking tie - not whichever
+// actually opened last. Call this alongside .classList.add('visible') on any
+// modal reachable from inside another one, so the one the GM is actually
+// looking at is always on top regardless of markup order.
+let topModalZIndex = 100;
+function bringModalToFront(modalEl) {
+  modalEl.style.zIndex = ++topModalZIndex;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +355,7 @@ ensureMusicLibraryIndex().then(() => {
 // ---------------------------------------------------------------------------
 // Creature sound folders (assets/creature-sounds/<folder>/*) - each folder
 // name doubles as the "creature type" value stored on a token's soundFolder
-// field (Add Token form + per-token card, see gmSidebarHtml/gmTokenListHtml)
+// field (Add Token modal + Token Manager row, see tokenManagerRowsHtml)
 // and as a soundboard button the GM can trigger on demand. Fetched once and
 // cached for the session, same pattern as musicLibraryIndex above.
 // ---------------------------------------------------------------------------
@@ -571,6 +583,19 @@ function handleMessage(msg) {
       updateAmbientMusic();
       break;
 
+    // map:revealed (Phase 10) - the Reveal/Hide toggle's own message type,
+    // deliberately distinct from state:full: it reuses filterSessionForRole
+    // via the same per-recipient session-replace pattern, but skips
+    // state:full's combat-log/roll-log/session-notes backlog refetches,
+    // which would be wasted round-trips on every single toggle click.
+    case 'map:revealed':
+      session = msg.session;
+      session.markers = session.markers || {};
+      render();
+      renderSidebar();
+      updateAmbientMusic();
+      break;
+
     case 'token:add':
       session.tokens[msg.token.id] = msg.token;
       render();
@@ -579,6 +604,23 @@ function handleMessage(msg) {
 
     case 'token:remove':
       delete session.tokens[msg.tokenId];
+      render();
+      renderSidebar();
+      break;
+
+    // token:update (Phase 10, Token Manager's multi-field edit save) - merges
+    // the broadcast token wholesale into the local mirror, same idea as
+    // token:add but for an existing id.
+    case 'token:update':
+      session.tokens[msg.token.id] = msg.token;
+      render();
+      renderSidebar();
+      break;
+
+    // token:remove:bulk (Phase 10, Token Manager's bulk-remove) - one message
+    // instead of N token:remove events.
+    case 'token:remove:bulk':
+      msg.tokenIds.forEach((id) => delete session.tokens[id]);
       render();
       renderSidebar();
       break;
@@ -774,6 +816,7 @@ function showApp() {
   document.getElementById('app').classList.add('active');
 }
 
+
 const identityKnown = document.getElementById('identityKnown');
 const identityUnknown = document.getElementById('identityUnknown');
 const identityName = document.getElementById('identityName');
@@ -824,7 +867,12 @@ document.getElementById('joinRoomBtn').addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 
 function render() {
-  if (!session || !session.map) {
+  // Phase 10: an unrevealed map sends players a truthy-but-fieldless
+  // session.map ({ revealed: false }, no imageUrl) rather than null, so this
+  // guard now checks imageUrl specifically - "map exists but isn't
+  // revealed yet" and "no map has ever been set" both land here, but get
+  // different copy below.
+  if (!session || !session.map || !session.map.imageUrl) {
     hideMapLayers();
     canvas.style.width = '';
     canvas.style.height = '';
@@ -835,11 +883,10 @@ function render() {
     ctx.fillStyle = '#666';
     ctx.font = '16px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(
-      role === 'gm' ? 'Upload and set a map to begin' : 'Waiting for the GM to set a map…',
-      canvas.width / 2,
-      canvas.height / 2,
-    );
+    let message = 'Waiting for the GM to set a map…';
+    if (role === 'gm') message = 'Upload and set a map to begin';
+    else if (session?.map?.revealed === false) message = 'Waiting for the GM to reveal the map…';
+    ctx.fillText(message, canvas.width / 2, canvas.height / 2);
     currentRenderedTokens = [];
     return;
   }
@@ -1828,6 +1875,7 @@ async function openImagePicker(onSelect) {
   pickerFileInput.value = '';
   pickerUploadThumb.classList.remove('visible');
   setPickerTab('library');
+  bringModalToFront(imagePickerModal);
   imagePickerModal.classList.add('visible');
 
   pickerStatus.textContent = 'Loading library…';
@@ -2054,6 +2102,7 @@ function openVisionModal(tokenId) {
   visionModalDark.value = token.visionDarkFt || 0;
   visionModalTrue.value = token.visionTrueFt || 0;
   visionModalDevil.value = token.visionDevilFt || 0;
+  bringModalToFront(visionModal);
   visionModal.classList.add('visible');
 }
 
@@ -2110,6 +2159,7 @@ function openConditionsModal(tokenId) {
       </label>
     </div>
   `).join('');
+  bringModalToFront(conditionsModal);
   conditionsModal.classList.add('visible');
 }
 
@@ -2232,6 +2282,7 @@ function renderCreatureLibraryModalList() {
 function openCreatureLibraryModal(onSelect) {
   creatureLibraryOnSelect = onSelect;
   renderCreatureLibraryModalList();
+  bringModalToFront(creatureLibraryModal);
   creatureLibraryModal.classList.add('visible');
 }
 
@@ -2304,6 +2355,7 @@ function renderSidebar() {
   sidebarEl.innerHTML = role === 'gm' ? gmSidebarHtml() : playerSidebarHtml();
   role === 'gm' ? wireGmSidebar() : wirePlayerSidebar();
   refreshCombatActionsModal();
+  refreshTokenManagerModal();
 }
 
 function playerListHtml() {
@@ -2525,116 +2577,23 @@ function musicOptionsHtml(selectedUrl) {
 }
 
 function gmSidebarHtml() {
-  const map = session.map || {};
-  const isCustomMusic = !!map.musicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.musicUrl);
-  const musicOptions = musicOptionsHtml(map.musicUrl || null);
-  const isCustomBattleMusic = !!map.battleMusicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.battleMusicUrl);
-  const battleMusicOptions = musicOptionsHtml(map.battleMusicUrl || null);
-  const ownerOptions = Object.values(session.players)
-    .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`)
-    .join('');
-
   return `
     ${roomInfoHtml('GM')}
 
     <div class="field"><button type="button" id="openSoundboardBtn" class="secondary">Soundboard…</button></div>
 
     <h2>Map</h2>
-    <div class="field"><label>Upload map (image or video)</label><input type="file" id="mapFileInput" accept="image/*,video/mp4,video/webm,.mp4,.webm,.m4v,.ogv" /></div>
-    <img id="mapThumb" class="thumb ${map.imageUrl && !isVideoUrl(map.imageUrl) ? 'visible' : ''}" src="${map.imageUrl && !isVideoUrl(map.imageUrl) ? map.imageUrl : ''}" />
-    <div class="field"><label>Image/video URL</label><input type="text" id="mapImageUrlInput" value="${escapeHtml(map.imageUrl || '')}" placeholder="/uploads/... or paste a URL" /></div>
     <div class="field row">
-      <div><label>Width (px)</label><input type="number" id="mapWidthInput" value="${map.widthPx || 1600}" /></div>
-      <div><label>Height (px)</label><input type="number" id="mapHeightInput" value="${map.heightPx || 1200}" /></div>
+      <div><button type="button" id="openMapSettingsBtn" class="secondary">Map Settings…</button></div>
+      ${session.map ? `<div><button type="button" id="revealMapBtn" class="secondary">${session.map.revealed ? 'Hide Map' : 'Reveal Map'}</button></div>` : ''}
     </div>
-    <div class="field row">
-      <div>
-        <label>Grid size (px/square)</label>
-        <div class="row">
-          <input type="number" id="mapGridSizeInput" value="${map.gridSizePx || 50}" />
-          <button type="button" id="gridSizeStandardBtn" class="secondary" title="Standard tabletop scale: 1 inch = 5ft, using the web's 96px-per-inch reference. Exact on-screen size can vary slightly by monitor/browser zoom.">1in=5ft</button>
-        </div>
-      </div>
-      <div><label>Ambient light</label>
-        <select id="mapBrightnessSelect">
-          <option value="bright" ${map.brightness === 'bright' ? 'selected' : ''}>Bright</option>
-          <option value="dim" ${map.brightness === 'dim' ? 'selected' : ''}>Dim</option>
-          <option value="dark" ${(!map.brightness || map.brightness === 'dark') ? 'selected' : ''}>Dark</option>
-        </select>
-      </div>
-    </div>
-    <div class="field">
-      <label>Ambient music</label>
-      <select id="mapMusicSelect">
-        <option value="">No music</option>
-        ${musicOptions}
-        <option value="__custom__" ${isCustomMusic ? 'selected' : ''}>Custom track…</option>
-      </select>
-    </div>
-    <div class="field" id="mapMusicCustomField" style="${isCustomMusic ? '' : 'display:none;'}">
-      <label>Upload or paste a track URL</label>
-      <input type="file" id="mapMusicFileInput" accept="audio/*" />
-      <input type="text" id="mapMusicUrlInput" value="${escapeHtml(isCustomMusic ? map.musicUrl : '')}" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
-    </div>
-    <div class="field">
-      <label>Battle music (plays instead, while combat is active)</label>
-      <select id="mapBattleMusicSelect">
-        <option value="">Same as ambient</option>
-        ${battleMusicOptions}
-        <option value="__custom__" ${isCustomBattleMusic ? 'selected' : ''}>Custom track…</option>
-      </select>
-    </div>
-    <div class="field" id="mapBattleMusicCustomField" style="${isCustomBattleMusic ? '' : 'display:none;'}">
-      <label>Upload or paste a track URL</label>
-      <input type="file" id="mapBattleMusicFileInput" accept="audio/*" />
-      <input type="text" id="mapBattleMusicUrlInput" value="${escapeHtml(isCustomBattleMusic ? map.battleMusicUrl : '')}" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
-    </div>
-    <button id="setMapBtn">Set map</button>
-
-    <h2>Add token</h2>
-    <div class="field row">
-      <div><button type="button" id="openCreatureLibraryBtn" class="secondary">Load from Creature Library…</button></div>
-      <div id="creatureLibraryLoadedLabel" style="align-self:center;font-size:12px;color:#888;"></div>
-    </div>
-    <div class="field row">
-      <div><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
-      <div><label>Quantity</label><input type="number" id="tokenQuantityInput" value="1" min="1" max="50" /></div>
-    </div>
-    <div class="field row">
-      <div><label>Type</label>
-        <select id="tokenTypeSelect">
-          <option value="pc">PC</option>
-          <option value="npc">NPC</option>
-          <option value="enemy">Enemy</option>
-        </select>
-      </div>
-      <div><label>Owner (for PCs)</label>
-        <select id="tokenOwnerSelect"><option value="">- none -</option>${ownerOptions}</select>
-      </div>
-    </div>
-    <div class="field"><label>Sound folder (attack cue)</label>
-      <select id="tokenSoundFolderSelect">${soundFolderOptionsHtml(null)}</select>
-    </div>
-    <div class="field row">
-      <div><label>Normal vision (ft)</label><input type="number" id="tokenVisionNormalInput" value="30" /></div>
-      <div><label>Darkvision (ft)</label><input type="number" id="tokenVisionDarkInput" value="0" /></div>
-    </div>
-    <div class="field row">
-      <div><label>HP</label><input type="number" id="tokenHpInput" value="10" /></div>
-      <div><label>Max HP</label><input type="number" id="tokenMaxHpInput" value="10" /></div>
-      <div><label>AC</label><input type="number" id="tokenAcInput" value="10" /></div>
-    </div>
-    <div class="field"><label>Speed (ft)</label><input type="number" id="tokenSpeedInput" value="30" /></div>
-    <div class="field"><button type="button" id="tokenBrowseLibraryBtn" class="secondary">Browse Token Library…</button></div>
-    <div class="field"><label>Or upload a custom image</label><input type="file" id="tokenFileInput" accept="image/*" /></div>
-    <img id="tokenThumb" class="thumb" />
-    <div class="field"><label>Image URL</label><input type="text" id="tokenImageUrlInput" placeholder="/uploads/... or paste a URL" /></div>
-    <div class="field"><label><input type="checkbox" id="tokenHiddenInput" /> Hidden from players</label></div>
-    <button id="addTokenBtn">Add token</button>
 
     <h2>Tokens</h2>
     <div class="field"><label><input type="checkbox" id="showMovementRangesToggle" ${showMovementRanges ? 'checked' : ''} /> Show movement ranges</label></div>
-    <div id="tokenList">${gmTokenListHtml()}</div>
+    <div class="field row">
+      <div><button type="button" id="openAddTokenBtn" class="secondary">Add Token…</button></div>
+      <div><button type="button" id="openTokenManagerBtn">Manage Tokens…</button></div>
+    </div>
 
     ${markerFormHtml()}
     <div id="markerList">${markerListHtml(true)}</div>
@@ -2727,9 +2686,16 @@ function gmAttacksHtml(t) {
   `;
 }
 
-function gmTokenListHtml() {
-  const tokens = Object.values(session.tokens);
-  if (!tokens.length) return '<p style="color:#666;font-size:12px;">No tokens yet.</p>';
+// Token Manager (Phase 10, Section 3) row template - formerly gmTokenListHtml,
+// rendered permanently inline in the sidebar for every token at once (the
+// clutter this phase exists to fix). Same per-token controls as before
+// (quick stat edits, manual attacks, condition/sound/vision/speed, and the
+// action-button row), just rendered inside the Token Manager modal's list
+// instead, plus a multi-select checkbox (Section 3c, bulk-remove) and an
+// Edit… button opening the Add Token form pre-filled (Section 3a) for the
+// fields that have no other inline editor - name, type, and owner.
+function tokenManagerRowsHtml(tokens) {
+  if (!tokens.length) return '<p style="color:#666;font-size:12px;">No tokens match.</p>';
 
   return tokens
     .map((t) => {
@@ -2740,7 +2706,8 @@ function gmTokenListHtml() {
       return `
         <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title">
-            <span>${t.imageUrl ? `<img class="token-thumb" src="${escapeHtml(t.imageUrl)}" alt="" />` : ''}${escapeHtml(t.name)} <span class="tag">${t.type}</span>${t.hidden ? ' <span class="tag">hidden</span>' : ''}</span>
+            <span><input type="checkbox" class="tokenManagerSelect" title="Select for bulk removal" /> ${t.imageUrl ? `<img class="token-thumb" src="${escapeHtml(t.imageUrl)}" alt="" />` : ''}${escapeHtml(t.name)} <span class="tag">${t.type}</span>${t.hidden ? ' <span class="tag">hidden</span>' : ''}</span>
+            <button type="button" class="secondary editTokenBtn">Edit…</button>
           </div>
           <div class="field row">
             <div><label>HP</label><input type="number" class="hpInput" value="${hp}" /></div>
@@ -2845,316 +2812,15 @@ function wireGmSidebar() {
     render(); // a view preference only - doesn't touch session state, no renderSidebar() needed
   });
 
-  const mapFileInput = document.getElementById('mapFileInput');
-  const mapImageUrlInput = document.getElementById('mapImageUrlInput');
-  const mapWidthInput = document.getElementById('mapWidthInput');
-  const mapHeightInput = document.getElementById('mapHeightInput');
-  const mapThumb = document.getElementById('mapThumb');
-
-  mapFileInput.addEventListener('change', async () => {
-    const file = mapFileInput.files[0];
-    if (!file) return;
-    const isVideo = file.type.startsWith('video/');
-    try {
-      const url = await uploadMedia(file, isVideo ? 'video' : 'image');
-      mapImageUrlInput.value = url;
-      if (isVideo) {
-        // The <img> thumb can't preview a video - just clear it and pull the
-        // natural dimensions from a throwaway (muted, never-played) element.
-        mapThumb.removeAttribute('src');
-        mapThumb.classList.remove('visible');
-        const probe = document.createElement('video');
-        probe.muted = true;
-        probe.onloadedmetadata = () => {
-          mapWidthInput.value = probe.videoWidth;
-          mapHeightInput.value = probe.videoHeight;
-          probe.removeAttribute('src');
-          probe.load();
-        };
-        probe.src = url;
-      } else {
-        const img = new Image();
-        img.onload = () => {
-          mapWidthInput.value = img.naturalWidth;
-          mapHeightInput.value = img.naturalHeight;
-          mapThumb.src = url;
-          mapThumb.classList.add('visible');
-        };
-        img.src = url;
-      }
-    } catch (err) {
-      alert(`Map upload failed: ${err.message || 'unknown error'}`);
-    }
-  });
-
-  document.getElementById('gridSizeStandardBtn').addEventListener('click', () => {
-    document.getElementById('mapGridSizeInput').value = 96;
-  });
-
-  const mapMusicSelect = document.getElementById('mapMusicSelect');
-  const mapMusicCustomField = document.getElementById('mapMusicCustomField');
-  const mapMusicFileInput = document.getElementById('mapMusicFileInput');
-  const mapMusicUrlInput = document.getElementById('mapMusicUrlInput');
-
-  mapMusicSelect.addEventListener('change', () => {
-    mapMusicCustomField.style.display = mapMusicSelect.value === '__custom__' ? '' : 'none';
-  });
-
-  mapMusicFileInput.addEventListener('change', async () => {
-    const file = mapMusicFileInput.files[0];
-    if (!file) return;
-    try {
-      const formData = new FormData();
-      formData.append('audio', file);
-      const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
-      if (!res.ok) throw new Error('upload_failed');
-      const data = await res.json();
-      mapMusicUrlInput.value = data.url;
-    } catch {
-      alert('Music track upload failed.');
-    }
-  });
-
-  const mapBattleMusicSelect = document.getElementById('mapBattleMusicSelect');
-  const mapBattleMusicCustomField = document.getElementById('mapBattleMusicCustomField');
-  const mapBattleMusicFileInput = document.getElementById('mapBattleMusicFileInput');
-  const mapBattleMusicUrlInput = document.getElementById('mapBattleMusicUrlInput');
-
-  mapBattleMusicSelect.addEventListener('change', () => {
-    mapBattleMusicCustomField.style.display = mapBattleMusicSelect.value === '__custom__' ? '' : 'none';
-  });
-
-  mapBattleMusicFileInput.addEventListener('change', async () => {
-    const file = mapBattleMusicFileInput.files[0];
-    if (!file) return;
-    try {
-      const formData = new FormData();
-      formData.append('audio', file);
-      const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
-      if (!res.ok) throw new Error('upload_failed');
-      const data = await res.json();
-      mapBattleMusicUrlInput.value = data.url;
-    } catch {
-      alert('Battle music upload failed.');
-    }
-  });
-
-  document.getElementById('setMapBtn').addEventListener('click', () => {
-    const imageUrl = mapImageUrlInput.value.trim();
-    if (!imageUrl) return alert('Upload or enter a map image URL first.');
-    const musicUrl = mapMusicSelect.value === '__custom__' ? mapMusicUrlInput.value.trim() || null : mapMusicSelect.value || null;
-    const battleMusicUrl = mapBattleMusicSelect.value === '__custom__' ? mapBattleMusicUrlInput.value.trim() || null : mapBattleMusicSelect.value || null;
-    send({
-      type: 'map:set',
-      map: {
-        imageUrl,
-        widthPx: Number(mapWidthInput.value) || 1600,
-        heightPx: Number(mapHeightInput.value) || 1200,
-        gridSizePx: Number(document.getElementById('mapGridSizeInput').value) || 50,
-        brightness: document.getElementById('mapBrightnessSelect').value,
-        musicUrl,
-        battleMusicUrl,
-      },
-    });
-  });
-
-  const tokenFileInput = document.getElementById('tokenFileInput');
-  const tokenImageUrlInput = document.getElementById('tokenImageUrlInput');
-  const tokenThumb = document.getElementById('tokenThumb');
-
-  tokenFileInput.addEventListener('change', async () => {
-    const file = tokenFileInput.files[0];
-    if (!file) return;
-    try {
-      const url = await uploadImage(file);
-      tokenImageUrlInput.value = url;
-      tokenThumb.src = url;
-      tokenThumb.classList.add('visible');
-    } catch {
-      alert('Token image upload failed.');
-    }
-  });
-
-  document.getElementById('tokenBrowseLibraryBtn').addEventListener('click', () => {
-    openImagePicker((url) => {
-      tokenImageUrlInput.value = url;
-      tokenThumb.src = url;
-      tokenThumb.classList.add('visible');
-    });
-  });
-
-  const creatureLibraryLoadedLabel = document.getElementById('creatureLibraryLoadedLabel');
-  // Attacks/actions have no field on the Add Token form (they're only
-  // editable once a token already exists, via gmAttacksHtml) - a template's
-  // actions are snapshotted here at load time instead, and carried into
-  // baseToken.actions below. A snapshot (not a re-lookup by id at
-  // addTokenBtn time) so deleting the template afterward can't silently
-  // drop the attacks that were already loaded into the form.
-  let pendingTemplateActions = [];
-
-  document.getElementById('openCreatureLibraryBtn').addEventListener('click', () => {
-    openCreatureLibraryModal((template) => {
-      const t = template.tokenJson || {};
-      pendingTemplateActions = t.actions || [];
-      creatureLibraryLoadedLabel.textContent = `Loaded: ${template.name}`;
-      document.getElementById('tokenNameInput').value = template.name;
-      document.getElementById('tokenTypeSelect').value = t.type || 'enemy';
-      document.getElementById('tokenSoundFolderSelect').value = t.soundFolder || '';
-      document.getElementById('tokenVisionNormalInput').value = t.visionNormalFt ?? 30;
-      document.getElementById('tokenVisionDarkInput').value = t.visionDarkFt ?? 0;
-      document.getElementById('tokenHpInput').value = t.stats?.hp ?? '';
-      document.getElementById('tokenMaxHpInput').value = t.stats?.maxHp ?? '';
-      document.getElementById('tokenAcInput').value = t.ac ?? '';
-      document.getElementById('tokenSpeedInput').value = t.speedFt ?? 30;
-      tokenImageUrlInput.value = t.imageUrl || '';
-      tokenThumb.src = t.imageUrl || '';
-      tokenThumb.classList.toggle('visible', !!t.imageUrl);
-    });
-  });
-
-  document.getElementById('addTokenBtn').addEventListener('click', () => {
-    const name = document.getElementById('tokenNameInput').value.trim();
-    if (!name) return alert('Give the token a name.');
-    const quantity = Math.max(1, Math.min(50, Number(document.getElementById('tokenQuantityInput').value) || 1));
-    const map = session.map || { widthPx: 800, heightPx: 600 };
-    const baseToken = {
-      type: document.getElementById('tokenTypeSelect').value,
-      ownerId: document.getElementById('tokenOwnerSelect').value || null,
-      soundFolder: document.getElementById('tokenSoundFolderSelect').value || null,
-      imageUrl: tokenImageUrlInput.value.trim() || null,
-      visionNormalFt: Number(document.getElementById('tokenVisionNormalInput').value) || 0,
-      visionDarkFt: Number(document.getElementById('tokenVisionDarkInput').value) || 0,
-      visionTrueFt: 0,
-      visionDevilFt: 0,
-      speedFt: Number(document.getElementById('tokenSpeedInput').value) || 0,
-      speedRemainingFt: Number(document.getElementById('tokenSpeedInput').value) || 0,
-      hidden: document.getElementById('tokenHiddenInput').checked,
-      // Top-level ac (not stats.ac) so the same field works for PCs and enemies;
-      // the server strips it from players for enemy/npc tokens (store.js filter).
-      ac: Number(document.getElementById('tokenAcInput').value) || 0,
-      stats: {
-        hp: Number(document.getElementById('tokenHpInput').value) || 0,
-        maxHp: Number(document.getElementById('tokenMaxHpInput').value) || 0,
-      },
-      // Not a form field (attacks are only editable once a token exists,
-      // via gmAttacksHtml) - carried over directly from the selected
-      // Creature Library template, if any.
-      actions: pendingTemplateActions,
-    };
-
-    // Quantity > 1 spawns a small grid of tokens centered on the map, named
-    // "Name 1", "Name 2", etc., rather than stacking them all on the exact
-    // same square - each still just a separate token:add, no new event or
-    // server-side concept needed. Quantity 1 keeps the original bare name
-    // (no " 1" suffix) so existing single-token behavior is unchanged.
-    const spacingPx = map.gridSizePx || 50;
-    const perRow = Math.ceil(Math.sqrt(quantity));
-    const rows = Math.ceil(quantity / perRow);
-    for (let i = 0; i < quantity; i++) {
-      const col = i % perRow;
-      const row = Math.floor(i / perRow);
-      const offsetX = (col - (perRow - 1) / 2) * spacingPx;
-      const offsetY = (row - (rows - 1) / 2) * spacingPx;
-      send({
-        type: 'token:add',
-        token: {
-          ...baseToken,
-          id: `token-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
-          name: quantity > 1 ? `${name} ${i + 1}` : name,
-          x: Math.round(map.widthPx / 2 + offsetX),
-          y: Math.round(map.heightPx / 2 + offsetY),
-        },
-      });
-    }
-  });
-
-  document.getElementById('tokenList').addEventListener('change', (e) => {
-    const card = e.target.closest('.token-card');
-    if (!card) return;
-    const tokenId = card.dataset.tokenId;
-    if (e.target.classList.contains('hpInput')) {
-      send({ type: 'token:stat:update', tokenId, stat: 'hp', value: Number(e.target.value) });
-    } else if (e.target.classList.contains('maxHpInput')) {
-      send({ type: 'token:stat:update', tokenId, stat: 'maxHp', value: Number(e.target.value) });
-    } else if (e.target.classList.contains('acInput')) {
-      // Enemy/npc AC is stripped from players by the server filter; the GM sets
-      // the true value here, and players only ever discover the `knownAc` bound.
-      send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
-    } else if (e.target.classList.contains('conditionSelect')) {
-      send({ type: 'token:stat:update', tokenId, stat: 'condition', value: e.target.value || null });
-    } else if (e.target.classList.contains('soundFolderSelect')) {
-      send({ type: 'token:stat:update', tokenId, stat: 'soundFolder', value: e.target.value || null });
-    } else if (e.target.classList.contains('darkvisionToggle')) {
-      // Quick on/off for the common 60ft case; Advanced Vision… below lets
-      // the GM dial in a non-standard range without losing the checkbox's
-      // on/off reading (it just reflects visionDarkFt > 0).
-      send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
-    } else if (e.target.classList.contains('speedInput')) {
-      // Editing base Speed resets remaining movement to match - it's the
-      // "this creature now has a fresh X ft to work with" control; the
-      // Remaining field and +/- buttons are for adjusting mid-turn.
-      const value = Number(e.target.value) || 0;
-      send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });
-      send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value });
-    } else if (e.target.classList.contains('speedRemainingInput')) {
-      send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: Number(e.target.value) || 0 });
-    }
-  });
-
-  document.getElementById('tokenList').addEventListener('click', (e) => {
-    const card = e.target.closest('.token-card');
-    if (!card) return;
-    const tokenId = card.dataset.tokenId;
-    const token = session.tokens[tokenId];
-    // --- Manual stat-block attacks (checked before the row, since the delete
-    // ✕ lives inside a .gm-attack-row) ---
-    if (e.target.classList.contains('gm-attack-del')) {
-      const idx = Number(e.target.dataset.actionIndex);
-      const next = (token?.actions || []).filter((_, i) => i !== idx);
-      send({ type: 'token:stat:update', tokenId, stat: 'actions', value: next });
-      return;
-    }
-    if (e.target.classList.contains('addAttackBtn')) {
-      const box = e.target.closest('.gm-attack-add');
-      const name = box.querySelector('.atkName').value.trim();
-      if (!name) return alert('Give the attack a name.');
-      const action = {
-        name,
-        toHitBonus: Number(box.querySelector('.atkHit').value) || 0,
-        damageRolls: box.querySelector('.atkDmg').value.trim(),
-        damageBonus: Number(box.querySelector('.atkDmgBonus').value) || 0,
-      };
-      send({ type: 'token:stat:update', tokenId, stat: 'actions', value: [...(token?.actions || []), action] });
-      return;
-    }
-    const attackRow = e.target.closest('.gm-attack-row');
-    if (attackRow && token) {
-      const action = (token.actions || [])[Number(attackRow.dataset.actionIndex)];
-      if (action) armActionTargeting(tokenId, action);
-      return;
-    }
-    if (e.target.classList.contains('toggleHiddenBtn')) {
-      send({ type: 'token:hidden:toggle', tokenId });
-    } else if (e.target.classList.contains('removeBtn')) {
-      if (confirm('Remove this token?')) send({ type: 'token:remove', tokenId });
-    } else if (e.target.classList.contains('advancedVisionBtn')) {
-      openVisionModal(tokenId);
-    } else if (e.target.classList.contains('conditionsBtn')) {
-      openConditionsModal(tokenId);
-    } else if (e.target.classList.contains('changeImageBtn')) {
-      openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
-    } else if (e.target.classList.contains('saveTemplateBtn')) {
-      saveTokenAsTemplate(token);
-    } else if (e.target.classList.contains('recenterTokenBtn')) {
-      recenterToken(tokenId);
-    } else if (e.target.classList.contains('speedMinusBtn')) {
-      adjustTokenSpeedRemaining(tokenId, -5);
-    } else if (e.target.classList.contains('speedPlusBtn')) {
-      adjustTokenSpeedRemaining(tokenId, 5);
-    } else if (e.target.classList.contains('speedResetBtn')) {
-      resetTokenSpeedRemaining(tokenId);
-    }
-  });
+  // Map Settings / Add Token / Token Manager (Phase 10) are now static modals
+  // (see index.html) wired once at module scope below, not recreated every
+  // renderSidebar() - only the buttons that open them live in the sidebar's
+  // re-rendered innerHTML, same reasoning as musicBar living outside it.
+  document.getElementById('openMapSettingsBtn').addEventListener('click', openMapSettingsModal);
+  // Only rendered once a map exists (see gmSidebarHtml) - nothing to reveal yet otherwise.
+  document.getElementById('revealMapBtn')?.addEventListener('click', () => send({ type: 'map:reveal' }));
+  document.getElementById('openAddTokenBtn').addEventListener('click', () => openAddTokenModal('create'));
+  document.getElementById('openTokenManagerBtn').addEventListener('click', openTokenManagerModal);
 
   wireMarkerForm();
 
@@ -3176,6 +2842,598 @@ function wireGmSidebar() {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// Map Settings modal (Phase 10, Section 2) - the map upload/dimensions/
+// grid-size/brightness/music fields, formerly inline in the GM sidebar.
+// Reveal/Hide deliberately stays a plain sidebar button next to this one
+// (see gmSidebarHtml/wireGmSidebar's revealMapBtn), not folded into this
+// modal - see the brief's framing for why: it's used far more often than
+// these "set once per map" fields. Static modal (index.html), wired once
+// here; fields are populated from session.map each time it opens, same
+// pattern as openVisionModal.
+// ---------------------------------------------------------------------------
+const mapSettingsModal = document.getElementById('mapSettingsModal');
+const mapFileInput = document.getElementById('mapFileInput');
+const mapImageUrlInput = document.getElementById('mapImageUrlInput');
+const mapWidthInput = document.getElementById('mapWidthInput');
+const mapHeightInput = document.getElementById('mapHeightInput');
+const mapThumb = document.getElementById('mapThumb');
+const mapGridSizeInput = document.getElementById('mapGridSizeInput');
+const mapBrightnessSelect = document.getElementById('mapBrightnessSelect');
+const mapMusicSelect = document.getElementById('mapMusicSelect');
+const mapMusicCustomField = document.getElementById('mapMusicCustomField');
+const mapMusicFileInput = document.getElementById('mapMusicFileInput');
+const mapMusicUrlInput = document.getElementById('mapMusicUrlInput');
+const mapBattleMusicSelect = document.getElementById('mapBattleMusicSelect');
+const mapBattleMusicCustomField = document.getElementById('mapBattleMusicCustomField');
+const mapBattleMusicFileInput = document.getElementById('mapBattleMusicFileInput');
+const mapBattleMusicUrlInput = document.getElementById('mapBattleMusicUrlInput');
+
+function openMapSettingsModal() {
+  const map = session.map || {};
+  const isCustomMusic = !!map.musicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.musicUrl);
+  const isCustomBattleMusic = !!map.battleMusicUrl && !musicLibraryIndex.some((t) => musicLibraryUrl(t) === map.battleMusicUrl);
+
+  mapImageUrlInput.value = map.imageUrl || '';
+  const showThumb = !!map.imageUrl && !isVideoUrl(map.imageUrl);
+  if (showThumb) mapThumb.src = map.imageUrl; else mapThumb.removeAttribute('src');
+  mapThumb.classList.toggle('visible', showThumb);
+  mapWidthInput.value = map.widthPx || 1600;
+  mapHeightInput.value = map.heightPx || 1200;
+  // Phase 10: 96 (not 50) is the default for a map that hasn't set a grid
+  // size yet - matches the "1in=5ft" standard-scale button below. Existing
+  // maps keep whatever gridSizePx they already have; no migration.
+  mapGridSizeInput.value = map.gridSizePx || 96;
+  mapBrightnessSelect.value = map.brightness || 'dark';
+
+  mapMusicSelect.innerHTML = `<option value="">No music</option>${musicOptionsHtml(map.musicUrl || null)}<option value="__custom__" ${isCustomMusic ? 'selected' : ''}>Custom track…</option>`;
+  mapMusicCustomField.style.display = isCustomMusic ? '' : 'none';
+  mapMusicUrlInput.value = isCustomMusic ? map.musicUrl : '';
+
+  mapBattleMusicSelect.innerHTML = `<option value="">Same as ambient</option>${musicOptionsHtml(map.battleMusicUrl || null)}<option value="__custom__" ${isCustomBattleMusic ? 'selected' : ''}>Custom track…</option>`;
+  mapBattleMusicCustomField.style.display = isCustomBattleMusic ? '' : 'none';
+  mapBattleMusicUrlInput.value = isCustomBattleMusic ? map.battleMusicUrl : '';
+
+  bringModalToFront(mapSettingsModal);
+  mapSettingsModal.classList.add('visible');
+}
+
+function closeMapSettingsModal() {
+  mapSettingsModal.classList.remove('visible');
+}
+
+document.getElementById('mapSettingsCancelBtn').addEventListener('click', closeMapSettingsModal);
+mapSettingsModal.addEventListener('click', (e) => {
+  if (e.target === mapSettingsModal) closeMapSettingsModal();
+});
+
+mapFileInput.addEventListener('change', async () => {
+  const file = mapFileInput.files[0];
+  if (!file) return;
+  const isVideo = file.type.startsWith('video/');
+  try {
+    const url = await uploadMedia(file, isVideo ? 'video' : 'image');
+    mapImageUrlInput.value = url;
+    if (isVideo) {
+      // The <img> thumb can't preview a video - just clear it and pull the
+      // natural dimensions from a throwaway (muted, never-played) element.
+      mapThumb.removeAttribute('src');
+      mapThumb.classList.remove('visible');
+      const probe = document.createElement('video');
+      probe.muted = true;
+      probe.onloadedmetadata = () => {
+        mapWidthInput.value = probe.videoWidth;
+        mapHeightInput.value = probe.videoHeight;
+        probe.removeAttribute('src');
+        probe.load();
+      };
+      probe.src = url;
+    } else {
+      const img = new Image();
+      img.onload = () => {
+        mapWidthInput.value = img.naturalWidth;
+        mapHeightInput.value = img.naturalHeight;
+        mapThumb.src = url;
+        mapThumb.classList.add('visible');
+      };
+      img.src = url;
+    }
+  } catch (err) {
+    alert(`Map upload failed: ${err.message || 'unknown error'}`);
+  }
+});
+
+document.getElementById('gridSizeStandardBtn').addEventListener('click', () => {
+  mapGridSizeInput.value = 96;
+});
+
+mapMusicSelect.addEventListener('change', () => {
+  mapMusicCustomField.style.display = mapMusicSelect.value === '__custom__' ? '' : 'none';
+});
+
+mapMusicFileInput.addEventListener('change', async () => {
+  const file = mapMusicFileInput.files[0];
+  if (!file) return;
+  try {
+    const formData = new FormData();
+    formData.append('audio', file);
+    const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
+    if (!res.ok) throw new Error('upload_failed');
+    const data = await res.json();
+    mapMusicUrlInput.value = data.url;
+  } catch {
+    alert('Music track upload failed.');
+  }
+});
+
+mapBattleMusicSelect.addEventListener('change', () => {
+  mapBattleMusicCustomField.style.display = mapBattleMusicSelect.value === '__custom__' ? '' : 'none';
+});
+
+mapBattleMusicFileInput.addEventListener('change', async () => {
+  const file = mapBattleMusicFileInput.files[0];
+  if (!file) return;
+  try {
+    const formData = new FormData();
+    formData.append('audio', file);
+    const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
+    if (!res.ok) throw new Error('upload_failed');
+    const data = await res.json();
+    mapBattleMusicUrlInput.value = data.url;
+  } catch {
+    alert('Battle music upload failed.');
+  }
+});
+
+document.getElementById('setMapBtn').addEventListener('click', () => {
+  const imageUrl = mapImageUrlInput.value.trim();
+  if (!imageUrl) return alert('Upload or enter a map image URL first.');
+  const musicUrl = mapMusicSelect.value === '__custom__' ? mapMusicUrlInput.value.trim() || null : mapMusicSelect.value || null;
+  const battleMusicUrl = mapBattleMusicSelect.value === '__custom__' ? mapBattleMusicUrlInput.value.trim() || null : mapBattleMusicSelect.value || null;
+  send({
+    type: 'map:set',
+    map: {
+      imageUrl,
+      widthPx: Number(mapWidthInput.value) || 1600,
+      heightPx: Number(mapHeightInput.value) || 1200,
+      gridSizePx: Number(mapGridSizeInput.value) || 96,
+      brightness: mapBrightnessSelect.value,
+      musicUrl,
+      battleMusicUrl,
+    },
+  });
+  closeMapSettingsModal();
+});
+
+// ---------------------------------------------------------------------------
+// Add Token modal (Phase 10, Section 2b) - formerly inline in the GM sidebar,
+// now serves both create (blank fields, quantity > 1 spawns one token:add per
+// copy - unchanged from before) and edit (pre-filled from an existing token,
+// a single token:update) from one shared form, per the project's "shared
+// form, not a second UI" convention (brief Section 3a). tokenFormState
+// mirrors combatActionsState's shape - a single mutable object naming
+// whatever's currently open.
+// ---------------------------------------------------------------------------
+const addTokenModal = document.getElementById('addTokenModal');
+const addTokenModalTitle = document.getElementById('addTokenModalTitle');
+const tokenQuantityField = document.getElementById('tokenQuantityField');
+const tokenNameInput = document.getElementById('tokenNameInput');
+const tokenQuantityInput = document.getElementById('tokenQuantityInput');
+const tokenTypeSelect = document.getElementById('tokenTypeSelect');
+const tokenOwnerField = document.getElementById('tokenOwnerField');
+const tokenOwnerSelect = document.getElementById('tokenOwnerSelect');
+const tokenSoundFolderSelect = document.getElementById('tokenSoundFolderSelect');
+const tokenVisionNormalInput = document.getElementById('tokenVisionNormalInput');
+const tokenVisionDarkInput = document.getElementById('tokenVisionDarkInput');
+const tokenHpInput = document.getElementById('tokenHpInput');
+const tokenMaxHpInput = document.getElementById('tokenMaxHpInput');
+const tokenAcInput = document.getElementById('tokenAcInput');
+const tokenSpeedInput = document.getElementById('tokenSpeedInput');
+const tokenFileInput = document.getElementById('tokenFileInput');
+const tokenImageUrlInput = document.getElementById('tokenImageUrlInput');
+const tokenThumb = document.getElementById('tokenThumb');
+const tokenHiddenInput = document.getElementById('tokenHiddenInput');
+const addTokenCreatureLibraryField = document.getElementById('addTokenCreatureLibraryField');
+const creatureLibraryLoadedLabel = document.getElementById('creatureLibraryLoadedLabel');
+const tokenSaveToCatalogBtn = document.getElementById('tokenSaveToCatalogBtn');
+const addTokenBtn = document.getElementById('addTokenBtn');
+
+// { mode: 'create' | 'edit', tokenId: string | null, originalHidden: boolean }
+// originalHidden is captured at open time so submit can tell whether the
+// checkbox actually changed - hidden must never travel through the generic
+// token:update patch (see the server-side comment on why: it would silently
+// desync a connected player), so a change here fires a separate
+// token:hidden:toggle instead.
+let tokenFormState = null;
+
+// Attacks/actions have no field on this form (only editable once a token
+// already exists, via the Token Manager row's inline attack editor) - a
+// Creature Library template's actions are snapshotted here at load time
+// instead, carried into the token:add payload. A snapshot (not a re-lookup
+// by id at submit time) so deleting the template afterward can't silently
+// drop attacks that were already loaded into the form.
+let pendingTemplateActions = [];
+
+// Section 3d: field visibility keys off the selected type, mirroring
+// wireMarkerForm's syncShapeFields - no `prop` type exists yet (Phase 12),
+// but this is the single hook point adding one will extend, not rework.
+function syncFieldVisibilityForType() {
+  tokenOwnerField.style.display = tokenTypeSelect.value === 'pc' ? '' : 'none';
+}
+
+function populateOwnerOptions() {
+  const options = Object.values(session.players)
+    .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`)
+    .join('');
+  tokenOwnerSelect.innerHTML = `<option value="">- none -</option>${options}`;
+}
+
+function resetAddTokenForm() {
+  pendingTemplateActions = [];
+  creatureLibraryLoadedLabel.textContent = '';
+  tokenNameInput.value = '';
+  tokenQuantityInput.value = 1;
+  tokenTypeSelect.value = 'pc';
+  tokenOwnerSelect.value = '';
+  tokenSoundFolderSelect.value = '';
+  tokenVisionNormalInput.value = 30;
+  tokenVisionDarkInput.value = 0;
+  tokenHpInput.value = 10;
+  tokenMaxHpInput.value = 10;
+  tokenAcInput.value = 10;
+  tokenSpeedInput.value = 30;
+  tokenImageUrlInput.value = '';
+  tokenThumb.removeAttribute('src');
+  tokenThumb.classList.remove('visible');
+  tokenHiddenInput.checked = false;
+}
+
+function populateAddTokenForm(token) {
+  tokenNameInput.value = token.name || '';
+  tokenTypeSelect.value = token.type || 'enemy';
+  tokenOwnerSelect.value = token.ownerId || '';
+  tokenSoundFolderSelect.value = token.soundFolder || '';
+  tokenVisionNormalInput.value = token.visionNormalFt ?? 30;
+  tokenVisionDarkInput.value = token.visionDarkFt ?? 0;
+  tokenHpInput.value = token.stats?.hp ?? '';
+  tokenMaxHpInput.value = token.stats?.maxHp ?? '';
+  tokenAcInput.value = token.ac ?? '';
+  tokenSpeedInput.value = token.speedFt ?? 30;
+  tokenImageUrlInput.value = token.imageUrl || '';
+  if (token.imageUrl) tokenThumb.src = token.imageUrl; else tokenThumb.removeAttribute('src');
+  tokenThumb.classList.toggle('visible', !!token.imageUrl);
+  tokenHiddenInput.checked = !!token.hidden;
+}
+
+function openAddTokenModal(mode, tokenId = null) {
+  populateOwnerOptions();
+  tokenSoundFolderSelect.innerHTML = soundFolderOptionsHtml(null);
+
+  if (mode === 'edit') {
+    const token = session.tokens[tokenId];
+    if (!token) return;
+    tokenFormState = { mode: 'edit', tokenId, originalHidden: !!token.hidden };
+    addTokenModalTitle.textContent = 'Edit Token';
+    tokenQuantityField.style.display = 'none';
+    addTokenCreatureLibraryField.style.display = 'none';
+    tokenSaveToCatalogBtn.style.display = '';
+    addTokenBtn.textContent = 'Save';
+    populateAddTokenForm(token);
+  } else {
+    tokenFormState = { mode: 'create', tokenId: null, originalHidden: false };
+    addTokenModalTitle.textContent = 'Add Token';
+    tokenQuantityField.style.display = '';
+    addTokenCreatureLibraryField.style.display = '';
+    tokenSaveToCatalogBtn.style.display = 'none';
+    addTokenBtn.textContent = 'Add token';
+    resetAddTokenForm();
+  }
+  syncFieldVisibilityForType();
+  bringModalToFront(addTokenModal);
+  addTokenModal.classList.add('visible');
+}
+
+function closeAddTokenModal() {
+  addTokenModal.classList.remove('visible');
+  tokenFormState = null;
+}
+
+document.getElementById('addTokenCancelBtn').addEventListener('click', closeAddTokenModal);
+addTokenModal.addEventListener('click', (e) => {
+  if (e.target === addTokenModal) closeAddTokenModal();
+});
+
+tokenTypeSelect.addEventListener('change', syncFieldVisibilityForType);
+
+tokenFileInput.addEventListener('change', async () => {
+  const file = tokenFileInput.files[0];
+  if (!file) return;
+  try {
+    const url = await uploadImage(file);
+    tokenImageUrlInput.value = url;
+    tokenThumb.src = url;
+    tokenThumb.classList.add('visible');
+  } catch {
+    alert('Token image upload failed.');
+  }
+});
+
+document.getElementById('tokenBrowseLibraryBtn').addEventListener('click', () => {
+  openImagePicker((url) => {
+    tokenImageUrlInput.value = url;
+    tokenThumb.src = url;
+    tokenThumb.classList.add('visible');
+  });
+});
+
+document.getElementById('openCreatureLibraryBtn').addEventListener('click', () => {
+  openCreatureLibraryModal((template) => {
+    const t = template.tokenJson || {};
+    pendingTemplateActions = t.actions || [];
+    creatureLibraryLoadedLabel.textContent = `Loaded: ${template.name}`;
+    tokenNameInput.value = template.name;
+    tokenTypeSelect.value = t.type || 'enemy';
+    tokenSoundFolderSelect.value = t.soundFolder || '';
+    tokenVisionNormalInput.value = t.visionNormalFt ?? 30;
+    tokenVisionDarkInput.value = t.visionDarkFt ?? 0;
+    tokenHpInput.value = t.stats?.hp ?? '';
+    tokenMaxHpInput.value = t.stats?.maxHp ?? '';
+    tokenAcInput.value = t.ac ?? '';
+    tokenSpeedInput.value = t.speedFt ?? 30;
+    tokenImageUrlInput.value = t.imageUrl || '';
+    if (t.imageUrl) tokenThumb.src = t.imageUrl; else tokenThumb.removeAttribute('src');
+    tokenThumb.classList.toggle('visible', !!t.imageUrl);
+    syncFieldVisibilityForType();
+  });
+});
+
+// Reads the form's *current* values into a token-shaped object (deliberately
+// NOT visionTrueFt/visionDevilFt - those have no field on this form and are
+// only ever set via the Advanced Vision modal, so they must never be
+// overwritten as a side effect of an unrelated edit-form save). Used for
+// token:add/token:update and for "Save to catalog", which must snapshot
+// what's on-screen right now, not session.tokens - the edit form batches
+// changes locally until Save, so reading session.tokens there would
+// silently save stale pre-edit values if a GM clicks Save to catalog before
+// Save.
+function readTokenFormFields() {
+  return {
+    name: tokenNameInput.value.trim(),
+    type: tokenTypeSelect.value,
+    ownerId: tokenOwnerSelect.value || null,
+    soundFolder: tokenSoundFolderSelect.value || null,
+    imageUrl: tokenImageUrlInput.value.trim() || null,
+    visionNormalFt: Number(tokenVisionNormalInput.value) || 0,
+    visionDarkFt: Number(tokenVisionDarkInput.value) || 0,
+    speedFt: Number(tokenSpeedInput.value) || 0,
+    ac: Number(tokenAcInput.value) || 0,
+    stats: {
+      hp: Number(tokenHpInput.value) || 0,
+      maxHp: Number(tokenMaxHpInput.value) || 0,
+    },
+    actions: pendingTemplateActions,
+  };
+}
+
+tokenSaveToCatalogBtn.addEventListener('click', () => {
+  saveTokenAsTemplate(readTokenFormFields());
+});
+
+addTokenBtn.addEventListener('click', () => {
+  const fields = readTokenFormFields();
+  if (!fields.name) return alert('Give the token a name.');
+
+  if (tokenFormState.mode === 'edit') {
+    const { tokenId, originalHidden } = tokenFormState;
+    send({
+      type: 'token:update',
+      tokenId,
+      patch: { ...fields, speedRemainingFt: fields.speedFt },
+    });
+    if (tokenHiddenInput.checked !== originalHidden) send({ type: 'token:hidden:toggle', tokenId });
+    closeAddTokenModal();
+    return;
+  }
+
+  const quantity = Math.max(1, Math.min(50, Number(tokenQuantityInput.value) || 1));
+  const map = session.map || { widthPx: 800, heightPx: 600 };
+  const baseToken = {
+    ...fields,
+    visionTrueFt: 0,
+    visionDevilFt: 0,
+    speedRemainingFt: fields.speedFt,
+    hidden: tokenHiddenInput.checked,
+  };
+
+  // Quantity > 1 spawns a small grid of tokens centered on the map, named
+  // "Name 1", "Name 2", etc., rather than stacking them all on the exact
+  // same square - each still just a separate token:add, no new event or
+  // server-side concept needed. Quantity 1 keeps the original bare name
+  // (no " 1" suffix) so existing single-token behavior is unchanged.
+  const spacingPx = map.gridSizePx || 50;
+  const perRow = Math.ceil(Math.sqrt(quantity));
+  const rows = Math.ceil(quantity / perRow);
+  for (let i = 0; i < quantity; i++) {
+    const col = i % perRow;
+    const row = Math.floor(i / perRow);
+    const offsetX = (col - (perRow - 1) / 2) * spacingPx;
+    const offsetY = (row - (rows - 1) / 2) * spacingPx;
+    send({
+      type: 'token:add',
+      token: {
+        ...baseToken,
+        id: `token-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+        name: quantity > 1 ? `${fields.name} ${i + 1}` : fields.name,
+        x: Math.round(map.widthPx / 2 + offsetX),
+        y: Math.round(map.heightPx / 2 + offsetY),
+      },
+    });
+  }
+  closeAddTokenModal();
+});
+
+// ---------------------------------------------------------------------------
+// Token Manager modal (Phase 10, Section 3) - replaces the old always-inline
+// per-token sidebar cards (the 20+-token clutter this phase exists to fix)
+// with one searchable/filterable list opened on demand. Rows reuse the same
+// per-token controls as before (tokenManagerRowsHtml - quick stat edits,
+// manual attacks, hide/remove/etc.), plus search/type-filter, multi-select +
+// bulk-remove (Section 3c), and an Edit… button into the Add Token modal's
+// edit mode for the fields that have no other inline editor (name/type/owner).
+// ---------------------------------------------------------------------------
+const tokenManagerModal = document.getElementById('tokenManagerModal');
+const tokenManagerList = document.getElementById('tokenManagerList');
+const tokenManagerSearchInput = document.getElementById('tokenManagerSearchInput');
+const tokenManagerTypeFilter = document.getElementById('tokenManagerTypeFilter');
+let tokenManagerSelectedIds = new Set();
+
+function filteredTokenManagerTokens() {
+  const search = tokenManagerSearchInput.value.trim().toLowerCase();
+  const type = tokenManagerTypeFilter.value;
+  return Object.values(session.tokens)
+    .filter((t) => (!type || t.type === type) && (!search || (t.name || '').toLowerCase().includes(search)))
+    .sort((a, b) => a.type.localeCompare(b.type) || (a.name || '').localeCompare(b.name || ''));
+}
+
+function renderTokenManagerList() {
+  const tokens = filteredTokenManagerTokens();
+  tokenManagerList.innerHTML = tokenManagerRowsHtml(tokens);
+  // Selection state doesn't survive a filter/search change or a token being
+  // removed elsewhere - re-check only the boxes for ids still present and
+  // still selected, rather than trying to preserve anything stale.
+  tokenManagerList.querySelectorAll('.token-card').forEach((card) => {
+    const checkbox = card.querySelector('.tokenManagerSelect');
+    if (checkbox) checkbox.checked = tokenManagerSelectedIds.has(card.dataset.tokenId);
+  });
+}
+
+function openTokenManagerModal() {
+  tokenManagerSelectedIds = new Set();
+  tokenManagerSearchInput.value = '';
+  tokenManagerTypeFilter.value = '';
+  renderTokenManagerList();
+  bringModalToFront(tokenManagerModal);
+  tokenManagerModal.classList.add('visible');
+}
+
+function closeTokenManagerModal() {
+  tokenManagerModal.classList.remove('visible');
+}
+
+// Re-renders the list in place if it's currently open, so HP/condition/etc.
+// changes broadcast in from elsewhere show up live - same refresh-on-broadcast
+// pattern as refreshCombatActionsModal, called from renderSidebar().
+function refreshTokenManagerModal() {
+  if (tokenManagerModal.classList.contains('visible')) renderTokenManagerList();
+}
+
+document.getElementById('tokenManagerCloseBtn').addEventListener('click', closeTokenManagerModal);
+document.getElementById('tokenManagerAddBtn').addEventListener('click', () => openAddTokenModal('create'));
+tokenManagerModal.addEventListener('click', (e) => {
+  if (e.target === tokenManagerModal) closeTokenManagerModal();
+});
+
+tokenManagerSearchInput.addEventListener('input', renderTokenManagerList);
+tokenManagerTypeFilter.addEventListener('change', renderTokenManagerList);
+
+document.getElementById('tokenManagerRemoveSelectedBtn').addEventListener('click', () => {
+  if (!tokenManagerSelectedIds.size) return;
+  if (!confirm(`Remove ${tokenManagerSelectedIds.size} selected token(s)?`)) return;
+  send({ type: 'token:remove:bulk', tokenIds: [...tokenManagerSelectedIds] });
+  tokenManagerSelectedIds = new Set();
+});
+
+tokenManagerList.addEventListener('change', (e) => {
+  const card = e.target.closest('.token-card');
+  if (!card) return;
+  const tokenId = card.dataset.tokenId;
+
+  if (e.target.classList.contains('tokenManagerSelect')) {
+    if (e.target.checked) tokenManagerSelectedIds.add(tokenId);
+    else tokenManagerSelectedIds.delete(tokenId);
+  } else if (e.target.classList.contains('hpInput')) {
+    send({ type: 'token:stat:update', tokenId, stat: 'hp', value: Number(e.target.value) });
+  } else if (e.target.classList.contains('maxHpInput')) {
+    send({ type: 'token:stat:update', tokenId, stat: 'maxHp', value: Number(e.target.value) });
+  } else if (e.target.classList.contains('acInput')) {
+    // Enemy/npc AC is stripped from players by the server filter; the GM sets
+    // the true value here, and players only ever discover the `knownAc` bound.
+    send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
+  } else if (e.target.classList.contains('conditionSelect')) {
+    send({ type: 'token:stat:update', tokenId, stat: 'condition', value: e.target.value || null });
+  } else if (e.target.classList.contains('soundFolderSelect')) {
+    send({ type: 'token:stat:update', tokenId, stat: 'soundFolder', value: e.target.value || null });
+  } else if (e.target.classList.contains('darkvisionToggle')) {
+    send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
+  } else if (e.target.classList.contains('speedInput')) {
+    const value = Number(e.target.value) || 0;
+    send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });
+    send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value });
+  } else if (e.target.classList.contains('speedRemainingInput')) {
+    send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: Number(e.target.value) || 0 });
+  }
+});
+
+tokenManagerList.addEventListener('click', (e) => {
+  const card = e.target.closest('.token-card');
+  if (!card) return;
+  const tokenId = card.dataset.tokenId;
+  const token = session.tokens[tokenId];
+
+  if (e.target.classList.contains('editTokenBtn')) {
+    openAddTokenModal('edit', tokenId);
+    return;
+  }
+  // --- Manual stat-block attacks (checked before the row, since the delete
+  // ✕ lives inside a .gm-attack-row) ---
+  if (e.target.classList.contains('gm-attack-del')) {
+    const idx = Number(e.target.dataset.actionIndex);
+    const next = (token?.actions || []).filter((_, i) => i !== idx);
+    send({ type: 'token:stat:update', tokenId, stat: 'actions', value: next });
+    return;
+  }
+  if (e.target.classList.contains('addAttackBtn')) {
+    const box = e.target.closest('.gm-attack-add');
+    const name = box.querySelector('.atkName').value.trim();
+    if (!name) return alert('Give the attack a name.');
+    const action = {
+      name,
+      toHitBonus: Number(box.querySelector('.atkHit').value) || 0,
+      damageRolls: box.querySelector('.atkDmg').value.trim(),
+      damageBonus: Number(box.querySelector('.atkDmgBonus').value) || 0,
+    };
+    send({ type: 'token:stat:update', tokenId, stat: 'actions', value: [...(token?.actions || []), action] });
+    return;
+  }
+  const attackRow = e.target.closest('.gm-attack-row');
+  if (attackRow && token) {
+    const action = (token.actions || [])[Number(attackRow.dataset.actionIndex)];
+    if (action) armActionTargeting(tokenId, action);
+    return;
+  }
+  if (e.target.classList.contains('toggleHiddenBtn')) {
+    send({ type: 'token:hidden:toggle', tokenId });
+  } else if (e.target.classList.contains('removeBtn')) {
+    if (confirm('Remove this token?')) send({ type: 'token:remove', tokenId });
+  } else if (e.target.classList.contains('advancedVisionBtn')) {
+    openVisionModal(tokenId);
+  } else if (e.target.classList.contains('conditionsBtn')) {
+    openConditionsModal(tokenId);
+  } else if (e.target.classList.contains('changeImageBtn')) {
+    openImagePicker((url) => send({ type: 'token:stat:update', tokenId, stat: 'imageUrl', value: url }));
+  } else if (e.target.classList.contains('saveTemplateBtn')) {
+    saveTokenAsTemplate(token);
+  } else if (e.target.classList.contains('recenterTokenBtn')) {
+    recenterToken(tokenId);
+  } else if (e.target.classList.contains('speedMinusBtn')) {
+    adjustTokenSpeedRemaining(tokenId, -5);
+  } else if (e.target.classList.contains('speedPlusBtn')) {
+    adjustTokenSpeedRemaining(tokenId, 5);
+  } else if (e.target.classList.contains('speedResetBtn')) {
+    resetTokenSpeedRemaining(tokenId);
+  }
+});
 
 // --- Player sidebar ------------------------------------------------------
 
@@ -3371,6 +3629,7 @@ function openSpellPicker(tokenId, clickedLevel, intent = 'attack') {
     });
   });
 
+  bringModalToFront(spellPickerModal);
   spellPickerModal.classList.add('visible');
 }
 
@@ -3393,6 +3652,7 @@ function openCombatActionsModal(tokenId, tab = 'attack') {
     btn.classList.toggle('active', btn.dataset.combatTab === tab);
   });
   renderCombatActionsBody();
+  bringModalToFront(combatActionsModal);
   combatActionsModal.classList.add('visible');
 }
 

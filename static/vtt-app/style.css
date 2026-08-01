@@ -44,8 +44,14 @@ body {
 #sidebar button:hover { background: #3a6bee; }
 #sidebar button.danger { background: #e53935; }
 #sidebar button.secondary { background: #3a3d44; }
-#sidebar .row { display: flex; gap: 6px; align-items: center; }
-#sidebar .row > * { flex: 1; }
+/* .row is a general-purpose "lay these fields out side by side" utility -
+   not sidebar-specific despite the name's origin. It used to be scoped to
+   #sidebar only, which silently did nothing once fields with the same
+   "field row" markup moved into a modal (Map Settings/Add Token/Token
+   Manager, Phase 10) - every such row rendered as plain stacked blocks
+   instead of columns. */
+.row { display: flex; gap: 6px; align-items: center; }
+.row > * { flex: 1; }
 
 .combat-encounter-id { font-size: 11px; color: #999; margin-top: 6px; }
 .combat-encounter-id code { color: #eee; background: #14161b; padding: 1px 4px; border-radius: 3px; }
@@ -203,6 +209,11 @@ body {
 .modal .field { margin-bottom: 10px; }
 .modal label { display: block; font-size: 12px; color: #999; margin-bottom: 2px; }
 .modal input { width: 100%; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 13px; }
+/* Checkboxes shouldn't stretch to the input rule above - full-width makes a
+   checkbox render as an oversized square with its label text pushed onto the
+   next line (Conditions modal, Token Manager's Darkvision toggle). Mirrors
+   the existing #sidebar input[type="checkbox"] override below. */
+.modal input[type="checkbox"] { width: auto; }
 .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .modal .actions button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; background: #4a7fff; color: #fff; }
 .modal .actions button.secondary { background: #3a3d44; }

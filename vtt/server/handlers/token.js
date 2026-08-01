@@ -163,15 +163,22 @@ function isValidHpTarget(meta, token, stat) {
 }
 
 // Broadcasts a token-bearing event: GM always gets the raw token; players get
-// it filtered, and not at all if the token is GM-hidden (Section 5). `extra`
-// may be a plain object (same for every recipient) or a function of
-// `recipient` - the latter exists for token:stat:update, which needs to omit
-// the raw value for player recipients when it's landing on a filtered field.
-function broadcastToken(context, sessionId, eventType, token, extra = {}) {
+// it filtered, and not at all if the token is GM-hidden (Section 5) OR the
+// map itself is unrevealed (Phase 10) - an unrevealed map is a hard gate
+// ahead of per-token visibility, same rule filterSessionForRole applies to
+// the join/reconnect snapshot, extended here so it also covers the
+// continuous per-event broadcasts (a GM populating an unrevealed map via
+// Token Manager must not leak real token data over the wire just because
+// nothing currently renders it). `extra` may be a plain object (same for
+// every recipient) or a function of `recipient` - the latter exists for
+// token:stat:update, which needs to omit the raw value for player recipients
+// when it's landing on a filtered field.
+function broadcastToken(context, session, sessionId, eventType, token, extra = {}) {
   const extraFor = typeof extra === 'function' ? extra : () => extra;
+  const mapHidden = session.map && !session.map.revealed;
   context.broadcast(sessionId, (recipient) => {
     if (recipient.role === 'gm') return { type: eventType, ...extraFor(recipient), token };
-    if (token.hidden) return null;
+    if (token.hidden || mapHidden) return null;
     return { type: eventType, ...extraFor(recipient), token: filterTokenForPlayer(token) };
   });
 }
@@ -207,7 +214,7 @@ function handleTokenEvent(meta, msg, context) {
       const isSelfPcToken = meta.role === 'player' && token.type === 'pc' && token.ownerId === meta.playerId;
       if (meta.role !== 'gm' && !isSelfPcToken) return;
       session.tokens[token.id] = token;
-      broadcastToken(context, meta.sessionId, 'token:add', token);
+      broadcastToken(context, session, meta.sessionId, 'token:add', token);
       break;
     }
 
@@ -229,7 +236,7 @@ function handleTokenEvent(meta, msg, context) {
       if (!token || !canEditToken(meta, token)) return;
       token.x = msg.x;
       token.y = msg.y;
-      broadcastToken(context, meta.sessionId, 'token:move', token, {
+      broadcastToken(context, session, meta.sessionId, 'token:move', token, {
         tokenId: token.id,
         x: token.x,
         y: token.y,
@@ -283,7 +290,7 @@ function handleTokenEvent(meta, msg, context) {
       // the token-level filter to cover it.
       const isSensitiveStat = (token.type === 'enemy' || token.type === 'npc')
         && (!TOKEN_LEVEL_STAT_FIELDS.has(msg.stat) || ENEMY_HIDDEN_TOKEN_FIELDS.has(msg.stat));
-      broadcastToken(context, meta.sessionId, 'token:stat:update', token, (recipient) => {
+      broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, (recipient) => {
         if (recipient.role === 'gm' || !isSensitiveStat) {
           return { tokenId: token.id, stat: msg.stat, value: appliedValue };
         }
@@ -297,16 +304,66 @@ function handleTokenEvent(meta, msg, context) {
       const token = session.tokens[msg.tokenId];
       if (!token) return;
       token.hidden = !token.hidden;
+      const mapHidden = session.map && !session.map.revealed;
       // Players never see a hidden:toggle event itself (that would leak the
-      // token's existence) - instead they see it appear/disappear.
+      // token's existence) - instead they see it appear/disappear. While the
+      // map itself is unrevealed (Phase 10), a player never had this token in
+      // the first place (broadcastToken already withholds it), so the
+      // un-hide branch's real token:add would leak it early - skip entirely.
       context.broadcast(meta.sessionId, (recipient) => {
         if (recipient.role === 'gm') {
           return { type: 'token:hidden:toggle', tokenId: token.id, hidden: token.hidden };
         }
+        if (mapHidden) return null;
         return token.hidden
           ? { type: 'token:remove', tokenId: token.id }
           : { type: 'token:add', token: filterTokenForPlayer(token) };
       });
+      break;
+    }
+
+    // token:update (Phase 10) - the Token Manager's multi-field edit form,
+    // GM-only. Deliberately gated on role alone, not canEditToken - that
+    // helper also passes for a token's own owner, which would let a player
+    // bypass PLAYER_EDITABLE_FIELDS' carefully-maintained allowlist via one
+    // unrestricted patch. `hidden` is stripped rather than assigned: toggling
+    // it here would silently desync a connected player (token:hidden:toggle
+    // exists specifically to synthesize the add/remove that retracts/reveals
+    // a token already sitting in their local state - a bare field write does
+    // not). id/x/y aren't form fields; stripped defensively so a malformed
+    // patch can't relocate or re-identify a token through this path.
+    case 'token:update': {
+      if (meta.role !== 'gm') return;
+      const token = session.tokens[msg.tokenId];
+      if (!token) return;
+      const patch = { ...(msg.patch || {}) };
+      delete patch.hidden;
+      delete patch.id;
+      delete patch.x;
+      delete patch.y;
+      Object.assign(token, patch);
+      // No `extra` here (unlike token:stat:update) - the patch itself must
+      // never ride along on the broadcast, since filterTokenForPlayer only
+      // strips `stats`/`ac` off the `token` object, not off an arbitrary
+      // side-channel value (the exact leak class ENEMY_HIDDEN_TOKEN_FIELDS/
+      // isSensitiveStat above already guards against for stat:update).
+      broadcastToken(context, session, meta.sessionId, 'token:update', token, { tokenId: token.id });
+      break;
+    }
+
+    // token:remove:bulk (Phase 10, Token Manager) - GM-only multi-token
+    // cleanup (e.g. clearing defeated enemies post-combat) as one broadcast
+    // instead of N. No target-window cleanup needed: every consumer of
+    // meta.lastTargetTokenIds (isValidHpTarget, attack:resolve, spell:resolve)
+    // already resolves session.tokens[id] first and bails if it's gone, so a
+    // stale reference to a removed id is already inert.
+    case 'token:remove:bulk': {
+      if (meta.role !== 'gm') return;
+      const tokenIds = Array.isArray(msg.tokenIds) ? msg.tokenIds : [];
+      const removed = tokenIds.filter((id) => session.tokens[id]);
+      removed.forEach((id) => delete session.tokens[id]);
+      if (!removed.length) return;
+      context.broadcast(meta.sessionId, () => ({ type: 'token:remove:bulk', tokenIds: removed }));
       break;
     }
 
@@ -372,7 +429,7 @@ function handleTokenEvent(meta, msg, context) {
       // Broadcast the resulting HP (value stripped for players on enemy/npc, same
       // rule as a direct stat:update) so everyone's token state stays in sync.
       if (hit) {
-        broadcastToken(context, meta.sessionId, 'token:stat:update', target, (recipient) => {
+        broadcastToken(context, session, meta.sessionId, 'token:stat:update', target, (recipient) => {
           const sensitive = target.type === 'enemy' || target.type === 'npc';
           if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
           return { tokenId: target.id, stat: 'hp' };
@@ -380,7 +437,7 @@ function handleTokenEvent(meta, msg, context) {
       }
       // knownAc is the intentionally-public discovered bound - value goes to all.
       if (knownAcChanged) {
-        broadcastToken(context, meta.sessionId, 'token:stat:update', target, {
+        broadcastToken(context, session, meta.sessionId, 'token:stat:update', target, {
           tokenId: target.id, stat: 'knownAc', value: target.knownAc,
         });
       }
@@ -481,7 +538,7 @@ function handleTokenEvent(meta, msg, context) {
           damageApplied: reportedAmount,
         }));
 
-        broadcastToken(context, meta.sessionId, 'token:stat:update', target, (recipient) => {
+        broadcastToken(context, session, meta.sessionId, 'token:stat:update', target, (recipient) => {
           if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
           return { tokenId: target.id, stat: 'hp' };
         });
@@ -518,7 +575,7 @@ function handleTokenEvent(meta, msg, context) {
         damageApplied,
       }));
 
-      broadcastToken(context, meta.sessionId, 'token:stat:update', target, (recipient) => {
+      broadcastToken(context, session, meta.sessionId, 'token:stat:update', target, (recipient) => {
         const sensitive = target.type === 'enemy' || target.type === 'npc';
         if (recipient.role === 'gm' || !sensitive) return { tokenId: target.id, stat: 'hp', value: target.stats.hp };
         return { tokenId: target.id, stat: 'hp' };
