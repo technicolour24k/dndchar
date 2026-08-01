@@ -1,7 +1,7 @@
 // Exported so main.js's Token Manager list (Phase 10) can reuse the exact
 // same type/condition swatch colors as the canvas, rather than inventing a
 // second color scheme for the same concepts.
-export const TYPE_COLOR = { pc: '#4caf50', npc: '#2196f3', enemy: '#e53935' };
+export const TYPE_COLOR = { pc: '#4caf50', npc: '#2196f3', enemy: '#e53935', prop: '#9c7f4f' };
 export const CONDITION_COLOR = { healthy: '#4caf50', bloodied: '#ff9800', critical: '#e53935' };
 
 function colorForType(type) {

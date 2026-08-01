@@ -325,8 +325,10 @@
        Manager's "+ Add Token") and edit (clicking a row in Token Manager)
        modes from the same form - see tokenFormState/openAddTokenModal in
        main.js. Field visibility is type-conditional (syncFieldVisibilityForType
-       in main.js) so a future `prop` type (Phase 12) is a hook to extend, not
-       a rewrite. -->
+       in main.js) - HP/AC/vision/speed/sound-folder fields hide for `type:
+       'prop'` (Phase 12), which has none of those. Light-emission fields
+       (tokenLightEmittingInput/tokenLightRadiusInput) are NOT type-conditional
+       - any token type can emit light (Phase 12 Section 2a). -->
   <div id="addTokenModal" class="modal-overlay">
     <div class="modal modal-wide">
       <h2 id="addTokenModalTitle">Add Token</h2>
@@ -344,9 +346,10 @@
             <option value="pc">PC</option>
             <option value="npc">NPC</option>
             <option value="enemy">Enemy</option>
+            <option value="prop">Prop</option>
           </select>
         </div>
-        <div id="tokenOwnerField"><label>Owner (for PCs)</label>
+        <div id="tokenOwnerField"><label>Owner (PCs, optionally Props)</label>
           <select id="tokenOwnerSelect"><option value="">- none -</option></select>
         </div>
       </div>
@@ -373,6 +376,10 @@
         <div><label>Image URL</label><input type="text" id="tokenImageUrlInput" placeholder="/uploads/... or paste a URL" /></div>
         <div style="flex: 0 0 120px;"><img id="tokenThumb" class="thumb" style="width: 120px;" /></div>
       </div>
+      <div class="field row">
+        <div><label><input type="checkbox" id="tokenLightEmittingInput" /> Light-emitting</label></div>
+        <div><label>Light radius (ft)</label><input type="number" id="tokenLightRadiusInput" value="20" /></div>
+      </div>
       <div class="field"><label><input type="checkbox" id="tokenHiddenInput" /> Hidden from players</label></div>
       <div class="actions">
         <button type="button" id="addTokenCancelBtn" class="secondary">Cancel</button>
@@ -396,6 +403,7 @@
             <option value="pc">PC</option>
             <option value="npc">NPC</option>
             <option value="enemy">Enemy</option>
+            <option value="prop">Prop</option>
           </select>
         </div>
       </div>

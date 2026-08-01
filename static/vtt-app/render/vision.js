@@ -78,6 +78,28 @@ export function isPointRevealed(x, y, radii) {
   });
 }
 
+// Phase 12 Section 2b: a light-emitting token's circle only counts for a
+// given viewer once the light source's own position is already within that
+// viewer's vision reach (their owned tokens' gray-band union - the outer
+// bound isPointRevealed already tests against, same "have I looked there
+// yet" semantics as everything else that consumes it). Binary, not partial -
+// outside reach contributes nothing, inside reach contributes the light's
+// full radius as an extra COLOR-layer circle (never gray; darkness-piercing
+// light doesn't make sense as a grayscale-only band). Deliberately its own
+// function rather than folded into computeVisionRadii's per-owned-token
+// loop above - it iterates ALL tokens (not just this viewer's own), against
+// radii already computed for this viewer, and must be recomputed on every
+// render() (light source moves, or the viewer's own token moves).
+export function computeLightRevealCircles(allTokens, radii, pxPerFoot) {
+  const circles = [];
+  for (const token of allTokens) {
+    if (!token.lightEmitting || !token.lightRadiusFt) continue;
+    if (!isPointRevealed(token.x, token.y, radii)) continue;
+    circles.push({ x: token.x, y: token.y, r: token.lightRadiusFt * pxPerFoot });
+  }
+  return circles;
+}
+
 // The vision mask itself is no longer rendered here. The old
 // renderVisionMaskedMap() drew the full map image once per vision circle
 // (grayscale pass + color pass) into the canvas - replaced by DOM layers

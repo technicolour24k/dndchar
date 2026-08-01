@@ -1,6 +1,6 @@
 import { drawGrid } from './render/map.js';
 import { drawTokens, TYPE_COLOR, CONDITION_COLOR } from './render/tokens.js';
-import { computeVisionRadii, isPointRevealed } from './render/vision.js';
+import { computeVisionRadii, isPointRevealed, computeLightRevealCircles } from './render/vision.js';
 import { updateMapLayers, hideMapLayers, isVideoUrl } from './render/mapLayers.js';
 import { drawMovementRange } from './render/movement.js';
 import { drawMarkers } from './render/markers.js';
@@ -935,7 +935,13 @@ function render() {
   } else {
     const ownedTokens = allTokens.filter((t) => t.ownerId === playerId);
     const radii = computeVisionRadii(ownedTokens, map);
-    updateMapLayers({ map, role, radii, zoomLevel });
+    // Phase 12 Section 2b: recomputed every render() (this viewer's own
+    // token moved, or any light source moved) against ALL tokens they've
+    // been sent - hidden light sources never reach this array in the first
+    // place (server-side filtering, Section 0.4), so they're already
+    // excluded with no extra check needed here.
+    const lightCircles = computeLightRevealCircles(allTokens, radii, map.gridSizePx / 5);
+    updateMapLayers({ map, role, radii, zoomLevel, lightCircles });
     const visibleTokens = allTokens.filter((t) => isPointRevealed(t.x, t.y, radii));
     // Only the player's own tokens' remaining-movement circle is shown - how
     // far an enemy or another player's token can still move is tactical
@@ -2751,21 +2757,27 @@ function gmAttacksHtml(t) {
 // instead, plus a multi-select checkbox (Section 3c, bulk-remove) and an
 // Edit… button opening the Add Token form pre-filled (Section 3a) for the
 // fields that have no other inline editor - name, type, and owner.
+// Phase 12: a `prop` has no HP/AC/attacks/condition/sound-cue/vision/speed -
+// those sections are omitted from its row entirely (not rendered with empty
+// values) rather than adding a fifth "is this a prop" check per section.
 function tokenManagerRowsHtml(tokens) {
   if (!tokens.length) return '<p style="color:#666;font-size:12px;">No tokens match.</p>';
 
   return tokens
     .map((t) => {
+      const isProp = t.type === 'prop';
       const hp = t.stats?.hp ?? '';
       const maxHp = t.stats?.maxHp ?? '';
       const speed = t.speedFt ?? '';
       const speedRemaining = t.speedRemainingFt ?? '';
+      const lightTag = t.lightEmitting ? ` <span class="tag">light ${t.lightRadiusFt || 0}ft</span>` : '';
       return `
         <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title">
-            <span><input type="checkbox" class="tokenManagerSelect" title="Select for bulk removal" /> ${t.imageUrl ? `<img class="token-thumb" src="${escapeHtml(t.imageUrl)}" alt="" />` : ''}${escapeHtml(t.name)} <span class="tag">${t.type}</span>${t.hidden ? ' <span class="tag">hidden</span>' : ''}</span>
+            <span><input type="checkbox" class="tokenManagerSelect" title="Select for bulk removal" /> ${t.imageUrl ? `<img class="token-thumb" src="${escapeHtml(t.imageUrl)}" alt="" />` : ''}${escapeHtml(t.name)} <span class="tag">${t.type}</span>${t.hidden ? ' <span class="tag">hidden</span>' : ''}${lightTag}</span>
             <button type="button" class="secondary editTokenBtn">Edit…</button>
           </div>
+          ${isProp ? '' : `
           <div class="field row">
             <div><label>HP</label><input type="number" class="hpInput" value="${hp}" /></div>
             <div><label>Max HP</label><input type="number" class="maxHpInput" value="${maxHp}" /></div>
@@ -2794,10 +2806,10 @@ function tokenManagerRowsHtml(tokens) {
             <button class="secondary speedResetBtn">Reset move</button>
           </div>
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
+          `}
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
-            <button class="secondary advancedVisionBtn">Advanced Vision…</button>
-            <button class="secondary conditionsBtn">Conditions…</button>
+            ${isProp ? '' : '<button class="secondary advancedVisionBtn">Advanced Vision…</button><button class="secondary conditionsBtn">Conditions…</button>'}
             <button class="secondary saveTemplateBtn">Save as Template…</button>
             <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if a token ever gets dragged somewhere unreachable">Recenter on Map</button>
             <button class="secondary toggleHiddenBtn">${t.hidden ? 'Unhide' : 'Hide'}</button>
@@ -3081,6 +3093,10 @@ const tokenTypeSelect = document.getElementById('tokenTypeSelect');
 const tokenOwnerField = document.getElementById('tokenOwnerField');
 const tokenOwnerSelect = document.getElementById('tokenOwnerSelect');
 const tokenSoundFolderSelect = document.getElementById('tokenSoundFolderSelect');
+const tokenSoundFolderField = document.getElementById('tokenSoundFolderField');
+const tokenSpeedField = document.getElementById('tokenSpeedField');
+const tokenVisionField = document.getElementById('tokenVisionField');
+const tokenStatsField = document.getElementById('tokenStatsField');
 const tokenVisionNormalInput = document.getElementById('tokenVisionNormalInput');
 const tokenVisionDarkInput = document.getElementById('tokenVisionDarkInput');
 const tokenHpInput = document.getElementById('tokenHpInput');
@@ -3090,6 +3106,8 @@ const tokenSpeedInput = document.getElementById('tokenSpeedInput');
 const tokenFileInput = document.getElementById('tokenFileInput');
 const tokenImageUrlInput = document.getElementById('tokenImageUrlInput');
 const tokenThumb = document.getElementById('tokenThumb');
+const tokenLightEmittingInput = document.getElementById('tokenLightEmittingInput');
+const tokenLightRadiusInput = document.getElementById('tokenLightRadiusInput');
 const tokenHiddenInput = document.getElementById('tokenHiddenInput');
 const addTokenCreatureLibraryField = document.getElementById('addTokenCreatureLibraryField');
 const creatureLibraryLoadedLabel = document.getElementById('creatureLibraryLoadedLabel');
@@ -3112,11 +3130,24 @@ let tokenFormState = null;
 // drop attacks that were already loaded into the form.
 let pendingTemplateActions = [];
 
-// Section 3d: field visibility keys off the selected type, mirroring
-// wireMarkerForm's syncShapeFields - no `prop` type exists yet (Phase 12),
-// but this is the single hook point adding one will extend, not rework.
+// Section 3d (Phase 10) / Phase 12 Section 1: field visibility keys off the
+// selected type, mirroring wireMarkerForm's syncShapeFields. A `prop` has no
+// HP/vision/speed/AC/sound-cue - those fields hide entirely rather than
+// sitting there unused (see readTokenFormFields, which omits the underlying
+// keys too, not just the UI). Light-emission fields are deliberately absent
+// from this function - they're valid on any type (Phase 12 Section 2a).
 function syncFieldVisibilityForType() {
-  tokenOwnerField.style.display = tokenTypeSelect.value === 'pc' ? '' : 'none';
+  const type = tokenTypeSelect.value;
+  const isProp = type === 'prop';
+  // Owner applies to PCs (the character's controlling player) and, per
+  // Phase 12 Section 1, optionally to props too (a carried torch) - move
+  // authorization is ownership-based regardless of type, so setting one here
+  // is all a prop needs to become player-movable.
+  tokenOwnerField.style.display = (type === 'pc' || isProp) ? '' : 'none';
+  tokenSoundFolderField.style.display = isProp ? 'none' : '';
+  tokenSpeedField.style.display = isProp ? 'none' : '';
+  tokenVisionField.style.display = isProp ? 'none' : '';
+  tokenStatsField.style.display = isProp ? 'none' : '';
 }
 
 function populateOwnerOptions() {
@@ -3143,6 +3174,8 @@ function resetAddTokenForm() {
   tokenImageUrlInput.value = '';
   tokenThumb.removeAttribute('src');
   tokenThumb.classList.remove('visible');
+  tokenLightEmittingInput.checked = false;
+  tokenLightRadiusInput.value = 20;
   tokenHiddenInput.checked = false;
 }
 
@@ -3160,6 +3193,8 @@ function populateAddTokenForm(token) {
   tokenImageUrlInput.value = token.imageUrl || '';
   if (token.imageUrl) tokenThumb.src = token.imageUrl; else tokenThumb.removeAttribute('src');
   tokenThumb.classList.toggle('visible', !!token.imageUrl);
+  tokenLightEmittingInput.checked = !!token.lightEmitting;
+  tokenLightRadiusInput.value = token.lightRadiusFt ?? 20;
   tokenHiddenInput.checked = !!token.hidden;
 }
 
@@ -3263,23 +3298,35 @@ document.getElementById('openCreatureLibraryBtn').addEventListener('click', () =
 // changes locally until Save, so reading session.tokens there would
 // silently save stale pre-edit values if a GM clicks Save to catalog before
 // Save.
+//
+// Phase 12 Section 1: for `type: 'prop'`, soundFolder/vision/speed/ac/stats
+// are omitted entirely rather than sent as zeroed values - a prop has no HP,
+// vision, or speed in the data model, not just a UI that hides them. Light
+// fields (lightEmitting/lightRadiusFt) are included regardless of type -
+// any token can emit light (Section 2a).
 function readTokenFormFields() {
-  return {
+  const isProp = tokenTypeSelect.value === 'prop';
+  const fields = {
     name: tokenNameInput.value.trim(),
     type: tokenTypeSelect.value,
     ownerId: tokenOwnerSelect.value || null,
-    soundFolder: tokenSoundFolderSelect.value || null,
     imageUrl: tokenImageUrlInput.value.trim() || null,
-    visionNormalFt: Number(tokenVisionNormalInput.value) || 0,
-    visionDarkFt: Number(tokenVisionDarkInput.value) || 0,
-    speedFt: Number(tokenSpeedInput.value) || 0,
-    ac: Number(tokenAcInput.value) || 0,
-    stats: {
+    lightEmitting: tokenLightEmittingInput.checked,
+    lightRadiusFt: Number(tokenLightRadiusInput.value) || 0,
+  };
+  if (!isProp) {
+    fields.soundFolder = tokenSoundFolderSelect.value || null;
+    fields.visionNormalFt = Number(tokenVisionNormalInput.value) || 0;
+    fields.visionDarkFt = Number(tokenVisionDarkInput.value) || 0;
+    fields.speedFt = Number(tokenSpeedInput.value) || 0;
+    fields.ac = Number(tokenAcInput.value) || 0;
+    fields.stats = {
       hp: Number(tokenHpInput.value) || 0,
       maxHp: Number(tokenMaxHpInput.value) || 0,
-    },
-    actions: pendingTemplateActions,
-  };
+    };
+    fields.actions = pendingTemplateActions;
+  }
+  return fields;
 }
 
 tokenSaveToCatalogBtn.addEventListener('click', () => {
@@ -3290,13 +3337,17 @@ addTokenBtn.addEventListener('click', () => {
   const fields = readTokenFormFields();
   if (!fields.name) return alert('Give the token a name.');
 
+  // Phase 12: speedRemainingFt/visionTrueFt/visionDevilFt are vision/speed
+  // stats too, same as the fields readTokenFormFields already omits for a
+  // prop - only added when the base fields exist, so a prop token:add/update
+  // never gets a zeroed vision/speed field the form itself doesn't show.
+  const isProp = fields.type === 'prop';
+
   if (tokenFormState.mode === 'edit') {
     const { tokenId, originalHidden } = tokenFormState;
-    send({
-      type: 'token:update',
-      tokenId,
-      patch: { ...fields, speedRemainingFt: fields.speedFt },
-    });
+    const patch = { ...fields };
+    if (!isProp) patch.speedRemainingFt = fields.speedFt;
+    send({ type: 'token:update', tokenId, patch });
     if (tokenHiddenInput.checked !== originalHidden) send({ type: 'token:hidden:toggle', tokenId });
     closeAddTokenModal();
     return;
@@ -3306,9 +3357,7 @@ addTokenBtn.addEventListener('click', () => {
   const map = session.map || { widthPx: 800, heightPx: 600 };
   const baseToken = {
     ...fields,
-    visionTrueFt: 0,
-    visionDevilFt: 0,
-    speedRemainingFt: fields.speedFt,
+    ...(isProp ? {} : { visionTrueFt: 0, visionDevilFt: 0, speedRemainingFt: fields.speedFt }),
     hidden: tokenHiddenInput.checked,
   };
 
@@ -3543,10 +3592,14 @@ function playerSidebarHtml() {
   `;
 }
 
+// Phase 12: a player-owned `prop` (a carried torch) has no HP/speed/
+// conditions to self-track - only art and position (movement itself is
+// drag-on-canvas, ownership-gated server-side, needs nothing here).
 function ownTokenListHtml(tokens) {
   if (!tokens.length) return '<p style="color:#666;font-size:12px;">You don\'t control any tokens yet - ask the GM to assign one.</p>';
   return tokens
     .map((t) => {
+      const isProp = t.type === 'prop';
       const hp = t.stats?.hp ?? '';
       const maxHp = t.stats?.maxHp ?? '';
       const speed = t.speedFt ?? '';
@@ -3554,6 +3607,7 @@ function ownTokenListHtml(tokens) {
       return `
         <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title"><span>${t.imageUrl ? `<img class="token-thumb" src="${escapeHtml(t.imageUrl)}" alt="" />` : ''}${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>
+          ${isProp ? '' : `
           <div class="field row">
             <div><label>HP</label><input type="number" class="hpInput" value="${hp}" /></div>
             <div><label>Max HP</label><input type="number" class="maxHpInput" value="${maxHp}" /></div>
@@ -3568,9 +3622,10 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedResetBtn">Reset move</button>
           </div>
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
+          `}
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
-            <button class="secondary conditionsBtn">Conditions…</button>
+            ${isProp ? '' : '<button class="secondary conditionsBtn">Conditions…</button>'}
             <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if your token ever gets dragged somewhere unreachable">Recenter on Map</button>
           </div>
           ${miniSheetHtml(t)}
