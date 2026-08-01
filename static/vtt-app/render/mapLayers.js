@@ -122,7 +122,11 @@ export function hideMapLayers() {
 // Called from render() every time - must be idempotent and cheap when
 // nothing relevant changed. `radii` is computeVisionRadii()'s output for the
 // viewing player's owned tokens (null for the GM, whose map is unclipped).
-export function updateMapLayers({ map, role, radii, zoomLevel }) {
+// `lightCircles` (Phase 12 Section 2b) is computeLightRevealCircles()'s
+// output - already-revealed-to-this-viewer light sources, contributed to the
+// color clip only, never gray. Omitted entirely for the GM (unclipped, no
+// clip geometry to extend).
+export function updateMapLayers({ map, role, radii, zoomLevel, lightCircles = [] }) {
   layersEl.style.display = '';
   layersEl.style.width = `${map.widthPx}px`;
   layersEl.style.height = `${map.heightPx}px`;
@@ -157,6 +161,9 @@ export function updateMapLayers({ map, role, radii, zoomLevel }) {
     // inside colorRadius the color layer paints over it anyway.
     if (grayRadius > colorRadius) grayEntries.push({ x: token.x, y: token.y, r: grayRadius });
   }
+  // Revealed light sources extend the color band only - a torch doesn't
+  // create a grayscale-only "sensed but dim" band the way darkvision does.
+  colorEntries.push(...lightCircles);
   // An empty <clipPath> clips everything away - a player with no owned
   // tokens (or no vision) correctly sees only the black backdrop.
   syncClipCircles(colorClipEl, colorEntries);
