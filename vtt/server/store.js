@@ -89,6 +89,16 @@ export function shouldPlayerSeeMarker(marker, playerId) {
 export function filterSessionForRole(session, role, playerId) {
   if (role === 'gm') return session;
 
+  // Phase 10: a GM-hidden map is a hard gate ahead of all other filtering -
+  // players get nothing map-related (no image/video, no tokens, no markers)
+  // regardless of any individual token/marker's own visibility, since there's
+  // nothing to render it onto. `{ revealed: false }` (not `null`) so the
+  // client can distinguish "no map set yet" from "map set but not revealed"
+  // and show an accurate waiting message (see render() in main.js).
+  if (session.map && !session.map.revealed) {
+    return { ...session, map: { revealed: false }, tokens: {}, markers: {} };
+  }
+
   const tokens = {};
   for (const [id, token] of Object.entries(session.tokens)) {
     if (token.hidden) continue;

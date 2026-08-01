@@ -73,14 +73,17 @@ export function attachVttWebSocketServer(httpServer) {
           break;
         case 'token:add':
         case 'token:remove':
+        case 'token:remove:bulk':
         case 'token:move':
         case 'token:stat:update':
+        case 'token:update':
         case 'token:hidden:toggle':
         case 'attack:resolve':
         case 'spell:resolve':
           handleTokenEvent(meta, msg, context);
           break;
         case 'map:set':
+        case 'map:reveal':
           handleMapEvent(meta, msg, context);
           break;
         case 'marker:add':
