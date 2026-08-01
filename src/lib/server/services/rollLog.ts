@@ -22,11 +22,26 @@ function toEntry(row: any): RollLogEntry {
 // Unlike combatLog.ts's logCombatEvent, the caller here already knows the
 // exact VTT room id (it's whatever the character joined via "Join Session"),
 // so this can broadcast directly instead of scanning sessions for a match.
+//
+// visibility 'gm' (Phase 9's freeform dice roller) is broadcast-only, never
+// persisted: the GET endpoint below is role-blind (any signed-in user who
+// knows the room's sessionId can fetch its backlog - there's no durable
+// server-side notion of "is this user the GM of this room", since GM/player
+// role is purely client-asserted per-connection, see join.js). Persisting a
+// private roll would silently leak it to any player's next reconnect via
+// that same backlog fetch, regardless of the live broadcast filtering below.
 export async function logRoll(
   sessionId: string,
   message: string,
-  details: Record<string, unknown> = {}
-): Promise<RollLogEntry> {
+  details: Record<string, unknown> = {},
+  visibility: 'public' | 'gm' = 'public'
+): Promise<RollLogEntry | null> {
+  if (visibility === 'gm') {
+    broadcast(sessionId, (recipient: { role: string | null }) =>
+      recipient.role === 'gm' ? { type: 'roll:log', message, details } : null
+    );
+    return null;
+  }
   const result = await query<any>(
     'INSERT INTO roll_log_entries (session_id, message, details) VALUES ($1,$2,$3) RETURNING *',
     [sessionId, message, JSON.stringify(details)]

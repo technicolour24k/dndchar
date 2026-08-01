@@ -7,6 +7,7 @@ import handleMapEvent from './handlers/map.js';
 import handleMarkerEvent from './handlers/marker.js';
 import handleTargetEvent from './handlers/target.js';
 import handleSoundboardEvent from './handlers/soundboard.js';
+import handleDiceEvent from './handlers/dice.js';
 
 const WS_PATH = '/vtt-ws';
 
@@ -93,6 +94,9 @@ export function attachVttWebSocketServer(httpServer) {
           break;
         case 'soundboard:play':
           handleSoundboardEvent(meta, msg, context);
+          break;
+        case 'dice:roll':
+          handleDiceEvent(meta, msg, context);
           break;
         default:
           break;

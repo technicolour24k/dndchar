@@ -1710,7 +1710,13 @@ async function uploadMedia(file, field) {
   const formData = new FormData();
   formData.append(field, file);
   const res = await fetch('/vtt/api/upload', { method: 'POST', body: formData });
-  if (!res.ok) throw new Error('upload_failed');
+  if (!res.ok) {
+    // +server.ts's error(status, reason) comes back as JSON { message: reason }
+    // (e.g. "file_too_large") - surface that instead of a bare "upload failed"
+    // so a future cap/type mismatch is diagnosable from the alert alone.
+    const reason = await res.json().then((body) => body?.message).catch(() => null);
+    throw new Error(reason || `upload_failed_${res.status}`);
+  }
   const data = await res.json();
   return data.url;
 }
@@ -2155,6 +2161,60 @@ soundboardModal.addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Dice Roller modal (Phase 9) - freeform d4/d6/d8/d10/d12/d20 roller,
+// available to both roles (the button lives in roomInfoHtml, shared by
+// gmSidebarHtml/playerSidebarHtml). Rolling happens client-side, same trust
+// model as the character sheet's ability/skill/save rolls - the server only
+// re-validates shape before logging (see dice.js), it doesn't re-roll.
+// ---------------------------------------------------------------------------
+
+const DICE_TYPES = ['d4', 'd6', 'd8', 'd10', 'd12', 'd20'];
+const diceRollerModal = document.getElementById('diceRollerModal');
+const diceRollerGmField = document.getElementById('diceRollerGmField');
+const diceRollerPublicToggle = document.getElementById('diceRollerPublicToggle');
+const diceRollerResult = document.getElementById('diceRollerResult');
+
+function openDiceRollerModal() {
+  diceRollerGmField.style.display = role === 'gm' ? '' : 'none';
+  diceRollerPublicToggle.checked = false; // always defaults private for GM - see the modal's own comment in index.html
+  diceRollerResult.style.display = 'none';
+  diceRollerModal.classList.add('visible');
+}
+
+function closeDiceRollerModal() {
+  diceRollerModal.classList.remove('visible');
+}
+
+document.getElementById('diceRollerCancelBtn').addEventListener('click', closeDiceRollerModal);
+diceRollerModal.addEventListener('click', (e) => {
+  if (e.target === diceRollerModal) closeDiceRollerModal();
+});
+
+document.getElementById('diceRollerRollBtn').addEventListener('click', () => {
+  const dice = [];
+  const results = [];
+  const parts = [];
+  for (const type of DICE_TYPES) {
+    const qty = Number(document.getElementById(`diceQty-${type}`).value) || 0;
+    if (qty <= 0) continue;
+    const sides = Number(type.slice(1));
+    const rolls = Array.from({ length: qty }, () => Math.floor(Math.random() * sides) + 1);
+    dice.push({ type, count: qty });
+    results.push(...rolls);
+    parts.push({ label: `${qty}${type}`, rolls });
+  }
+  if (!dice.length) return;
+
+  const total = results.reduce((sum, r) => sum + r, 0);
+  const breakdown = `${parts.map((p) => p.label).join(' + ')}: ${parts.map((p) => `[${p.rolls.join(', ')}]`).join(' + ')} = ${total}`;
+  diceRollerResult.textContent = breakdown;
+  diceRollerResult.style.display = '';
+
+  const isPublic = role !== 'gm' || diceRollerPublicToggle.checked;
+  send({ type: 'dice:roll', dice, results, total, public: isPublic });
+});
+
+// ---------------------------------------------------------------------------
 // Creature Library modal - GM-only saved-creature picker (see
 // saveTokenAsTemplate). Same callback shape as openImagePicker: the caller
 // (openCreatureLibraryBtn's click handler in wireGmSidebar) decides what
@@ -2257,6 +2317,7 @@ function playerListHtml() {
 
 function roomInfoHtml(roleLabel) {
   return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+    <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${combatControlHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
@@ -2776,6 +2837,7 @@ function wireGmSidebar() {
   document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
   wireSessionNotesControls();
 
+  document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
   document.getElementById('openSoundboardBtn').addEventListener('click', openSoundboardModal);
 
   document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
@@ -2820,8 +2882,8 @@ function wireGmSidebar() {
         };
         img.src = url;
       }
-    } catch {
-      alert('Map upload failed.');
+    } catch (err) {
+      alert(`Map upload failed: ${err.message || 'unknown error'}`);
     }
   });
 
@@ -3466,6 +3528,7 @@ document.getElementById('combatActionsCancelBtn').addEventListener('click', () =
 function wirePlayerSidebar() {
   document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
   wireSessionNotesControls();
+  document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
 
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;

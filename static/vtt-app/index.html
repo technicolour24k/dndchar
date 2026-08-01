@@ -235,6 +235,33 @@
     </div>
   </div>
 
+  <!-- Dice Roller (Phase 9): freeform d4/d6/d8/d10/d12/d20 roller, independent
+       of any specific check - results post to the Roll Log via dice:roll.
+       GM-only "Make this roll public" toggle, defaulting unchecked on every
+       open (see openDiceRollerModal in main.js) so a GM never accidentally
+       reveals a private roll by assuming the default was public. -->
+  <div id="diceRollerModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Roll Dice</h2>
+      <div class="field" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        <div><label>d4</label><input type="number" id="diceQty-d4" min="0" value="0" /></div>
+        <div><label>d6</label><input type="number" id="diceQty-d6" min="0" value="0" /></div>
+        <div><label>d8</label><input type="number" id="diceQty-d8" min="0" value="0" /></div>
+        <div><label>d10</label><input type="number" id="diceQty-d10" min="0" value="0" /></div>
+        <div><label>d12</label><input type="number" id="diceQty-d12" min="0" value="0" /></div>
+        <div><label>d20</label><input type="number" id="diceQty-d20" min="0" value="0" /></div>
+      </div>
+      <div class="field" id="diceRollerGmField" style="display:none;">
+        <label><input type="checkbox" id="diceRollerPublicToggle" /> Make this roll public (visible to players)</label>
+      </div>
+      <div id="diceRollerResult" class="combat-log-line" style="display:none;"></div>
+      <div class="actions">
+        <button type="button" id="diceRollerCancelBtn" class="secondary">Close</button>
+        <button type="button" id="diceRollerRollBtn">Roll</button>
+      </div>
+    </div>
+  </div>
+
   <script type="module" src="/vtt-app/main.js"></script>
 </body>
 </html>
