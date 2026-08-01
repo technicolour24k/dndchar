@@ -8,6 +8,15 @@ function colorForType(type) {
   return TYPE_COLOR[type] || '#9e9e9e';
 }
 
+// getImage() (main.js) returns either a cached <img> or, for animated token
+// art, a cached <video> - readiness is a different property on each, but
+// ctx.drawImage() itself accepts both once ready, no other branch needed.
+function isMediaReady(media) {
+  if (!media) return false;
+  if (media.tagName === 'VIDEO') return media.readyState >= 2 && media.videoWidth > 0;
+  return media.complete && media.naturalWidth > 0;
+}
+
 // Hidden tokens only ever reach this function on the GM's own client -
 // filterSessionForRole strips them from a player's session entirely, so
 // there's no risk of the transparency itself being a tell for players who
@@ -30,7 +39,7 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage, viewerId = null) {
     ctx.save();
     ctx.globalAlpha = token.hidden ? HIDDEN_TOKEN_OPACITY : 1;
 
-    if (img && img.complete && img.naturalWidth) {
+    if (isMediaReady(img)) {
       ctx.save();
       ctx.beginPath();
       ctx.arc(token.x, token.y, radius, 0, Math.PI * 2);
