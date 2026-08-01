@@ -13,7 +13,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const TOKEN_PACKS_ROOT = path.join(process.cwd(), 'assets', 'images', 'tokens');
-const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+// Phase 11: some packs (e.g. HoloHeroes_AnimatedTokens_Tokens) ship .webm
+// alongside their static art - without these extensions here, the indexer
+// silently skips every animated file and the picker never lists them.
+const MEDIA_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.mp4', '.m4v', '.webm', '.ogv']);
 
 let cachedIndex = null;
 
@@ -54,7 +57,7 @@ function walk(dir, relativeSegments, source, category, entries) {
       continue;
     }
 
-    if (!IMAGE_EXT.has(path.extname(dirent.name).toLowerCase())) continue;
+    if (!MEDIA_EXT.has(path.extname(dirent.name).toLowerCase())) continue;
 
     entries.push({
       path: [...relativeSegments, dirent.name].join('/'),

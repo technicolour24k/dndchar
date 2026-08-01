@@ -63,16 +63,31 @@ let sessionNoteLines = []; // { id, displayName, message, createdAt } - Session 
 
 const imageCache = new Map();
 
+// Returns a cached <img> for static art, or a cached <video> (muted, looped,
+// never attached to the DOM - drawImage() reads decoded frames from a video
+// element regardless of whether it's in the document) for a token whose art
+// is one of the animated .webm files - see render/tokens.js's drawTokens()
+// for how each is drawn, and ensureTokenVideoLoop() below for what keeps a
+// video's frame current on canvas.
 function getImage(url) {
   if (!url) return null;
-  let img = imageCache.get(url);
-  if (!img) {
-    img = new Image();
-    img.onload = () => render();
-    img.src = url;
-    imageCache.set(url, img);
+  let media = imageCache.get(url);
+  if (!media) {
+    if (isVideoUrl(url)) {
+      media = document.createElement('video');
+      media.muted = true;
+      media.loop = true;
+      media.playsInline = true;
+      media.src = url;
+      media.play().catch(() => {}); // muted autoplay is allowed; failure just means a stalled first frame
+    } else {
+      media = new Image();
+      media.onload = () => render();
+      media.src = url;
+    }
+    imageCache.set(url, media);
   }
-  return img;
+  return media;
 }
 
 function escapeHtml(str) {
@@ -888,6 +903,7 @@ function render() {
     else if (session?.map?.revealed === false) message = 'Waiting for the GM to reveal the map…';
     ctx.fillText(message, canvas.width / 2, canvas.height / 2);
     currentRenderedTokens = [];
+    ensureTokenVideoLoop();
     return;
   }
 
@@ -976,6 +992,38 @@ function render() {
     ctx.fillText(label, dragState.x, dragState.y - radius - 10);
     ctx.restore();
   }
+
+  ensureTokenVideoLoop();
+}
+
+// ---------------------------------------------------------------------------
+// Animated tokens (Phase 11) - unlike the map (render/mapLayers.js), tokens
+// stay on canvas: they're small in count/area, and moving them to DOM layers
+// would drag hit-testing/drag/click-to-target along with it. Instead, a
+// lightweight rAF loop just keeps calling the existing full render() - cheap
+// enough at token scale (see the brief) - but only while it actually needs
+// to: as soon as no currently-rendered token is a playing video, the tick
+// below stops rescheduling itself and rendering goes back to purely
+// event-driven, same as when no animated content exists at all.
+// ---------------------------------------------------------------------------
+
+let tokenVideoRafId = null;
+
+function anyVisibleTokenIsVideo() {
+  return currentRenderedTokens.some((t) => t.imageUrl && isVideoUrl(t.imageUrl));
+}
+
+function ensureTokenVideoLoop() {
+  if (tokenVideoRafId !== null) return; // already scheduled
+  if (!anyVisibleTokenIsVideo()) return;
+  tokenVideoRafId = requestAnimationFrame(tokenVideoTick);
+}
+
+function tokenVideoTick() {
+  tokenVideoRafId = null;
+  if (!anyVisibleTokenIsVideo()) return; // stop - falls back to event-driven render()
+  render(); // render() itself calls ensureTokenVideoLoop() at its end - the call below is then a no-op
+  ensureTokenVideoLoop();
 }
 
 function canvasCoords(e) {
@@ -1768,10 +1816,6 @@ async function uploadMedia(file, field) {
   return data.url;
 }
 
-async function uploadImage(file) {
-  return uploadMedia(file, 'image');
-}
-
 // ---------------------------------------------------------------------------
 // Token image picker - browse the bundled art library (fetched once and
 // filtered client-side; ~1400 entries is small enough for that) or upload a
@@ -1849,9 +1893,15 @@ function renderPickerResults() {
     .map((entry) => {
       const url = libraryImageUrl(entry);
       const title = `${entry.friendlyName} - ${entry.source}`;
+      // An <img src> can't decode video - the animated-token batch's .webm
+      // entries need a real <video> thumb or they'd just show a broken-image
+      // icon in the browse grid.
+      const media = isVideoUrl(url)
+        ? `<video src="${url}" muted loop autoplay playsinline></video>`
+        : `<img src="${url}" loading="lazy" alt="${escapeHtml(entry.friendlyName)}" />`;
       return `
         <div class="picker-item" data-url="${escapeHtml(url)}" title="${escapeHtml(title)}">
-          <img src="${url}" loading="lazy" alt="${escapeHtml(entry.friendlyName)}" />
+          ${media}
           <span>${escapeHtml(entry.friendlyName)}</span>
         </div>
       `;
@@ -1909,10 +1959,17 @@ pickerResults.addEventListener('click', (e) => {
 pickerFileInput.addEventListener('change', async () => {
   const file = pickerFileInput.files[0];
   if (!file) return;
-  pickerUploadThumb.src = URL.createObjectURL(file);
-  pickerUploadThumb.classList.add('visible');
+  const isVideo = file.type.startsWith('video/');
+  if (isVideo) {
+    // Same as the token form's thumb: an <img> can't preview a video.
+    pickerUploadThumb.removeAttribute('src');
+    pickerUploadThumb.classList.remove('visible');
+  } else {
+    pickerUploadThumb.src = URL.createObjectURL(file);
+    pickerUploadThumb.classList.add('visible');
+  }
   try {
-    const url = await uploadImage(file);
+    const url = await uploadMedia(file, isVideo ? 'video' : 'image');
     const onSelect = pickerOnSelect;
     closeImagePicker();
     if (onSelect) onSelect(url);
@@ -3149,13 +3206,22 @@ tokenTypeSelect.addEventListener('change', syncFieldVisibilityForType);
 tokenFileInput.addEventListener('change', async () => {
   const file = tokenFileInput.files[0];
   if (!file) return;
+  const isVideo = file.type.startsWith('video/');
   try {
-    const url = await uploadImage(file);
+    const url = await uploadMedia(file, isVideo ? 'video' : 'image');
     tokenImageUrlInput.value = url;
-    tokenThumb.src = url;
-    tokenThumb.classList.add('visible');
-  } catch {
-    alert('Token image upload failed.');
+    if (isVideo) {
+      // Same tradeoff as the map upload's thumb: an <img> can't preview a
+      // video, so just clear it - the token itself will animate correctly
+      // once placed on the map.
+      tokenThumb.removeAttribute('src');
+      tokenThumb.classList.remove('visible');
+    } else {
+      tokenThumb.src = url;
+      tokenThumb.classList.add('visible');
+    }
+  } catch (err) {
+    alert(`Token image upload failed: ${err.message || 'unknown error'}`);
   }
 });
 

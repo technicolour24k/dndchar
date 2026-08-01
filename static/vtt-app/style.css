@@ -260,7 +260,7 @@ body {
   text-align: center;
 }
 .picker-item:hover { border-color: #4a7fff; }
-.picker-item img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #000; display: block; }
+.picker-item img, .picker-item video { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #000; display: block; }
 .picker-item span { display: block; font-size: 10px; color: #aaa; margin-top: 4px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .token-thumb { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; vertical-align: middle; margin-right: 6px; background: #000; }
