@@ -11,15 +11,18 @@ import { attachVttWebSocketServer } from './vtt/server/wsServer.js';
 // uploads over that size, even though the upload route itself allows far more.
 // (This is a production-only limit; `vite dev` has no such cap, so large
 // uploads "work locally" but fail once deployed.) Raise it to comfortably
-// clear the upload route's own largest per-type cap - currently 50M for video
-// map backgrounds (the earlier 20M value also silently rejected 20-25MB audio
-// despite the route advertising a 25M audio cap; 60M clears everything). It
-// must be set BEFORE the handler module is imported - adapter-node reads the
-// value once at module load (handler.js: `const body_size_limit =
-// parse_as_bytes(env('BODY_SIZE_LIMIT', '512K'))`) - so the handler is pulled
-// in dynamically below, after this line. An explicit host env var still wins
-// if one is provided.
-process.env.BODY_SIZE_LIMIT = process.env.BODY_SIZE_LIMIT || '60M';
+// clear the upload route's own largest cap - a static 60M for map images/video
+// (src/routes/vtt/api/upload/+server.ts's MAX_MAP_BYTES) - with headroom for
+// multipart form-data overhead (boundaries/headers), so a genuine 60M file
+// doesn't get silently rejected at this layer right at the wall (the earlier
+// 20M value had this exact problem with 20-25MB audio despite the route
+// advertising a 25M audio cap; matching the cap exactly reproduces that bug
+// with a bigger number). It must be set BEFORE the handler module is imported
+// - adapter-node reads the value once at module load (handler.js: `const
+// body_size_limit = parse_as_bytes(env('BODY_SIZE_LIMIT', '512K'))`) - so the
+// handler is pulled in dynamically below, after this line. An explicit host
+// env var still wins if one is provided.
+process.env.BODY_SIZE_LIMIT = process.env.BODY_SIZE_LIMIT || '65M';
 
 const { handler } = await import('./build/handler.js');
 

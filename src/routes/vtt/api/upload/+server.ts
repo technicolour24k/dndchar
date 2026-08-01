@@ -7,14 +7,15 @@ const UPLOAD_DIR = path.join(process.cwd(), 'data', 'vtt-uploads');
 const ALLOWED_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 const ALLOWED_AUDIO_EXT = new Set(['.mp3', '.ogg', '.wav', '.m4a']);
 const ALLOWED_VIDEO_EXT = new Set(['.mp4', '.webm', '.m4v', '.ogv']);
-const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-// Animated map backgrounds. Whatever this cap is, it MUST stay under
-// BODY_SIZE_LIMIT (server.js, currently 60M) - adapter-node rejects larger
-// bodies before this route ever runs, so a cap above that limit would be
-// advertised-but-unreachable (the exact trap the original 512K default set
-// for images, and which the old 20M limit set for 20-25MB audio).
-const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
+// One static cap for map backgrounds regardless of image vs video - a JPG
+// scan/photo of a physical map can be just as large as a short video loop,
+// so there's no reason to split these. Must stay under BODY_SIZE_LIMIT
+// (server.js, now 65M to give this headroom) - adapter-node rejects larger
+// bodies before this route ever runs, so a cap at or above that limit would
+// be advertised-but-unreachable (the exact trap the original 512K default
+// set for images, and which the old 20M limit set for 20-25MB audio).
+const MAX_MAP_BYTES = 60 * 1024 * 1024;
 
 // Lets the GM drop in a custom map background (image or looping video), token
 // image, or ambient music track on the fly instead of relying on a hardcoded
@@ -41,7 +42,7 @@ export async function POST({ request }) {
   if (!isImage && !isAudio && !isVideo) throw error(400, 'invalid_type');
 
   const allowedExt = isImage ? ALLOWED_IMAGE_EXT : isAudio ? ALLOWED_AUDIO_EXT : ALLOWED_VIDEO_EXT;
-  const maxBytes = isImage ? MAX_IMAGE_BYTES : isAudio ? MAX_AUDIO_BYTES : MAX_VIDEO_BYTES;
+  const maxBytes = isAudio ? MAX_AUDIO_BYTES : MAX_MAP_BYTES;
   if (file.size > maxBytes) throw error(400, 'file_too_large');
 
   const ext = allowedExt.has(path.extname(file.name).toLowerCase())
