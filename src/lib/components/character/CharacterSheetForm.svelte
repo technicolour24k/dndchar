@@ -770,6 +770,13 @@
     };
   });
 
+  // Rendered newest-first. The underlying entries arrays and their afterId poll
+  // cursors above stay oldest-first (ascending) untouched - only these render
+  // views are reversed.
+  let combatLogNewestFirst = $derived([...combatLogEntries].reverse());
+  let rollLogNewestFirst = $derived([...rollLogEntries].reverse());
+  let sessionNotesNewestFirst = $derived([...sessionNoteEntries].reverse());
+
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
     contentBusy = true;
     const body = new FormData();
@@ -1275,7 +1282,7 @@
       <div class="battle-main-row">
         <section class="panel stack">
           <h2>Battle Actions</h2>
-          <p class="muted">Read-only actions from equipped inventory rows flagged as equipment or given combat values.</p>
+          <p class="muted">Read-only actions from equipped inventory rows given attack or damage values.</p>
           <div class="action-table">
             <div class="action-row header">
               <span>Item</span>
@@ -1398,7 +1405,7 @@
           <h2>Equipment</h2>
           <button type="button" class="compact-button" onclick={() => openNewItem('equipped')}>Add Item</button>
         </div>
-        <p class="muted">Items here can become read-only Battle Actions when marked as equipment or given attack values.</p>
+        <p class="muted">Items here can become read-only Battle Actions when given attack or damage values.</p>
         <div class="inventory-table equipped-table">
           {#each equippedInventoryRows as item, index (item.id ?? `equipment-${item.name}-${index}`)}
             <div class="inventory-row equipped-row">
@@ -2000,7 +2007,7 @@
               <div class="combat-log-panel">
                 <span class="field-label-with-help">Combat is active in this room</span>
                 <div class="combat-log-entries">
-                  {#each combatLogEntries as entry (entry.id)}
+                  {#each combatLogNewestFirst as entry (entry.id)}
                     <div class="combat-log-line">{entry.message}</div>
                   {:else}
                     <span class="combat-log-empty">No combat activity yet.</span>
@@ -2031,7 +2038,7 @@
             {#if activeVttSessionId}
               <div class="combat-log-panel">
                 <div class="combat-log-entries">
-                  {#each rollLogEntries as entry (entry.id)}
+                  {#each rollLogNewestFirst as entry (entry.id)}
                     <div class="combat-log-line">
                       {entry.message}
                       {#if entry.details?.breakdown}
@@ -2056,7 +2063,7 @@
                   <button type="button" class="text-button" onclick={() => (sessionNotesModalId = liveGameSessionId)}>Full log</button>
                 </span>
                 <div class="combat-log-entries">
-                  {#each sessionNoteEntries as entry (entry.id)}
+                  {#each sessionNotesNewestFirst as entry (entry.id)}
                     <div class="combat-log-line"><strong>{entry.displayName}:</strong> {entry.message}</div>
                   {:else}
                     <span class="combat-log-empty">No notes yet.</span>

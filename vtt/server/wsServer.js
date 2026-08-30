@@ -75,6 +75,7 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:remove':
         case 'token:remove:bulk':
         case 'token:move':
+        case 'token:move:resetAll':
         case 'token:stat:update':
         case 'token:update':
         case 'token:hidden:toggle':

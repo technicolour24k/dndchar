@@ -76,7 +76,7 @@ export async function getUserForToken(token: string | undefined): Promise<{ user
         users.email,
         users.display_name,
         users.role,
-        COALESCE(users.theme_background_color, '#f1f1f1') AS theme_background_color,
+        COALESCE(users.theme_background_color, '#14161b') AS theme_background_color,
         COALESCE(users.theme_panel_color, '#292929') AS theme_panel_color,
         COALESCE(users.theme_text_color, '#f4f4f4') AS theme_text_color
       FROM sessions

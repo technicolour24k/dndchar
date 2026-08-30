@@ -562,7 +562,7 @@ export function equippedItems(inventory: InventoryItem[]): InventoryItem[] {
 
 export function equippedAttackItems(inventory: InventoryItem[]): InventoryItem[] {
   return inventory.filter(
-    (item) => (item.location === 'equipped' || item.equipped) && (item.isEquipment || item.damageRolls || item.toHitBonus || item.damageBonus)
+    (item) => (item.location === 'equipped' || item.equipped) && (item.damageRolls || item.toHitBonus || item.damageBonus)
   );
 }
 

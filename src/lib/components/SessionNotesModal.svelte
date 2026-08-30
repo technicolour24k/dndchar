@@ -20,6 +20,10 @@
   let posting = $state(false);
   let joining = $state(false);
 
+  // Rendered newest-first. `notes` itself and its afterId poll cursor above
+  // stay oldest-first (ascending) untouched - only this render view is reversed.
+  let notesNewestFirst = $derived([...notes].reverse());
+
   // Fetches fresh whenever the modal opens for a (possibly different)
   // session, and polls for new notes while open - same 4s/afterId pattern
   // used everywhere else in this app. This is a plain client-fetched modal,
@@ -126,7 +130,7 @@
         </div>
 
         <div class="combat-log-entries">
-          {#each notes as note (note.id)}
+          {#each notesNewestFirst as note (note.id)}
             <p class="encounter-log-line"><strong>{note.displayName}:</strong> {note.message}</p>
           {:else}
             <p class="muted">No notes yet.</p>
