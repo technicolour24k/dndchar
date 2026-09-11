@@ -4,16 +4,18 @@
 
   let { data, children } = $props();
   const appName = env.PUBLIC_APP_NAME || 'D&D Character Manager';
-  const themeStyle = $derived(data.user
-    ? `--app-bg: ${data.user.themeBackgroundColor}; --app-panel: ${data.user.themePanelColor}; --app-text: ${data.user.themeTextColor};`
-    : '');
 </script>
 
 <svelte:head>
   <title>{appName}</title>
 </svelte:head>
 
-<div class="app-frame" style={themeStyle}>
+<!-- Theme colours are applied to <html> itself, not here - see
+     src/hooks.server.ts's transformPageChunk. Setting them on this div
+     never worked: :root's own derivations in src/styles.css only ever
+     resolve against :root, and this div is a descendant, not an ancestor,
+     of <body>, so it could never reach the page background either. -->
+<div class="app-frame">
   {#if data.user}
     <header class="topbar">
       <a class="brand" href="/dashboard">

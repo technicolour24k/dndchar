@@ -9,7 +9,7 @@ function normalizeColor(value: FormDataEntryValue | null, fallback: string): str
 
 export async function updateProfile(userId: string, form: FormData): Promise<void> {
   const displayName = String(form.get('displayName') || '').trim();
-  const backgroundColor = normalizeColor(form.get('backgroundColor'), '#f1f1f1');
+  const backgroundColor = normalizeColor(form.get('backgroundColor'), '#14161b');
   const panelColor = normalizeColor(form.get('panelColor'), '#292929');
   const textColor = normalizeColor(form.get('textColor'), '#f4f4f4');
 

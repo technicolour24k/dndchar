@@ -30,6 +30,13 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'preparedSpells',
 ]);
 
+// Shared cap for the three live log arrays (combat log, roll log, session
+// notes) and their matching DOM containers below - keeps both the backing
+// arrays and the rendered lines bounded the same way, so a long session
+// doesn't accumulate unbounded nodes in a tab that never triggers a full
+// renderSidebar() in between (see the appendCombatLogLine() family).
+const LIVE_LOG_CAP = 200;
+
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const sidebarEl = document.getElementById('sidebar');
@@ -642,7 +649,19 @@ function handleMessage(msg) {
 
     case 'token:move': {
       const t = session.tokens[msg.tokenId];
-      if (t) { t.x = msg.x; t.y = msg.y; }
+      if (t) {
+        t.x = msg.x;
+        t.y = msg.y;
+        // Server-computed movement decrement rides on this same broadcast
+        // (see item 4/token.js) - apply it here so the token's remaining
+        // budget stays correct for the next drag's ghost label, then push
+        // the new number straight into the sidebar's "Remaining (ft)" inputs
+        // via a targeted updater - a full renderSidebar() here would fire on
+        // every drag from every client, which is exactly what item 7 was
+        // about (see the comment below).
+        if (typeof msg.speedRemainingFt === 'number') t.speedRemainingFt = msg.speedRemainingFt;
+        updateSpeedRemainingReadouts(msg.tokenId);
+      }
       if (dragState && dragState.tokenId === msg.tokenId) dragState = null;
       render();
       // A move can push a token into or out of vision range, which changes
@@ -656,6 +675,19 @@ function handleMessage(msg) {
       // marker color picker being the reported case) - see
       // updateOtherTokensInViewList.
       updateOtherTokensInViewList();
+      break;
+    }
+
+    // GM's bulk "Reset all movement" - infrequent, explicit GM action, so
+    // (unlike token:move/token:stat:update above) a full renderSidebar() here
+    // is fine rather than a targeted updater.
+    case 'token:move:resetAll': {
+      for (const update of msg.updates || []) {
+        const t = session.tokens[update.tokenId];
+        if (t) t.speedRemainingFt = update.speedRemainingFt;
+      }
+      render();
+      renderSidebar();
       break;
     }
 
@@ -752,15 +784,17 @@ function handleMessage(msg) {
 
     case 'combat:log':
       combatLogLines.push(msg.message);
-      if (combatLogLines.length > 200) combatLogLines.shift();
-      renderSidebar();
+      if (combatLogLines.length > LIVE_LOG_CAP) combatLogLines.shift();
+      appendCombatLogLine(msg.message);
       break;
 
-    case 'roll:log':
-      rollLogLines.push({ message: msg.message, details: msg.details || {} });
-      if (rollLogLines.length > 200) rollLogLines.shift();
-      renderSidebar();
+    case 'roll:log': {
+      const entry = { message: msg.message, details: msg.details || {} };
+      rollLogLines.push(entry);
+      if (rollLogLines.length > LIVE_LOG_CAP) rollLogLines.shift();
+      appendRollLogLine(entry);
       break;
+    }
 
     case 'game_session:state':
       session.gameSessionId = msg.gameSessionId;
@@ -770,8 +804,8 @@ function handleMessage(msg) {
 
     case 'game_session:note':
       sessionNoteLines.push(msg.note);
-      if (sessionNoteLines.length > 200) sessionNoteLines.shift();
-      renderSidebar();
+      if (sessionNoteLines.length > LIVE_LOG_CAP) sessionNoteLines.shift();
+      appendSessionNoteLine(msg.note);
       break;
 
     default:
@@ -2457,7 +2491,10 @@ function combatControlHtml() {
 
 function combatLogHtml() {
   if (!session.encounterId && !combatLogLines.length) return '';
-  const lines = combatLogLines.map((line) => `<div class="combat-log-line">${escapeHtml(line)}</div>`).join('')
+  // Rendered newest-first. The underlying array stays oldest-first (ascending)
+  // so the afterId poll cursor and the push+shift cap keep working - reverse a
+  // copy here, never the array itself.
+  const lines = [...combatLogLines].reverse().map((line) => `<div class="combat-log-line">${escapeHtml(line)}</div>`).join('')
     || '<span style="color:#666;">No combat activity yet.</span>';
   return `<h2>Combat Log</h2><div id="combatLog" class="combat-log">${lines}</div>`;
 }
@@ -2467,7 +2504,8 @@ function combatLogHtml() {
 // get a native <details>/<summary> for a free, no-JS expand/collapse "[?]".
 function rollLogHtml() {
   if (!rollLogLines.length) return '';
-  const lines = rollLogLines.map((entry) => {
+  // Rendered newest-first, same reversed-copy approach as combatLogHtml() above.
+  const lines = [...rollLogLines].reverse().map((entry) => {
     const breakdown = entry.details?.breakdown;
     return breakdown
       ? `<details class="combat-log-line"><summary>${escapeHtml(entry.message)}</summary><pre>${escapeHtml(String(breakdown))}</pre></details>`
@@ -2495,7 +2533,9 @@ function sessionNotesControlHtml() {
 
 function sessionNotesHtml() {
   if (!session.gameSessionId) return '';
-  const lines = sessionNoteLines
+  // Rendered newest-first, same reversed-copy approach as combatLogHtml() above.
+  const lines = [...sessionNoteLines]
+    .reverse()
     .map((note) => `<div class="combat-log-line"><strong>${escapeHtml(note.displayName)}:</strong> ${escapeHtml(note.message)}</div>`)
     .join('') || '<span style="color:#666;">No notes yet.</span>';
   return `
@@ -2506,6 +2546,76 @@ function sessionNotesHtml() {
       <button type="button" id="postSessionNoteBtn" class="secondary">Post</button>
     </div>
   `;
+}
+
+// Targeted appenders for the three highest-frequency, purely-additive live
+// events - combat log lines, roll log lines, session notes. Same precedent
+// as updateOtherTokensInViewList() above (see the token:move handler's
+// comment): write directly into the existing container by id instead of
+// triggering a full renderSidebar(), which was wiping out whatever else the
+// viewer was mid-interaction with elsewhere in the sidebar (a GM half-typing
+// a Token Manager stat field, say) on every single new line (see
+// vtt-sheet-punch-list item 7). Falls back to a full renderSidebar() when the
+// container isn't currently in the DOM - combatLogHtml()/rollLogHtml()/
+// sessionNotesHtml() above render '' until an encounter/room/session exists
+// (or, for rolls, until the first roll at all), so the very first line
+// always goes through the normal full render that creates the panel.
+// New lines go at the front (newest-first, see item 1's render-time reversal
+// - the underlying arrays these read from stay oldest-first/ascending), and
+// pruneLogContainer() below trims the tail to LIVE_LOG_CAP to match the
+// arrays' own push+shift cap - otherwise a long session with no intervening
+// full renderSidebar() (token:add/remove/stat:update etc., which rebuild
+// the whole panel anyway) would grow these containers unboundedly.
+function pruneLogContainer(container) {
+  while (container.children.length > LIVE_LOG_CAP) {
+    container.removeChild(container.lastChild);
+  }
+}
+
+function appendCombatLogLine(message) {
+  const container = document.getElementById('combatLog');
+  if (!container) { renderSidebar(); return; }
+  if (container.querySelector('span')) container.innerHTML = ''; // clear the "No combat activity yet." placeholder
+  const line = document.createElement('div');
+  line.className = 'combat-log-line';
+  line.textContent = message;
+  container.insertBefore(line, container.firstChild);
+  pruneLogContainer(container);
+}
+
+function appendRollLogLine(entry) {
+  const container = document.getElementById('rollLog');
+  if (!container) { renderSidebar(); return; }
+  const breakdown = entry.details?.breakdown;
+  let line;
+  if (breakdown) {
+    line = document.createElement('details');
+    line.className = 'combat-log-line';
+    const summary = document.createElement('summary');
+    summary.textContent = entry.message;
+    const pre = document.createElement('pre');
+    pre.textContent = String(breakdown);
+    line.append(summary, pre);
+  } else {
+    line = document.createElement('div');
+    line.className = 'combat-log-line';
+    line.textContent = entry.message;
+  }
+  container.insertBefore(line, container.firstChild);
+  pruneLogContainer(container);
+}
+
+function appendSessionNoteLine(note) {
+  const container = document.getElementById('sessionNotes');
+  if (!container) { renderSidebar(); return; }
+  if (container.querySelector('span')) container.innerHTML = ''; // clear the "No notes yet." placeholder
+  const line = document.createElement('div');
+  line.className = 'combat-log-line';
+  const strong = document.createElement('strong');
+  strong.textContent = `${note.displayName}:`;
+  line.append(strong, ` ${note.message}`);
+  container.insertBefore(line, container.firstChild);
+  pruneLogContainer(container);
 }
 
 async function startGameSession() {
@@ -2657,6 +2767,7 @@ function gmSidebarHtml() {
       <div><button type="button" id="openAddTokenBtn" class="secondary">Add Token…</button></div>
       <div><button type="button" id="openTokenManagerBtn">Manage Tokens…</button></div>
     </div>
+    <div class="field"><button type="button" id="resetAllMovementBtn" class="secondary">Reset all movement</button></div>
 
     ${markerFormHtml()}
     <div id="markerList">${markerListHtml(true)}</div>
@@ -2890,6 +3001,10 @@ function wireGmSidebar() {
   document.getElementById('revealMapBtn')?.addEventListener('click', () => send({ type: 'map:reveal' }));
   document.getElementById('openAddTokenBtn').addEventListener('click', () => openAddTokenModal('create'));
   document.getElementById('openTokenManagerBtn').addEventListener('click', openTokenManagerModal);
+  // Bulk counterpart to each token's own per-token Reset button - there's no
+  // turn tracker in the VTT to hang an automatic reset on, so this is a
+  // deliberate manual "everyone's back to full movement" GM action.
+  document.getElementById('resetAllMovementBtn').addEventListener('click', () => send({ type: 'token:move:resetAll' }));
 
   wireMarkerForm();
 
@@ -3289,6 +3404,18 @@ document.getElementById('openCreatureLibraryBtn').addEventListener('click', () =
   });
 });
 
+// A blank AC field must stay unknown, not coerce to a real AC of 0 -
+// `Number('') || 0` would otherwise produce exactly that, and
+// drawAcIndicator() treats `typeof ac === 'number'` as "AC is known".
+// Shared by the Add/Edit Token form (readTokenFormFields below) and the
+// two inline Token Manager/mini-sheet acInput change handlers - all three
+// write paths need the same blank-stays-unknown treatment (see
+// vtt-sheet-punch-list item 2).
+function acFieldValue(raw) {
+  const trimmed = String(raw ?? '').trim();
+  return trimmed === '' ? null : (Number(trimmed) || 0);
+}
+
 // Reads the form's *current* values into a token-shaped object (deliberately
 // NOT visionTrueFt/visionDevilFt - those have no field on this form and are
 // only ever set via the Advanced Vision modal, so they must never be
@@ -3319,7 +3446,7 @@ function readTokenFormFields() {
     fields.visionNormalFt = Number(tokenVisionNormalInput.value) || 0;
     fields.visionDarkFt = Number(tokenVisionDarkInput.value) || 0;
     fields.speedFt = Number(tokenSpeedInput.value) || 0;
-    fields.ac = Number(tokenAcInput.value) || 0;
+    fields.ac = acFieldValue(tokenAcInput.value);
     fields.stats = {
       hp: Number(tokenHpInput.value) || 0,
       maxHp: Number(tokenMaxHpInput.value) || 0,
@@ -3439,9 +3566,29 @@ function closeTokenManagerModal() {
 // Re-renders the list in place if it's currently open, so HP/condition/etc.
 // changes broadcast in from elsewhere show up live - same refresh-on-broadcast
 // pattern as refreshCombatActionsModal, called from renderSidebar().
+//
+// Skips the rebuild while the GM is mid-edit inside the list (e.g. typing an
+// AC value into a token card, not yet blurred) - an innerHTML replacement
+// would otherwise wipe out whatever's half-typed and steal focus, on every
+// single stat-update/token-add/etc. broadcast from anyone in the room (see
+// vtt-sheet-punch-list item 7). Deferred rather than dropped: the focusout
+// listener below re-runs it as soon as focus actually leaves the list, so
+// the refresh just arrives a beat late instead of interrupting the edit.
 function refreshTokenManagerModal() {
-  if (tokenManagerModal.classList.contains('visible')) renderTokenManagerList();
+  if (!tokenManagerModal.classList.contains('visible')) return;
+  if (tokenManagerList.contains(document.activeElement)) return;
+  renderTokenManagerList();
 }
+
+tokenManagerList.addEventListener('focusout', () => {
+  // setTimeout(0) so document.activeElement has already moved to whatever's
+  // receiving focus next (including nothing, i.e. document.body) before we
+  // check it - checking synchronously inside the focusout handler itself
+  // would still see the field that's losing focus.
+  setTimeout(() => {
+    if (!tokenManagerList.contains(document.activeElement)) refreshTokenManagerModal();
+  }, 0);
+});
 
 document.getElementById('tokenManagerCloseBtn').addEventListener('click', closeTokenManagerModal);
 document.getElementById('tokenManagerAddBtn').addEventListener('click', () => openAddTokenModal('create'));
@@ -3474,7 +3621,9 @@ tokenManagerList.addEventListener('change', (e) => {
   } else if (e.target.classList.contains('acInput')) {
     // Enemy/npc AC is stripped from players by the server filter; the GM sets
     // the true value here, and players only ever discover the `knownAc` bound.
-    send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
+    // acFieldValue() keeps a blank field as null (unknown) rather than
+    // coercing it to a real AC of 0 - see vtt-sheet-punch-list item 2.
+    send({ type: 'token:stat:update', tokenId, stat: 'ac', value: acFieldValue(e.target.value) });
   } else if (e.target.classList.contains('conditionSelect')) {
     send({ type: 'token:stat:update', tokenId, stat: 'condition', value: e.target.value || null });
   } else if (e.target.classList.contains('soundFolderSelect')) {
@@ -3558,6 +3707,27 @@ tokenManagerList.addEventListener('click', (e) => {
 // the token:move handler's full renderSidebar() nuking whatever else the
 // player had open in the sidebar (a marker color picker, mid-edit) every
 // time some other player's token moved anywhere on the map.
+// Refreshes just the "Remaining (ft)" inputs for one token, wherever they're
+// currently on screen - the GM Token Manager card and the player's own-token
+// card both render `.speedRemainingInput` inside a `[data-token-id]` card, so
+// one query covers both. Needed because the server's movement decrement rides
+// on the token:move broadcast (see item 4), and that handler deliberately
+// avoids a full renderSidebar() - so without this the number in the sidebar
+// stayed frozen at its old value while the underlying token was decrementing
+// correctly, which read as "movement isn't reducing when I move".
+// Skips an input the viewer is currently typing in, same rationale as the
+// refreshTokenManagerModal/refreshCombatActionsModal activeElement guards.
+function updateSpeedRemainingReadouts(tokenId) {
+  const token = session?.tokens?.[tokenId];
+  if (!token) return;
+  const value = token.speedRemainingFt ?? '';
+  const selector = '[data-token-id="' + (window.CSS && CSS.escape ? CSS.escape(tokenId) : tokenId) + '"] .speedRemainingInput';
+  for (const input of document.querySelectorAll(selector)) {
+    if (input === document.activeElement) continue;
+    input.value = value;
+  }
+}
+
 function updateOtherTokensInViewList() {
   if (role !== 'player') return; // GM's sidebar has no position-dependent list to refresh
   const list = document.getElementById('otherTokenList');
@@ -3781,9 +3951,21 @@ function openCombatActionsModal(tokenId, tab = 'attack') {
 // quantity changes broadcast in from the server (or from this same modal's own
 // Use/Reset buttons) show up without having to close and reopen. Called from
 // renderSidebar() - the same place the old inline mini-sheet relied on to refresh.
+//
+// Same document.activeElement guard as refreshTokenManagerModal() above -
+// protects a GM mid-typing a manual attack's name/to-hit/damage in here from
+// being wiped by an unrelated broadcast (see vtt-sheet-punch-list item 7).
 function refreshCombatActionsModal() {
-  if (combatActionsState && combatActionsModal.classList.contains('visible')) renderCombatActionsBody();
+  if (!combatActionsState || !combatActionsModal.classList.contains('visible')) return;
+  if (combatActionsBody.contains(document.activeElement)) return;
+  renderCombatActionsBody();
 }
+
+combatActionsBody.addEventListener('focusout', () => {
+  setTimeout(() => {
+    if (!combatActionsBody.contains(document.activeElement)) refreshCombatActionsModal();
+  }, 0);
+});
 
 function renderCombatActionsBody() {
   if (!combatActionsState) return;
@@ -3922,7 +4104,9 @@ function wirePlayerSidebar() {
     } else if (e.target.classList.contains('maxHpInput')) {
       send({ type: 'token:stat:update', tokenId, stat: 'maxHp', value: Number(e.target.value) });
     } else if (e.target.classList.contains('acInput')) {
-      send({ type: 'token:stat:update', tokenId, stat: 'ac', value: Number(e.target.value) });
+      // acFieldValue() keeps a blank field as null (unknown) rather than
+      // coercing it to a real AC of 0 - see vtt-sheet-punch-list item 2.
+      send({ type: 'token:stat:update', tokenId, stat: 'ac', value: acFieldValue(e.target.value) });
     } else if (e.target.classList.contains('speedInput')) {
       const value = Number(e.target.value) || 0;
       send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });

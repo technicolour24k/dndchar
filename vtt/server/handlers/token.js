@@ -234,12 +234,62 @@ function handleTokenEvent(meta, msg, context) {
     case 'token:move': {
       const token = session.tokens[msg.tokenId];
       if (!token || !canEditToken(meta, token)) return;
+      const prevX = token.x;
+      const prevY = token.y;
       token.x = msg.x;
       token.y = msg.y;
+      // Decrement speedRemainingFt to match the drag ghost label's distance
+      // (main.js's dragState rendering) - same Euclidean formula and
+      // rounding, so the two never disagree. Never blocks the move (product
+      // philosophy: automate/suggest, never hard-enforce) - just clamps the
+      // remaining budget at 0 and lets the overage show visually client-side.
+      // Rides on the existing token:move broadcast rather than a separate
+      // token:stat:update, which would trigger a full sidebar rebuild on
+      // every connected client on every single drag (see item 7).
+      // Props omit speed fields entirely (see main.js's readTokenFormFields),
+      // and a session with no map set has no gridSizePx to convert by - skip
+      // the decrement rather than deriving a bogus number in either case.
+      const gridSizePx = session.map?.gridSizePx;
+      if (typeof token.speedRemainingFt === 'number' && typeof gridSizePx === 'number' && gridSizePx > 0) {
+        const pxPerFoot = gridSizePx / 5;
+        const distanceFt = Math.round(Math.hypot(token.x - prevX, token.y - prevY) / pxPerFoot);
+        token.speedRemainingFt = Math.max(0, token.speedRemainingFt - distanceFt);
+      }
       broadcastToken(context, session, meta.sessionId, 'token:move', token, {
         tokenId: token.id,
         x: token.x,
         y: token.y,
+        speedRemainingFt: token.speedRemainingFt,
+      });
+      break;
+    }
+
+    // GM-only bulk counterpart to the per-token Reset button - there's no
+    // turn tracker in the VTT to hang an automatic reset on (see
+    // vtt-sheet-punch-list item 4), so this is a deliberate manual "everyone
+    // is back to full movement" action instead. speedRemainingFt isn't a
+    // secret field (players already see it and the +5/-5/Reset control for
+    // their own token), so every recipient gets every update - the only
+    // filtering needed is dropping updates for tokens a player was never
+    // sent in the first place (hidden tokens / an unrevealed map).
+    case 'token:move:resetAll': {
+      if (meta.role !== 'gm') return;
+      const mapHidden = session.map && !session.map.revealed;
+      const updates = [];
+      for (const token of Object.values(session.tokens)) {
+        if (typeof token.speedRemainingFt !== 'number') continue;
+        token.speedRemainingFt = token.speedFt || 0;
+        updates.push(token);
+      }
+      context.broadcast(meta.sessionId, (recipient) => {
+        const visible = recipient.role === 'gm'
+          ? updates
+          : updates.filter((token) => !token.hidden && !mapHidden);
+        if (!visible.length) return null;
+        return {
+          type: 'token:move:resetAll',
+          updates: visible.map((token) => ({ tokenId: token.id, speedRemainingFt: token.speedRemainingFt })),
+        };
       });
       break;
     }
@@ -280,6 +330,15 @@ function handleTokenEvent(meta, msg, context) {
         token.stats = token.stats || {};
         token.stats[msg.stat] = appliedValue;
       }
+      // Writing the real AC invalidates any previously-discovered knownAc
+      // bound (a stale "Known AC <=" would otherwise outlive the correction
+      // and persist for the life of the in-memory session) - clear it and
+      // broadcast the reset the same way attack:resolve broadcasts a new one.
+      let knownAcCleared = false;
+      if (msg.stat === 'ac' && token.knownAc != null) {
+        token.knownAc = null;
+        knownAcCleared = true;
+      }
       // Enemy/npc stats.* fields (hp, maxHp, etc.) are never sent to players -
       // filterTokenForPlayer already strips `stats` from the token object
       // above, but the raw `value` on the event itself would otherwise leak
@@ -296,6 +355,13 @@ function handleTokenEvent(meta, msg, context) {
         }
         return { tokenId: token.id, stat: msg.stat };
       });
+      // knownAc is the intentionally-public discovered bound - the reset goes
+      // to everyone, same as attack:resolve's knownAc broadcast.
+      if (knownAcCleared) {
+        broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+          tokenId: token.id, stat: 'knownAc', value: null,
+        });
+      }
       break;
     }
 
@@ -341,7 +407,15 @@ function handleTokenEvent(meta, msg, context) {
       delete patch.id;
       delete patch.x;
       delete patch.y;
+      const prevAc = token.ac;
       Object.assign(token, patch);
+      // Writing a changed real AC invalidates any previously-discovered
+      // knownAc bound, same reasoning as token:stat:update above - the full
+      // token already rides on the broadcast below, so no extra message
+      // is needed to carry the reset.
+      if (patch.ac !== undefined && patch.ac !== prevAc && token.knownAc != null) {
+        token.knownAc = null;
+      }
       // No `extra` here (unlike token:stat:update) - the patch itself must
       // never ride along on the broadcast, since filterTokenForPlayer only
       // strips `stats`/`ac` off the `token` object, not off an arbitrary

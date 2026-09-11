@@ -244,7 +244,7 @@ export async function addContentToCharacter(userId: string, characterId: string,
       const inventory=await client.query<{id:string}>(`INSERT INTO character_inventory_items
         (character_id, name, category, quantity, equipped, location, is_equipment, ac_bonus, to_hit_bonus,
          damage_bonus, attack_ability, damage_rolls, source_content_id, attuned, notes, sort_order)
-        VALUES ($1,$2,$3,1,false,'backpack',($3 IN ('weapon','armor','shield','focus')),$4,$5,$6,$7,$8,$9,false,'',
+        VALUES ($1,$2,$3,1,false,'backpack',($3 IN ('weapon')),$4,$5,$6,$7,$8,$9,false,'',
           COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1),0)) RETURNING id`,
         [characterId, item.name, item.category || 'gear', item.ac_bonus || 0, item.to_hit_bonus || 0,
           item.damage_bonus || 0, item.attack_ability || 'str', item.damage_rolls || '', contentId]);

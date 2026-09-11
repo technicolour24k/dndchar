@@ -89,29 +89,45 @@ export function drawTokens(ctx, tokens, gridSizePx, getImage, viewerId = null) {
 // sees the true AC only for tokens whose AC isn't secret (their own / ally PCs,
 // where the server never strips it); for an enemy, the real AC never reaches
 // the client at all - the player only ever sees `knownAc`, the lowest attack
-// roll that has actually hit it, rendered as an upper bound "AC ≤ X" they
-// tighten through play. Nothing shows until either is known.
+// roll that has actually hit it, rendered as an upper bound they tighten
+// through play. Nothing shows until either is known.
+//
+// The two readouts are deliberately distinct and never rendered on the same
+// line: the true AC uses the same `trueAc` resolution for both the GM and
+// player branches (token.ac, falling back to token.stats.ac), and `knownAc`
+// only ever renders when no true AC reached this client at all - it is a
+// discovered upper bound, not the real AC, and must never be mistaken for
+// it. It gets its own colour, its own line further down, and an unambiguous
+// "Known AC <=" prefix.
 function drawAcIndicator(ctx, token, radius, viewerId) {
-  let text = null;
   const trueAc = typeof token.ac === 'number' ? token.ac
     : (token.stats && typeof token.stats.ac === 'number' ? token.stats.ac : null);
-  if (viewerId === null) {
-    if (trueAc != null) text = `AC ${trueAc}`;
-  } else if (typeof token.ac === 'number') {
-    text = `AC ${token.ac}`; // unstripped -> own/ally PC, not secret
-  } else if (typeof token.knownAc === 'number') {
-    text = `AC ≤ ${token.knownAc}`;
+
+  let trueText = null;
+  let knownText = null;
+  if (trueAc != null) {
+    trueText = `AC ${trueAc}`;
+  } else if (viewerId !== null && typeof token.knownAc === 'number') {
+    knownText = `Known AC ≤ ${token.knownAc}`;
   }
-  if (text == null) return;
+  if (trueText == null && knownText == null) return;
 
   ctx.font = 'bold 10px sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillStyle = '#9fc5ff';
   ctx.strokeStyle = '#000';
   ctx.lineWidth = 3;
-  const y = token.y + radius + 26; // just below the name label
-  ctx.strokeText(text, token.x, y);
-  ctx.fillText(text, token.x, y);
+
+  if (trueText != null) {
+    ctx.fillStyle = '#9fc5ff';
+    const y = token.y + radius + 26; // just below the name label
+    ctx.strokeText(trueText, token.x, y);
+    ctx.fillText(trueText, token.x, y);
+  } else {
+    ctx.fillStyle = '#ffb74d';
+    const y = token.y + radius + 38; // one line below where the real-AC readout would sit
+    ctx.strokeText(knownText, token.x, y);
+    ctx.fillText(knownText, token.x, y);
+  }
 }
 
 function drawHpBar(ctx, token, radius) {

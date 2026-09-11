@@ -1,5 +1,5 @@
 :root {
-  --app-bg: #f1f1f1;
+  --app-bg: #14161b;
   --app-panel: #292929;
   --app-text: #f4f4f4;
   --bg: var(--app-bg);
@@ -279,7 +279,7 @@ label.compact-check {
 }
 
 .page-head {
-  color: #111;
+  color: var(--text);
 }
 
 .eyebrow {

@@ -1,8 +1,29 @@
 import { redirect, type Handle } from '@sveltejs/kit';
 import { getUserForToken, readSessionCookie } from '$lib/server/auth/session';
 import { requireAdmin } from '$lib/server/auth/authorization';
+import type { SessionUser } from '$lib/types/auth';
 
 const publicRoutes = new Set(['/login', '/register']);
+
+// Same pattern profile.ts's normalizeColor enforces on write - re-checked
+// here rather than trusted from the DB, because this lands directly in a
+// raw HTML attribute via transformPageChunk below, not through Svelte's
+// normal auto-escaping.
+const hexColorPattern = /^#[0-9a-f]{6}$/i;
+
+// Applied to <html> itself (not just the app-frame div) so :root's own
+// derivations in src/styles.css (--bg, --panel, --panel-dark, etc., which
+// are declared - and resolve - on :root) pick up the user's colours, and so
+// the page background propagates to the whole viewport, not just the
+// app-frame's box. Empty string for a logged-out page - :root's hard-coded
+// defaults in styles.css take over.
+function themeStyleFor(user: SessionUser | null): string {
+  if (!user) return '';
+  const { themeBackgroundColor, themePanelColor, themeTextColor } = user;
+  const values = [themeBackgroundColor, themePanelColor, themeTextColor];
+  if (!values.every((color) => hexColorPattern.test(color))) return '';
+  return `--app-bg: ${themeBackgroundColor}; --app-panel: ${themePanelColor}; --app-text: ${themeTextColor};`;
+}
 
 export const handle: Handle = async ({ event, resolve }) => {
   const session = await getUserForToken(readSessionCookie(event.cookies));
@@ -30,5 +51,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 
   if (event.url.pathname.startsWith('/admin')) requireAdmin(event.locals.user);
 
-  return resolve(event);
+  return resolve(event, {
+    transformPageChunk: ({ html }) => html.replace('%theme.style%', themeStyleFor(event.locals.user))
+  });
 };
