@@ -21,11 +21,25 @@ import {
   resolvedFlatBonuses,
   resolvedNumericModifiers,
   skillModifier,
+  speedFt,
+  speedPipeline,
+  spellAttackBonus,
   spellSaveDc,
   standardSpellSlotMaximums,
   totalLevel
 } from './dnd5e';
 import type { ActiveCharacterEffect, EffectModifier } from '$lib/types/character';
+import { rollWithModifiers } from './attackRoll';
+import {
+  manualOverrideLines,
+  parseStatInput,
+  readStatOverrides,
+  resolveCharacterStats,
+  resolveSpellcastingAbility,
+  resolveStat,
+  withManualLines,
+  type CharacterStatInputs
+} from './characterStats';
 
 describe('D&D 5e helpers', () => {
   it('calculates ability modifiers', () => {
@@ -147,6 +161,37 @@ describe('D&D 5e helpers', () => {
 
   it('calculates spell save DC with modifier bonuses', () => {
     expect(spellSaveDc(16, 5, [2])).toBe(16);
+  });
+
+  it('lets spellSaveDc/spellAttackBonus take an explicit proficiency bonus instead of recomputing it from level', () => {
+    expect(spellSaveDc(16, 5, [2], 6)).toBe(19);
+    expect(spellAttackBonus(16, 5, [2], 6)).toBe(11);
+  });
+
+  it('folds a manual speed adjustment into the base, before any set modifier', () => {
+    expect(speedPipeline([], {}, 10).value).toBe(40);
+
+    const grappled: ActiveCharacterEffect = {
+      id: 'active-grappled', effectId: 'grappled', effectKey: 'grappled', name: 'Grappled', sourceType: 'condition',
+      sourceName: 'Grappled', description: '', durationType: '', requiresConcentration: false, isCondition: true,
+      isSelectable: true, remainingRounds: null,
+      modifiers: [{ target: 'speed.all', modifierType: 'set', label: '', valueExpression: '0', defaultValueExpression: '0',
+        valueOverrideExpression: '', conditionExpression: '', priority: 0 }]
+    };
+    const grappledResult = speedPipeline([grappled], {}, 10);
+    expect(grappledResult.value).toBe(0);
+    expect(grappledResult.adjustmentReplacedBy).not.toBeNull();
+
+    const hasted: ActiveCharacterEffect = {
+      id: 'active-haste', effectId: 'haste', effectKey: 'haste', name: 'Haste', sourceType: 'spell', sourceName: 'Haste',
+      description: '', durationType: 'concentration', requiresConcentration: true, isCondition: false, isSelectable: true,
+      remainingRounds: null,
+      modifiers: [{ target: 'speed.all', modifierType: 'multiplier', label: '', valueExpression: '2', defaultValueExpression: '2',
+        valueOverrideExpression: '', conditionExpression: '', priority: 0 }]
+    };
+    expect(speedPipeline([hasted], {}, 10).value).toBe(80);
+
+    expect(speedFt([hasted], {})).toBe(60);
   });
 
   it('resolves safe resource maximum expressions', () => {
@@ -384,5 +429,210 @@ describe('D&D 5e helpers', () => {
     const profile = resolveSpellDamage(sleep, { castAtSlotLevel: 1, casterLevel: 5, modifierSources: [doublingItem] });
     expect(profile.diceExpression).toBe('5d8 + 5d8');
     expect(profile.flatBonuses).toEqual([{ label: 'Somnolent Rod', value: 3 }]);
+  });
+});
+
+describe('stat overrides', () => {
+  const simplePipeline = (base: number) => (adjustment: number) => ({ value: base + adjustment });
+
+  it('gives the computed value when there is no override entry', () => {
+    const stat = resolveStat(undefined, simplePipeline(10));
+    expect(stat).toMatchObject({ computed: 10, adjusted: 10, adjustment: 0, value: 10, isAdjusted: false, isOverridden: false });
+  });
+
+  it('folds a manual adjustment into a simple pipeline', () => {
+    const stat = resolveStat({ adjustment: 3, override: null }, simplePipeline(10));
+    expect(stat).toMatchObject({ computed: 10, adjusted: 13, adjustment: 3, value: 13, isAdjusted: true, isOverridden: false });
+  });
+
+  it('lets a hard override win over an adjustment', () => {
+    const stat = resolveStat({ adjustment: 3, override: 20 }, simplePipeline(10));
+    expect(stat).toMatchObject({ computed: 10, adjusted: 13, override: 20, value: 20, isAdjusted: true, isOverridden: true });
+  });
+
+  it('treats override: 0 as a real override, not falsy/absent', () => {
+    const stat = resolveStat({ adjustment: 0, override: 0 }, simplePipeline(10));
+    expect(stat).toMatchObject({ value: 0, isOverridden: true });
+  });
+
+  it('clamps the adjusted value to opts.min with a negative adjustment', () => {
+    const stat = resolveStat({ adjustment: -50, override: null }, simplePipeline(10), { min: 0 });
+    expect(stat).toMatchObject({ computed: 10, adjusted: 0, value: 0 });
+  });
+
+  it('clamps a hard override to opts.min too, not just the adjusted value - the invariant must hold for every caller, not only the UI that happens to clamp on write', () => {
+    const stat = resolveStat({ adjustment: 0, override: -20 }, simplePipeline(10), { min: 0 });
+    expect(stat).toMatchObject({ override: 0, value: 0, isOverridden: true });
+  });
+
+  it('passes adjustmentReplacedBy through from the pipeline', () => {
+    const pipeline = (adjustment: number) => ({ value: 0, adjustmentReplacedBy: adjustment !== 0 ? 'Grappled' : null });
+    const stat = resolveStat({ adjustment: 10, override: null }, pipeline);
+    expect(stat.adjustmentReplacedBy).toBe('Grappled');
+  });
+
+  it('reads statOverrides tolerantly, dropping junk and default entries', () => {
+    expect(readStatOverrides(null)).toEqual({});
+    expect(readStatOverrides(undefined)).toEqual({});
+    expect(readStatOverrides({ statOverrides: 'nope' })).toEqual({});
+    expect(readStatOverrides({ statOverrides: [] })).toEqual({});
+    expect(readStatOverrides({
+      statOverrides: {
+        armorClass: { adjustment: 2, override: 18 },
+        unknownKey: { adjustment: 5, override: null },
+        initiative: 'abc',
+        speed: { adjustment: '3', override: null },
+        proficiency: { adjustment: 0, override: null }
+      }
+    })).toEqual({
+      armorClass: { adjustment: 2, override: 18 },
+      speed: { adjustment: 3, override: null }
+    });
+  });
+
+  it('parses stat input strings, taking the leading signed integer', () => {
+    expect(parseStatInput('+3')).toBe(3);
+    expect(parseStatInput('3')).toBe(3);
+    expect(parseStatInput('-1')).toBe(-1);
+    expect(parseStatInput('30 ft.')).toBe(30);
+    expect(parseStatInput('30ft')).toBe(30);
+    expect(parseStatInput('')).toBe('blank');
+    expect(parseStatInput('  ')).toBe('blank');
+    expect(parseStatInput('fast')).toBe('invalid');
+    expect(parseStatInput('2.6')).toBe(2);
+  });
+
+  it('builds manual-override breakdown lines for adjust-only, override-only, both, and set-replaced', () => {
+    const fmt = (n: number) => String(n);
+    expect(manualOverrideLines(resolveStat(undefined, simplePipeline(10)), fmt)).toEqual([]);
+
+    expect(manualOverrideLines(resolveStat({ adjustment: 3, override: null }, simplePipeline(10)), fmt)).toEqual([
+      'Calculated: 10', 'Manual adjustment: +3', 'Adjusted: 13', 'Total: 13'
+    ]);
+
+    expect(manualOverrideLines(resolveStat({ adjustment: 0, override: 18 }, simplePipeline(10)), fmt)).toEqual([
+      'Calculated: 10', 'Manual override: 18 (computed: 10)', 'Total: 18'
+    ]);
+
+    expect(manualOverrideLines(resolveStat({ adjustment: 3, override: 18 }, simplePipeline(10)), fmt)).toEqual([
+      'Calculated: 10', 'Manual adjustment: +3 (not applied - overridden)', 'Manual override: 18 (computed: 13)', 'Total: 18'
+    ]);
+
+    const setReplacedPipeline = (adjustment: number) => ({ value: 0, adjustmentReplacedBy: adjustment !== 0 ? 'Grappled' : null });
+    expect(manualOverrideLines(resolveStat({ adjustment: 10, override: null }, setReplacedPipeline), fmt)).toEqual([
+      'Calculated: 0', 'Manual adjustment: +10 (replaced by Grappled)', 'Total: 0'
+    ]);
+  });
+
+  it('withManualLines leaves baseLines untouched with no manual state, otherwise swaps the trailing Total for the manual section', () => {
+    const fmt = (n: number) => String(n);
+    const base = ['Base: 10', 'Total: 10'];
+    expect(withManualLines(base, resolveStat(undefined, simplePipeline(10)), fmt)).toBe(base);
+
+    expect(withManualLines(base, resolveStat({ adjustment: 0, override: 18 }, simplePipeline(10)), fmt)).toEqual([
+      'Base: 10', 'Calculated: 10', 'Manual override: 18 (computed: 10)', 'Total: 18'
+    ]);
+  });
+});
+
+describe('resolveCharacterStats', () => {
+  const abilityScores = { str: 10, dex: 14, con: 10, int: 16, wis: 14, cha: 10 };
+  const baseInput: CharacterStatInputs = {
+    classes: [{ className: 'Wizard', level: 5 }],
+    abilityScores,
+    modifierSources: [],
+    inventory: [],
+    savingThrowProficiencies: ['wis'],
+    skillProficiencies: ['perception'],
+    spellcastingAbility: 'int',
+    overrides: {}
+  };
+
+  const grappled: ActiveCharacterEffect = {
+    id: 'active-grappled', effectId: 'grappled', effectKey: 'grappled', name: 'Grappled', sourceType: 'condition',
+    sourceName: 'Grappled', description: '', durationType: '', requiresConcentration: false, isCondition: true,
+    isSelectable: true, remainingRounds: null,
+    modifiers: [{ target: 'speed.all', modifierType: 'set', label: '', valueExpression: '0', defaultValueExpression: '0',
+      valueOverrideExpression: '', conditionExpression: '', priority: 0 }]
+  };
+
+  it('matches the existing helper outputs when there are no overrides', () => {
+    const stats = resolveCharacterStats(baseInput);
+    expect(stats.level).toBe(5);
+    expect(stats.proficiency.value).toBe(proficiencyBonus(5));
+    expect(stats.armorClass.value).toBe(10 + abilityModifier(abilityScores.dex));
+    expect(stats.passivePerception.value).toBe(10 + abilityModifier(abilityScores.wis) + proficiencyBonus(5));
+    expect(stats.passiveInsight.value).toBe(10 + abilityModifier(abilityScores.wis));
+    expect(stats.spellSaveDc.value).toBe(spellSaveDc(abilityScores.int, 5));
+    expect(stats.spellAttackBonus.value).toBe(spellAttackBonus(abilityScores.int, 5));
+    expect(stats.savingThrows.wis).toBe(abilityModifier(abilityScores.wis) + proficiencyBonus(5));
+    expect(stats.savingThrows.str).toBe(abilityModifier(abilityScores.str));
+  });
+
+  it('cascades a proficiency override into proficient passives, spell DC/attack, and proficient saves - but not non-proficient ones', () => {
+    const stats = resolveCharacterStats({ ...baseInput, overrides: { proficiency: { adjustment: 0, override: 6 } } });
+    const delta = 6 - proficiencyBonus(5);
+    expect(stats.proficiency.value).toBe(6);
+    expect(stats.passivePerception.value).toBe(10 + abilityModifier(abilityScores.wis) + proficiencyBonus(5) + delta);
+    expect(stats.passiveInsight.value).toBe(10 + abilityModifier(abilityScores.wis)); // not proficient, untouched
+    expect(stats.spellSaveDc.value).toBe(spellSaveDc(abilityScores.int, 5) + delta);
+    expect(stats.spellAttackBonus.value).toBe(spellAttackBonus(abilityScores.int, 5) + delta);
+    expect(stats.savingThrows.wis).toBe(abilityModifier(abilityScores.wis) + proficiencyBonus(5) + delta);
+    expect(stats.savingThrows.str).toBe(abilityModifier(abilityScores.str)); // not proficient, untouched
+  });
+
+  it('cascades a proficiency adjustment the same way an override does', () => {
+    const stats = resolveCharacterStats({ ...baseInput, overrides: { proficiency: { adjustment: 1, override: null } } });
+    expect(stats.proficiency.value).toBe(proficiencyBonus(5) + 1);
+    expect(stats.spellSaveDc.value).toBe(spellSaveDc(abilityScores.int, 5) + 1);
+    expect(stats.savingThrows.wis).toBe(abilityModifier(abilityScores.wis) + proficiencyBonus(5) + 1);
+  });
+
+  it('lets a spell DC override win even with a proficiency override also set', () => {
+    const stats = resolveCharacterStats({
+      ...baseInput,
+      overrides: { proficiency: { adjustment: 0, override: 6 }, spellSaveDc: { adjustment: 0, override: 20 } }
+    });
+    expect(stats.spellSaveDc.value).toBe(20);
+    expect(stats.proficiency.value).toBe(6);
+  });
+
+  it('applies a plain AC adjustment as an extra term', () => {
+    const stats = resolveCharacterStats({ ...baseInput, overrides: { armorClass: { adjustment: 1, override: null } } });
+    expect(stats.armorClass.value).toBe(10 + abilityModifier(abilityScores.dex) + 1);
+  });
+
+  it('resolves speed adjustment/override against a set modifier exactly per the precedence rule', () => {
+    const grappledAdjusted = resolveCharacterStats({ ...baseInput, modifierSources: [grappled], overrides: { speed: { adjustment: 10, override: null } } });
+    expect(grappledAdjusted.speed.value).toBe(0);
+    expect(grappledAdjusted.speed.adjustmentReplacedBy).not.toBeNull();
+
+    const grappledOverridden = resolveCharacterStats({ ...baseInput, modifierSources: [grappled], overrides: { speed: { adjustment: 0, override: 40 } } });
+    expect(grappledOverridden.speed.value).toBe(40);
+
+    const freeAdjusted = resolveCharacterStats({ ...baseInput, overrides: { speed: { adjustment: 10, override: null } } });
+    expect(freeAdjusted.speed.value).toBe(40);
+  });
+
+  it('resolves the spellcasting ability fallback chain: class -> metadata -> int', () => {
+    expect(resolveSpellcastingAbility([{ className: 'Cleric', level: 3, spellcastingAbility: 'wis' }], {})).toBe('wis');
+    expect(resolveSpellcastingAbility([{ className: 'Sorcerer', level: 3 }], { spellcastingAbility: 'CHA' })).toBe('cha');
+    expect(resolveSpellcastingAbility([{ className: 'Sorcerer', level: 3 }], { spellcastingAbility: 'not-a-key' })).toBe('int');
+    expect(resolveSpellcastingAbility([], {})).toBe('int');
+  });
+});
+
+describe('rollWithModifiers flatModifiersIncluded', () => {
+  it('skips the flat bonus/penalty sum when the caller already folded it into `modifier`, to avoid double-counting', () => {
+    const source: ActiveCharacterEffect = {
+      id: 'active-ring', effectId: 'ring', effectKey: 'ring', name: 'Ring of Initiative', sourceType: 'item',
+      sourceName: 'Ring of Initiative', description: '', durationType: 'while_applicable', requiresConcentration: false,
+      isCondition: false, isSelectable: false, remainingRounds: null,
+      modifiers: [{ target: 'initiative', modifierType: 'bonus', label: '', valueExpression: '2', defaultValueExpression: '2',
+        valueOverrideExpression: '', conditionExpression: '', priority: 0 }]
+    };
+    const rollDie = () => 10;
+    expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie).total).toBe(17);
+    expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie, { flatModifiersIncluded: true }).total).toBe(15);
   });
 });

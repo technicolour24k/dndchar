@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { abilityKeys, clampResource } from '$lib/rules/dnd5e';
+import { readStatOverrides, type StatOverrides } from '$lib/rules/characterStats';
 import { getCombatClock, listCharacterContent, listSpellSlots, syncCharacterSpellSlots } from '$lib/server/services/catalogue';
 import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
 import { applyCharacterEffect } from '$lib/server/services/effects';
@@ -115,21 +116,22 @@ const defaultNotes: CharacterNote[] = [
   { key: 'additional_notes', title: 'Additional Notes', content: '' }
 ];
 
+// armorClass/initiative/speed/hitDice/passivePerception/spellSaveDc/spellAttackBonus used to be
+// listed here, written on every save as write-only derived copies of the computed sheet values.
+// Nothing ever read them back (grep-verified across src/, static/vtt-app/, vtt/) - every consumer
+// recomputes live via resolveCharacterStats()/characterStatsFor(). They're deliberately not
+// listed below any more, so they stop being written; old values may still linger in existing
+// metadata_json rows and version snapshots, but must never be treated as authoritative.
+// spellcastingAbility stays - it IS read (see meta('spellcastingAbility') and
+// resolveSpellcastingAbility()).
 const metadataFields = [
   'race',
   'alignment',
   'playerName',
   'experiencePoints',
-  'armorClass',
-  'initiative',
-  'speed',
-  'hitDice',
   'deathSaveSuccesses',
   'deathSaveFailures',
-  'passivePerception',
   'spellcastingAbility',
-  'spellSaveDc',
-  'spellAttackBonus',
   'currencyCp',
   'currencySp',
   'currencyEp',
@@ -317,6 +319,9 @@ export async function updateCharacter(userId: string, characterId: string, form:
     previousHp = prevHpRow.rows[0]?.current_value ?? null;
     characterName = String(form.get('name') || '').trim() || 'A character';
 
+    const overrides = parseStatOverridesField(form);
+    const metadataPatch = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
+
     await client.query(
       `
         UPDATE characters
@@ -331,7 +336,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
         characterName,
         String(form.get('ancestry') || '').trim(),
         String(form.get('background') || '').trim(),
-        JSON.stringify(parseMetadata(form)),
+        JSON.stringify(metadataPatch),
         characterId
       ]
     );
@@ -1234,6 +1239,32 @@ function parseMetadata(form: FormData): Record<string, string> {
   return Object.fromEntries(metadataFields.map((field) => [field, String(form.get(field) || '').trim()]));
 }
 
+// Overridable-sheet-stats: the sheet always submits statOverridesJson (see
+// CharacterSheetForm.svelte's always-present hidden input), so a missing field, invalid JSON, or
+// JSON that doesn't even parse to a plain object (null, a bare string/number, an array) means
+// something odd happened to the form, not "clear every override" - returning undefined here
+// tells updateCharacter to leave the stored statOverrides key untouched rather than wipe it.
+// Notably, readStatOverrides() itself is tolerant and would happily coerce any of those
+// non-object shapes to `{}` (empty overrides) - which, unlike here, is exactly right when it's
+// reading genuinely-stored metadata (an old/corrupt record should behave as "all auto", not
+// throw). Here that same tolerance would silently wipe legitimate overrides, so the "is this
+// even a plain object" check has to happen before readStatOverrides() gets a chance to launder
+// it into `{}`. A genuine reset (an entry removed by the player) still persists correctly,
+// because readStatOverrides() only keeps non-default entries and the caller writes the whole
+// object back.
+export function parseStatOverridesField(form: FormData): StatOverrides | undefined {
+  const raw = form.get('statOverridesJson');
+  if (typeof raw !== 'string') return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  return readStatOverrides({ statOverrides: parsed });
+}
+
 function parseActiveEffectKeys(form: FormData): string[] {
   return form.getAll('activeEffectKey').map((value) => String(value).trim()).filter(Boolean);
 }
@@ -1272,7 +1303,7 @@ export async function spendHitDice(
   characterId: string,
   classIndex: number,
   spent: number,
-  classLevel: number,
+  defaultMax: number,
   hpGained: number
 ): Promise<void> {
   await withTransaction(async (client) => {
@@ -1282,14 +1313,17 @@ export async function spendHitDice(
     );
     if (!owned.rowCount) throw new Error('Character not found.');
 
-    // Decrement hit dice pool for this class
+    // Decrement hit dice pool for this class. `defaultMax` only seeds max_value on first
+    // INSERT (a pool that doesn't exist yet) - the ON CONFLICT branch deliberately does NOT
+    // touch max_value any more, since the sheet's hit dice max is now player-editable
+    // (overridable-sheet-stats) and a "Use" click must never silently reset a customised max
+    // back to the class level.
     await client.query(`
       INSERT INTO character_resources (character_id, resource_key, label, current_value, max_value, sort_order)
       VALUES ($1, $2, 'Hit Dice', GREATEST(0, $3::int - $4::int), $3::int, ${99 + classIndex})
       ON CONFLICT (character_id, resource_key) DO UPDATE
-        SET current_value = GREATEST(0, LEAST(character_resources.max_value, character_resources.current_value - $4)),
-            max_value = $3
-    `, [characterId, `hit_dice_${classIndex}`, Math.max(1, classLevel), Math.max(0, spent)]);
+        SET current_value = GREATEST(0, LEAST(character_resources.max_value, character_resources.current_value - $4))
+    `, [characterId, `hit_dice_${classIndex}`, Math.max(1, defaultMax), Math.max(0, spent)]);
 
     // Recover HP up to max
     if (hpGained > 0) {

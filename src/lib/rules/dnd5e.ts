@@ -27,10 +27,6 @@ export function skillModifier(score: number, proficient: boolean, level: number)
   return abilityModifier(score) + (proficient ? proficiencyBonus(level) : 0);
 }
 
-export function savingThrowModifier(score: number, proficient: boolean, level: number): number {
-  return skillModifier(score, proficient, level);
-}
-
 export function clampResource(currentValue: number, maxValue: number): number {
   return Math.max(0, Math.min(Number(currentValue) || 0, Math.max(0, Number(maxValue) || 0)));
 }
@@ -362,12 +358,18 @@ export function pactMagicSlots(classes: CharacterClass[]): { level: number; slot
   };
 }
 
-export function spellSaveDc(score: number, level: number, bonuses: number[] = []): number {
-  return 8 + abilityModifier(score) + proficiencyBonus(level) + bonuses.reduce((sum, value) => sum + value, 0);
+// The optional 4th param lets a caller supply an already-resolved proficiency bonus (e.g. one
+// carrying its own manual adjustment/override via characterStats.ts's resolveStat) instead of
+// recomputing it from level. Defaults to proficiencyBonus(level), so every existing caller (and
+// the existing spellSaveDc(16, 5, [2]) test) is unaffected. Deliberately a separate 4th param
+// rather than repurposing `level`, so a caller can't silently swap level for a prof value and
+// still typecheck.
+export function spellSaveDc(score: number, level: number, bonuses: number[] = [], prof: number = proficiencyBonus(level)): number {
+  return 8 + abilityModifier(score) + prof + bonuses.reduce((sum, value) => sum + value, 0);
 }
 
-export function spellAttackBonus(score: number, level: number, bonuses: number[] = []): number {
-  return abilityModifier(score) + proficiencyBonus(level) + bonuses.reduce((sum, value) => sum + value, 0);
+export function spellAttackBonus(score: number, level: number, bonuses: number[] = [], prof: number = proficiencyBonus(level)): number {
+  return abilityModifier(score) + prof + bonuses.reduce((sum, value) => sum + value, 0);
 }
 
 // Same transform content-admin.ts's private slug() uses for content_key generation -
@@ -495,18 +497,38 @@ export function initiativeBonus(
   return abilityModifier(dexScore) + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
 }
 
-// Order of operations matters here and must stay exact: base (or the last
-// 'set' modifier, if any) -> additive bonuses -> chained multipliers (each
-// multiplier compounds on the running total, not on the base) -> floor,
-// clamped to >= 0.
-export function speedFt(modifierSources: ActiveCharacterEffect[], context: ModifierContext = {}): number {
+// Order of operations matters here and must stay exact: base (or the last 'set' modifier, if
+// any) -> additive bonuses -> chained multipliers (each multiplier compounds on the running
+// total, not on the base) -> floor, clamped to >= 0.
+//
+// Manual stat adjustments (overridable-sheet-stats): speed is the only one of the 9 overridable
+// stats whose resolver honours a 'set' modifier today, so it's also the only one where the
+// adjustment/set interaction matters. Per the user's confirmed precedence rule, the adjustment
+// is summed into the BASE before 'set' is applied - so a 'set' (e.g. Grappled -> 0) discards it
+// entirely, same as it would discard a flat class feature bonus baked into the base. A manual
+// *override* (see characterStats.ts) is applied by the caller, outside this pipeline entirely,
+// and beats the 'set' result regardless. If 'set' support is ever added to the other 8 stats,
+// the same rule applies there too: set replaces base + adjustment, override replaces everything.
+export function speedPipeline(
+  modifierSources: ActiveCharacterEffect[],
+  context: ModifierContext = {},
+  adjustment = 0
+): { value: number; adjustmentReplacedBy: string | null } {
   const setValues = resolvedNumericModifiers(modifierSources, ['speed.all', 'speed.walk'], ['set'], context);
   const bonuses = resolvedAdditiveModifiers(modifierSources, ['speed.all', 'speed.walk'], context);
   const multipliers = resolvedNumericModifiers(modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], context);
-  const base = setValues.length ? setValues.at(-1)?.value ?? 30 : 30;
+  const activeSet = setValues.length ? setValues.at(-1) : undefined;
+  const base = activeSet ? activeSet.value : 30 + adjustment;
   const withBonuses = base + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
   const multiplied = multipliers.reduce((value, multiplier) => value * multiplier.value, withBonuses);
-  return Math.max(0, Math.floor(multiplied));
+  return {
+    value: Math.max(0, Math.floor(multiplied)),
+    adjustmentReplacedBy: activeSet && adjustment !== 0 ? activeSet.label : null
+  };
+}
+
+export function speedFt(modifierSources: ActiveCharacterEffect[], context: ModifierContext = {}): number {
+  return speedPipeline(modifierSources, context, 0).value;
 }
 
 // Generalizes the near-identical passive perception/insight/investigation

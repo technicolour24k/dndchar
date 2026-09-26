@@ -12,6 +12,11 @@
   --accent: var(--app-text);
   --danger: #ff9a9a;
   --ok: #9dd7a5;
+  /* Overridable sheet stats (docs/architecture/modifier-primacy-status.md, "Deliberate
+     deviations (accepted)") - derived from the theme's own colours via color-mix rather than a
+     hardcoded hex, so a manual-override/adjustment indicator stays visible whatever the user has
+     set --app-bg/--app-panel/--app-text to. */
+  --stat-manual: color-mix(in srgb, var(--app-text) 55%, #5aa9ff);
 }
 
 * {
@@ -1259,8 +1264,15 @@ select.hit-dice-class-select {
 .field-label-with-help {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+/* Pushes the "?" button flush right regardless of whether a .stat-flag sits between it and the
+   label text - keeps the flag directly after the label text instead of being centred by
+   space-between once there are 3 flex children (text, flag, button). */
+.field-label-with-help > .formula-help-button {
+  margin-left: auto;
 }
 
 button.formula-help-button {
@@ -1350,6 +1362,66 @@ button.formula-help-button:focus-visible {
   min-height: 34px;
   padding: 5px 8px;
   border-radius: 7px;
+}
+
+/* Overridable sheet stats - stat-overridden/stat-adjusted mark the <label> wrapping one of the
+   9 overridable combat-summary/magic fields; .stat-flag is the small "M"/"+N" token next to the
+   field's label text. See src/lib/rules/characterStats.ts for what each state means. */
+.stat-overridden input {
+  border: 1px dashed var(--stat-manual);
+}
+
+.stat-adjusted input {
+  border-left: 3px solid var(--stat-manual);
+}
+
+.stat-flag {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--stat-manual);
+  white-space: nowrap;
+}
+
+.manual-stat-controls {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.manual-stat-controls h3 {
+  font-size: 14px;
+}
+
+.manual-stat-controls .mini-grid input {
+  width: 100%;
+}
+
+.hit-dice-pool-rows {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0;
+}
+
+.hit-dice-pool-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.hit-dice-pool-class {
+  color: var(--muted);
+  min-width: 60px;
+}
+
+input.hit-dice-pool-input {
+  width: 44px;
+  min-height: 30px;
+  padding: 4px 5px;
+  text-align: center;
 }
 
 .death-save-grid {

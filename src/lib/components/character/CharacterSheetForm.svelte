@@ -3,8 +3,9 @@
   import { invalidateAll } from '$app/navigation';
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
-  import { abilityMap, abilityModifier, armorClass, equippedAttackItems, equippedItems, hitDiceSummary, initiativeBonus, passiveScore, proficiencyBonus, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, speedFt, spellAttackBonus, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
   import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
+  import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { CharacterContentInstance, ContentDefinition, ContentType } from '$lib/types/content';
 
@@ -42,17 +43,53 @@
   const inspiration = $derived(resources.inspiration?.currentValue ?? 0);
   const abilityScores = $derived(abilityMap(character.abilities));
   const level = $derived(totalLevel(classRows));
-  const prof = $derived(proficiencyBonus(level));
+
+  // Overridable sheet stats (docs/architecture/modifier-primacy-status.md, "Deliberate
+  // deviations (accepted)"): manual adjustments/overrides live in metadata.statOverrides, not
+  // as Modifier grants. Local $state so edits are instant/local; resynced from the server below
+  // only when the server value actually changed, so an unrelated invalidateAll() (Next Turn, add
+  // content, etc.) can't clobber an override that hasn't autosaved yet.
+  let statOverrides = $state<StatOverrides>(readStatOverrides(untrack(() => character.metadata)));
+  let lastServerOverridesJson = $state(untrack(() => JSON.stringify(readStatOverrides(character.metadata))));
+  $effect(() => {
+    const serverJson = JSON.stringify(readStatOverrides(character.metadata));
+    if (serverJson !== lastServerOverridesJson) {
+      lastServerOverridesJson = serverJson;
+      statOverrides = readStatOverrides(character.metadata);
+    }
+  });
+
+  // Per-class hit dice pools (current/max) are directly editable (overridable-sheet-stats), not
+  // just a read-only summary derived from the class level - so they're local $state, resynced
+  // from the server only when the server value actually changed (same guard pattern as
+  // statOverrides above), so an unrelated invalidateAll() can't clobber an unsaved edit.
+  function hitDicePoolFor(row: { level: number }, index: number) {
+    const resource = character.resources.find((r) => r.key === `hit_dice_${index}`);
+    return { current: resource?.currentValue ?? row.level, max: resource?.maxValue ?? row.level };
+  }
+  let hitDicePools = $state<Array<{ current: number; max: number }>>(
+    untrack(() => classRows.map((row, i) => hitDicePoolFor(row, i)))
+  );
+  let lastServerHitDiceJson = $state(untrack(() =>
+    JSON.stringify(character.resources.filter((r) => r.key.startsWith('hit_dice_')).map((r) => [r.key, r.currentValue, r.maxValue]))
+  ));
+  $effect(() => {
+    const serverJson = JSON.stringify(character.resources.filter((r) => r.key.startsWith('hit_dice_')).map((r) => [r.key, r.currentValue, r.maxValue]));
+    if (serverJson !== lastServerHitDiceJson) {
+      lastServerHitDiceJson = serverJson;
+      hitDicePools = classRows.map((row, i) => hitDicePoolFor(row, i));
+    }
+  });
+
   const classHitDice = $derived(classRows.map((row, i) => ({
     className: row.className || 'Class',
     level: row.level,
     dieSize: parseInt(hitDieForRow(row)) || 8,
-    remaining: character.resources.find((r) => r.key === `hit_dice_${i}`)?.currentValue ?? row.level
+    remaining: hitDicePools[i]?.current ?? row.level,
+    max: hitDicePools[i]?.max ?? row.level
   })));
-  const hitDiceDisplay = $derived(
-    classHitDice.map((c) => `${c.remaining}d${c.dieSize}`).join(' + ') || '-'
-  );
   const hitDiceRemainingTotal = $derived(classHitDice.reduce((s, c) => s + c.remaining, 0));
+  const hitDiceMaxTotal = $derived(classHitDice.reduce((s, c) => s + c.max, 0));
   let hitDiceCount = $state(1);
   let hitDiceClassIndex = $state(0);
   const metadata = $derived(character.metadata ?? {});
@@ -105,6 +142,7 @@
   const proficiencies = $derived(character.proficiencies ?? { savingThrows: [], skills: [], weapons: [] });
 
   let activeTab = $state<'battle' | 'traits' | 'inventory' | 'character'>('battle');
+  let sheetFormEl: HTMLFormElement;
   let autosaveTimer: ReturnType<typeof setTimeout>;
   let autosaveStatus = $state('Ready');
   let lastAutosaveAt = 0;
@@ -145,7 +183,8 @@
   } | null>(null);
   let formulaHelp = $state<{
     title: string;
-    lines: string[];
+    lines?: string[];
+    statKey?: OverridableStat;
   } | null>(null);
   let inventoryMessage = $state<string | null>(null);
   const autosaveIntervalMs = 30_000;
@@ -219,43 +258,85 @@
     equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
   );
   const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ac'], { classes: classRows }));
-  const computedArmorClass = $derived(armorClass(abilityScores.dex, equippedAcBonus, character.modifierSources, { classes: classRows }));
   const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['initiative'], { classes: classRows }));
-  const computedInitiative = $derived(initiativeBonus(abilityScores.dex, character.modifierSources, { classes: classRows }));
-  const spellcastingAbility = $derived((classes.spellcastingAbility || meta('spellcastingAbility', 'int').toLowerCase()) as AbilityKey);
+  const spellcastingAbility = $derived(resolveSpellcastingAbility(classRows, metadata));
   const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_save_dc'], { classes: classRows }));
   const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
-  const computedSpellSaveDc = $derived(spellSaveDc(abilityScores[spellcastingAbility] ?? 10, level, spellDcBonuses.map((bonus) => bonus.value)));
-  const computedSpellAttackBonus = $derived(spellAttackBonus(abilityScores[spellcastingAbility] ?? 10, level, spellAttackBonuses.map((bonus) => bonus.value)));
-  const spellDcFormula = $derived([
-    'Base: 8', `Proficiency: ${signed(prof)}`, `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`,
-    ...spellDcBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`), `Total: ${computedSpellSaveDc}`
-  ]);
   const characterSpells = $derived(character.content.filter((entry) => entry.type === 'spell'));
   const characterFeats = $derived(character.content.filter((entry) => entry.type === 'feat'));
   const characterFeatures = $derived(character.content.filter((entry) => entry.type === 'class_feature'));
-  const computedSpeedValue = $derived(speedFt(character.modifierSources, { classes: classRows }));
-  const computedSpeed = $derived(`${computedSpeedValue} ft.`);
-  const computedHitDice = $derived(hitDiceSummary(classRows));
   const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
-  const computedPassivePerception = $derived(
-    passiveScore(abilityScores.wis, isSkillProficient('perception'), prof, character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows })
-  );
   const passiveInsightBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows }));
-  const computedPassiveInsight = $derived(
-    passiveScore(abilityScores.wis, isSkillProficient('insight'), prof, character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows })
-  );
   const passiveInvestigationBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows }));
-  const computedPassiveInvestigation = $derived(
-    passiveScore(abilityScores.int, isSkillProficient('investigation'), prof, character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows })
-  );
   const savingThrowModifierBonuses = $derived(
     Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>
   );
   const skillCheckModifierBonuses = $derived(
     Object.fromEntries(skillChecks.map((skill) => [skill.key, resolvedAdditiveModifiers(character.modifierSources, [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], { classes: classRows })])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
   );
-  const combatFormulaHelp = $derived.by(() => {
+
+  // The single reusable resolver (src/lib/rules/characterStats.ts) for all 9 overridable
+  // combat-summary/magic stats. Proficiency is resolved first inside it, so an override/
+  // adjustment on it cascades into every dependent stat below - the exact same resolver the VTT
+  // server routes and roll endpoints now use, so the sheet and VTT can't drift on this math.
+  const stats = $derived(resolveCharacterStats({
+    classes: classRows,
+    abilityScores,
+    modifierSources: character.modifierSources,
+    inventory: inventoryRows,
+    savingThrowProficiencies: selectedSavingThrowProficiencies,
+    skillProficiencies: selectedSkillProficiencies,
+    spellcastingAbility,
+    overrides: statOverrides
+  }));
+  const prof = $derived(stats.proficiency.value);
+
+  const statFmt: Record<OverridableStat, (n: number) => string> = {
+    proficiency: signed,
+    armorClass: String,
+    initiative: signed,
+    speed: (n) => `${n} ft.`,
+    passivePerception: String,
+    passiveInsight: String,
+    passiveInvestigation: String,
+    spellSaveDc: String,
+    spellAttackBonus: signed
+  };
+
+  // The small text flag shown next to a field label: 'M' when overridden (the override wins
+  // regardless of any stored adjustment), or the signed adjustment when only an adjustment is
+  // set. One short token, so the tight combat-summary-grid doesn't reflow on mobile.
+  function statFlag(key: OverridableStat): string {
+    const stat = stats[key];
+    if (stat.isOverridden) return 'M';
+    if (stat.isAdjusted) return signed(stat.adjustment);
+    return '';
+  }
+
+  function statFlagTitle(key: OverridableStat): string {
+    const stat = stats[key];
+    const fmt = statFmt[key];
+    if (stat.adjustmentReplacedBy) return `${signed(stat.adjustment)} adjustment replaced by ${stat.adjustmentReplacedBy}`;
+    if (stat.isOverridden) return `Manual override (computed: ${fmt(stat.adjusted)}) - clear the field or open ? to reset`;
+    if (stat.isAdjusted) return `Manual adjustment (computed: ${fmt(stat.computed)}) - clear the field or open ? to reset`;
+    return '';
+  }
+
+  // "<X> proficiency"/"Proficiency" breakdown line shared by passives, spell DC/attack, saves
+  // and skills - labelled "(manual)" whenever the effective proficiency carries a manual
+  // adjustment/override, so the cascade is visible wherever proficiency shows up, not just on
+  // the Proficiency field's own breakdown.
+  function proficiencyLine(prefix: string, proficient: boolean) {
+    if (!proficient) return `${prefix}: +0`;
+    const manual = stats.proficiency.isAdjusted || stats.proficiency.isOverridden;
+    return `${prefix}${manual ? ' (manual)' : ''}: ${signed(prof)}`;
+  }
+
+  // Breakdown lines for the 9 overridable stats. Each entry's `Total:` line is computed with NO
+  // manual input (stats.X.computed), then withManualLines() (characterStats.ts) appends the
+  // Manual section when an adjustment/override is set, replacing that line with the real
+  // (overridden/adjusted) total - see manualOverrideLines' contract for the exact wording.
+  const statFormulaLines = $derived.by((): Record<OverridableStat, string[]> => {
     const dexMod = abilityModifier(abilityScores.dex);
     const wisMod = abilityModifier(abilityScores.wis);
     const speedSetValues = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
@@ -264,55 +345,139 @@
     const speedBase = speedSetValues.length ? speedSetValues.at(-1)?.value ?? 30 : 30;
 
     return {
-      proficiency: [`Total level: ${level}`, `Formula: 2 + floor((level - 1) / 4)`, `Result: ${signed(prof)}`],
-      armorClass: [
+      proficiency: withManualLines(
+        [`Total level: ${level}`, `Formula: 2 + floor((level - 1) / 4)`, `Result: ${signed(stats.proficiency.computed)}`],
+        stats.proficiency, statFmt.proficiency
+      ),
+      armorClass: withManualLines([
         'Base: 10',
         `DEX modifier: ${signed(dexMod)}`,
         `Equipped item AC bonuses: ${signed(equippedAcBonus)}`,
         ...acModifierBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
-        `Total: ${computedArmorClass}`
-      ],
-      hitDice: [
-        ...classRows.map((row) => `${row.className || 'Class'} ${row.level}: ${row.level}d${row.className ? hitDiceSummary([row]).split('d')[1] || '8' : '8'}`),
-        `Total: ${computedHitDice || 'None'}`
-      ],
-      passivePerception: [
-        'Base: 10',
-        `WIS modifier: ${signed(wisMod)}`,
-        `Perception proficiency: ${isSkillProficient('perception') ? signed(prof) : '+0'}`,
-        ...passivePerceptionBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
-        `Total: ${computedPassivePerception}`
-      ],
-      passiveInsight: [
-        'Base: 10',
-        `WIS modifier: ${signed(wisMod)}`,
-        `Insight proficiency: ${isSkillProficient('insight') ? signed(prof) : '+0'}`,
-        ...passiveInsightBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
-        `Total: ${computedPassiveInsight}`
-      ],
-      passiveInvestigation: [
-        'Base: 10',
-        `INT modifier: ${signed(abilityModifier(abilityScores.int))}`,
-        `Investigation proficiency: ${isSkillProficient('investigation') ? signed(prof) : '+0'}`,
-        ...passiveInvestigationBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
-        `Total: ${computedPassiveInvestigation}`
-      ],
-      initiative: [
+        `Total: ${statFmt.armorClass(stats.armorClass.computed)}`
+      ], stats.armorClass, statFmt.armorClass),
+      initiative: withManualLines([
         `DEX modifier: ${signed(dexMod)}`,
         ...initiativeModifierBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
-        `Total: ${signed(computedInitiative)}`
-      ],
-      speed: [
+        `Total: ${signed(stats.initiative.computed)}`
+      ], stats.initiative, statFmt.initiative),
+      speed: withManualLines([
         speedSetValues.length ? `Base set by effect: ${speedBase} ft.` : 'Base walking speed: 30 ft.',
         ...speedBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)} ft.`),
         ...speedMultipliers.map((bonus) => `${bonus.label}: x${bonus.value}`),
-        `Total: ${computedSpeed}`
-      ]
+        `Total: ${statFmt.speed(stats.speed.computed)}`
+      ], stats.speed, statFmt.speed),
+      passivePerception: withManualLines([
+        'Base: 10',
+        `WIS modifier: ${signed(wisMod)}`,
+        proficiencyLine('Perception proficiency', isSkillProficient('perception')),
+        ...passivePerceptionBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.passivePerception(stats.passivePerception.computed)}`
+      ], stats.passivePerception, statFmt.passivePerception),
+      passiveInsight: withManualLines([
+        'Base: 10',
+        `WIS modifier: ${signed(wisMod)}`,
+        proficiencyLine('Insight proficiency', isSkillProficient('insight')),
+        ...passiveInsightBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.passiveInsight(stats.passiveInsight.computed)}`
+      ], stats.passiveInsight, statFmt.passiveInsight),
+      passiveInvestigation: withManualLines([
+        'Base: 10',
+        `INT modifier: ${signed(abilityModifier(abilityScores.int))}`,
+        proficiencyLine('Investigation proficiency', isSkillProficient('investigation')),
+        ...passiveInvestigationBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.passiveInvestigation(stats.passiveInvestigation.computed)}`
+      ], stats.passiveInvestigation, statFmt.passiveInvestigation),
+      spellSaveDc: withManualLines([
+        'Base: 8',
+        proficiencyLine('Proficiency', true),
+        `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`,
+        ...spellDcBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.spellSaveDc(stats.spellSaveDc.computed)}`
+      ], stats.spellSaveDc, statFmt.spellSaveDc),
+      spellAttackBonus: withManualLines([
+        proficiencyLine('Proficiency', true),
+        `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`,
+        ...spellAttackBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.spellAttackBonus(stats.spellAttackBonus.computed)}`
+      ], stats.spellAttackBonus, statFmt.spellAttackBonus)
     };
   });
 
   function openFormulaHelp(title: string, lines: string[]) {
     formulaHelp = { title, lines };
+  }
+
+  // Opens the formula-help modal in "live" mode for one of the 9 overridable stats: lines are
+  // read from the reactive statFormulaLines map (so they update live as the manual
+  // adjustment/override inputs in the modal change) rather than a frozen snapshot.
+  function openStatHelp(title: string, key: OverridableStat) {
+    formulaHelp = { title, statKey: key };
+  }
+
+  function setStatOverride(key: OverridableStat, value: number | null) {
+    const current = statOverrides[key] ?? { adjustment: 0, override: null };
+    const next = { ...current, override: key === 'speed' && value !== null ? Math.max(0, value) : value };
+    applyStatOverrideEntry(key, next);
+  }
+
+  function setStatAdjustment(key: OverridableStat, adjustment: number) {
+    const current = statOverrides[key] ?? { adjustment: 0, override: null };
+    applyStatOverrideEntry(key, { ...current, adjustment });
+  }
+
+  function resetStat(key: OverridableStat) {
+    applyStatOverrideEntry(key, { adjustment: 0, override: null });
+  }
+
+  // Shared write path for the three helpers above - drops the entry entirely once it's back to
+  // default (adjustment 0, override null) so a reset genuinely clears statOverrides rather than
+  // leaving a no-op entry behind, then kicks off an immediate autosave so a manual edit isn't
+  // lost if the tab closes before the next scheduled autosave tick.
+  function applyStatOverrideEntry(key: OverridableStat, entry: { adjustment: number; override: number | null }) {
+    const { [key]: _dropped, ...rest } = statOverrides;
+    statOverrides = entry.adjustment === 0 && entry.override === null ? rest : { ...rest, [key]: entry };
+    requestImmediateSave();
+  }
+
+  function commitStatInput(key: OverridableStat, event: Event & { currentTarget: HTMLInputElement }) {
+    const parsed = parseStatInput(event.currentTarget.value);
+    if (parsed === 'blank') {
+      setStatOverride(key, null);
+      return;
+    }
+    if (parsed === 'invalid') {
+      event.currentTarget.value = statFmt[key](stats[key].value);
+      return;
+    }
+    // Typing back the already-effective value while not overridden is a no-op, so tabbing
+    // through the combat summary without any real edits never manufactures an override entry.
+    if (parsed === stats[key].value && !stats[key].isOverridden) return;
+    setStatOverride(key, parsed);
+  }
+
+  // Same parse rules as the field itself (commitStatInput), but for the Manual section's
+  // dedicated Override box in the formula-help modal - reverts to the current override's
+  // display text (not the effective field value) on invalid input, since this box only ever
+  // edits `override`, never the adjustment.
+  function commitStatOverrideInput(key: OverridableStat, event: Event & { currentTarget: HTMLInputElement }) {
+    const parsed = parseStatInput(event.currentTarget.value);
+    if (parsed === 'blank') {
+      setStatOverride(key, null);
+      return;
+    }
+    if (parsed === 'invalid') {
+      const current = stats[key].override;
+      event.currentTarget.value = current !== null ? statFmt[key](current) : '';
+      return;
+    }
+    setStatOverride(key, parsed);
+  }
+
+  function requestImmediateSave() {
+    clearTimeout(autosaveTimer);
+    autosaveStatus = 'Unsaved';
+    if (sheetFormEl) void runAutosave(sheetFormEl);
   }
 
   function helpTitle(lines: string[]) {
@@ -333,10 +498,24 @@
 
   const hitDiceFormulaLines = $derived(
     [
-      ...classHitDice.map((c) => `${c.className} ${c.level}: ${c.remaining}/${c.level}d${c.dieSize}`),
-      `Total: ${hitDiceRemainingTotal} / ${level}`
+      ...classHitDice.map((c, i) => `${classHitDice.length > 1 ? `Class ${i + 1} (${c.className})` : c.className}: ${c.remaining}/${c.max}d${c.dieSize}`),
+      `Total: ${hitDiceRemainingTotal} / ${hitDiceMaxTotal}`
     ]
   );
+
+  function setHitDicePoolCurrent(index: number, raw: string) {
+    const pools = [...hitDicePools];
+    pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), current: Math.max(0, Number(raw) || 0) };
+    hitDicePools = pools;
+    requestImmediateSave();
+  }
+
+  function setHitDicePoolMax(index: number, raw: string) {
+    const pools = [...hitDicePools];
+    pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), max: Math.max(0, Number(raw) || 0) };
+    hitDicePools = pools;
+    requestImmediateSave();
+  }
 
   function isEffectSelected(key: string) {
     return selectedEffectKeys.includes(key);
@@ -420,15 +599,14 @@
   }
 
   function savingThrowTotal(key: AbilityKey) {
-    const bonuses = savingThrowModifierBonuses[key] ?? [];
-    return abilityModifier(abilityScores[key]) + (isSavingThrowProficient(key) ? prof : 0) + bonuses.reduce((sum, b) => sum + b.value, 0);
+    return stats.savingThrows[key];
   }
 
   function savingThrowFormula(key: AbilityKey): string[] {
     const bonuses = savingThrowModifierBonuses[key] ?? [];
     return [
       `${key.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[key]))}`,
-      ...(isSavingThrowProficient(key) ? [`Proficiency: ${signed(prof)}`] : []),
+      ...(isSavingThrowProficient(key) ? [proficiencyLine('Proficiency', true)] : []),
       ...bonuses.map((b) => `${b.label}: ${signed(b.value)}`),
       `Total: ${signed(savingThrowTotal(key))}`
     ];
@@ -443,7 +621,7 @@
     const bonuses = skillCheckModifierBonuses[skill.key] ?? [];
     return [
       `${skill.ability.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[skill.ability]))}`,
-      ...(isSkillProficient(skill.key) ? [`Proficiency: ${signed(prof)}`] : []),
+      ...(isSkillProficient(skill.key) ? [proficiencyLine('Proficiency', true)] : []),
       ...bonuses.map((b) => `${b.label}: ${signed(b.value)}`),
       `Total: ${signed(skillCheckTotal(skill))}`
     ];
@@ -452,41 +630,45 @@
   // Thin wrapper over the shared, pure rollWithModifiers (src/lib/rules/attackRoll.ts) - the
   // component just supplies its own reactive modifierSources and RNG. The VTT's server endpoint
   // calls the exact same function, so saves/skills/attacks can't drift between the two surfaces.
-  function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = []) {
-    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie);
+  // flatModifiersIncluded must be true whenever `modifier` already has bonus/penalty modifiers
+  // folded in (saves, skills, initiative - all of which go through resolvedAdditiveModifiers()/
+  // resolveCharacterStats() before calling this), otherwise rollWithModifiers would add them a
+  // second time (see attackRoll.ts's flatModifiersIncluded comment).
+  function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = [], flatModifiersIncluded = false) {
+    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie, { flatModifiersIncluded });
   }
 
   function rollAllSavingThrows() {
     simpleRollResult = {
       title: 'Saving Throws',
-      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`]) }))
+      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`], [], true) }))
     };
   }
 
   function rollAllSkillChecks() {
     simpleRollResult = {
       title: 'Skill Checks',
-      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]) }))
+      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], [], true) }))
     };
   }
 
   function rollSingleSavingThrow(key: AbilityKey) {
     const label = `${key.toUpperCase()} Save`;
-    const result = rollText(savingThrowTotal(key), [`saving_throw.${key}`]);
+    const result = rollText(savingThrowTotal(key), [`saving_throw.${key}`], [], true);
     simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label, ...result }] };
     void logRoll(label, result);
   }
 
   function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
     const passiveScores: Record<string, number> = {
-      perception: computedPassivePerception,
-      insight: computedPassiveInsight,
-      investigation: computedPassiveInvestigation
+      perception: stats.passivePerception.value,
+      insight: stats.passiveInsight.value,
+      investigation: stats.passiveInvestigation.value
     };
     const passiveNote = skill.key in passiveScores
       ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
       : undefined;
-    const result = rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`]);
+    const result = rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], [], true);
     simpleRollResult = {
       title: skill.name,
       lines: [{ label: skill.name, ...result }],
@@ -497,13 +679,15 @@
 
   function rollAbilityCheck(key: AbilityKey) {
     const label = `${key.toUpperCase()} Check`;
+    // Deliberately flatModifiersIncluded: false (the default) - rollAbilityCheck passes the raw
+    // ability mod only, with no bonus/penalty modifiers folded in first.
     const result = rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]);
     simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label, ...result }] };
     void logRoll(label, result);
   }
 
   function rollInitiative() {
-    const result = rollText(computedInitiative, ['initiative']);
+    const result = rollText(stats.initiative.value, ['initiative'], [], true);
     simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...result }] };
     void logRoll('Initiative', result);
   }
@@ -538,7 +722,9 @@
     const body = new FormData();
     body.set('classIndex', String(idx));
     body.set('spent', String(count));
-    body.set('classLevel', String(hdc.level));
+    // Only used server-side to seed max_value if this pool has never been saved before - an
+    // existing pool's (now player-editable) max is left alone. See spendHitDice in characters.ts.
+    body.set('defaultMax', String(hdc.max));
     body.set('hpGained', String(hpGained));
     const response = await fetch('?/spendHitDice', { method: 'POST', body });
     if (!response.ok) {
@@ -812,10 +998,59 @@
 
   function addClassRow() {
     classRows = [...classRows, { className: '', level: 1, subclassName: '', spellcastingAbility: null }];
+    hitDicePools = [...hitDicePools, { current: 1, max: 1 }];
   }
 
   function removeClassRow(index: number) {
-    if (classRows.length > 1) classRows = classRows.filter((_, rowIndex) => rowIndex !== index);
+    if (classRows.length === 1) return;
+    classRows = classRows.filter((_, rowIndex) => rowIndex !== index);
+    // Index-based hit_dice_<i> keys stay aligned on the next save because the whole spliced
+    // array is what gets saved - removing a middle class re-keys the remaining pools server-side
+    // too, which is pre-existing behaviour this doesn't change.
+    hitDicePools = hitDicePools.filter((_, rowIndex) => rowIndex !== index);
+  }
+
+  // Snapshot of each class row's level as it stood BEFORE the current edit, keyed by row index -
+  // plain (non-reactive) bookkeeping, not $state, since nothing renders from it. Needed because
+  // the level input updates classRows live on every keystroke (so other derived stats stay in
+  // sync while typing), which means classRows[index].level can no longer be trusted as "the
+  // level before this edit" by the time the level-follow decision runs - see captureClassLevel.
+  const classLevelBeforeEdit = new Map<number, number>();
+
+  // Captured on focus, before any keystroke of this edit has touched classRows - this is what
+  // "the old level" must be compared against, not classRows[index].level read later (see below).
+  function captureClassLevel(index: number) {
+    classLevelBeforeEdit.set(index, classRows[index]?.level ?? 1);
+  }
+
+  // Runs on every keystroke so level-dependent stats (proficiency, spell slots, etc.) update
+  // live. Deliberately does NOT touch hitDicePools here - see commitClassLevel.
+  function updateClassLevelInput(index: number, raw: string) {
+    const clamped = Math.max(1, Math.min(20, Number(raw) || 1));
+    classRows = classRows.map((row, rowIndex) => (rowIndex === index ? { ...row, level: clamped } : row));
+  }
+
+  // Hit dice max follows class level unless it's been customised: if a pool's max still equals
+  // the class's OLD level, it shifts by the same delta as the level change (current shifts with
+  // it, clamped >= 0). If the max was already edited to something else, it's left alone - the
+  // player's custom max wins over the level-follow convenience.
+  //
+  // Runs once on blur/Enter (onchange), not per keystroke: a multi-digit level typed as separate
+  // input events (e.g. "1" then "12") would otherwise let the first keystroke's write to
+  // classRows.level get misread as "the old level" by the second keystroke, spuriously matching
+  // a customised pool.max and clobbering it. Comparing against the onfocus-captured snapshot
+  // instead of classRows[index].level avoids that regardless of how many input events fired.
+  function commitClassLevel(index: number) {
+    const newLevel = classRows[index]?.level ?? 1;
+    const oldLevel = classLevelBeforeEdit.get(index) ?? newLevel;
+    classLevelBeforeEdit.delete(index);
+    const pool = hitDicePools[index];
+    if (pool && pool.max === oldLevel && newLevel !== oldLevel) {
+      const delta = newLevel - oldLevel;
+      hitDicePools = hitDicePools.map((entry, rowIndex) =>
+        rowIndex === index ? { current: Math.max(0, entry.current + delta), max: newLevel } : entry
+      );
+    }
   }
 
   function damageSummary(item: InventoryItem) {
@@ -1040,6 +1275,7 @@
   method="POST"
   action="?/save"
   class="sheet-form"
+  bind:this={sheetFormEl}
   use:enhance={() => {
     return async ({ update, result }) => {
       await update({ reset: false });
@@ -1102,13 +1338,39 @@
             <label>Temp HP <input name="tempHp" type="number" value={tempHp.currentValue} /></label>
             <label>Inspiration <input name="inspiration" type="number" min="0" value={inspiration} /></label>
           </div>
-          <label class="hit-dice-label">
+          <div class="hit-dice-label">
             <span class="field-label-with-help">
               Hit Dice
               <button type="button" class="formula-help-button" title={helpTitle(hitDiceFormulaLines)} aria-label="Hit Dice formula breakdown" onclick={() => openFormulaHelp('Hit Dice', hitDiceFormulaLines)}>?</button>
             </span>
+            <div class="hit-dice-pool-rows">
+              {#each classHitDice as hdc, i}
+                <span class="hit-dice-pool-row">
+                  {#if classHitDice.length > 1}<span class="hit-dice-pool-class">{hdc.className}</span>{/if}
+                  <input
+                    type="number"
+                    min="0"
+                    inputmode="numeric"
+                    class="hit-dice-pool-input"
+                    value={hdc.remaining}
+                    oninput={(event) => setHitDicePoolCurrent(i, event.currentTarget.value)}
+                    aria-label={`${hdc.className} hit dice current`}
+                  />
+                  <span>/</span>
+                  <input
+                    type="number"
+                    min="0"
+                    inputmode="numeric"
+                    class="hit-dice-pool-input"
+                    value={hdc.max}
+                    oninput={(event) => setHitDicePoolMax(i, event.currentTarget.value)}
+                    aria-label={`${hdc.className} hit dice max`}
+                  />
+                  <span>d{hdc.dieSize}</span>
+                </span>
+              {/each}
+            </div>
             <span class="summary-input-roll">
-              <input value={hitDiceDisplay} readonly title="{hitDiceRemainingTotal} / {level} remaining" />
               {#if classHitDice.length > 1}
                 <select bind:value={hitDiceClassIndex} aria-label="Hit die type" class="hit-dice-class-select">
                   {#each classHitDice as hdc, i}
@@ -1119,58 +1381,64 @@
               <input type="number" class="hit-dice-count-input" min="1" max={classHitDice[hitDiceClassIndex]?.remaining ?? 1} bind:value={hitDiceCount} aria-label="Number of hit dice to use" />
               <button type="button" class="compact-use-button" disabled={(classHitDice[hitDiceClassIndex]?.remaining ?? 0) <= 0} onclick={useHitDie}>Use</button>
             </span>
-          </label>
+          </div>
         </section>
 
         <section class="panel stack compact-panel">
           <h2>Combat Summary</h2>
           <div class="combat-summary-grid">
-            <label>
+            <label class:stat-overridden={stats.proficiency.isOverridden} class:stat-adjusted={stats.proficiency.isAdjusted && !stats.proficiency.isOverridden}>
               <span class="field-label-with-help">
                 Proficiency
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.proficiency)} aria-label="Proficiency formula breakdown" onclick={() => openFormulaHelp('Proficiency', combatFormulaHelp.proficiency)}>?</button>
+                {#if statFlag('proficiency')}<span class="stat-flag" title={statFlagTitle('proficiency')}>{statFlag('proficiency')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.proficiency)} aria-label="Proficiency formula breakdown" onclick={() => openStatHelp('Proficiency', 'proficiency')}>?</button>
               </span>
-              <input type="text" value={`+${prof}`} readonly />
+              <input type="text" inputmode="numeric" value={statFmt.proficiency(stats.proficiency.value)} onchange={(event) => commitStatInput('proficiency', event)} />
             </label>
-            <label>
+            <label class:stat-overridden={stats.armorClass.isOverridden} class:stat-adjusted={stats.armorClass.isAdjusted && !stats.armorClass.isOverridden}>
               <span class="field-label-with-help">
                 Armor Class
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.armorClass)} aria-label="Armor Class formula breakdown" onclick={() => openFormulaHelp('Armor Class', combatFormulaHelp.armorClass)}>?</button>
+                {#if statFlag('armorClass')}<span class="stat-flag" title={statFlagTitle('armorClass')}>{statFlag('armorClass')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.armorClass)} aria-label="Armor Class formula breakdown" onclick={() => openStatHelp('Armor Class', 'armorClass')}>?</button>
               </span>
-              <input name="armorClass" type="number" value={computedArmorClass} readonly />
+              <input type="text" inputmode="numeric" value={statFmt.armorClass(stats.armorClass.value)} onchange={(event) => commitStatInput('armorClass', event)} />
             </label>
-            <label class="combat-stat-pp">
+            <label class="combat-stat-pp" class:stat-overridden={stats.passivePerception.isOverridden} class:stat-adjusted={stats.passivePerception.isAdjusted && !stats.passivePerception.isOverridden}>
               <span class="field-label-with-help">
                 Passive Perception
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passivePerception)} aria-label="Passive Perception formula breakdown" onclick={() => openFormulaHelp('Passive Perception', combatFormulaHelp.passivePerception)}>?</button>
+                {#if statFlag('passivePerception')}<span class="stat-flag" title={statFlagTitle('passivePerception')}>{statFlag('passivePerception')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.passivePerception)} aria-label="Passive Perception formula breakdown" onclick={() => openStatHelp('Passive Perception', 'passivePerception')}>?</button>
               </span>
-              <input name="passivePerception" type="number" value={computedPassivePerception} readonly />
+              <input type="text" inputmode="numeric" value={statFmt.passivePerception(stats.passivePerception.value)} onchange={(event) => commitStatInput('passivePerception', event)} />
             </label>
-            <label class="initiative-control">
+            <label class="initiative-control" class:stat-overridden={stats.initiative.isOverridden} class:stat-adjusted={stats.initiative.isAdjusted && !stats.initiative.isOverridden}>
               <span class="field-label-with-help">
                 Initiative
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.initiative)} aria-label="Initiative formula breakdown" onclick={() => openFormulaHelp('Initiative', combatFormulaHelp.initiative)}>?</button>
+                {#if statFlag('initiative')}<span class="stat-flag" title={statFlagTitle('initiative')}>{statFlag('initiative')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.initiative)} aria-label="Initiative formula breakdown" onclick={() => openStatHelp('Initiative', 'initiative')}>?</button>
               </span>
               <span class="summary-input-roll">
-                <input name="initiative" value={signed(computedInitiative)} readonly />
+                <input type="text" inputmode="numeric" value={statFmt.initiative(stats.initiative.value)} onchange={(event) => commitStatInput('initiative', event)} />
                 <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={rollInitiative}>
                   <img src={d20Icon} alt="" />
                 </button>
               </span>
             </label>
-            <label class="speed-control">
+            <label class="speed-control" class:stat-overridden={stats.speed.isOverridden} class:stat-adjusted={stats.speed.isAdjusted && !stats.speed.isOverridden}>
               <span class="field-label-with-help">
                 Speed
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.speed)} aria-label="Speed formula breakdown" onclick={() => openFormulaHelp('Speed', combatFormulaHelp.speed)}>?</button>
+                {#if statFlag('speed')}<span class="stat-flag" title={statFlagTitle('speed')}>{statFlag('speed')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.speed)} aria-label="Speed formula breakdown" onclick={() => openStatHelp('Speed', 'speed')}>?</button>
               </span>
-              <input name="speed" value={computedSpeed} readonly />
+              <input type="text" inputmode="numeric" value={statFmt.speed(stats.speed.value)} onchange={(event) => commitStatInput('speed', event)} />
             </label>
-            <label class="combat-stat-pi">
+            <label class="combat-stat-pi" class:stat-overridden={stats.passiveInsight.isOverridden} class:stat-adjusted={stats.passiveInsight.isAdjusted && !stats.passiveInsight.isOverridden}>
               <span class="field-label-with-help">
                 Passive Insight
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passiveInsight)} aria-label="Passive Insight formula breakdown" onclick={() => openFormulaHelp('Passive Insight', combatFormulaHelp.passiveInsight)}>?</button>
+                {#if statFlag('passiveInsight')}<span class="stat-flag" title={statFlagTitle('passiveInsight')}>{statFlag('passiveInsight')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.passiveInsight)} aria-label="Passive Insight formula breakdown" onclick={() => openStatHelp('Passive Insight', 'passiveInsight')}>?</button>
               </span>
-              <input type="number" value={computedPassiveInsight} readonly />
+              <input type="text" inputmode="numeric" value={statFmt.passiveInsight(stats.passiveInsight.value)} onchange={(event) => commitStatInput('passiveInsight', event)} />
             </label>
             <div class="death-save-grid" aria-label="Death saves">
               <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
@@ -1206,12 +1474,13 @@
                 </div>
               </div>
             </div>
-            <label class="combat-stat-piv">
+            <label class="combat-stat-piv" class:stat-overridden={stats.passiveInvestigation.isOverridden} class:stat-adjusted={stats.passiveInvestigation.isAdjusted && !stats.passiveInvestigation.isOverridden}>
               <span class="field-label-with-help">
                 Passive Investigation
-                <button type="button" class="formula-help-button" title={helpTitle(combatFormulaHelp.passiveInvestigation)} aria-label="Passive Investigation formula breakdown" onclick={() => openFormulaHelp('Passive Investigation', combatFormulaHelp.passiveInvestigation)}>?</button>
+                {#if statFlag('passiveInvestigation')}<span class="stat-flag" title={statFlagTitle('passiveInvestigation')}>{statFlag('passiveInvestigation')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.passiveInvestigation)} aria-label="Passive Investigation formula breakdown" onclick={() => openStatHelp('Passive Investigation', 'passiveInvestigation')}>?</button>
               </span>
-              <input type="number" value={computedPassiveInvestigation} readonly />
+              <input type="text" inputmode="numeric" value={statFmt.passiveInvestigation(stats.passiveInvestigation.value)} onchange={(event) => commitStatInput('passiveInvestigation', event)} />
             </label>
           </div>
         </section>
@@ -1319,8 +1588,8 @@
           <h2>Magic & Battle Notes</h2>
           <div class="mini-grid">
             <label>Spellcasting Ability <select name="spellcastingAbility" value={spellcastingAbility}>{#each abilityOrder as key}<option value={key}>{key.toUpperCase()}</option>{/each}</select></label>
-            <label><span class="field-label-with-help">Spell Save DC<button type="button" class="formula-help-button" onclick={() => openFormulaHelp('Spell Save DC', spellDcFormula)}>?</button></span><input name="spellSaveDc" type="number" value={computedSpellSaveDc} readonly /></label>
-            <label><span class="field-label-with-help">Spell Attack Bonus<button type="button" class="formula-help-button" onclick={() => openFormulaHelp('Spell Attack Bonus', [`Proficiency: ${signed(prof)}`, `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`, ...spellAttackBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`), `Total: ${signed(computedSpellAttackBonus)}`])}>?</button></span><input name="spellAttackBonus" value={signed(computedSpellAttackBonus)} readonly /></label>
+            <label class:stat-overridden={stats.spellSaveDc.isOverridden} class:stat-adjusted={stats.spellSaveDc.isAdjusted && !stats.spellSaveDc.isOverridden}><span class="field-label-with-help">Spell Save DC{#if statFlag('spellSaveDc')}<span class="stat-flag" title={statFlagTitle('spellSaveDc')}>{statFlag('spellSaveDc')}</span>{/if}<button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.spellSaveDc)} onclick={() => openStatHelp('Spell Save DC', 'spellSaveDc')}>?</button></span><input type="text" inputmode="numeric" value={statFmt.spellSaveDc(stats.spellSaveDc.value)} onchange={(event) => commitStatInput('spellSaveDc', event)} /></label>
+            <label class:stat-overridden={stats.spellAttackBonus.isOverridden} class:stat-adjusted={stats.spellAttackBonus.isAdjusted && !stats.spellAttackBonus.isOverridden}><span class="field-label-with-help">Spell Attack Bonus{#if statFlag('spellAttackBonus')}<span class="stat-flag" title={statFlagTitle('spellAttackBonus')}>{statFlag('spellAttackBonus')}</span>{/if}<button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.spellAttackBonus)} onclick={() => openStatHelp('Spell Attack Bonus', 'spellAttackBonus')}>?</button></span><input type="text" inputmode="numeric" value={statFmt.spellAttackBonus(stats.spellAttackBonus.value)} onchange={(event) => commitStatInput('spellAttackBonus', event)} /></label>
           </div>
           <div class="structured-section">
             <div class="panel-head compact-head"><h3>Spell Slots</h3><div class="actions"><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button></div></div>
@@ -1573,7 +1842,7 @@
             <div class="class-row">
               <label>Class <input name="className" bind:value={classRow.className} /></label>
               <label>Subclass <input name="subclassName" bind:value={classRow.subclassName} placeholder="Eldritch Knight" /></label>
-              <label>Level <input name="classLevel" type="number" min="1" max="20" bind:value={classRow.level} /></label>
+              <label>Level <input name="classLevel" type="number" min="1" max="20" value={classRow.level} onfocus={() => captureClassLevel(index)} oninput={(event) => updateClassLevelInput(index, event.currentTarget.value)} onchange={() => commitClassLevel(index)} /></label>
               <label>Spellcasting Ability<select name="classSpellcastingAbility" bind:value={classRow.spellcastingAbility}><option value={null}>None</option>{#each abilityOrder as key}<option value={key}>{key.toUpperCase()}</option>{/each}</select></label>
               <button type="button" class="compact-button danger" disabled={classRows.length === 1} onclick={() => removeClassRow(index)}>Remove</button>
             </div>
@@ -1619,6 +1888,9 @@
   {/if}
 
   <div class="hidden-save-fields" aria-hidden="true">
+    <!-- Always present regardless of tab - the one field statOverrides is submitted through
+         (see readStatOverrides()/parseStatOverridesField() on the server). -->
+    <input name="statOverridesJson" type="hidden" value={JSON.stringify(statOverrides)} />
     <input name="exhaustionLevel" type="hidden" value={selectedExhaustionLevel} />
     {#each selectedEffectKeys as effectKey}
       <input name="activeEffectKey" type="hidden" value={effectKey} />
@@ -1638,7 +1910,7 @@
     {/each}
     {#each classHitDice as hdc, i}
       <input name="hitDiceCurrent_{i}" type="hidden" value={hdc.remaining} />
-      <input name="hitDiceMax_{i}" type="hidden" value={hdc.level} />
+      <input name="hitDiceMax_{i}" type="hidden" value={hdc.max} />
     {/each}
 
     {#if activeTab !== 'battle'}
@@ -1646,13 +1918,8 @@
       <input name="hpMax" type="hidden" value={hp.maxValue} />
       <input name="tempHp" type="hidden" value={tempHp.currentValue} />
       <input name="inspiration" type="hidden" value={inspiration} />
-      <input name="armorClass" type="hidden" value={computedArmorClass} />
-      <input name="initiative" type="hidden" value={signed(computedInitiative)} />
-      <input name="speed" type="hidden" value={computedSpeed} />
-      <input name="hitDice" type="hidden" value={computedHitDice} />
       <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
       <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
-      <input name="passivePerception" type="hidden" value={computedPassivePerception} />
       {#each Object.entries(abilityScores) as [key, score]}
         <input name={`ability_${key}`} type="hidden" value={score} />
       {/each}
@@ -1662,8 +1929,6 @@
       <input name="attackDamageDice" type="hidden" value={attack.damageDice} />
       <input name="attackNotes" type="hidden" value={attack.notes} />
       <input name="spellcastingAbility" type="hidden" value={spellcastingAbility} />
-      <input name="spellSaveDc" type="hidden" value={computedSpellSaveDc} />
-      <input name="spellAttackBonus" type="hidden" value={signed(computedSpellAttackBonus)} />
       <input name="spellcastingNote" type="hidden" value={notes.spellcasting ?? ''} />
       <input name="spellSlotsNote" type="hidden" value={notes.spell_slots ?? ''} />
       <input name="preparedSpellsNote" type="hidden" value={notes.prepared_spells ?? ''} />
@@ -1923,6 +2188,8 @@
   {/if}
 
   {#if formulaHelp}
+    {@const statKey = formulaHelp.statKey}
+    {@const stat = statKey ? stats[statKey] : null}
     <div class="modal-backdrop" role="presentation" onpointerdown={() => (formulaHelp = null)}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
@@ -1930,10 +2197,36 @@
           <button type="button" class="text-button" onclick={() => (formulaHelp = null)}>Close</button>
         </div>
         <div class="formula-breakdown">
-          {#each formulaHelp.lines as line}
+          {#each (statKey ? statFormulaLines[statKey] : formulaHelp.lines) ?? [] as line}
             <p>{line}</p>
           {/each}
         </div>
+        {#if statKey && stat}
+          <div class="manual-stat-controls">
+            <h3>Manual</h3>
+            <div class="mini-grid">
+              <label>Adjustment
+                <input
+                  type="number"
+                  step="1"
+                  value={stat.adjustment || ''}
+                  oninput={(event) => setStatAdjustment(statKey, Number(event.currentTarget.value) || 0)}
+                />
+              </label>
+              <label>Override
+                <input
+                  type="text"
+                  inputmode="numeric"
+                  placeholder={`Auto (${statFmt[statKey](stat.adjusted)})`}
+                  value={stat.override !== null ? statFmt[statKey](stat.override) : ''}
+                  onchange={(event) => commitStatOverrideInput(statKey, event)}
+                />
+              </label>
+            </div>
+            <button type="button" class="compact-button" disabled={!stat.isAdjusted && !stat.isOverridden} onclick={() => resetStat(statKey)}>Reset to auto</button>
+            <p class="muted">Adjustment is added into the calculation (effects that set a value, like Grappled, still win). Override replaces the final value completely until you reset it.</p>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}

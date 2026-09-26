@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
-import { abilityModifier, abilityMap, proficiencyBonus, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
+import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
+import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
 import type { CharacterContentInstance, ContentDefinition, ContentType, RechargePeriod, SpellSlot } from '$lib/types/content';
@@ -533,16 +534,26 @@ async function assertCharacterOwner(client: pg.PoolClient, userId: string, chara
   if (!owned.rowCount) throw new Error('Character not found.');
 }
 
+// Known limitation (accepted, left as-is - see the overridable-sheet-stats plan and
+// modifier-primacy-status.md §3): these resource maxima only recompute when content is added or
+// its resource definition is edited, same as a level change today. Changing a proficiency
+// override/adjustment after the fact doesn't retro-update an already-initialized pool's max.
+async function characterProficiencyForResources(client: pg.PoolClient, characterId: string, level: number): Promise<number> {
+  const metadataRow = await client.query<{ metadata_json: Record<string, unknown> }>('SELECT metadata_json FROM characters WHERE id = $1', [characterId]);
+  return effectiveProficiencyBonus(level, readStatOverrides(metadataRow.rows[0]?.metadata_json));
+}
+
 async function initializeContentResources(client: pg.PoolClient, instanceId: string, characterId: string): Promise<void> {
   const classes = await getClasses(client, characterId);
   const abilities = await getAbilities(client, characterId);
   const level = totalLevel(classes);
   const maxAbility = Math.max(...Object.values(abilityMap(abilities)).map(abilityModifier));
+  const prof = await characterProficiencyForResources(client, characterId, level);
   const definitions = await client.query<any>(`SELECT d.* FROM content_resource_definitions d
     JOIN character_content_instances i ON i.content_id = d.content_id WHERE i.id = $1`, [instanceId]);
   for (const definition of definitions.rows) {
     const maximum = resolveResourceMaximum(definition.max_value_expression, {
-      level, proficiencyBonus: proficiencyBonus(level), abilityModifier: maxAbility
+      level, proficiencyBonus: prof, abilityModifier: maxAbility
     });
     await client.query(`INSERT INTO character_content_resources
       (character_content_id, resource_definition_id, current_value, max_value) VALUES ($1,$2,$3,$3)
@@ -554,8 +565,9 @@ async function initializeContentResources(client: pg.PoolClient, instanceId: str
 async function initializeInventoryResources(client:pg.PoolClient,inventoryId:string,characterId:string,contentId:string):Promise<void>{
   const classes=await getClasses(client,characterId);const abilities=await getAbilities(client,characterId);const level=totalLevel(classes);
   const maxAbility=Math.max(...Object.values(abilityMap(abilities)).map(abilityModifier));
+  const prof=await characterProficiencyForResources(client,characterId,level);
   const definitions=await client.query<any>('SELECT * FROM content_resource_definitions WHERE content_id=$1',[contentId]);
-  for(const definition of definitions.rows){const maximum=resolveResourceMaximum(definition.max_value_expression,{level,proficiencyBonus:proficiencyBonus(level),abilityModifier:maxAbility});
+  for(const definition of definitions.rows){const maximum=resolveResourceMaximum(definition.max_value_expression,{level,proficiencyBonus:prof,abilityModifier:maxAbility});
     await client.query(`INSERT INTO character_inventory_resources(inventory_item_id,resource_definition_id,current_value,max_value)
       VALUES($1,$2,$3,$3) ON CONFLICT(inventory_item_id,resource_definition_id) DO UPDATE SET max_value=EXCLUDED.max_value,
       current_value=LEAST(character_inventory_resources.current_value,EXCLUDED.max_value)`,[inventoryId,definition.id,maximum]);}
