@@ -1,7 +1,8 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { getCharacterForRoll } from '$lib/server/services/characters';
-import { abilityMap, equippedAttackItems, proficiencyBonus, totalLevel } from '$lib/rules/dnd5e';
+import { abilityMap, equippedAttackItems } from '$lib/rules/dnd5e';
+import { characterStatsFor } from '$lib/rules/characterStats';
 import { rollAttack } from '$lib/rules/attackRoll';
 
 // Server-side attack roll for the VTT. The vanilla VTT client can't import $lib (no build step),
@@ -29,11 +30,12 @@ export const POST: RequestHandler = async ({ params, request }) => {
   const item = equippedAttackItems(character.inventory).find((entry) => entry.name === itemName);
   if (!item) return json({ error: 'item_not_found' }, { status: 404 });
 
-  const level = totalLevel(character.classes);
+  // characterStatsFor resolves the proficiency override/adjustment cascade the same way the
+  // sheet does, so a manually-set proficiency shows up in a VTT-triggered attack roll too.
   const result = rollAttack(item, {
     modifierSources: character.modifierSources,
     abilityScores: abilityMap(character.abilities),
-    proficiencyBonus: proficiencyBonus(level),
+    proficiencyBonus: characterStatsFor(character).proficiency.value,
     classes: character.classes
   });
 

@@ -32,12 +32,23 @@ function signed(value: number) {
 // modifier-primacy.md §3.3 - count advantage/disadvantage sources per bucket (don't just detect
 // presence), net them, and roll a 1+|net|-size d20 pool in the net's direction. §2.6 - emit a
 // source-attributed audit trail, not just a number.
+//
+// Two calling conventions, distinguished by options.flatModifiersIncluded:
+//   - false (default): `modifier` is a raw base (e.g. a weapon's to-hit bonus with no
+//     bonus/penalty modifiers folded in yet) - this function resolves and adds the candidates'
+//     'bonus'/'penalty' modifiers itself. Used by rollAttack/rollManualAttack.
+//   - true: `modifier` already has those same bonus/penalty modifiers summed into it (e.g. the
+//     sheet's savingThrowTotal()/skillCheckTotal()/effective initiative, which go through
+//     resolvedAdditiveModifiers()/resolveCharacterStats() before calling this) - so the 'flat'
+//     sum here is skipped to avoid double-counting. Advantage/disadvantage and extra_die still
+//     resolve either way, since those are per-roll dice, not part of the passed-in stat.
 export function rollWithModifiers(
   modifierSources: ActiveCharacterEffect[],
   modifier: number,
   candidates: string[] = [],
   modifierBreakdown: Array<{ label: string; value: number }> = [],
-  rollDie: (sides: number) => number = defaultRollDie
+  rollDie: (sides: number) => number = defaultRollDie,
+  options: { flatModifiersIncluded?: boolean } = {}
 ): { text: string; natural: number; total: number } {
   const relevant = modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
     .filter(({ entry }) => modifierTargetMatches(entry.target, candidates));
@@ -47,7 +58,7 @@ export function rollWithModifiers(
   const pool = resolveDicePool(advantageSources.length, disadvantageSources.length);
   const { rolls, chosen: d20 } = rollD20Pool(pool.poolSize, pool.direction, rollDie);
 
-  const flat = relevant.reduce((sum, { entry }) => {
+  const flat = options.flatModifiersIncluded ? 0 : relevant.reduce((sum, { entry }) => {
     const value = Number(entry.valueExpression) || 0;
     return sum + (entry.modifierType === 'bonus' ? value : entry.modifierType === 'penalty' ? -value : 0);
   }, 0);

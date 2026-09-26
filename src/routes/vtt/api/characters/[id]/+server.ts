@@ -4,17 +4,11 @@ import { getCharacter } from '$lib/server/services/characters';
 import {
   abilityMap,
   abilityModifier,
-  armorClass,
   equippedAttackItems,
-  equippedItems,
-  proficiencyBonus,
-  savingThrowModifier,
-  speedFt,
-  totalLevel,
   usableConsumableItems,
   visionRadii
 } from '$lib/rules/dnd5e';
-import type { AbilityKey } from '$lib/types/character';
+import { characterStatsFor } from '$lib/rules/characterStats';
 
 // Full computed combat snapshot for a single character, ownership-scoped
 // exactly like getCharacter() itself (a player can only pull their own
@@ -29,26 +23,28 @@ export const GET: RequestHandler = async ({ locals, params }) => {
 
   const context = { classes: character.classes };
   const abilities = abilityMap(character.abilities);
-  const level = totalLevel(character.classes);
-  const prof = proficiencyBonus(level);
+  // characterStatsFor resolves overrides/adjustments and the proficiency cascade the same way
+  // the sheet does (see src/lib/rules/characterStats.ts) - AC/speed only take effect here at
+  // token creation, since the 30s poll (applyCharacterSyncFields) deliberately excludes them
+  // (VTT-session-authoritative once a token exists).
+  const stats = characterStatsFor(character);
   const attackItems = equippedAttackItems(character.inventory);
-  const equippedAcBonus = equippedItems(character.inventory).reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0);
 
   const hpResource = character.resources.find((resource) => resource.key === 'hp');
 
+  // Proficient saving throws only (matches the shape this endpoint has always returned), now
+  // including saving_throw.* modifiers and the effective (overridden/adjusted) proficiency
+  // bonus - both previously missing here, a sheet/VTT drift fix.
   const saves = Object.fromEntries(
-    character.proficiencies.savingThrows.map((key: AbilityKey) => [
-      key,
-      savingThrowModifier(abilities[key], true, level)
-    ])
+    character.proficiencies.savingThrows.map((key) => [key, stats.savingThrows[key]])
   );
 
   return json({
     hp: hpResource?.currentValue ?? 0,
     maxHp: hpResource?.maxValue ?? 0,
-    speedFt: speedFt(character.modifierSources, context),
+    speedFt: stats.speed.value,
     vision: visionRadii(character.modifierSources, context),
-    ac: armorClass(abilities.dex, equippedAcBonus, character.modifierSources, context),
+    ac: stats.armorClass.value,
     saves,
     actions: [
       ...attackItems.map((item) => ({
@@ -64,7 +60,7 @@ export const GET: RequestHandler = async ({ locals, params }) => {
       // up automatically using the flat numbers computed here.
       {
         name: 'Unarmed Strike',
-        toHitBonus: prof + abilityModifier(abilities.str),
+        toHitBonus: stats.proficiency.value + abilityModifier(abilities.str),
         damageBonus: abilityModifier(abilities.str),
         damageRolls: '1'
       }

@@ -2,7 +2,8 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { getCharacter } from '$lib/server/services/characters';
 import { castCharacterSpell, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
-import { abilityMap, proficiencyBonus, resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, spellSaveDc, totalLevel } from '$lib/rules/dnd5e';
+import { resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, totalLevel } from '$lib/rules/dnd5e';
+import { characterStatsFor } from '$lib/rules/characterStats';
 import { rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
 
 // Server-side spell cast + damage roll for the VTT, mirroring roll-attack/+server.ts's
@@ -37,15 +38,22 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   if (!character) return json({ error: 'not_found' }, { status: 404 });
 
   const level = totalLevel(character.classes);
-  const abilities = abilityMap(character.abilities);
-  const spellcastingAbility = (character.classes[0]?.spellcastingAbility || 'int') as keyof typeof abilities;
+  // characterStatsFor resolves the spellcasting ability fallback chain (class -> metadata ->
+  // 'int' - this endpoint used to hardcode 'int' and ignore metadata.spellcastingAbility, unlike
+  // the sheet), plus overrides/adjustments and the proficiency cascade. spellAttackBonus/
+  // spellSaveDc below now include spell_attack_roll/spell_save_dc modifiers and a manual
+  // override/adjustment, both previously ignored here.
+  const stats = characterStatsFor(character);
 
   let attack: { text: string; total: number; natural: number } | undefined;
   let outcomes: string[] = [];
   if (spell.resolutionType === 'attack') {
-    const attackBonus = proficiencyBonus(level) + Math.floor((abilities[spellcastingAbility] - 10) / 2);
+    const attackBonus = stats.spellAttackBonus.value;
+    // flatModifiersIncluded: true - attackBonus already has spell_attack_roll/attack_roll.spell
+    // bonus/penalty modifiers folded in via resolveCharacterStats(), so rollWithModifiers must
+    // not add them again (see attackRoll.ts's flatModifiersIncluded comment).
     const rolled = rollWithModifiers(character.modifierSources, attackBonus, ['spell_attack_roll', 'attack_roll.spell'],
-      [{ label: 'Spell Attack', value: attackBonus }]);
+      [{ label: 'Spell Attack', value: attackBonus }], undefined, { flatModifiersIncluded: true });
     const critThreshold = resolveCritThreshold(character.modifierSources, { attackType: 'spell' });
     outcomes = resolveD20Outcomes(rolled.natural, critThreshold);
     attack = rolled;
@@ -70,7 +78,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     attackTotal: attack?.total,
     attackNatural: attack?.natural,
     outcomes,
-    saveDc: profile.resolution === 'save' ? spellSaveDc(abilities[spellcastingAbility], level) : undefined,
+    saveDc: profile.resolution === 'save' ? stats.spellSaveDc.value : undefined,
     saveAbility: profile.saveAbility,
     saveEffect: profile.saveEffect,
     effects
