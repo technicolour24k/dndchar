@@ -1652,6 +1652,10 @@ button.death-save-icon.failure.active {
   color: var(--ok);
 }
 
+.save-state.unsaved {
+  color: var(--danger);
+}
+
 .sheet-header-actions {
   grid-column: 4;
   justify-content: end;

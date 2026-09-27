@@ -46,12 +46,6 @@ export const actions = {
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { saved: true };
   },
-  autosave: async ({ request, params, locals }) => {
-    const form = await request.formData();
-    await updateCharacter(locals.user!.id, params.id, form, 'Autosave');
-    emitRealtimeEvent('character:updated', { characterId: params.id });
-    return { autosaved: true };
-  },
   resource: async ({ request, params, locals }) => {
     const form = await request.formData();
     await updateCharacter(locals.user!.id, params.id, form, 'Resource update');

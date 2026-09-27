@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { pollWhileVisible } from '$lib/stores/visiblePoll';
+
   type GameSession = { id: string; name: string; isActive: boolean; createdAt: string };
   type Note = { id: string; displayName: string; message: string; createdAt: string };
 
@@ -71,11 +73,10 @@
     }
 
     loadGameSession();
-    pollNotes();
-    const interval = setInterval(pollNotes, 4000);
+    const stopPolling = pollWhileVisible(pollNotes, 4000);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
     };
   });
 

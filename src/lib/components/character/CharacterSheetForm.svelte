@@ -1,6 +1,7 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
   import { invalidateAll } from '$app/navigation';
+  import { pollWhileVisible } from '$lib/stores/visiblePoll';
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
@@ -48,7 +49,7 @@
   // deviations (accepted)"): manual adjustments/overrides live in metadata.statOverrides, not
   // as Modifier grants. Local $state so edits are instant/local; resynced from the server below
   // only when the server value actually changed, so an unrelated invalidateAll() (Next Turn, add
-  // content, etc.) can't clobber an override that hasn't autosaved yet.
+  // content, etc.) can't clobber an override that hasn't been saved yet.
   let statOverrides = $state<StatOverrides>(readStatOverrides(untrack(() => character.metadata)));
   let lastServerOverridesJson = $state(untrack(() => JSON.stringify(readStatOverrides(character.metadata))));
   $effect(() => {
@@ -143,9 +144,11 @@
 
   let activeTab = $state<'battle' | 'traits' | 'inventory' | 'character'>('battle');
   let sheetFormEl: HTMLFormElement;
-  let autosaveTimer: ReturnType<typeof setTimeout>;
-  let autosaveStatus = $state('Ready');
-  let lastAutosaveAt = 0;
+  // No autosave - every save rewrote the whole sheet and wrote a full version snapshot, which
+  // burned through the DB's network quota. Saving is manual only; hasUnsavedChanges drives the
+  // status label and the leave-page warning below.
+  let saveStatus = $state('Ready');
+  let hasUnsavedChanges = $state(false);
   let deathSaveSuccesses = $state(0);
   let deathSaveFailures = $state(0);
   let savingThrowsOpen = $state(false);
@@ -187,7 +190,6 @@
     statKey?: OverridableStat;
   } | null>(null);
   let inventoryMessage = $state<string | null>(null);
-  const autosaveIntervalMs = 30_000;
   const modifierFilters = [
     { key: 'active', label: 'Active' },
     { key: 'automated', label: 'Automated' },
@@ -432,12 +434,12 @@
 
   // Shared write path for the three helpers above - drops the entry entirely once it's back to
   // default (adjustment 0, override null) so a reset genuinely clears statOverrides rather than
-  // leaving a no-op entry behind, then kicks off an immediate autosave so a manual edit isn't
-  // lost if the tab closes before the next scheduled autosave tick.
+  // leaving a no-op entry behind, then flags the sheet as unsaved (these hidden-field edits don't
+  // fire the form's own input event, so markUnsaved has to be called explicitly).
   function applyStatOverrideEntry(key: OverridableStat, entry: { adjustment: number; override: number | null }) {
     const { [key]: _dropped, ...rest } = statOverrides;
     statOverrides = entry.adjustment === 0 && entry.override === null ? rest : { ...rest, [key]: entry };
-    requestImmediateSave();
+    markUnsaved();
   }
 
   function commitStatInput(key: OverridableStat, event: Event & { currentTarget: HTMLInputElement }) {
@@ -474,10 +476,23 @@
     setStatOverride(key, parsed);
   }
 
-  function requestImmediateSave() {
-    clearTimeout(autosaveTimer);
-    autosaveStatus = 'Unsaved';
-    if (sheetFormEl) void runAutosave(sheetFormEl);
+  function markUnsaved() {
+    hasUnsavedChanges = true;
+    saveStatus = 'Unsaved changes';
+  }
+
+  // Only named inputs are actually submitted with the sheet - unnamed ones (catalogue pickers,
+  // room code, hit-dice spend count, etc.) are UI-only and shouldn't flag the sheet as dirty.
+  function markUnsavedIfSheetField(event: Event) {
+    const target = event.target as HTMLInputElement | null;
+    if (target?.name) markUnsaved();
+  }
+
+  // Browser's own "leave site?" prompt - the only safety net now autosave is gone.
+  function warnIfUnsaved(event: BeforeUnloadEvent) {
+    if (!hasUnsavedChanges) return;
+    event.preventDefault();
+    event.returnValue = '';
   }
 
   function helpTitle(lines: string[]) {
@@ -507,14 +522,14 @@
     const pools = [...hitDicePools];
     pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), current: Math.max(0, Number(raw) || 0) };
     hitDicePools = pools;
-    requestImmediateSave();
+    markUnsaved();
   }
 
   function setHitDicePoolMax(index: number, raw: string) {
     const pools = [...hitDicePools];
     pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), max: Math.max(0, Number(raw) || 0) };
     hitDicePools = pools;
-    requestImmediateSave();
+    markUnsaved();
   }
 
   function isEffectSelected(key: string) {
@@ -762,10 +777,10 @@
         // best-effort - a missed tick just means the modal lags one interval behind
       }
     }
-    const interval = setInterval(poll, 4000);
+    const stopPolling = pollWhileVisible(poll, 10_000, { immediate: false });
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
     };
   });
 
@@ -801,11 +816,10 @@
         // best-effort - a missed poll tick just means the log lags one interval behind
       }
     }
-    poll();
-    const interval = setInterval(poll, 4000);
+    const stopPolling = pollWhileVisible(poll, 4000);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
     };
   });
 
@@ -888,11 +902,10 @@
         // best-effort - a missed poll tick just means the log lags one interval behind
       }
     }
-    poll();
-    const interval = setInterval(poll, 4000);
+    const stopPolling = pollWhileVisible(poll, 4000);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
     };
   });
 
@@ -948,11 +961,10 @@
         // best-effort - a missed poll tick just means the panel lags one interval behind
       }
     }
-    poll();
-    const interval = setInterval(poll, 4000);
+    const stopPolling = pollWhileVisible(poll, 4000);
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      stopPolling();
     };
   });
 
@@ -1223,33 +1235,6 @@
     form?.requestSubmit();
   }
 
-  async function runAutosave(form: HTMLFormElement) {
-    autosaveStatus = 'Autosaving';
-    const response = await fetch('?/autosave', {
-      method: 'POST',
-      body: new FormData(form)
-    });
-    lastAutosaveAt = Date.now();
-    autosaveStatus = response.ok ? 'Autosaved' : 'Autosave failed';
-  }
-
-  function scheduleAutosaveOnBlur(form: HTMLFormElement) {
-    const elapsed = Date.now() - lastAutosaveAt;
-    clearTimeout(autosaveTimer);
-    autosaveStatus = 'Unsaved';
-
-    if (elapsed >= autosaveIntervalMs) {
-      void runAutosave(form);
-      return;
-    }
-
-    const wait = autosaveIntervalMs - elapsed;
-    autosaveStatus = `Autosave queued (${Math.ceil(wait / 1000)}s)`;
-    autosaveTimer = setTimeout(() => {
-      void runAutosave(form);
-    }, wait);
-  }
-
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
   function closeOpenModal() {
     if (rollResult) { rollResult = null; return; }
@@ -1269,7 +1254,7 @@
   }
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window onkeydown={handleGlobalKeydown} onbeforeunload={warnIfUnsaved} />
 
 <form
   method="POST"
@@ -1279,10 +1264,12 @@
   use:enhance={() => {
     return async ({ update, result }) => {
       await update({ reset: false });
-      autosaveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
+      if (result.type === 'success') hasUnsavedChanges = false;
+      saveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
     };
   }}
-  onfocusout={(event) => scheduleAutosaveOnBlur(event.currentTarget)}
+  oninput={markUnsavedIfSheetField}
+  onchange={markUnsavedIfSheetField}
 >
   <section class="panel sheet-header compact">
     <div>
@@ -1311,7 +1298,7 @@
         <div class="save-command-row">
           <div class="save-button-col">
             <button type="submit" class="compact-button">Save</button>
-            <span class="save-state">{autosaveStatus}</span>
+            <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
             {#if result?.saved}
               <span class="save-state good">Saved</span>
             {/if}
