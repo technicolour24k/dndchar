@@ -2,6 +2,13 @@ import { redirect, type Handle } from '@sveltejs/kit';
 import { getUserForToken, readSessionCookie } from '$lib/server/auth/session';
 import { requireAdmin } from '$lib/server/auth/authorization';
 import type { SessionUser } from '$lib/types/auth';
+import { queryStatsStorage, startPeriodicSummary, statsEnabled, type QueryStats } from '$lib/server/db/queryStats';
+
+// Phase 0 of db-traffic-reduction (see plan doc): starts the rolling 60s
+// summary log once per server start when DB_QUERY_STATS=1. Module-level so it
+// runs once at import time rather than per-request; startPeriodicSummary
+// itself guards against duplicate intervals from Vite's dev-mode HMR.
+if (statsEnabled()) startPeriodicSummary();
 
 const publicRoutes = new Set(['/login', '/register']);
 
@@ -25,7 +32,10 @@ function themeStyleFor(user: SessionUser | null): string {
   return `--app-bg: ${themeBackgroundColor}; --app-panel: ${themePanelColor}; --app-text: ${themeTextColor};`;
 }
 
-export const handle: Handle = async ({ event, resolve }) => {
+// The original handle body, unwrapped. Split out so the stats wrapper below
+// can run the session lookup (the one query every request makes) inside the
+// same AsyncLocalStorage scope as everything resolve() triggers downstream.
+async function handleRequest({ event, resolve }: Parameters<Handle>[0]) {
   const session = await getUserForToken(readSessionCookie(event.cookies));
   event.locals.user = session?.user ?? null;
   event.locals.sessionId = session?.sessionId ?? null;
@@ -53,5 +63,25 @@ export const handle: Handle = async ({ event, resolve }) => {
 
   return resolve(event, {
     transformPageChunk: ({ html }) => html.replace('%theme.style%', themeStyleFor(event.locals.user))
+  });
+}
+
+export const handle: Handle = async (input) => {
+  // Off by default (DB_QUERY_STATS unset): skip the AsyncLocalStorage wrapper
+  // entirely so there's no per-request overhead at all.
+  if (!statsEnabled()) return handleRequest(input);
+
+  const stats: QueryStats = { queries: 0, rows: 0, bytes: 0 };
+  return queryStatsStorage.run(stats, async () => {
+    const response = await handleRequest(input);
+    // Only log requests that actually touched the DB - static assets, cached
+    // 304s etc. would otherwise drown out the interesting lines.
+    if (stats.queries > 0) {
+      const kb = (stats.bytes / 1024).toFixed(1);
+      console.log(
+        `[db] ${input.event.request.method} ${input.event.url.pathname} -> ${response.status}: ${stats.queries}q ${stats.rows}r ~${kb}KB`
+      );
+    }
+    return response;
   });
 };
