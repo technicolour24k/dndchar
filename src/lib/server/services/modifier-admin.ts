@@ -1,4 +1,5 @@
 import { query, withTransaction } from '$lib/server/db';
+import { invalidateReferenceData } from '$lib/server/cache/referenceData';
 
 export const modifierTargets = [
   ['ac', 'Armor Class'],
@@ -112,6 +113,7 @@ export async function createModifierTarget(form: FormData): Promise<void> {
       value_kind=EXCLUDED.value_kind, description=EXCLUDED.description`,
     [key, label, String(form.get('targetCategory') || 'custom'), String(form.get('valueKind') || 'number'),
       String(form.get('targetDescription') || '')]);
+  invalidateReferenceData('createModifierTarget');
 }
 
 export async function loadModifierCatalogue() {
@@ -288,6 +290,7 @@ export async function updateEffect(form: FormData): Promise<string> {
     ]
   );
 
+  invalidateReferenceData('updateEffect');
   return effectId;
 }
 
@@ -343,6 +346,7 @@ export async function createEffect(userId: string, form: FormData): Promise<stri
     [effectId, sourceType, `custom.${slug}`, name, userId]
   );
 
+  invalidateReferenceData('createEffect');
   return effectId;
 }
 
@@ -369,6 +373,7 @@ export async function createModifier(form: FormData): Promise<string> {
     ]
   );
 
+  invalidateReferenceData('createModifier');
   return result.rows[0].id;
 }
 
@@ -398,6 +403,7 @@ export async function attachModifierToEffect(form: FormData): Promise<string> {
     ]
   );
 
+  invalidateReferenceData('attachModifierToEffect');
   return effectId;
 }
 
@@ -407,6 +413,7 @@ export async function detachModifierFromEffect(form: FormData): Promise<string> 
   if (!linkId) throw new Error('Link is required.');
 
   await query('DELETE FROM effect_modifier_links WHERE id = $1', [linkId]);
+  invalidateReferenceData('detachModifierFromEffect');
   return effectId;
 }
 
@@ -605,4 +612,5 @@ export async function seedCoreEffects(): Promise<void> {
       }
     }
   });
+  invalidateReferenceData('seedCoreEffects');
 }

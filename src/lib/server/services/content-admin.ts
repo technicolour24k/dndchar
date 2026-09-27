@@ -1,4 +1,5 @@
 import { query, withTransaction } from '$lib/server/db';
+import { invalidateReferenceData } from '$lib/server/cache/referenceData';
 import type { ContentType } from '$lib/types/content';
 
 export type AdminContentRecord={id:string;type:ContentType;name:string;description:string;key:string;sourceKind:string;
@@ -54,12 +55,13 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
 }
 
 export async function createAdminContent(userId:string,type:ContentType,form:FormData){const name=String(form.get('name')||'').trim();if(!name)throw new Error('Name is required.');
-  const key=`admin:${type}:${slug(name)}:${Date.now()}`;return withTransaction(async(client)=>{const created=await client.query<{id:string}>(`INSERT INTO content_definitions
+  const key=`admin:${type}:${slug(name)}:${Date.now()}`;const id=await withTransaction(async(client)=>{const created=await client.query<{id:string}>(`INSERT INTO content_definitions
     (content_key,content_type,name,description,source_kind,owner_user_id,metadata_json) VALUES($1,$2,$3,$4,'homebrew',$5,'{}') RETURNING id`,[key,type,name,String(form.get('description')||''),userId]);
     const id=created.rows[0].id;if(type==='spell')await client.query('INSERT INTO spell_definitions(content_id,spell_level) VALUES($1,0)',[id]);
-    if(type==='item')await client.query('INSERT INTO item_definitions(content_id) VALUES($1)',[id]);return id;});}
+    if(type==='item')await client.query('INSERT INTO item_definitions(content_id) VALUES($1)',[id]);return id;});
+  invalidateReferenceData('createAdminContent');return id;}
 
-export async function updateAdminContent(form:FormData){const id=String(form.get('contentId')||'');return withTransaction(async(client)=>{
+export async function updateAdminContent(form:FormData){const id=String(form.get('contentId')||'');const result=await withTransaction(async(client)=>{
   const current=await client.query<{content_type:ContentType}>('SELECT content_type FROM content_definitions WHERE id=$1',[id]);if(!current.rowCount)throw new Error('Catalogue entry not found.');
   await client.query('UPDATE content_definitions SET name=$2,description=$3,updated_at=now() WHERE id=$1',[id,String(form.get('name')||'').trim(),String(form.get('description')||'')]);
   if(current.rows[0].content_type==='spell')await client.query(`INSERT INTO spell_definitions(content_id,spell_level,school,casting_time,spell_range,components,duration,ritual,concentration,classes,
@@ -74,34 +76,37 @@ export async function updateAdminContent(form:FormData){const id=String(form.get
   if(current.rows[0].content_type==='item')await client.query(`INSERT INTO item_definitions(content_id,category,equipment_type,requires_attunement,ac_bonus,to_hit_bonus,damage_bonus,attack_ability,damage_rolls)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(content_id) DO UPDATE SET category=EXCLUDED.category,equipment_type=EXCLUDED.equipment_type,
     requires_attunement=EXCLUDED.requires_attunement,ac_bonus=EXCLUDED.ac_bonus,to_hit_bonus=EXCLUDED.to_hit_bonus,damage_bonus=EXCLUDED.damage_bonus,
-    attack_ability=EXCLUDED.attack_ability,damage_rolls=EXCLUDED.damage_rolls`,[id,String(form.get('category')||'gear'),String(form.get('equipmentType')||'item'),form.get('requiresAttunement')==='on',Number(form.get('acBonus'))||0,Number(form.get('toHitBonus'))||0,Number(form.get('damageBonus'))||0,String(form.get('attackAbility')||'str'),String(form.get('damageRolls')||'')]);return id;});}
+    attack_ability=EXCLUDED.attack_ability,damage_rolls=EXCLUDED.damage_rolls`,[id,String(form.get('category')||'gear'),String(form.get('equipmentType')||'item'),form.get('requiresAttunement')==='on',Number(form.get('acBonus'))||0,Number(form.get('toHitBonus'))||0,Number(form.get('damageBonus'))||0,String(form.get('attackAbility')||'str'),String(form.get('damageRolls')||'')]);return id;});
+  invalidateReferenceData('updateAdminContent');return result;}
 
-export async function toggleAdminContentArchive(form:FormData){const id=String(form.get('contentId')||'');await query('UPDATE content_definitions SET is_archived=NOT is_archived,updated_at=now() WHERE id=$1',[id]);return id;}
+export async function toggleAdminContentArchive(form:FormData){const id=String(form.get('contentId')||'');await query('UPDATE content_definitions SET is_archived=NOT is_archived,updated_at=now() WHERE id=$1',[id]);invalidateReferenceData('toggleAdminContentArchive');return id;}
 
 export async function attachModifierToContent(form:FormData){const contentId=String(form.get('contentId')||''),modifierId=String(form.get('modifierId')||''),activation=String(form.get('activationType')||'manual');
   if(!['carried','equipped','attuned','known','prepared','manual'].includes(activation))throw new Error('On-use mechanics must be attached through an Action.');
   await query(`INSERT INTO content_modifier_links(content_id,modifier_id,activation_type,value_override_expression,condition_expression,priority,sort_order)
     VALUES($1,$2,$3,NULLIF($4,''),NULLIF($5,''),$6,COALESCE((SELECT max(sort_order)+1 FROM content_modifier_links WHERE content_id=$1),0)) ON CONFLICT DO NOTHING`,
-    [contentId,modifierId,activation,String(form.get('valueOverrideExpression')||'').trim(),String(form.get('conditionExpression')||'').trim(),Number(form.get('priority'))||0]);return contentId;}
-export async function detachContentModifier(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_modifier_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);return id;}
+    [contentId,modifierId,activation,String(form.get('valueOverrideExpression')||'').trim(),String(form.get('conditionExpression')||'').trim(),Number(form.get('priority'))||0]);
+  invalidateReferenceData('attachModifierToContent');return contentId;}
+export async function detachContentModifier(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_modifier_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachContentModifier');return id;}
 
 export async function attachEffectToAdminContent(form:FormData){const id=String(form.get('contentId')||''),effectId=String(form.get('effectId')||''),activation=String(form.get('activationType')||'manual');
-  return withTransaction(async client=>{if(activation!=='on_use'){await client.query(`INSERT INTO content_effect_links(content_id,effect_id,activation_type) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,[id,effectId,activation]);return id;}
+  const result=await withTransaction(async client=>{if(activation!=='on_use'){await client.query(`INSERT INTO content_effect_links(content_id,effect_id,activation_type) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,[id,effectId,activation]);return id;}
     const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[id]);if(!content.rowCount)throw new Error('Content not found.');
     const action=await client.query<{id:string}>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id) VALUES($1,$2,$3,$4)
       ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,[`content:${id}:on_use`,`Use ${content.rows[0].name}`,`Actions for ${content.rows[0].name}`,content.rows[0].owner_user_id]);
     await client.query("INSERT INTO content_action_links(content_id,action_id,trigger_type) VALUES($1,$2,'on_use') ON CONFLICT DO NOTHING",[id,action.rows[0].id]);
     await client.query(`INSERT INTO action_steps(action_id,step_type,operation,effect_id,label,sort_order)
       SELECT $1,'apply_effect','apply',$2,effect.name,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
-      FROM effect_definitions effect WHERE effect.id=$2 AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,[action.rows[0].id,effectId]);return id;});}
-export async function detachEffectFromAdminContent(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_effect_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);return id;}
+      FROM effect_definitions effect WHERE effect.id=$2 AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,[action.rows[0].id,effectId]);return id;});
+  invalidateReferenceData('attachEffectToAdminContent');return result;}
+export async function detachEffectFromAdminContent(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_effect_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachEffectFromAdminContent');return id;}
 
 export async function addContentResourceAction(form:FormData){const contentId=String(form.get('contentId')||''),trigger=String(form.get('activationType')||'on_use')==='on_use'?'on_use':'manual';
   const stepType=String(form.get('stepType')||'resource_change'),operation=String(form.get('actionOperation')||'add'),target=String(form.get('targetType')||''),key=String(form.get('targetKey')||''),rawExpression=String(form.get('valueExpression')||'');
   const expression=['apply_effect','remove_effect'].includes(stepType)?'':validateDice(rawExpression||'0');
   if(!['resource_change','damage','healing','apply_effect','remove_effect','spend_resource','spend_item','roll_output'].includes(stepType))throw new Error('Choose a valid action step.');
   if(stepType==='resource_change'&&(!['add','subtract','set'].includes(operation)||!['hp','temp_hp','spell_slot','coin'].includes(target)))throw new Error('Choose a valid resource action.');
-  return withTransaction(async(client)=>{const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[contentId]);if(!content.rowCount)throw new Error('Content not found.');
+  const result=await withTransaction(async(client)=>{const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[contentId]);if(!content.rowCount)throw new Error('Content not found.');
     const requestedAction=String(form.get('actionId')||'');const action=requestedAction
       ? await client.query<{id:string}>('SELECT action.id FROM action_definitions action JOIN content_action_links link ON link.action_id=action.id WHERE action.id=$1 AND link.content_id=$2',[requestedAction,contentId])
       : await client.query<{id:string}>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id)
@@ -110,20 +115,22 @@ export async function addContentResourceAction(form:FormData){const contentId=St
     await client.query('INSERT INTO content_action_links(content_id,action_id,trigger_type) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[contentId,action.rows[0].id,trigger]);
     await client.query(`INSERT INTO action_steps(action_id,step_type,operation,target_type,target_key,value_expression,effect_id,target_mode,label,sort_order)
       VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,'')::uuid,$8,$9,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0))`,
-      [action.rows[0].id,stepType,operation,target,key,expression,String(form.get('effectId')||''),String(form.get('targetMode')||'self'),String(form.get('actionLabel')||'').trim()]);return contentId;});}
-export async function removeContentResourceAction(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM action_steps WHERE id=$1',[String(form.get('actionId')||'')]);return id;}
+      [action.rows[0].id,stepType,operation,target,key,expression,String(form.get('effectId')||''),String(form.get('targetMode')||'self'),String(form.get('actionLabel')||'').trim()]);return contentId;});
+  invalidateReferenceData('addContentResourceAction');return result;}
+export async function removeContentResourceAction(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM action_steps WHERE id=$1',[String(form.get('actionId')||'')]);invalidateReferenceData('removeContentResourceAction');return id;}
 
 export async function attachActionToContent(form:FormData){const id=String(form.get('contentId')||'');await query(`INSERT INTO content_action_links(content_id,action_id,trigger_type)
-  VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,[id,String(form.get('actionId')||''),String(form.get('triggerType')||'manual')]);return id;}
-export async function detachActionFromContent(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_action_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);return id;}
+  VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,[id,String(form.get('actionId')||''),String(form.get('triggerType')||'manual')]);invalidateReferenceData('attachActionToContent');return id;}
+export async function detachActionFromContent(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_action_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachActionFromContent');return id;}
 
 export async function addSpellAccess(form:FormData){const owner=String(form.get('contentId')||'');await query(`INSERT INTO content_spell_access
   (owner_content_id,spell_content_id,access_type,availability_type,resource_definition_id,resource_cost_expression,cast_level_mode,fixed_cast_level,save_dc_mode,fixed_save_dc,spell_attack_mode,fixed_spell_attack_bonus)
   VALUES($1,$2,$3,$4,NULLIF($5,'')::uuid,$6,$7,NULLIF($8,'')::int,$9,NULLIF($10,'')::int,$11,NULLIF($12,'')::int) ON CONFLICT(owner_content_id,spell_content_id,access_type) DO UPDATE SET
   availability_type=EXCLUDED.availability_type,resource_definition_id=EXCLUDED.resource_definition_id,resource_cost_expression=EXCLUDED.resource_cost_expression,
   cast_level_mode=EXCLUDED.cast_level_mode,fixed_cast_level=EXCLUDED.fixed_cast_level,save_dc_mode=EXCLUDED.save_dc_mode,fixed_save_dc=EXCLUDED.fixed_save_dc,
-  spell_attack_mode=EXCLUDED.spell_attack_mode,fixed_spell_attack_bonus=EXCLUDED.fixed_spell_attack_bonus`,[owner,String(form.get('spellContentId')||''),String(form.get('accessType')||'at_will'),String(form.get('availabilityType')||'equipped'),String(form.get('resourceDefinitionId')||''),String(form.get('resourceCostExpression')||'1'),String(form.get('castLevelMode')||'spell_level'),String(form.get('fixedCastLevel')||''),String(form.get('saveDcMode')||'character'),String(form.get('fixedSaveDc')||''),String(form.get('spellAttackMode')||'character'),String(form.get('fixedSpellAttackBonus')||'')]);return owner;}
-export async function removeSpellAccess(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_spell_access WHERE id=$1 AND owner_content_id=$2',[String(form.get('accessId')||''),id]);return id;}
+  spell_attack_mode=EXCLUDED.spell_attack_mode,fixed_spell_attack_bonus=EXCLUDED.fixed_spell_attack_bonus`,[owner,String(form.get('spellContentId')||''),String(form.get('accessType')||'at_will'),String(form.get('availabilityType')||'equipped'),String(form.get('resourceDefinitionId')||''),String(form.get('resourceCostExpression')||'1'),String(form.get('castLevelMode')||'spell_level'),String(form.get('fixedCastLevel')||''),String(form.get('saveDcMode')||'character'),String(form.get('fixedSaveDc')||''),String(form.get('spellAttackMode')||'character'),String(form.get('fixedSpellAttackBonus')||'')]);
+  invalidateReferenceData('addSpellAccess');return owner;}
+export async function removeSpellAccess(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_spell_access WHERE id=$1 AND owner_content_id=$2',[String(form.get('accessId')||''),id]);invalidateReferenceData('removeSpellAccess');return id;}
 
 function groupActions(rows:any[]){const map=new Map<string,any>();for(const row of rows){const action=map.get(row.id)||{id:row.id,linkId:row.link_id,name:row.name,description:row.description,triggerType:row.trigger_type,steps:[]};if(row.step_id)action.steps.push({id:row.step_id,type:row.step_type,operation:row.operation,targetType:row.target_type,targetKey:row.target_key,valueExpression:row.value_expression,effectId:row.effect_id,targetMode:row.target_mode,label:row.label,sortOrder:row.sort_order});map.set(row.id,action);}return[...map.values()];}
 function mapSpellAccess(row:any){return{id:row.id,spellContentId:row.spell_content_id,spellName:row.spell_name,accessType:row.access_type,availabilityType:row.availability_type,resourceDefinitionId:row.resource_definition_id,resourceCostExpression:row.resource_cost_expression,castLevelMode:row.cast_level_mode,fixedCastLevel:row.fixed_cast_level,saveDcMode:row.save_dc_mode,fixedSaveDc:row.fixed_save_dc,spellAttackMode:row.spell_attack_mode,fixedSpellAttackBonus:row.fixed_spell_attack_bonus};}
