@@ -483,6 +483,9 @@
 
   // Only named inputs are actually submitted with the sheet - unnamed ones (catalogue pickers,
   // room code, hit-dice spend count, etc.) are UI-only and shouldn't flag the sheet as dirty.
+  // Edits that go through buttons or unnamed inputs but DO end up in a submitted hidden field
+  // (death saves, exhaustion, condition/proficiency toggles, class rows, attuned/proficient
+  // checkboxes) call markUnsaved() themselves.
   function markUnsavedIfSheetField(event: Event) {
     const target = event.target as HTMLInputElement | null;
     if (target?.name) markUnsaved();
@@ -540,6 +543,7 @@
     selectedEffectKeys = isEffectSelected(key)
       ? selectedEffectKeys.filter((selected) => selected !== key)
       : [...selectedEffectKeys, key];
+    markUnsaved();
   }
 
   function categoryOptionsFor(category: string) {
@@ -565,23 +569,46 @@
   function setDeathSaves(kind: 'success' | 'failure', value: number) {
     if (kind === 'success') {
       deathSaveSuccesses = deathSaveSuccesses === value ? value - 1 : value;
-      return;
+    } else {
+      deathSaveFailures = deathSaveFailures === value ? value - 1 : value;
     }
-
-    deathSaveFailures = deathSaveFailures === value ? value - 1 : value;
+    markUnsaved();
   }
 
+  // Both effects below resync local edit state from the server only when the server value actually
+  // changed (same guard as statOverrides/hitDicePools above). Without autosave, an unrelated
+  // invalidateAll() - a GM's Next Turn, adding content - would otherwise silently wipe a death save
+  // or condition toggle the player hasn't hit Save on yet.
+  let lastServerDeathSavesJson = '';
   $effect(() => {
-    deathSaveSuccesses = clampDeathSave(metadata.deathSaveSuccesses);
-    deathSaveFailures = clampDeathSave(metadata.deathSaveFailures);
+    const successes = clampDeathSave(metadata.deathSaveSuccesses);
+    const failures = clampDeathSave(metadata.deathSaveFailures);
+    const serverJson = JSON.stringify([successes, failures]);
+    if (serverJson === lastServerDeathSavesJson) return;
+    lastServerDeathSavesJson = serverJson;
+    deathSaveSuccesses = successes;
+    deathSaveFailures = failures;
   });
 
+  let lastServerSelectionsJson = '';
   $effect(() => {
-    selectedEffectKeys = character.activeEffects.filter((effect) => !effect.id.startsWith('content:') && !effect.id.startsWith('item:')).map((effect) => effect.effectKey);
-    selectedExhaustionLevel = character.exhaustionLevel ?? 0;
-    selectedSavingThrowProficiencies = [...proficiencies.savingThrows];
-    selectedSkillProficiencies = [...proficiencies.skills];
+    const effectKeys = character.activeEffects.filter((effect) => !effect.id.startsWith('content:') && !effect.id.startsWith('item:')).map((effect) => effect.effectKey);
+    const exhaustion = character.exhaustionLevel ?? 0;
+    const savingThrows = [...proficiencies.savingThrows];
+    const skills = [...proficiencies.skills];
+    const serverJson = JSON.stringify([effectKeys, exhaustion, savingThrows, skills]);
+    if (serverJson === lastServerSelectionsJson) return;
+    lastServerSelectionsJson = serverJson;
+    selectedEffectKeys = effectKeys;
+    selectedExhaustionLevel = exhaustion;
+    selectedSavingThrowProficiencies = savingThrows;
+    selectedSkillProficiencies = skills;
   });
+
+  function setExhaustionLevel(raw: string) {
+    selectedExhaustionLevel = Math.min(6, Math.max(0, Number(raw) || 0));
+    markUnsaved();
+  }
 
   function signed(value: number) {
     return value >= 0 ? `+${value}` : String(value);
@@ -591,6 +618,7 @@
     const input = event.currentTarget as HTMLInputElement;
     const hidden = input.closest('label')?.querySelector<HTMLInputElement>('input[type="hidden"]');
     if (hidden) hidden.value = input.checked ? 'true' : 'false';
+    markUnsaved();
   }
 
   function isSavingThrowProficient(key: AbilityKey) {
@@ -605,12 +633,14 @@
     selectedSavingThrowProficiencies = isSavingThrowProficient(key)
       ? selectedSavingThrowProficiencies.filter((value) => value !== key)
       : [...selectedSavingThrowProficiencies, key];
+    markUnsaved();
   }
 
   function toggleSkillProficiency(key: string) {
     selectedSkillProficiencies = isSkillProficient(key)
       ? selectedSkillProficiencies.filter((value) => value !== key)
       : [...selectedSkillProficiencies, key];
+    markUnsaved();
   }
 
   function savingThrowTotal(key: AbilityKey) {
@@ -1011,6 +1041,7 @@
   function addClassRow() {
     classRows = [...classRows, { className: '', level: 1, subclassName: '', spellcastingAbility: null }];
     hitDicePools = [...hitDicePools, { current: 1, max: 1 }];
+    markUnsaved();
   }
 
   function removeClassRow(index: number) {
@@ -1020,6 +1051,7 @@
     // array is what gets saved - removing a middle class re-keys the remaining pools server-side
     // too, which is pre-existing behaviour this doesn't change.
     hitDicePools = hitDicePools.filter((_, rowIndex) => rowIndex !== index);
+    markUnsaved();
   }
 
   // Snapshot of each class row's level as it stood BEFORE the current edit, keyed by row index -
@@ -1510,7 +1542,7 @@
                 min="0"
                 max="6"
                 value={selectedExhaustionLevel}
-                oninput={(event) => (selectedExhaustionLevel = Math.min(6, Math.max(0, Number(event.currentTarget.value) || 0)))}
+                oninput={(event) => setExhaustionLevel(event.currentTarget.value)}
               />
             </label>
             <div class="active-mods">
@@ -2088,7 +2120,7 @@
             min="0"
             max="6"
             value={selectedExhaustionLevel}
-            oninput={(event) => (selectedExhaustionLevel = Math.min(6, Math.max(0, Number(event.currentTarget.value) || 0)))}
+            oninput={(event) => setExhaustionLevel(event.currentTarget.value)}
           />
         </label>
 
