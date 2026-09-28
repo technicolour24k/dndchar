@@ -2,44 +2,48 @@ import { error, fail } from '@sveltejs/kit';
 import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
+import { getCharacter, listItemCategories, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
-import { getActiveEncounterForCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
+import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
-import { getRoomGameSessionId, listGameSessionsForUser, logSessionNote } from '$lib/server/services/gameSessions';
+import { getRoomGameSessionId, logSessionNote } from '$lib/server/services/gameSessions';
 import { sessions } from '$vtt/store.js';
 
-export async function load({ params, locals }) {
+// db-traffic-reduction Phase 4: load() only carries what the sheet renders on every
+// view - versions (VersionList.svelte) and the Activity Log's Past Encounters/Past
+// Sessions tabs are now fetched lazily, only when those rarely-opened modals actually
+// open, via GET .../versions and GET .../history. depends('app:character-sheet') lets
+// every button action narrow invalidateAll() down to just this load(), instead of
+// re-running the whole page tree (see the Narrow refresh changes below/in the form).
+export async function load({ params, locals, depends }) {
+  depends('app:character-sheet');
   const character = await getCharacter(locals.user!.id, params.id);
   if (!character) throw error(404, 'Character not found.');
 
-  return {
-    character,
-    itemCategories: await listItemCategories(),
-    // db-traffic-reduction Phase 3: the full catalogue used to ship here (300-row-capped, full
-    // descriptions) purely so the sheet's pickers could populate a <select>. Those pickers are
-    // now CatalogueSearch.svelte, backed by GET /api/catalogue/search against a server-side
-    // in-memory index - see catalogue.ts's getCatalogueIndex(). The /catalogue management page
-    // still uses listCatalogue() directly and is unaffected.
-    versions: await listVersions(locals.user!.id, params.id),
-    // All three - activeVttSessionId (the one thing a player joins),
+  // Independent reads, so they can run concurrently rather than one round-trip each.
+  const [itemCategories, activeVttSessionId, activeEncounterId, activeGameSessionId] = await Promise.all([
+    listItemCategories(),
+    // All three below - activeVttSessionId (the one thing a player joins),
     // activeEncounterId, activeGameSessionId - are user-scoped, not
     // character-scoped: a player joins a room once, and every character sheet
     // they open reflects it. Combat/session activity is derived live from
     // that room's in-memory state, not a separate join per feature.
-    activeVttSessionId: await getUserVttSessionId(locals.user!.id),
-    activeEncounterId: await getActiveEncounterForCharacter(params.id),
+    getUserVttSessionId(locals.user!.id),
+    getActiveEncounterForCharacter(params.id),
     // Pure room-derivation (getRoomGameSessionId), not the fallback-chained
     // getActiveGameSessionForUser - the character sheet must only ever
     // reflect/post to what's active in the room the player is actually
     // connected to, never a stale session joined ages ago via a different
     // flow (that fallback is scoped to SessionNotesModal's own join check).
-    activeGameSessionId: await getRoomGameSessionId(locals.user!.id),
-    encounterHistory: await listEncountersForCharacter(params.id),
-    // Session Notes history is user-scoped too (see above) - shown in the
-    // Session Notes tab the same way Past Encounters is shown in the Combat
-    // tab, rather than needing its own separate /sessions list page.
-    gameSessionHistory: await listGameSessionsForUser(locals.user!.id)
+    getRoomGameSessionId(locals.user!.id)
+  ]);
+
+  return {
+    character,
+    itemCategories,
+    activeVttSessionId,
+    activeEncounterId,
+    activeGameSessionId
   };
 }
 
@@ -49,12 +53,6 @@ export const actions = {
     await updateCharacter(locals.user!.id, params.id, form, 'Manual save');
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { saved: true };
-  },
-  resource: async ({ request, params, locals }) => {
-    const form = await request.formData();
-    await updateCharacter(locals.user!.id, params.id, form, 'Resource update');
-    emitRealtimeEvent('resource:changed', { characterId: params.id });
-    return fail(200, { resourceUpdated: true });
   },
   restoreVersion: async ({ request, params, locals }) => {
     const form = await request.formData();
@@ -99,6 +97,46 @@ export const actions = {
       FROM owned
     `, [params.id, locals.user!.id, name, category, quantity, notes, location]);
     if (!result.rowCount) return fail(403, { error: 'Character not found.' });
+    emitRealtimeEvent('character:updated', { characterId: params.id });
+    return { contentUpdated: true };
+  },
+  // db-traffic-reduction Phase 4: equip/unequip used to submit the whole sheet form
+  // (a full character rewrite plus a version snapshot) just to flip one row. This is
+  // a single UPDATE instead - no version, no touching any other field the player may
+  // have unsaved elsewhere. Writes exactly what toggleEquipped's old client code set
+  // on the hidden fields: location follows equipped, and is_equipment is always left
+  // true either way (equipment gear keeps its combat stats even parked in the backpack).
+  setEquipped: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const inventoryId = String(form.get('inventoryId') || '');
+    const equipped = String(form.get('equipped')) === 'true';
+    if (!inventoryId) return fail(400, { error: 'Missing item.' });
+    const result = await query(`
+      UPDATE character_inventory_items
+      SET equipped = $3,
+          location = CASE WHEN $3 THEN 'equipped' ELSE 'backpack' END,
+          is_equipment = true
+      WHERE id = $1
+        AND character_id = $2
+        AND EXISTS (SELECT 1 FROM characters WHERE id = $2 AND owner_user_id = $4)
+    `, [inventoryId, params.id, equipped, locals.user!.id]);
+    if (!result.rowCount) return fail(403, { error: 'Item not found.' });
+    emitRealtimeEvent('character:updated', { characterId: params.id });
+    return { contentUpdated: true };
+  },
+  // Same reasoning as setEquipped above: a single DELETE, no version, no whole-sheet
+  // submit. character_inventory_resources rows for this item cascade (migration 016).
+  removeInventoryItem: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const inventoryId = String(form.get('inventoryId') || '');
+    if (!inventoryId) return fail(400, { error: 'Missing item.' });
+    const result = await query(`
+      DELETE FROM character_inventory_items
+      WHERE id = $1
+        AND character_id = $2
+        AND EXISTS (SELECT 1 FROM characters WHERE id = $2 AND owner_user_id = $3)
+    `, [inventoryId, params.id, locals.user!.id]);
+    if (!result.rowCount) return fail(403, { error: 'Item not found.' });
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { contentUpdated: true };
   },

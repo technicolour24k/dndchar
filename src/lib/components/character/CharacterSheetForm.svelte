@@ -1,6 +1,6 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
-  import { invalidateAll } from '$app/navigation';
+  import { invalidate } from '$app/navigation';
   import { pollWhileVisible } from '$lib/stores/visiblePoll';
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
@@ -19,8 +19,6 @@
     activeEncounterId = null,
     activeVttSessionId = null,
     activeGameSessionId = null,
-    encounterHistory = [],
-    gameSessionHistory = [],
     onVersionHistory
   }: {
     character: CharacterDetail;
@@ -30,8 +28,6 @@
     activeEncounterId?: string | null;
     activeVttSessionId?: string | null;
     activeGameSessionId?: string | null;
-    encounterHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
-    gameSessionHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -47,8 +43,8 @@
   // Overridable sheet stats (docs/architecture/modifier-primacy-status.md, "Deliberate
   // deviations (accepted)"): manual adjustments/overrides live in metadata.statOverrides, not
   // as Modifier grants. Local $state so edits are instant/local; resynced from the server below
-  // only when the server value actually changed, so an unrelated invalidateAll() (Next Turn, add
-  // content, etc.) can't clobber an override that hasn't been saved yet.
+  // only when the server value actually changed, so an unrelated invalidate('app:character-sheet')
+  // (Next Turn, add content, etc.) can't clobber an override that hasn't been saved yet.
   let statOverrides = $state<StatOverrides>(readStatOverrides(untrack(() => character.metadata)));
   let lastServerOverridesJson = $state(untrack(() => JSON.stringify(readStatOverrides(character.metadata))));
   $effect(() => {
@@ -62,7 +58,8 @@
   // Per-class hit dice pools (current/max) are directly editable (overridable-sheet-stats), not
   // just a read-only summary derived from the class level - so they're local $state, resynced
   // from the server only when the server value actually changed (same guard pattern as
-  // statOverrides above), so an unrelated invalidateAll() can't clobber an unsaved edit.
+  // statOverrides above), so an unrelated invalidate('app:character-sheet') can't clobber an
+  // unsaved edit.
   function hitDicePoolFor(row: { level: number }, index: number) {
     const resource = character.resources.find((r) => r.key === `hit_dice_${index}`);
     return { current: resource?.currentValue ?? row.level, max: resource?.maxValue ?? row.level };
@@ -156,6 +153,31 @@
   let activityLogOpen = $state(false);
   let sessionNotesModalId = $state<string | null>(null);
   let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
+
+  // db-traffic-reduction Phase 4: Past Encounters / Past Sessions used to arrive as props
+  // from load(), fetched on every single sheet view even though this modal is rarely
+  // opened. Fetched fresh from GET /characters/[id]/history every time the modal opens
+  // instead - same "own its data, fetch on open" idiom as SessionNotesModal.svelte.
+  let encounterHistory = $state<Array<{ id: string; name: string; isActive: boolean; createdAt: string }>>([]);
+  let gameSessionHistory = $state<Array<{ id: string; name: string; isActive: boolean; createdAt: string }>>([]);
+  $effect(() => {
+    if (!activityLogOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/characters/${character.id}/history`);
+        if (cancelled || !res.ok) return;
+        const body = await res.json();
+        encounterHistory = body.encounterHistory ?? [];
+        gameSessionHistory = body.gameSessionHistory ?? [];
+      } catch {
+        // best-effort - the history tabs just stay at whatever they last showed
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
   let selectedEffectKeys = $state<string[]>([]);
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
@@ -576,8 +598,8 @@
 
   // Both effects below resync local edit state from the server only when the server value actually
   // changed (same guard as statOverrides/hitDicePools above). Without autosave, an unrelated
-  // invalidateAll() - a GM's Next Turn, adding content - would otherwise silently wipe a death save
-  // or condition toggle the player hasn't hit Save on yet.
+  // invalidate('app:character-sheet') - a GM's Next Turn, adding content - would otherwise silently
+  // wipe a death save or condition toggle the player hasn't hit Save on yet.
   let lastServerDeathSavesJson = '';
   $effect(() => {
     const successes = clampDeathSave(metadata.deathSaveSuccesses);
@@ -775,7 +797,7 @@
       simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) - refresh the page.` };
       return;
     }
-    await invalidateAll();
+    await invalidate('app:character-sheet');
   }
 
   // activeEncounterId/activeGameSessionId only ever reflect the load()-time
@@ -871,7 +893,7 @@
     joinRoomBusy = false;
     if (response.ok) {
       joinRoomIdInput = '';
-      await invalidateAll();
+      await invalidate('app:character-sheet');
     } else {
       const actionResult = deserialize(await response.text()) as { data?: { joinRoomError?: string } };
       joinRoomError = actionResult.data?.joinRoomError || 'Could not join room.';
@@ -887,7 +909,7 @@
     // real (even empty) FormData body, same as every other action call here.
     await fetch('?/leaveRoom', { method: 'POST', body: new FormData() });
     leaveRoomBusy = false;
-    await invalidateAll();
+    await invalidate('app:character-sheet');
   }
 
   // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
@@ -1010,7 +1032,7 @@
     for (const [key, value] of Object.entries(values)) body.set(key, String(value));
     const response = await fetch(`?/${action}`, { method: 'POST', body });
     contentBusy = false;
-    if (response.ok) await invalidateAll();
+    if (response.ok) await invalidate('app:character-sheet');
     else inventoryMessage = `Could not update character content (${response.status}).`;
   }
 
@@ -1228,6 +1250,12 @@
     await runResourceAction('castSpell',body,`${spell.name} cast.`);
   }
 
+  // db-traffic-reduction Phase 4: this used to stash its message in sessionStorage and do a
+  // full document reload (location.reload()) so the message would survive it - a full SSR
+  // reload of everything just to show what a potion/spell/item did. HP, resources, hit dice
+  // pools etc. are all plain $derived off the `character` prop (or resynced-on-change local
+  // $state - see statOverrides/hitDicePools above), so a narrow invalidate() refreshes every
+  // visible value exactly as well as a full reload did, without the round-trip cost.
   async function runResourceAction(action:string,body:FormData,heading:string){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
@@ -1239,31 +1267,29 @@
     const lines=[heading,...results.map(result=>
       result.before===null?`${result.label}: ${result.detail||`${result.expression} rolled ${result.rolled}`} (${result.target})`:
       `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
-    sessionStorage.setItem('inventory-use-result',lines.join('\n'));
-    location.reload();
+    inventoryMessage=lines.join('\n');
+    await invalidate('app:character-sheet');
   }
 
-  $effect(()=>{
-    const message=sessionStorage.getItem('inventory-use-result');
-    if(message){sessionStorage.removeItem('inventory-use-result');inventoryMessage=message;}
-  });
-
+  // db-traffic-reduction Phase 4: used to zero the quantity then requestSubmit() the whole
+  // sheet form - a full character rewrite plus a version snapshot just to delete one row, and
+  // it would also silently save any unrelated unsaved edit elsewhere on the sheet. Now a tiny
+  // standalone action (single DELETE, no version) via runContentAction, same as every other
+  // button-driven content action. Every rendered inventory row's id is always real (backed by
+  // character.inventory, i.e. already persisted) - only the separate "Add Item" modal below
+  // deals with not-yet-saved rows, and that still goes through the whole-sheet Save button.
   function removeInventoryItem(event: MouseEvent) {
-    setInventoryQuantity(event, 0);
-    (event.currentTarget as HTMLElement).closest('form')?.requestSubmit();
+    const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    if (!inventoryId) return;
+    void runContentAction('removeInventoryItem', { inventoryId });
   }
 
+  // Same reasoning as removeInventoryItem above - a tiny standalone action (single UPDATE, no
+  // version) instead of flipping hidden fields and submitting the whole sheet form.
   function toggleEquipped(event: MouseEvent, equipped: boolean) {
-    const row = findInventoryRow(event);
-    const form = (event.currentTarget as HTMLElement).closest('form');
-    const location = row?.querySelector<HTMLInputElement>('input[name="inventoryLocation"]');
-    const equippedInput = row?.querySelector<HTMLInputElement>('input[name="inventoryEquipped"]');
-    const equipmentInput = row?.querySelector<HTMLInputElement>('input[name="inventoryIsEquipment"]');
-
-    if (location) location.value = equipped ? 'equipped' : 'backpack';
-    if (equippedInput) equippedInput.value = equipped ? 'true' : 'false';
-    if (equipmentInput) equipmentInput.value = 'true';
-    form?.requestSubmit();
+    const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    if (!inventoryId) return;
+    void runContentAction('setEquipped', { inventoryId, equipped });
   }
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
@@ -1294,9 +1320,13 @@
   bind:this={sheetFormEl}
   use:enhance={() => {
     return async ({ update, result }) => {
-      await update({ reset: false });
+      // invalidateAll: false - SvelteKit reruns this page's load() either way (it always does
+      // after a form action), but this keeps that rerun scoped to this route's own
+      // depends('app:character-sheet') rather than also re-running unrelated layout loads.
+      await update({ reset: false, invalidateAll: false });
       if (result.type === 'success') hasUnsavedChanges = false;
       saveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
+      await invalidate('app:character-sheet');
     };
   }}
   oninput={markUnsavedIfSheetField}
