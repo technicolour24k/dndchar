@@ -20,6 +20,13 @@ function getGlobalStore() {
     globalThis[GLOBAL_KEY] = {
       sessions: new Map(),
       socketsBySession: new Map(),
+      // db-traffic-reduction Phase 5: a "watcher" is a sheet (or Session Notes
+      // modal) tab that subscribed to a topic via {type:'watch'} - it never
+      // joins a VTT session (no 'join' message, no role/playerId), it just
+      // wants a narrow slice of events pushed to it. Keyed by topic string
+      // ("room:<sessionId>" or "game-session:<gameSessionId>"), value is the
+      // Set of watcher `meta` objects currently watching that topic.
+      watchersByTopic: new Map(),
     };
   }
   return globalThis[GLOBAL_KEY];
@@ -27,6 +34,56 @@ function getGlobalStore() {
 
 export const sessions = getGlobalStore().sessions;
 export const socketsBySession = getGlobalStore().socketsBySession;
+export const watchersByTopic = getGlobalStore().watchersByTopic;
+
+const MAX_WATCH_TOPICS = 10;
+
+// Replaces whatever topics `meta` was previously watching with `topics`
+// (capped defensively - the protocol-level cap/validation lives in
+// wsServer.js's 'watch' handler, this is just a second safety net). Called
+// on every {type:'watch'} message, including a re-subscribe with an updated
+// list from the same socket.
+export function setWatches(meta, topics) {
+  removeWatcher(meta);
+  meta.watchTopics = new Set(topics.slice(0, MAX_WATCH_TOPICS));
+  for (const topic of meta.watchTopics) {
+    let watchers = watchersByTopic.get(topic);
+    if (!watchers) {
+      watchers = new Set();
+      watchersByTopic.set(topic, watchers);
+    }
+    watchers.add(meta);
+  }
+}
+
+// Removes `meta` from every topic it's currently watching - called on a
+// re-subscribe (via setWatches above) and on socket close.
+export function removeWatcher(meta) {
+  if (!meta.watchTopics) return;
+  for (const topic of meta.watchTopics) {
+    const watchers = watchersByTopic.get(topic);
+    if (!watchers) continue;
+    watchers.delete(meta);
+    if (watchers.size === 0) watchersByTopic.delete(topic);
+  }
+  meta.watchTopics = new Set();
+}
+
+// Sends payload (plus the topic it came from, so a client with several
+// subscriptions open on one socket can route it) to every watcher of `topic`.
+export function publish(topic, payload) {
+  const watchers = watchersByTopic.get(topic);
+  if (!watchers) return;
+  const message = JSON.stringify({ ...payload, topic });
+  for (const meta of watchers) {
+    if (meta.ws.readyState === meta.ws.OPEN) meta.ws.send(message);
+  }
+}
+
+// Narrow allow-list of broadcast() types that are safe and useful to forward
+// to sheet watchers: state changes and append-only log lines, never raw VTT
+// token/map/marker data (that stays participant-only, see filterSessionForRole).
+const WATCHABLE_BROADCAST_TYPES = new Set(['combat:state', 'combat:log', 'roll:log', 'game_session:state']);
 
 export function generateRoomCode(existingSessions) {
   let code;
@@ -115,14 +172,32 @@ export function filterSessionForRole(session, role, playerId) {
 
 // Sends a per-recipient payload to every socket in a session. buildPayload
 // returns null to skip a given recipient (used for GM-only/hidden-token data).
+//
+// Also forwards a narrow allow-list of types (WATCHABLE_BROADCAST_TYPES) to
+// any sheet watching "room:<sessionId>" (db-traffic-reduction Phase 5), built
+// with a synthetic { role: 'watcher', playerId: null } recipient - every
+// buildPayload lambda in this codebase only ever reads recipient.role/
+// recipient.playerId (never recipient.ws), so this is safe, and it means a
+// GM-only payload (role !== 'gm' check) correctly never reaches a watcher.
+// Only computed when something is actually watching that room, to avoid
+// paying for it on every single high-frequency token:move-style broadcast.
 export function broadcast(sessionId, buildPayload) {
   const sockets = socketsBySession.get(sessionId);
-  if (!sockets) return;
-  for (const meta of sockets) {
-    const payload = buildPayload(meta);
-    if (payload === null || payload === undefined) continue;
-    if (meta.ws.readyState === meta.ws.OPEN) {
-      meta.ws.send(JSON.stringify(payload));
+  if (sockets) {
+    for (const meta of sockets) {
+      const payload = buildPayload(meta);
+      if (payload === null || payload === undefined) continue;
+      if (meta.ws.readyState === meta.ws.OPEN) {
+        meta.ws.send(JSON.stringify(payload));
+      }
+    }
+  }
+
+  const roomTopic = `room:${sessionId}`;
+  if (watchersByTopic.get(roomTopic)?.size) {
+    const watcherPayload = buildPayload({ role: 'watcher', playerId: null });
+    if (watcherPayload && WATCHABLE_BROADCAST_TYPES.has(watcherPayload.type)) {
+      publish(roomTopic, watcherPayload);
     }
   }
 }

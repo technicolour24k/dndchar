@@ -47,7 +47,12 @@ export async function logRoll(
     [sessionId, message, JSON.stringify(details)]
   );
   const entry = toEntry(result.rows[0]);
-  broadcast(sessionId, () => ({ type: 'roll:log', message, details }));
+  // db-traffic-reduction Phase 5: entry included (see combatLog.ts's
+  // logCombatEvent for the same reasoning) so a pushed sheet subscriber can
+  // merge it directly. The visibility==='gm' branch above never persists and
+  // never reaches a watcher anyway (see broadcast()'s synthetic 'watcher'
+  // recipient in store.js), so it has no entry to include.
+  broadcast(sessionId, () => ({ type: 'roll:log', message, details, entry }));
   return entry;
 }
 

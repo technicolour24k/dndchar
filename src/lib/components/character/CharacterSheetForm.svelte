@@ -1,7 +1,7 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
   import { invalidate } from '$app/navigation';
-  import { pollWhileVisible } from '$lib/stores/visiblePoll';
+  import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
@@ -803,8 +803,8 @@
   // activeEncounterId/activeGameSessionId only ever reflect the load()-time
   // snapshot otherwise - if a GM starts combat or a game session *after* this
   // page was already open, nothing would pick that up without a full reload.
-  // These local copies get refreshed by a background poll below so the
-  // Activity Log modal reflects what's actually live right now.
+  // These local copies get refreshed by the room-topic push subscription
+  // below so the Activity Log modal reflects what's actually live right now.
   let liveEncounterId = $state<string | null>(null);
   let liveGameSessionId = $state<string | null>(null);
   $effect(() => {
@@ -813,65 +813,102 @@
   $effect(() => {
     liveGameSessionId = activeGameSessionId;
   });
-  $effect(() => {
-    let cancelled = false;
-    async function poll() {
-      if (cancelled) return;
-      try {
-        const res = await fetch(`/vtt/api/characters/${character.id}/activity-status`);
-        if (res.ok) {
-          const data = await res.json();
-          liveEncounterId = data.encounterId;
-          liveGameSessionId = data.gameSessionId;
-        }
-      } catch {
-        // best-effort - a missed tick just means the modal lags one interval behind
+
+  // Cheap ownership-scoped re-derive of liveEncounterId/liveGameSessionId
+  // (see that endpoint's own comment for why it's not full getCharacter) -
+  // used to be polled every 10s; now only called from the room-topic
+  // subscription's onResync (below) and on a combat:state/game_session:state
+  // push, so it only ever runs when something might actually have changed.
+  async function refreshActivityStatus() {
+    try {
+      const res = await fetch(`/vtt/api/characters/${character.id}/activity-status`);
+      if (res.ok) {
+        const data = await res.json();
+        liveEncounterId = data.encounterId;
+        liveGameSessionId = data.gameSessionId;
       }
+    } catch {
+      // best-effort - a missed refresh just means the modal lags until the next one
     }
-    const stopPolling = pollWhileVisible(poll, 10_000, { immediate: false });
-    return () => {
-      cancelled = true;
-      stopPolling();
-    };
+  }
+
+  // db-traffic-reduction Phase 5: pushed live over /vtt-ws instead of polled
+  // (see src/lib/stores/liveUpdates.ts). The sheet has no other reason to
+  // reach the combat-log/roll-log endpoints now except an afterId catch-up
+  // fetch, either on first join or on every reconnect (onResync).
+  let combatLogEntries = $state<Array<{ id: string; message: string; createdAt: string }>>([]);
+  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown>; createdAt: string }>>([]);
+
+  async function fetchCombatLogSince(encounterId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ encounterId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/log?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.entries?.length) combatLogEntries = mergeLogEntries(combatLogEntries, data.entries, 200);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the log lags until the next resync
+    }
+  }
+
+  async function fetchRollLogSince(sessionId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ sessionId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/roll-log?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.entries?.length) rollLogEntries = mergeLogEntries(rollLogEntries, data.entries, 200);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the log lags until the next resync
+    }
+  }
+
+  // Only (re)starts when liveEncounterId itself changes - a fresh/changed
+  // encounter has no locally-known backlog, so this clears and does one full
+  // fetch. Ongoing entries arrive via the room-topic push below instead.
+  $effect(() => {
+    const encounterId = liveEncounterId;
+    combatLogEntries = [];
+    if (!encounterId) return;
+    fetchCombatLogSince(encounterId, undefined);
   });
 
-  // Polls the same combat-log endpoint the VTT's live panel writes to (see
-  // src/routes/vtt/api/log/+server.ts) - the sheet has no live transport of its
-  // own (Socket.IO is stubbed, the raw ws server only serves the VTT client),
-  // so a plain sheet HP edit shows up here within one polling interval instead
-  // of instantly. Only (re)starts when liveEncounterId itself changes -
-  // combatLogEntries is written from the async poll callback, not read
-  // synchronously here, so appending to it doesn't re-trigger this effect.
-  let combatLogEntries = $state<Array<{ id: string; message: string }>>([]);
+  // The one live transport for everything room-scoped: combat/roll log lines,
+  // and "something changed, re-check activity status" for combat/game-session
+  // start-stop. Gated on activeVttSessionId (same gate the old roll-log poll
+  // used) since there's nothing to watch before a room's been joined - the
+  // "Join Room" action already calls invalidate('app:character-sheet'), which
+  // reruns this effect the moment activeVttSessionId actually changes.
   $effect(() => {
-    if (!liveEncounterId) {
-      combatLogEntries = [];
+    if (!activeVttSessionId) {
+      rollLogEntries = [];
       return;
     }
-    let cancelled = false;
-    let lastId: string | undefined;
-    async function poll() {
-      if (cancelled) return;
-      const qs = new URLSearchParams({ encounterId: liveEncounterId! });
-      if (lastId) qs.set('afterId', lastId);
-      try {
-        const res = await fetch(`/vtt/api/log?${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.entries?.length) {
-            combatLogEntries = [...combatLogEntries, ...data.entries].slice(-200);
-            lastId = data.entries[data.entries.length - 1].id;
-          }
+    const sessionId = activeVttSessionId;
+    rollLogEntries = [];
+    fetchRollLogSince(sessionId, undefined);
+
+    const unsubscribe = subscribeTopic(`room:${sessionId}`, {
+      onResync: () => {
+        refreshActivityStatus();
+        fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
+        if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
+      },
+      onMessage: (msg) => {
+        if (msg.type === 'roll:log' && msg.entry) {
+          rollLogEntries = mergeLogEntries(rollLogEntries, [msg.entry as (typeof rollLogEntries)[number]], 200);
+        } else if (msg.type === 'combat:log' && msg.entry && (msg.entry as { encounterId: string }).encounterId === liveEncounterId) {
+          combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
+        } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
+          refreshActivityStatus();
         }
-      } catch {
-        // best-effort - a missed poll tick just means the log lags one interval behind
       }
-    }
-    const stopPolling = pollWhileVisible(poll, 4000);
-    return () => {
-      cancelled = true;
-      stopPolling();
-    };
+    });
+    return unsubscribe;
   });
 
   // The one join a player needs - covers combat, rolls, and session notes at
@@ -925,41 +962,6 @@
     await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
   }
 
-  // Same polling shape as the combat-log effect above, against the separate
-  // roll-log table/endpoint (see docs on why rolls are scoped to the VTT room
-  // rather than an encounter - most rolls happen with no combat active).
-  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown> }>>([]);
-  $effect(() => {
-    if (!activeVttSessionId) {
-      rollLogEntries = [];
-      return;
-    }
-    let cancelled = false;
-    let lastId: string | undefined;
-    async function poll() {
-      if (cancelled) return;
-      const qs = new URLSearchParams({ sessionId: activeVttSessionId! });
-      if (lastId) qs.set('afterId', lastId);
-      try {
-        const res = await fetch(`/vtt/api/roll-log?${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.entries?.length) {
-            rollLogEntries = [...rollLogEntries, ...data.entries].slice(-200);
-            lastId = data.entries[data.entries.length - 1].id;
-          }
-        }
-      } catch {
-        // best-effort - a missed poll tick just means the log lags one interval behind
-      }
-    }
-    const stopPolling = pollWhileVisible(poll, 4000);
-    return () => {
-      cancelled = true;
-      stopPolling();
-    };
-  });
-
   function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
     const label = String(entry.details.label ?? 'Roll');
     simpleRollResult = {
@@ -985,38 +987,45 @@
     if (response.ok) sessionNoteInput = '';
   }
 
-  // Same polling shape as the combat/roll log panels - this panel only shows
-  // the most recent handful; the full log lives at /sessions/[id].
-  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string }>>([]);
+  // Pushed live over the "game-session:<id>" topic (db-traffic-reduction
+  // Phase 5) - this panel only shows the most recent handful; the full log
+  // lives at /sessions/[id] (SessionNotesModal.svelte, same subscription
+  // shape). (Re)starts when liveGameSessionId changes, same "fresh id, no
+  // known backlog" reasoning as the combat-log effect above.
+  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string; createdAt: string }>>([]);
+
+  async function fetchSessionNotesSince(gameSessionId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ gameSessionId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/session-notes?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.notes?.length) sessionNoteEntries = mergeLogEntries(sessionNoteEntries, data.notes, 20);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the panel lags until the next resync
+    }
+  }
+
   $effect(() => {
     if (!liveGameSessionId) {
       sessionNoteEntries = [];
       return;
     }
-    let cancelled = false;
-    let lastId: string | undefined;
-    async function poll() {
-      if (cancelled) return;
-      const qs = new URLSearchParams({ gameSessionId: liveGameSessionId! });
-      if (lastId) qs.set('afterId', lastId);
-      try {
-        const res = await fetch(`/vtt/api/session-notes?${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.notes?.length) {
-            sessionNoteEntries = [...sessionNoteEntries, ...data.notes].slice(-20);
-            lastId = data.notes[data.notes.length - 1].id;
-          }
+    const gameSessionId = liveGameSessionId;
+    sessionNoteEntries = [];
+    fetchSessionNotesSince(gameSessionId, undefined);
+
+    const unsubscribe = subscribeTopic(`game-session:${gameSessionId}`, {
+      onResync: () => fetchSessionNotesSince(gameSessionId, sessionNoteEntries.at(-1)?.id),
+      onMessage: (msg) => {
+        if (msg.type === 'game_session:note' && msg.note) {
+          sessionNoteEntries = mergeLogEntries(sessionNoteEntries, [msg.note as (typeof sessionNoteEntries)[number]], 20);
         }
-      } catch {
-        // best-effort - a missed poll tick just means the panel lags one interval behind
       }
-    }
-    const stopPolling = pollWhileVisible(poll, 4000);
-    return () => {
-      cancelled = true;
-      stopPolling();
-    };
+    });
+    return unsubscribe;
   });
 
   // Rendered newest-first. The underlying entries arrays and their afterId poll

@@ -1,6 +1,6 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
-import { sessions, socketsBySession, broadcast } from './store.js';
+import { sessions, socketsBySession, broadcast, setWatches, removeWatcher } from './store.js';
 import handleJoin from './handlers/join.js';
 import handleTokenEvent from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
@@ -10,6 +10,15 @@ import handleSoundboardEvent from './handlers/soundboard.js';
 import handleDiceEvent from './handlers/dice.js';
 
 const WS_PATH = '/vtt-ws';
+
+// db-traffic-reduction Phase 5: a "watch" subscription is unauthenticated,
+// same as the rest of this ws server (small trusted group, user decision) -
+// topic shape is validated so a client can't subscribe to an unbounded or
+// malformed topic string. At most 10 per socket (also enforced defensively
+// in store.js's setWatches).
+const WATCH_TOPIC_PATTERN = /^(room|game-session):[A-Za-z0-9-]{1,64}$/;
+const MAX_WATCH_TOPICS = 10;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 
 // token.js needs to persist combat-log rows via POST /vtt/api/log, but it can't
 // import $lib/server/services/combatLog.ts directly (see that route's own
@@ -56,8 +65,36 @@ export function attachVttWebSocketServer(httpServer) {
     });
   });
 
+  // 5a. Heartbeat: every socket gets a native ping each round; one that
+  // didn't pong back since the *previous* round is assumed dead and
+  // terminated. Also lets a watcher-only socket (never joined a session, so
+  // it has no VTT traffic of its own to notice a dead path from) detect one
+  // via the app-level {type:'hb'} frame below. Created once per process
+  // (guarded by the `if (wss) return wss;` above) and cleared if the wss
+  // itself is ever closed (not expected in normal operation, but keeps a
+  // stray interval from outliving its server on e.g. a test teardown).
+  const heartbeatInterval = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        ws.terminate();
+        continue;
+      }
+      ws.isAlive = false;
+      ws.ping();
+      if (ws.vttMeta?.watchTopics?.size) {
+        ws.send(JSON.stringify({ type: 'hb' }));
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+  wss.on('close', () => clearInterval(heartbeatInterval));
+
   wss.on('connection', (ws) => {
-    const meta = { ws, sessionId: null, role: null, playerId: null, playerName: null };
+    const meta = { ws, sessionId: null, role: null, playerId: null, playerName: null, watchTopics: new Set() };
+    ws.vttMeta = meta;
+    ws.isAlive = true;
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
 
     ws.on('message', (raw) => {
       let msg;
@@ -71,6 +108,19 @@ export function attachVttWebSocketServer(httpServer) {
         case 'join':
           handleJoin(meta, msg, context);
           break;
+        // 5c. A sheet (or Session Notes modal) subscribing to a narrow slice
+        // of events, unrelated to (and not requiring) a 'join' - see
+        // store.js's setWatches/publish. Replaces the whole topic list each
+        // time, so a subsequent 'watch' with a different list is how a
+        // caller changes/drops subscriptions on the same socket.
+        case 'watch': {
+          const requested = Array.isArray(msg.topics) ? msg.topics : [];
+          const valid = requested
+            .filter((topic) => typeof topic === 'string' && WATCH_TOPIC_PATTERN.test(topic))
+            .slice(0, MAX_WATCH_TOPICS);
+          setWatches(meta, valid);
+          break;
+        }
         case 'token:add':
         case 'token:remove':
         case 'token:remove:bulk':
@@ -108,6 +158,10 @@ export function attachVttWebSocketServer(httpServer) {
     });
 
     ws.on('close', () => {
+      // Runs regardless of whether this socket ever joined a session - a
+      // watch-only socket (sheet/Session Notes modal) has meta.sessionId ===
+      // null and must still be cleaned out of watchersByTopic.
+      removeWatcher(meta);
       if (!meta.sessionId) return;
       const sockets = socketsBySession.get(meta.sessionId);
       if (sockets) sockets.delete(meta);

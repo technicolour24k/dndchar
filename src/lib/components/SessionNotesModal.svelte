@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { pollWhileVisible } from '$lib/stores/visiblePoll';
+  import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
 
   type GameSession = { id: string; name: string; isActive: boolean; createdAt: string };
   type Note = { id: string; displayName: string; message: string; createdAt: string };
@@ -27,12 +27,14 @@
   let notesNewestFirst = $derived([...notes].reverse());
 
   // Fetches fresh whenever the modal opens for a (possibly different)
-  // session, and polls for new notes while open - same 4s/afterId pattern
-  // used everywhere else in this app. This is a plain client-fetched modal,
+  // session, and subscribes to that session's "game-session:<id>" topic for
+  // new notes while open (db-traffic-reduction Phase 5 - see
+  // src/lib/stores/liveUpdates.ts). This is a plain client-fetched modal,
   // not a page - it can be opened from anywhere (the /sessions list, the
   // character sheet, or the thin /sessions/[id] route for direct links)
   // without a navigation, so it owns its own data loading rather than
-  // relying on a route's load().
+  // relying on a route's load(). No cap on `notes` here (unlike the
+  // character sheet's own small panel) - this is the full-session view.
   $effect(() => {
     if (!open || !gameSessionId) return;
     const id = gameSessionId;
@@ -40,7 +42,6 @@
     notes = [];
     notFound = false;
     let cancelled = false;
-    let lastId: string | undefined;
 
     async function loadGameSession() {
       const res = await fetch(`/vtt/api/game-sessions/${id}`);
@@ -54,18 +55,14 @@
       joined = body.joined;
     }
 
-    async function pollNotes() {
-      if (cancelled) return;
+    async function fetchNotesSince(afterId: string | undefined) {
       const qs = new URLSearchParams({ gameSessionId: id });
-      if (lastId) qs.set('afterId', lastId);
+      if (afterId) qs.set('afterId', afterId);
       try {
         const res = await fetch(`/vtt/api/session-notes?${qs}`);
         if (res.ok) {
           const body = await res.json();
-          if (body.notes?.length) {
-            notes = [...notes, ...body.notes];
-            lastId = body.notes[body.notes.length - 1].id;
-          }
+          if (body.notes?.length) notes = mergeLogEntries(notes, body.notes, Infinity);
         }
       } catch {
         // best-effort
@@ -73,10 +70,17 @@
     }
 
     loadGameSession();
-    const stopPolling = pollWhileVisible(pollNotes, 4000);
+    const unsubscribe = subscribeTopic(`game-session:${id}`, {
+      onResync: () => fetchNotesSince(notes.at(-1)?.id),
+      onMessage: (msg) => {
+        if (msg.type === 'game_session:note' && msg.note) {
+          notes = mergeLogEntries(notes, [msg.note as Note], Infinity);
+        }
+      }
+    });
     return () => {
       cancelled = true;
-      stopPolling();
+      unsubscribe();
     };
   });
 
