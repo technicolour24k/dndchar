@@ -35,6 +35,12 @@
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   let abortController: AbortController | undefined;
 
+  // Don't let a pending debounce or in-flight search outlive the component.
+  $effect(() => () => {
+    clearTimeout(debounceTimer);
+    abortController?.abort();
+  });
+
   async function runSearch() {
     abortController?.abort();
     const controller = new AbortController();
@@ -130,6 +136,7 @@
     aria-activedescendant={open && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined}
     autocomplete="off"
     {placeholder}
+    aria-label={placeholder}
     {disabled}
     bind:value={query}
     oninput={handleInput}

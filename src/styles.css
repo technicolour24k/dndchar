@@ -1068,7 +1068,7 @@ button.equipment-toggle .item-kind-icon {
   list-style: none;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #080808;
+  background: var(--panel-dark);
   box-shadow: 0 10px 30px rgb(0 0 0 / 35%);
 }
 

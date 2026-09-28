@@ -1026,14 +1026,43 @@
   let rollLogNewestFirst = $derived([...rollLogEntries].reverse());
   let sessionNotesNewestFirst = $derived([...sessionNoteEntries].reverse());
 
+  // contentBusy stays true until the refreshed character has landed, not just until the action's
+  // own response - the whole-sheet Save is blocked while it's set (see the form's enhance below).
+  // Otherwise a Save clicked in that gap would submit the stale on-screen inventory, and
+  // replaceInventory (delete-all-then-upsert from the form) would quietly undo an equip toggle or
+  // bring a just-removed item back.
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
     contentBusy = true;
-    const body = new FormData();
-    for (const [key, value] of Object.entries(values)) body.set(key, String(value));
-    const response = await fetch(`?/${action}`, { method: 'POST', body });
-    contentBusy = false;
-    if (response.ok) await invalidate('app:character-sheet');
-    else inventoryMessage = `Could not update character content (${response.status}).`;
+    try {
+      const body = new FormData();
+      for (const [key, value] of Object.entries(values)) body.set(key, String(value));
+      const response = await fetch(`?/${action}`, { method: 'POST', body });
+      if (response.ok) await invalidate('app:character-sheet');
+      else inventoryMessage = `Could not update character content (${response.status}).`;
+    } finally {
+      contentBusy = false;
+    }
+  }
+
+  // Saves the whole sheet form in place (no navigation), for actions that need pending edits
+  // written first. Returns false if the save failed, so the caller can stop.
+  async function saveSheetNow(): Promise<boolean> {
+    if (!sheetFormEl) return false;
+    saveStatus = 'Saving';
+    const response = await fetch('?/save', {
+      method: 'POST',
+      body: new FormData(sheetFormEl),
+      headers: { 'x-sveltekit-action': 'true' }
+    });
+    let ok = false;
+    try {
+      ok = response.ok && deserialize(await response.text()).type === 'success';
+    } catch {
+      // Non-JSON error page (e.g. a 500) - treat as a failed save.
+    }
+    if (ok) hasUnsavedChanges = false;
+    saveStatus = ok ? 'Saved' : 'Save failed';
+    return ok;
   }
 
   function addSelectedContent(type: ContentType) {
@@ -1278,10 +1307,24 @@
   // button-driven content action. Every rendered inventory row's id is always real (backed by
   // character.inventory, i.e. already persisted) - only the separate "Add Item" modal below
   // deals with not-yet-saved rows, and that still goes through the whole-sheet Save button.
+  // Equip/remove are tiny standalone actions, but if the sheet has unsaved edits they're saved
+  // first - an equipped/unequipped row moves between the Equipped and Backpack lists, which
+  // re-renders it from the server and would silently drop any unsaved edits on that row. This
+  // matches the old behaviour (equip/remove used to submit the whole sheet) only when needed.
+  async function runInventoryAction(action: 'setEquipped' | 'removeInventoryItem', values: Record<string, string | boolean>) {
+    if (contentBusy) return;
+    if (hasUnsavedChanges) {
+      contentBusy = true;
+      const saved = await saveSheetNow().finally(() => (contentBusy = false));
+      if (!saved) return;
+    }
+    await runContentAction(action, values);
+  }
+
   function removeInventoryItem(event: MouseEvent) {
     const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
     if (!inventoryId) return;
-    void runContentAction('removeInventoryItem', { inventoryId });
+    void runInventoryAction('removeInventoryItem', { inventoryId });
   }
 
   // Same reasoning as removeInventoryItem above - a tiny standalone action (single UPDATE, no
@@ -1289,7 +1332,7 @@
   function toggleEquipped(event: MouseEvent, equipped: boolean) {
     const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
     if (!inventoryId) return;
-    void runContentAction('setEquipped', { inventoryId, equipped });
+    void runInventoryAction('setEquipped', { inventoryId, equipped });
   }
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
@@ -1318,8 +1361,16 @@
   action="?/save"
   class="sheet-form"
   bind:this={sheetFormEl}
-  use:enhance={() => {
+  use:enhance={({ cancel }) => {
+    // Blocked while a content/inventory action is still in flight or refreshing - see
+    // runContentAction. Also covers a native submit from pressing Enter in a text field.
+    if (contentBusy) {
+      cancel();
+      return;
+    }
+    contentBusy = true;
     return async ({ update, result }) => {
+      contentBusy = false;
       // invalidateAll: false - SvelteKit reruns this page's load() either way (it always does
       // after a form action), but this keeps that rerun scoped to this route's own
       // depends('app:character-sheet') rather than also re-running unrelated layout loads.
@@ -1358,7 +1409,7 @@
       <div class="save-cluster">
         <div class="save-command-row">
           <div class="save-button-col">
-            <button type="submit" class="compact-button">Save</button>
+            <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
             <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
             {#if result?.saved}
               <span class="save-state good">Saved</span>
