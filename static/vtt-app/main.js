@@ -567,7 +567,11 @@ function handleMessage(msg) {
       render();
       renderSidebar();
       updateAmbientMusic();
-      if (role === 'player') startCharacterSync();
+      // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
+      // a periodic poll - anything that happens while connected arrives via
+      // 'character:changed' below instead. See that case and
+      // syncOwnedCharacterTokens's own comment for the full reasoning.
+      if (role === 'player') syncOwnedCharacterTokens();
       // Reconnecting mid-combat: combat:log only carries entries seen live from
       // here on, so pull the backlog for whatever encounter is already active.
       if (session.encounterId) loadCombatLogBacklog(session.encounterId);
@@ -806,6 +810,14 @@ function handleMessage(msg) {
       sessionNoteLines.push(msg.note);
       if (sessionNoteLines.length > LIVE_LOG_CAP) sessionNoteLines.shift();
       appendSessionNoteLine(msg.note);
+      break;
+
+    // db-traffic-reduction Phase 6: "something about this character changed
+    // on the sheet (or via setEquipped/removeInventoryItem) - go re-sync it"
+    // (see src/lib/server/realtime.ts's emitRealtimeEvent). Debounced per
+    // characterId so a burst of saves/equips doesn't fire a sync per event.
+    case 'character:changed':
+      if (role === 'player') scheduleCharacterSync(msg.characterId);
       break;
 
     default:
@@ -2115,46 +2127,67 @@ characterPickerList.addEventListener('click', async (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Character resync polling - re-pulls each owned token's source character
-// periodically and pushes any changed reference fields through the existing
-// token:stat:update event, so leveling up / re-equipping mid-session doesn't
-// require removing and re-adding the token. Only syncs fields with NO
-// editable control anywhere in the VTT session (ac, saves, actions,
-// preparedSpells) - not just hp/spellSlots as originally scoped. The first
-// version also synced speedFt/vision*/maxHp, which are each editable by the
-// GM or player during a session (the Speed field, the Darkvision checkbox,
-// the Advanced Vision modal, Max HP) - a poll landing after a GM manually
-// granted a player temporary darkvision (a spell, a potion) would silently
-// revert it back to the sheet's baseline on the very next tick, which is
-// exactly the "reverts to unchecked and 0" bug this was found from. The
-// dividing line is simple: if a human can edit it in the VTT, the poll must
-// never touch it - only genuinely read-only-in-VTT reference data is safe to
-// auto-sync. This is the interim, self-contained version; a real push-based
-// system (sheet save -> VTT) is the longer-term direction once there's a
-// real realtime layer to hang it on (see the current-state doc's Known
-// Fragility notes).
+// Character resync - re-pulls a token's source character and pushes any
+// changed reference fields through the existing token:stat:update event, so
+// leveling up / re-equipping mid-session doesn't require removing and
+// re-adding the token. Only syncs fields with NO editable control anywhere in
+// the VTT session (ac, saves, actions, preparedSpells) - not just hp/
+// spellSlots as originally scoped. The first version also synced speedFt/
+// vision*/maxHp, which are each editable by the GM or player during a session
+// (the Speed field, the Darkvision checkbox, the Advanced Vision modal, Max
+// HP) - a sync landing after a GM manually granted a player temporary
+// darkvision (a spell, a potion) would silently revert it back to the
+// sheet's baseline, which is exactly the "reverts to unchecked and 0" bug
+// this was found from. The dividing line is simple: if a human can edit it
+// in the VTT, a sync must never touch it - only genuinely read-only-in-VTT
+// reference data is safe to auto-sync.
+//
+// db-traffic-reduction Phase 6: this used to run on a 30s poll for every
+// owned token regardless of whether anything had actually changed. Now it
+// runs (a) once on join/reconnect as a catch-up (see 'state:full' above),
+// and (b) on a 'character:changed' push from the server (see
+// src/lib/server/realtime.ts's emitRealtimeEvent, fired by every character
+// write path including Phase 4's setEquipped/removeInventoryItem) - see
+// scheduleCharacterSync below for the debounce, and case 'character:changed'
+// in handleMessage for the entry point. No poll remains.
 // ---------------------------------------------------------------------------
 
-const CHARACTER_SYNC_INTERVAL_MS = 30000;
-let characterSyncTimer = null;
+// A burst of saves/equips/removes on the same character (each its own
+// emitRealtimeEvent call) shouldn't each trigger their own full re-fetch -
+// coalesce into one sync per characterId, 1s after the last push seen for it.
+const characterSyncDebounceTimers = new Map();
+const CHARACTER_SYNC_DEBOUNCE_MS = 1000;
 
-function startCharacterSync() {
-  if (characterSyncTimer) clearInterval(characterSyncTimer);
-  characterSyncTimer = setInterval(syncOwnedCharacterTokens, CHARACTER_SYNC_INTERVAL_MS);
+function scheduleCharacterSync(characterId) {
+  if (!session || role !== 'player' || !characterId) return;
+  const owns = Object.values(session.tokens).some((t) => t.ownerId === playerId && t.characterId === characterId);
+  if (!owns) return; // not one of this player's tokens - nothing to sync
+
+  const existing = characterSyncDebounceTimers.get(characterId);
+  if (existing) clearTimeout(existing);
+  characterSyncDebounceTimers.set(characterId, setTimeout(() => {
+    characterSyncDebounceTimers.delete(characterId);
+    syncOwnedCharacterTokens(characterId);
+  }, CHARACTER_SYNC_DEBOUNCE_MS));
 }
 
-async function syncOwnedCharacterTokens() {
+// onlyCharacterId, when given, limits the sync to that one character (the
+// 'character:changed' push already knows exactly which one changed) rather
+// than re-fetching every owned token - only the join/reconnect catch-up call
+// omits it, since it genuinely doesn't know what (if anything) changed while
+// disconnected.
+async function syncOwnedCharacterTokens(onlyCharacterId) {
   if (!session || role !== 'player') return;
-  const tokens = Object.values(session.tokens).filter((t) => t.ownerId === playerId && t.characterId);
+  const tokens = Object.values(session.tokens).filter((t) => t.ownerId === playerId && t.characterId && (!onlyCharacterId || t.characterId === onlyCharacterId));
   for (const token of tokens) {
     try {
       const res = await fetch('/vtt/api/characters/' + token.characterId);
-      if (!res.ok) continue; // character deleted, or a transient error - try again next tick
+      if (!res.ok) continue; // character deleted, or a transient error
       const snapshot = await res.json();
       applyCharacterSyncFields(token, snapshot);
     } catch {
       // A single character's fetch failing (network blip) shouldn't stop
-      // the rest of this player's tokens from syncing on this tick.
+      // the rest of this player's tokens from syncing.
     }
   }
 }
