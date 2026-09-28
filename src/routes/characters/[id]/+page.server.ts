@@ -3,7 +3,7 @@ import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacter, listItemCategories, listVersions, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, listCatalogue, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { getActiveEncounterForCharacter, listEncountersForCharacter } from '$lib/server/services/encounters';
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
 import { getRoomGameSessionId, listGameSessionsForUser, logSessionNote } from '$lib/server/services/gameSessions';
@@ -16,7 +16,11 @@ export async function load({ params, locals }) {
   return {
     character,
     itemCategories: await listItemCategories(),
-    catalogue: await listCatalogue(locals.user!.id),
+    // db-traffic-reduction Phase 3: the full catalogue used to ship here (300-row-capped, full
+    // descriptions) purely so the sheet's pickers could populate a <select>. Those pickers are
+    // now CatalogueSearch.svelte, backed by GET /api/catalogue/search against a server-side
+    // in-memory index - see catalogue.ts's getCatalogueIndex(). The /catalogue management page
+    // still uses listCatalogue() directly and is unaffected.
     versions: await listVersions(locals.user!.id, params.id),
     // All three - activeVttSessionId (the one thing a player joins),
     // activeEncounterId, activeGameSessionId - are user-scoped, not

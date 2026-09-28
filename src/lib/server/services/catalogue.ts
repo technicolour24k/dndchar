@@ -1,6 +1,7 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
-import { invalidateReferenceData } from '$lib/server/cache/referenceData';
+import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
+import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
@@ -85,6 +86,32 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
       maxValueExpression: resource.max_value_expression, rechargePeriod: resource.recharge_period
     }))
   }));
+}
+
+// db-traffic-reduction Phase 3: the in-memory search index behind /api/catalogue/search,
+// superseding the old "ship the whole (300-row-capped) catalogue in the sheet's load()" design.
+// One query, no descriptions, no LIMIT - the sheet only ever needed id/type/name/spell level,
+// and capping at 300 hid homebrew and late-alphabet SRD entries. Cached via cachedReference at
+// a 24h TTL (refreshed sooner by any in-app content write invalidating reference data, or by
+// the admin "Reload catalogue" button - see admin/settings/+page.server.ts).
+async function loadCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
+  const result = await query<any>(`
+    SELECT c.id, c.content_type, c.name, c.source_kind, s.spell_level
+    FROM content_definitions c
+    LEFT JOIN spell_definitions s ON s.content_id = c.id
+    WHERE c.is_archived = false AND c.content_type IN ('spell', 'item', 'feat', 'class_feature')
+  `);
+  return result.rows.map((row: any) => buildIndexEntry({
+    id: row.id,
+    type: row.content_type,
+    name: row.name,
+    sourceKind: row.source_kind,
+    spellLevel: row.spell_level ?? null
+  }));
+}
+
+export async function getCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
+  return cachedReference('catalogue-index', loadCatalogueIndex, { ttlMs: 24 * 60 * 60 * 1000 });
 }
 
 export async function createHomebrewContent(userId: string, form: FormData): Promise<string> {
