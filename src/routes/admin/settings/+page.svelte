@@ -36,3 +36,22 @@
     Current state: <strong>{registrationEnabled ? 'Enabled' : 'Disabled'}</strong>
   </p>
 </section>
+
+<section class="panel stack settings-panel">
+  <div>
+    <h2>Catalogue</h2>
+    <p class="muted">
+      The spell/item/feat/class feature search used by character sheet pickers refreshes daily,
+      and immediately after any in-app content edit. Use this if content was changed by a script
+      or direct database edit instead.
+    </p>
+  </div>
+
+  <form method="POST" action="?/reloadCatalogue" class="settings-row">
+    <button type="submit">Reload Catalogue</button>
+  </form>
+
+  {#if form?.catalogueReloaded}
+    <p class="form-success">Catalogue reloaded.</p>
+  {/if}
+</section>

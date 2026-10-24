@@ -1,4 +1,5 @@
 import { query } from '$lib/server/db';
+import { invalidateSessionsForUser } from '$lib/server/auth/session';
 
 const hexColorPattern = /^#[0-9a-f]{6}$/i;
 
@@ -25,4 +26,8 @@ export async function updateProfile(userId: string, form: FormData): Promise<voi
     `,
     [displayName || 'Player', backgroundColor, panelColor, textColor, userId]
   );
+
+  // The session cache (Phase 1) caches display name and theme colours -
+  // without this, a changed name/theme wouldn't show up for up to 60s.
+  invalidateSessionsForUser(userId);
 }

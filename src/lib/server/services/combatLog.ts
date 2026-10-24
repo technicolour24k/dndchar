@@ -25,10 +25,17 @@ function toEntry(row: any): CombatLogEntry {
 // gets this for free instead of each caller re-implementing it. Unlike
 // rollLog.ts's logRoll, the caller here only knows the encounter id, not a
 // specific room, so this has to scan for a match rather than broadcast directly.
-function broadcastToMatchingSession(encounterId: string, message: string, details: Record<string, unknown>) {
+//
+// db-traffic-reduction Phase 5: includes the full `entry` (id + createdAt),
+// not just message/details, so a pushed sheet subscriber (liveUpdates.ts) can
+// merge it straight into its local log array (mergeLogEntries dedupes by id)
+// without an extra round trip. `message`/`details` stay top-level too, kept
+// for the VTT client's own handler (static/vtt-app/main.js), which only ever
+// read those two fields and doesn't need to change for this.
+function broadcastToMatchingSession(encounterId: string, message: string, details: Record<string, unknown>, entry: CombatLogEntry) {
   for (const session of sessions.values()) {
     if (session.encounterId === encounterId) {
-      broadcast(session.id, () => ({ type: 'combat:log', message, details }));
+      broadcast(session.id, () => ({ type: 'combat:log', message, details, entry }));
     }
   }
 }
@@ -42,8 +49,9 @@ export async function logCombatEvent(
     'INSERT INTO combat_log_entries (encounter_id, message, details) VALUES ($1,$2,$3) RETURNING *',
     [encounterId, message, JSON.stringify(details)]
   );
-  broadcastToMatchingSession(encounterId, message, details);
-  return toEntry(result.rows[0]);
+  const entry = toEntry(result.rows[0]);
+  broadcastToMatchingSession(encounterId, message, details, entry);
+  return entry;
 }
 
 // afterId narrows to entries created after the given entry's timestamp - used

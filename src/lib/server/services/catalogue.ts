@@ -1,5 +1,7 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
+import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
+import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
@@ -86,12 +88,38 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
   }));
 }
 
+// db-traffic-reduction Phase 3: the in-memory search index behind /api/catalogue/search,
+// superseding the old "ship the whole (300-row-capped) catalogue in the sheet's load()" design.
+// One query, no descriptions, no LIMIT - the sheet only ever needed id/type/name/spell level,
+// and capping at 300 hid homebrew and late-alphabet SRD entries. Cached via cachedReference at
+// a 24h TTL (refreshed sooner by any in-app content write invalidating reference data, or by
+// the admin "Reload catalogue" button - see admin/settings/+page.server.ts).
+async function loadCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
+  const result = await query<any>(`
+    SELECT c.id, c.content_type, c.name, c.source_kind, s.spell_level
+    FROM content_definitions c
+    LEFT JOIN spell_definitions s ON s.content_id = c.id
+    WHERE c.is_archived = false AND c.content_type IN ('spell', 'item', 'feat', 'class_feature')
+  `);
+  return result.rows.map((row: any) => buildIndexEntry({
+    id: row.id,
+    type: row.content_type,
+    name: row.name,
+    sourceKind: row.source_kind,
+    spellLevel: row.spell_level ?? null
+  }));
+}
+
+export async function getCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
+  return cachedReference('catalogue-index', loadCatalogueIndex, { ttlMs: 24 * 60 * 60 * 1000 });
+}
+
 export async function createHomebrewContent(userId: string, form: FormData): Promise<string> {
   const type = String(form.get('contentType') || '') as ContentType;
   const name = String(form.get('name') || '').trim();
   if (!contentTypes.has(type) || !name) throw new Error('A valid content type and name are required.');
 
-  return withTransaction(async (client) => {
+  const id = await withTransaction(async (client) => {
     const key = `custom:${userId}:${type}:${slug(name)}:${Date.now()}`;
     const created = await client.query<{ id: string }>(
       `INSERT INTO content_definitions
@@ -123,12 +151,15 @@ export async function createHomebrewContent(userId: string, form: FormData): Pro
     }
     return id;
   });
+  invalidateReferenceData('createHomebrewContent');
+  return id;
 }
 
 export async function setContentArchived(userId:string,contentId:string,isAdmin=false):Promise<void>{
   const result=await query(`UPDATE content_definitions SET is_archived=NOT is_archived,updated_at=now()
     WHERE id=$1 AND ($2::boolean OR owner_user_id=$3) RETURNING id`,[contentId,isAdmin,userId]);
   if(!result.rowCount)throw new Error('Catalogue entry not found or not editable.');
+  invalidateReferenceData('setContentArchived');
 }
 
 export async function updateOwnedContent(userId:string,form:FormData):Promise<void>{
@@ -136,6 +167,7 @@ export async function updateOwnedContent(userId:string,form:FormData):Promise<vo
     WHERE id=$1 AND owner_user_id=$2 AND source_kind='homebrew'`,[String(form.get('contentId')||''),userId,
     String(form.get('name')||'').trim(),String(form.get('description')||'').trim()]);
   if(!result.rowCount)throw new Error('Homebrew entry not found or not editable.');
+  invalidateReferenceData('updateOwnedContent');
 }
 
 export async function attachEffectToContent(form: FormData): Promise<void> {
@@ -154,6 +186,7 @@ export async function attachEffectToContent(form: FormData): Promise<void> {
     WHERE ed.id=$2 AND cd.content_type='condition'
     ON CONFLICT DO NOTHING`,
     [contentId, effectId, activationType]);
+  invalidateReferenceData('attachEffectToContent');
 }
 
 export async function attachEffectToOwnedContent(userId: string, form: FormData): Promise<void> {
@@ -189,6 +222,7 @@ export async function attachEffectToOwnedContent(userId: string, form: FormData)
           AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,
         [action.rows[0].id, effectId, null, null, actionContainerId]);
     });
+    invalidateReferenceData('attachEffectToOwnedContent');
     return;
   }
   await attachEffectToContent(form);
@@ -212,12 +246,14 @@ export async function addContentResourceDefinition(form: FormData): Promise<void
     const inventory=await client.query<{id:string;character_id:string}>('SELECT id,character_id FROM character_inventory_items WHERE source_content_id=$1',[contentId]);
     for(const item of inventory.rows)await initializeInventoryResources(client,item.id,item.character_id,contentId);
   });
+  invalidateReferenceData('addContentResourceDefinition');
 }
 
 export async function grantContentFromContent(form: FormData): Promise<void> {
   await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
     VALUES ($1,$2,$3) ON CONFLICT (source_content_id, granted_content_id, activation_type) DO NOTHING`,
     [String(form.get('sourceContentId') || ''), String(form.get('grantedContentId') || ''), String(form.get('activationType') || 'equipped')]);
+  invalidateReferenceData('grantContentFromContent');
 }
 
 export async function addOwnedContentResourceDefinition(userId: string, form: FormData): Promise<void> {

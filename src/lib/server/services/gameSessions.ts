@@ -1,5 +1,5 @@
 import { query } from '$lib/server/db';
-import { sessions, broadcast } from '$vtt/store.js';
+import { sessions, broadcast, publish } from '$vtt/store.js';
 
 export type GameSession = { id: string; name: string; isActive: boolean; ownerUserId: string; createdAt: string };
 export type SessionNote = { id: string; gameSessionId: string; userId: string; displayName: string; message: string; createdAt: string };
@@ -114,6 +114,15 @@ export async function logSessionNote(gameSessionId: string, userId: string, mess
     createdAt: row.created_at
   };
   broadcastToMatchingSession(gameSessionId, note);
+  // db-traffic-reduction Phase 5: unlike broadcastToMatchingSession above
+  // (which only reaches players/GM actually joined to a live VTT room), a
+  // note can be posted from a surface with no room in scope at all (the
+  // character sheet outside a room, or /sessions/[id] directly) - so sheet/
+  // SessionNotesModal watchers subscribe to "game-session:<id>" directly
+  // (see store.js's setWatches/publish) rather than via a room. This is an
+  // addition, not a replacement - a VTT client actually in the room still
+  // gets its copy via broadcastToMatchingSession above.
+  publish(`game-session:${gameSessionId}`, { type: 'game_session:note', note });
   return note;
 }
 

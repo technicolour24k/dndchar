@@ -1,4 +1,5 @@
 import { query, withTransaction } from '$lib/server/db';
+import { invalidateReferenceData } from '$lib/server/cache/referenceData';
 import type { ModifierOperation } from '$lib/types/rules';
 
 export const operationRegistry: Array<{ key: ModifierOperation; label: string; value: 'none' | 'number' | 'dice' | 'formula' | 'text' }> = [
@@ -98,6 +99,7 @@ export async function createRuleHook(form: FormData) {
   await query(`INSERT INTO modifier_targets(target_key,label,category,value_kind,runtime_supported,description,is_system)
     VALUES($1,$2,$3,$4,false,$5,false)`, [key, label, String(form.get('category') || 'custom'),
     String(form.get('valueKind') || 'formula'), String(form.get('description') || '').trim()]);
+  invalidateReferenceData('createRuleHook');
   return key;
 }
 
@@ -105,6 +107,7 @@ export async function archiveRuleHook(key:string){
   const result=await query(`UPDATE modifier_targets SET is_archived=NOT is_archived,updated_at=now()
     WHERE target_key=$1 AND is_system=false RETURNING target_key`,[key]);
   if(!result.rowCount)throw new Error('System Rule Hooks cannot be archived.');
+  invalidateReferenceData('archiveRuleHook');
 }
 
 export async function saveModifier(form: FormData, mode: 'create' | 'update' | 'copy') {
@@ -119,6 +122,7 @@ export async function saveModifier(form: FormData, mode: 'create' | 'update' | '
     if (!id || form.get('confirmShared') !== 'on') throw new Error('Confirm that all references should use the updated Modifier.');
     await query(`UPDATE modifier_definitions SET target=$2,modifier_type=$3,default_value_expression=NULLIF($4,''),
       label=NULLIF($5,''),description=NULLIF($6,''),updated_at=now() WHERE id=$1`, [id,target,operation,value,label,description]);
+    invalidateReferenceData('saveModifier');
     return id;
   }
   const result = await query<{id:string}>(`INSERT INTO modifier_definitions
@@ -128,12 +132,14 @@ export async function saveModifier(form: FormData, mode: 'create' | 'update' | '
       SET label=COALESCE(NULLIF(EXCLUDED.label,''),modifier_definitions.label),
           description=COALESCE(NULLIF(EXCLUDED.description,''),modifier_definitions.description)
     RETURNING id`, [target,operation,value,label,description]);
+  invalidateReferenceData('saveModifier');
   return result.rows[0].id;
 }
 
 export async function archiveModifier(id: string) {
   const result = await query<{is_archived:boolean}>('UPDATE modifier_definitions SET is_archived=NOT is_archived,updated_at=now() WHERE id=$1 RETURNING is_archived',[id]);
   if (!result.rowCount) throw new Error('Modifier not found.');
+  invalidateReferenceData('archiveModifier');
 }
 
 export async function saveEffect(userId: string, form: FormData) {
@@ -151,7 +157,7 @@ export async function saveEffect(userId: string, form: FormData) {
     form.get('isCondition')==='on',form.get('isSelectable')==='on',stackBehavior,expiryBoundary];
   const mappedDuration = legacyDurationToNew(durationType);
 
-  return withTransaction(async (client) => {
+  const savedId = await withTransaction(async (client) => {
     if (id) {
       await client.query(`UPDATE effect_definitions SET name=$2,source_type=$3,description=$4,duration_type=$5,duration_rounds=$6,
         requires_concentration=$7,is_condition=$8,is_selectable=$9,stack_behavior=$10,default_expiry_boundary=$11,updated_at=now()
@@ -176,6 +182,8 @@ export async function saveEffect(userId: string, form: FormData) {
       ['condition:'+key,name,description,mappedDuration,durationRounds,requiresConcentration,expiryBoundary,stackBehavior]);
     return effectId;
   });
+  invalidateReferenceData('saveEffect');
+  return savedId;
 }
 
 export async function attachEffectModifier(form: FormData) {
@@ -184,7 +192,7 @@ export async function attachEffectModifier(form: FormData) {
   const override=String(form.get('valueOverride')||'').trim();
   const condition=String(form.get('condition')||'').trim();
   const priority=Number(form.get('priority'))||0;
-  return withTransaction(async (client) => {
+  const result = await withTransaction(async (client) => {
     await client.query(`INSERT INTO effect_modifier_links(effect_id,modifier_id,value_override_expression,condition_expression,priority)
       VALUES($1,$2,NULLIF($3,''),NULLIF($4,''),$5) ON CONFLICT DO NOTHING`,[effectId,modifierId,override,condition,priority]);
     // Dual-write: resolve the unified Container id via the effect's key, then insert into content_modifier_links.
@@ -195,6 +203,8 @@ export async function attachEffectModifier(form: FormData) {
       ON CONFLICT DO NOTHING`,[effectId,modifierId,override,condition,priority]);
     return effectId;
   });
+  invalidateReferenceData('attachEffectModifier');
+  return result;
 }
 
 export async function detachEffectModifier(effectId:string,linkId:string){
@@ -217,6 +227,7 @@ export async function detachEffectModifier(effectId:string,linkId:string){
     }
     await client.query('DELETE FROM effect_modifier_links WHERE id=$1 AND effect_id=$2',[linkId,effectId]);
   });
+  invalidateReferenceData('detachEffectModifier');
 }
 
 export async function archiveEffect(id:string){
@@ -226,6 +237,7 @@ export async function archiveEffect(id:string){
   await query(`UPDATE content_definitions SET is_archived=$1,updated_at=now()
     WHERE content_key=$2 AND content_type='condition'`,
     [result.rows[0].is_archived,'condition:'+result.rows[0].effect_key]);
+  invalidateReferenceData('archiveEffect');
 }
 
 function legacyDurationToNew(d:string):string|null{

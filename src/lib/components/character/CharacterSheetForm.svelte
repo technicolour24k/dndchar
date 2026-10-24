@@ -1,37 +1,33 @@
 <script lang="ts">
   import { deserialize, enhance } from '$app/forms';
-  import { invalidateAll } from '$app/navigation';
+  import { invalidate } from '$app/navigation';
+  import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
+  import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
   import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
-  import type { CharacterContentInstance, ContentDefinition, ContentType } from '$lib/types/content';
+  import type { CharacterContentInstance, ContentType } from '$lib/types/content';
 
   let {
     character,
-    catalogue = [],
     itemCategories = [],
     result,
     isAdmin = false,
     activeEncounterId = null,
     activeVttSessionId = null,
     activeGameSessionId = null,
-    encounterHistory = [],
-    gameSessionHistory = [],
     onVersionHistory
   }: {
     character: CharacterDetail;
-    catalogue?: ContentDefinition[];
     itemCategories?: ItemCategory[];
     result?: Record<string, unknown>;
     isAdmin?: boolean;
     activeEncounterId?: string | null;
     activeVttSessionId?: string | null;
     activeGameSessionId?: string | null;
-    encounterHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
-    gameSessionHistory?: Array<{ id: string; name: string; isActive: boolean; createdAt: string }>;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -47,8 +43,8 @@
   // Overridable sheet stats (docs/architecture/modifier-primacy-status.md, "Deliberate
   // deviations (accepted)"): manual adjustments/overrides live in metadata.statOverrides, not
   // as Modifier grants. Local $state so edits are instant/local; resynced from the server below
-  // only when the server value actually changed, so an unrelated invalidateAll() (Next Turn, add
-  // content, etc.) can't clobber an override that hasn't autosaved yet.
+  // only when the server value actually changed, so an unrelated invalidate('app:character-sheet')
+  // (Next Turn, add content, etc.) can't clobber an override that hasn't been saved yet.
   let statOverrides = $state<StatOverrides>(readStatOverrides(untrack(() => character.metadata)));
   let lastServerOverridesJson = $state(untrack(() => JSON.stringify(readStatOverrides(character.metadata))));
   $effect(() => {
@@ -62,7 +58,8 @@
   // Per-class hit dice pools (current/max) are directly editable (overridable-sheet-stats), not
   // just a read-only summary derived from the class level - so they're local $state, resynced
   // from the server only when the server value actually changed (same guard pattern as
-  // statOverrides above), so an unrelated invalidateAll() can't clobber an unsaved edit.
+  // statOverrides above), so an unrelated invalidate('app:character-sheet') can't clobber an
+  // unsaved edit.
   function hitDicePoolFor(row: { level: number }, index: number) {
     const resource = character.resources.find((r) => r.key === `hit_dice_${index}`);
     return { current: resource?.currentValue ?? row.level, max: resource?.maxValue ?? row.level };
@@ -143,9 +140,11 @@
 
   let activeTab = $state<'battle' | 'traits' | 'inventory' | 'character'>('battle');
   let sheetFormEl: HTMLFormElement;
-  let autosaveTimer: ReturnType<typeof setTimeout>;
-  let autosaveStatus = $state('Ready');
-  let lastAutosaveAt = 0;
+  // No autosave - every save rewrote the whole sheet and wrote a full version snapshot, which
+  // burned through the DB's network quota. Saving is manual only; hasUnsavedChanges drives the
+  // status label and the leave-page warning below.
+  let saveStatus = $state('Ready');
+  let hasUnsavedChanges = $state(false);
   let deathSaveSuccesses = $state(0);
   let deathSaveFailures = $state(0);
   let savingThrowsOpen = $state(false);
@@ -154,6 +153,31 @@
   let activityLogOpen = $state(false);
   let sessionNotesModalId = $state<string | null>(null);
   let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
+
+  // db-traffic-reduction Phase 4: Past Encounters / Past Sessions used to arrive as props
+  // from load(), fetched on every single sheet view even though this modal is rarely
+  // opened. Fetched fresh from GET /characters/[id]/history every time the modal opens
+  // instead - same "own its data, fetch on open" idiom as SessionNotesModal.svelte.
+  let encounterHistory = $state<Array<{ id: string; name: string; isActive: boolean; createdAt: string }>>([]);
+  let gameSessionHistory = $state<Array<{ id: string; name: string; isActive: boolean; createdAt: string }>>([]);
+  $effect(() => {
+    if (!activityLogOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/characters/${character.id}/history`);
+        if (cancelled || !res.ok) return;
+        const body = await res.json();
+        encounterHistory = body.encounterHistory ?? [];
+        gameSessionHistory = body.gameSessionHistory ?? [];
+      } catch {
+        // best-effort - the history tabs just stay at whatever they last showed
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
   let selectedEffectKeys = $state<string[]>([]);
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
@@ -187,7 +211,6 @@
     statKey?: OverridableStat;
   } | null>(null);
   let inventoryMessage = $state<string | null>(null);
-  const autosaveIntervalMs = 30_000;
   const modifierFilters = [
     { key: 'active', label: 'Active' },
     { key: 'automated', label: 'Automated' },
@@ -432,12 +455,12 @@
 
   // Shared write path for the three helpers above - drops the entry entirely once it's back to
   // default (adjustment 0, override null) so a reset genuinely clears statOverrides rather than
-  // leaving a no-op entry behind, then kicks off an immediate autosave so a manual edit isn't
-  // lost if the tab closes before the next scheduled autosave tick.
+  // leaving a no-op entry behind, then flags the sheet as unsaved (these hidden-field edits don't
+  // fire the form's own input event, so markUnsaved has to be called explicitly).
   function applyStatOverrideEntry(key: OverridableStat, entry: { adjustment: number; override: number | null }) {
     const { [key]: _dropped, ...rest } = statOverrides;
     statOverrides = entry.adjustment === 0 && entry.override === null ? rest : { ...rest, [key]: entry };
-    requestImmediateSave();
+    markUnsaved();
   }
 
   function commitStatInput(key: OverridableStat, event: Event & { currentTarget: HTMLInputElement }) {
@@ -474,10 +497,26 @@
     setStatOverride(key, parsed);
   }
 
-  function requestImmediateSave() {
-    clearTimeout(autosaveTimer);
-    autosaveStatus = 'Unsaved';
-    if (sheetFormEl) void runAutosave(sheetFormEl);
+  function markUnsaved() {
+    hasUnsavedChanges = true;
+    saveStatus = 'Unsaved changes';
+  }
+
+  // Only named inputs are actually submitted with the sheet - unnamed ones (catalogue pickers,
+  // room code, hit-dice spend count, etc.) are UI-only and shouldn't flag the sheet as dirty.
+  // Edits that go through buttons or unnamed inputs but DO end up in a submitted hidden field
+  // (death saves, exhaustion, condition/proficiency toggles, class rows, attuned/proficient
+  // checkboxes) call markUnsaved() themselves.
+  function markUnsavedIfSheetField(event: Event) {
+    const target = event.target as HTMLInputElement | null;
+    if (target?.name) markUnsaved();
+  }
+
+  // Browser's own "leave site?" prompt - the only safety net now autosave is gone.
+  function warnIfUnsaved(event: BeforeUnloadEvent) {
+    if (!hasUnsavedChanges) return;
+    event.preventDefault();
+    event.returnValue = '';
   }
 
   function helpTitle(lines: string[]) {
@@ -507,14 +546,14 @@
     const pools = [...hitDicePools];
     pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), current: Math.max(0, Number(raw) || 0) };
     hitDicePools = pools;
-    requestImmediateSave();
+    markUnsaved();
   }
 
   function setHitDicePoolMax(index: number, raw: string) {
     const pools = [...hitDicePools];
     pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), max: Math.max(0, Number(raw) || 0) };
     hitDicePools = pools;
-    requestImmediateSave();
+    markUnsaved();
   }
 
   function isEffectSelected(key: string) {
@@ -525,6 +564,7 @@
     selectedEffectKeys = isEffectSelected(key)
       ? selectedEffectKeys.filter((selected) => selected !== key)
       : [...selectedEffectKeys, key];
+    markUnsaved();
   }
 
   function categoryOptionsFor(category: string) {
@@ -550,23 +590,46 @@
   function setDeathSaves(kind: 'success' | 'failure', value: number) {
     if (kind === 'success') {
       deathSaveSuccesses = deathSaveSuccesses === value ? value - 1 : value;
-      return;
+    } else {
+      deathSaveFailures = deathSaveFailures === value ? value - 1 : value;
     }
-
-    deathSaveFailures = deathSaveFailures === value ? value - 1 : value;
+    markUnsaved();
   }
 
+  // Both effects below resync local edit state from the server only when the server value actually
+  // changed (same guard as statOverrides/hitDicePools above). Without autosave, an unrelated
+  // invalidate('app:character-sheet') - a GM's Next Turn, adding content - would otherwise silently
+  // wipe a death save or condition toggle the player hasn't hit Save on yet.
+  let lastServerDeathSavesJson = '';
   $effect(() => {
-    deathSaveSuccesses = clampDeathSave(metadata.deathSaveSuccesses);
-    deathSaveFailures = clampDeathSave(metadata.deathSaveFailures);
+    const successes = clampDeathSave(metadata.deathSaveSuccesses);
+    const failures = clampDeathSave(metadata.deathSaveFailures);
+    const serverJson = JSON.stringify([successes, failures]);
+    if (serverJson === lastServerDeathSavesJson) return;
+    lastServerDeathSavesJson = serverJson;
+    deathSaveSuccesses = successes;
+    deathSaveFailures = failures;
   });
 
+  let lastServerSelectionsJson = '';
   $effect(() => {
-    selectedEffectKeys = character.activeEffects.filter((effect) => !effect.id.startsWith('content:') && !effect.id.startsWith('item:')).map((effect) => effect.effectKey);
-    selectedExhaustionLevel = character.exhaustionLevel ?? 0;
-    selectedSavingThrowProficiencies = [...proficiencies.savingThrows];
-    selectedSkillProficiencies = [...proficiencies.skills];
+    const effectKeys = character.activeEffects.filter((effect) => !effect.id.startsWith('content:') && !effect.id.startsWith('item:')).map((effect) => effect.effectKey);
+    const exhaustion = character.exhaustionLevel ?? 0;
+    const savingThrows = [...proficiencies.savingThrows];
+    const skills = [...proficiencies.skills];
+    const serverJson = JSON.stringify([effectKeys, exhaustion, savingThrows, skills]);
+    if (serverJson === lastServerSelectionsJson) return;
+    lastServerSelectionsJson = serverJson;
+    selectedEffectKeys = effectKeys;
+    selectedExhaustionLevel = exhaustion;
+    selectedSavingThrowProficiencies = savingThrows;
+    selectedSkillProficiencies = skills;
   });
+
+  function setExhaustionLevel(raw: string) {
+    selectedExhaustionLevel = Math.min(6, Math.max(0, Number(raw) || 0));
+    markUnsaved();
+  }
 
   function signed(value: number) {
     return value >= 0 ? `+${value}` : String(value);
@@ -576,6 +639,7 @@
     const input = event.currentTarget as HTMLInputElement;
     const hidden = input.closest('label')?.querySelector<HTMLInputElement>('input[type="hidden"]');
     if (hidden) hidden.value = input.checked ? 'true' : 'false';
+    markUnsaved();
   }
 
   function isSavingThrowProficient(key: AbilityKey) {
@@ -590,12 +654,14 @@
     selectedSavingThrowProficiencies = isSavingThrowProficient(key)
       ? selectedSavingThrowProficiencies.filter((value) => value !== key)
       : [...selectedSavingThrowProficiencies, key];
+    markUnsaved();
   }
 
   function toggleSkillProficiency(key: string) {
     selectedSkillProficiencies = isSkillProficient(key)
       ? selectedSkillProficiencies.filter((value) => value !== key)
       : [...selectedSkillProficiencies, key];
+    markUnsaved();
   }
 
   function savingThrowTotal(key: AbilityKey) {
@@ -731,14 +797,14 @@
       simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) - refresh the page.` };
       return;
     }
-    await invalidateAll();
+    await invalidate('app:character-sheet');
   }
 
   // activeEncounterId/activeGameSessionId only ever reflect the load()-time
   // snapshot otherwise - if a GM starts combat or a game session *after* this
   // page was already open, nothing would pick that up without a full reload.
-  // These local copies get refreshed by a background poll below so the
-  // Activity Log modal reflects what's actually live right now.
+  // These local copies get refreshed by the room-topic push subscription
+  // below so the Activity Log modal reflects what's actually live right now.
   let liveEncounterId = $state<string | null>(null);
   let liveGameSessionId = $state<string | null>(null);
   $effect(() => {
@@ -747,66 +813,102 @@
   $effect(() => {
     liveGameSessionId = activeGameSessionId;
   });
-  $effect(() => {
-    let cancelled = false;
-    async function poll() {
-      if (cancelled) return;
-      try {
-        const res = await fetch(`/vtt/api/characters/${character.id}/activity-status`);
-        if (res.ok) {
-          const data = await res.json();
-          liveEncounterId = data.encounterId;
-          liveGameSessionId = data.gameSessionId;
-        }
-      } catch {
-        // best-effort - a missed tick just means the modal lags one interval behind
+
+  // Cheap ownership-scoped re-derive of liveEncounterId/liveGameSessionId
+  // (see that endpoint's own comment for why it's not full getCharacter) -
+  // used to be polled every 10s; now only called from the room-topic
+  // subscription's onResync (below) and on a combat:state/game_session:state
+  // push, so it only ever runs when something might actually have changed.
+  async function refreshActivityStatus() {
+    try {
+      const res = await fetch(`/vtt/api/characters/${character.id}/activity-status`);
+      if (res.ok) {
+        const data = await res.json();
+        liveEncounterId = data.encounterId;
+        liveGameSessionId = data.gameSessionId;
       }
+    } catch {
+      // best-effort - a missed refresh just means the modal lags until the next one
     }
-    const interval = setInterval(poll, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
+  }
+
+  // db-traffic-reduction Phase 5: pushed live over /vtt-ws instead of polled
+  // (see src/lib/stores/liveUpdates.ts). The sheet has no other reason to
+  // reach the combat-log/roll-log endpoints now except an afterId catch-up
+  // fetch, either on first join or on every reconnect (onResync).
+  let combatLogEntries = $state<Array<{ id: string; message: string; createdAt: string }>>([]);
+  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown>; createdAt: string }>>([]);
+
+  async function fetchCombatLogSince(encounterId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ encounterId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/log?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.entries?.length) combatLogEntries = mergeLogEntries(combatLogEntries, data.entries, 200);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the log lags until the next resync
+    }
+  }
+
+  async function fetchRollLogSince(sessionId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ sessionId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/roll-log?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.entries?.length) rollLogEntries = mergeLogEntries(rollLogEntries, data.entries, 200);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the log lags until the next resync
+    }
+  }
+
+  // Only (re)starts when liveEncounterId itself changes - a fresh/changed
+  // encounter has no locally-known backlog, so this clears and does one full
+  // fetch. Ongoing entries arrive via the room-topic push below instead.
+  $effect(() => {
+    const encounterId = liveEncounterId;
+    combatLogEntries = [];
+    if (!encounterId) return;
+    fetchCombatLogSince(encounterId, undefined);
   });
 
-  // Polls the same combat-log endpoint the VTT's live panel writes to (see
-  // src/routes/vtt/api/log/+server.ts) - the sheet has no live transport of its
-  // own (Socket.IO is stubbed, the raw ws server only serves the VTT client),
-  // so a plain sheet HP edit shows up here within one polling interval instead
-  // of instantly. Only (re)starts when liveEncounterId itself changes -
-  // combatLogEntries is written from the async poll callback, not read
-  // synchronously here, so appending to it doesn't re-trigger this effect.
-  let combatLogEntries = $state<Array<{ id: string; message: string }>>([]);
+  // The one live transport for everything room-scoped: combat/roll log lines,
+  // and "something changed, re-check activity status" for combat/game-session
+  // start-stop. Gated on activeVttSessionId (same gate the old roll-log poll
+  // used) since there's nothing to watch before a room's been joined - the
+  // "Join Room" action already calls invalidate('app:character-sheet'), which
+  // reruns this effect the moment activeVttSessionId actually changes.
   $effect(() => {
-    if (!liveEncounterId) {
-      combatLogEntries = [];
+    if (!activeVttSessionId) {
+      rollLogEntries = [];
       return;
     }
-    let cancelled = false;
-    let lastId: string | undefined;
-    async function poll() {
-      if (cancelled) return;
-      const qs = new URLSearchParams({ encounterId: liveEncounterId! });
-      if (lastId) qs.set('afterId', lastId);
-      try {
-        const res = await fetch(`/vtt/api/log?${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.entries?.length) {
-            combatLogEntries = [...combatLogEntries, ...data.entries].slice(-200);
-            lastId = data.entries[data.entries.length - 1].id;
-          }
+    const sessionId = activeVttSessionId;
+    rollLogEntries = [];
+    fetchRollLogSince(sessionId, undefined);
+
+    const unsubscribe = subscribeTopic(`room:${sessionId}`, {
+      onResync: () => {
+        refreshActivityStatus();
+        fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
+        if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
+      },
+      onMessage: (msg) => {
+        if (msg.type === 'roll:log' && msg.entry) {
+          rollLogEntries = mergeLogEntries(rollLogEntries, [msg.entry as (typeof rollLogEntries)[number]], 200);
+        } else if (msg.type === 'combat:log' && msg.entry && (msg.entry as { encounterId: string }).encounterId === liveEncounterId) {
+          combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
+        } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
+          refreshActivityStatus();
         }
-      } catch {
-        // best-effort - a missed poll tick just means the log lags one interval behind
       }
-    }
-    poll();
-    const interval = setInterval(poll, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
+    });
+    return unsubscribe;
   });
 
   // The one join a player needs - covers combat, rolls, and session notes at
@@ -828,7 +930,7 @@
     joinRoomBusy = false;
     if (response.ok) {
       joinRoomIdInput = '';
-      await invalidateAll();
+      await invalidate('app:character-sheet');
     } else {
       const actionResult = deserialize(await response.text()) as { data?: { joinRoomError?: string } };
       joinRoomError = actionResult.data?.joinRoomError || 'Could not join room.';
@@ -844,7 +946,7 @@
     // real (even empty) FormData body, same as every other action call here.
     await fetch('?/leaveRoom', { method: 'POST', body: new FormData() });
     leaveRoomBusy = false;
-    await invalidateAll();
+    await invalidate('app:character-sheet');
   }
 
   // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
@@ -859,42 +961,6 @@
     body.set('natural', String(result.natural));
     await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
   }
-
-  // Same polling shape as the combat-log effect above, against the separate
-  // roll-log table/endpoint (see docs on why rolls are scoped to the VTT room
-  // rather than an encounter - most rolls happen with no combat active).
-  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown> }>>([]);
-  $effect(() => {
-    if (!activeVttSessionId) {
-      rollLogEntries = [];
-      return;
-    }
-    let cancelled = false;
-    let lastId: string | undefined;
-    async function poll() {
-      if (cancelled) return;
-      const qs = new URLSearchParams({ sessionId: activeVttSessionId! });
-      if (lastId) qs.set('afterId', lastId);
-      try {
-        const res = await fetch(`/vtt/api/roll-log?${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.entries?.length) {
-            rollLogEntries = [...rollLogEntries, ...data.entries].slice(-200);
-            lastId = data.entries[data.entries.length - 1].id;
-          }
-        }
-      } catch {
-        // best-effort - a missed poll tick just means the log lags one interval behind
-      }
-    }
-    poll();
-    const interval = setInterval(poll, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  });
 
   function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
     const label = String(entry.details.label ?? 'Roll');
@@ -921,39 +987,45 @@
     if (response.ok) sessionNoteInput = '';
   }
 
-  // Same polling shape as the combat/roll log panels - this panel only shows
-  // the most recent handful; the full log lives at /sessions/[id].
-  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string }>>([]);
+  // Pushed live over the "game-session:<id>" topic (db-traffic-reduction
+  // Phase 5) - this panel only shows the most recent handful; the full log
+  // lives at /sessions/[id] (SessionNotesModal.svelte, same subscription
+  // shape). (Re)starts when liveGameSessionId changes, same "fresh id, no
+  // known backlog" reasoning as the combat-log effect above.
+  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string; createdAt: string }>>([]);
+
+  async function fetchSessionNotesSince(gameSessionId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ gameSessionId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/session-notes?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.notes?.length) sessionNoteEntries = mergeLogEntries(sessionNoteEntries, data.notes, 20);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the panel lags until the next resync
+    }
+  }
+
   $effect(() => {
     if (!liveGameSessionId) {
       sessionNoteEntries = [];
       return;
     }
-    let cancelled = false;
-    let lastId: string | undefined;
-    async function poll() {
-      if (cancelled) return;
-      const qs = new URLSearchParams({ gameSessionId: liveGameSessionId! });
-      if (lastId) qs.set('afterId', lastId);
-      try {
-        const res = await fetch(`/vtt/api/session-notes?${qs}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.notes?.length) {
-            sessionNoteEntries = [...sessionNoteEntries, ...data.notes].slice(-20);
-            lastId = data.notes[data.notes.length - 1].id;
-          }
+    const gameSessionId = liveGameSessionId;
+    sessionNoteEntries = [];
+    fetchSessionNotesSince(gameSessionId, undefined);
+
+    const unsubscribe = subscribeTopic(`game-session:${gameSessionId}`, {
+      onResync: () => fetchSessionNotesSince(gameSessionId, sessionNoteEntries.at(-1)?.id),
+      onMessage: (msg) => {
+        if (msg.type === 'game_session:note' && msg.note) {
+          sessionNoteEntries = mergeLogEntries(sessionNoteEntries, [msg.note as (typeof sessionNoteEntries)[number]], 20);
         }
-      } catch {
-        // best-effort - a missed poll tick just means the panel lags one interval behind
       }
-    }
-    poll();
-    const interval = setInterval(poll, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
+    });
+    return unsubscribe;
   });
 
   // Rendered newest-first. The underlying entries arrays and their afterId poll
@@ -963,14 +1035,43 @@
   let rollLogNewestFirst = $derived([...rollLogEntries].reverse());
   let sessionNotesNewestFirst = $derived([...sessionNoteEntries].reverse());
 
+  // contentBusy stays true until the refreshed character has landed, not just until the action's
+  // own response - the whole-sheet Save is blocked while it's set (see the form's enhance below).
+  // Otherwise a Save clicked in that gap would submit the stale on-screen inventory, and
+  // replaceInventory (delete-all-then-upsert from the form) would quietly undo an equip toggle or
+  // bring a just-removed item back.
   async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
     contentBusy = true;
-    const body = new FormData();
-    for (const [key, value] of Object.entries(values)) body.set(key, String(value));
-    const response = await fetch(`?/${action}`, { method: 'POST', body });
-    contentBusy = false;
-    if (response.ok) await invalidateAll();
-    else inventoryMessage = `Could not update character content (${response.status}).`;
+    try {
+      const body = new FormData();
+      for (const [key, value] of Object.entries(values)) body.set(key, String(value));
+      const response = await fetch(`?/${action}`, { method: 'POST', body });
+      if (response.ok) await invalidate('app:character-sheet');
+      else inventoryMessage = `Could not update character content (${response.status}).`;
+    } finally {
+      contentBusy = false;
+    }
+  }
+
+  // Saves the whole sheet form in place (no navigation), for actions that need pending edits
+  // written first. Returns false if the save failed, so the caller can stop.
+  async function saveSheetNow(): Promise<boolean> {
+    if (!sheetFormEl) return false;
+    saveStatus = 'Saving';
+    const response = await fetch('?/save', {
+      method: 'POST',
+      body: new FormData(sheetFormEl),
+      headers: { 'x-sveltekit-action': 'true' }
+    });
+    let ok = false;
+    try {
+      ok = response.ok && deserialize(await response.text()).type === 'success';
+    } catch {
+      // Non-JSON error page (e.g. a 500) - treat as a failed save.
+    }
+    if (ok) hasUnsavedChanges = false;
+    saveStatus = ok ? 'Saved' : 'Save failed';
+    return ok;
   }
 
   function addSelectedContent(type: ContentType) {
@@ -999,6 +1100,7 @@
   function addClassRow() {
     classRows = [...classRows, { className: '', level: 1, subclassName: '', spellcastingAbility: null }];
     hitDicePools = [...hitDicePools, { current: 1, max: 1 }];
+    markUnsaved();
   }
 
   function removeClassRow(index: number) {
@@ -1008,6 +1110,7 @@
     // array is what gets saved - removing a middle class re-keys the remaining pools server-side
     // too, which is pre-existing behaviour this doesn't change.
     hitDicePools = hitDicePools.filter((_, rowIndex) => rowIndex !== index);
+    markUnsaved();
   }
 
   // Snapshot of each class row's level as it stood BEFORE the current edit, keyed by row index -
@@ -1185,6 +1288,12 @@
     await runResourceAction('castSpell',body,`${spell.name} cast.`);
   }
 
+  // db-traffic-reduction Phase 4: this used to stash its message in sessionStorage and do a
+  // full document reload (location.reload()) so the message would survive it - a full SSR
+  // reload of everything just to show what a potion/spell/item did. HP, resources, hit dice
+  // pools etc. are all plain $derived off the `character` prop (or resynced-on-change local
+  // $state - see statOverrides/hitDicePools above), so a narrow invalidate() refreshes every
+  // visible value exactly as well as a full reload did, without the round-trip cost.
   async function runResourceAction(action:string,body:FormData,heading:string){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
@@ -1196,58 +1305,43 @@
     const lines=[heading,...results.map(result=>
       result.before===null?`${result.label}: ${result.detail||`${result.expression} rolled ${result.rolled}`} (${result.target})`:
       `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
-    sessionStorage.setItem('inventory-use-result',lines.join('\n'));
-    location.reload();
+    inventoryMessage=lines.join('\n');
+    await invalidate('app:character-sheet');
   }
 
-  $effect(()=>{
-    const message=sessionStorage.getItem('inventory-use-result');
-    if(message){sessionStorage.removeItem('inventory-use-result');inventoryMessage=message;}
-  });
+  // db-traffic-reduction Phase 4: used to zero the quantity then requestSubmit() the whole
+  // sheet form - a full character rewrite plus a version snapshot just to delete one row, and
+  // it would also silently save any unrelated unsaved edit elsewhere on the sheet. Now a tiny
+  // standalone action (single DELETE, no version) via runContentAction, same as every other
+  // button-driven content action. Every rendered inventory row's id is always real (backed by
+  // character.inventory, i.e. already persisted) - only the separate "Add Item" modal below
+  // deals with not-yet-saved rows, and that still goes through the whole-sheet Save button.
+  // Equip/remove are tiny standalone actions, but if the sheet has unsaved edits they're saved
+  // first - an equipped/unequipped row moves between the Equipped and Backpack lists, which
+  // re-renders it from the server and would silently drop any unsaved edits on that row. This
+  // matches the old behaviour (equip/remove used to submit the whole sheet) only when needed.
+  async function runInventoryAction(action: 'setEquipped' | 'removeInventoryItem', values: Record<string, string | boolean>) {
+    if (contentBusy) return;
+    if (hasUnsavedChanges) {
+      contentBusy = true;
+      const saved = await saveSheetNow().finally(() => (contentBusy = false));
+      if (!saved) return;
+    }
+    await runContentAction(action, values);
+  }
 
   function removeInventoryItem(event: MouseEvent) {
-    setInventoryQuantity(event, 0);
-    (event.currentTarget as HTMLElement).closest('form')?.requestSubmit();
+    const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    if (!inventoryId) return;
+    void runInventoryAction('removeInventoryItem', { inventoryId });
   }
 
+  // Same reasoning as removeInventoryItem above - a tiny standalone action (single UPDATE, no
+  // version) instead of flipping hidden fields and submitting the whole sheet form.
   function toggleEquipped(event: MouseEvent, equipped: boolean) {
-    const row = findInventoryRow(event);
-    const form = (event.currentTarget as HTMLElement).closest('form');
-    const location = row?.querySelector<HTMLInputElement>('input[name="inventoryLocation"]');
-    const equippedInput = row?.querySelector<HTMLInputElement>('input[name="inventoryEquipped"]');
-    const equipmentInput = row?.querySelector<HTMLInputElement>('input[name="inventoryIsEquipment"]');
-
-    if (location) location.value = equipped ? 'equipped' : 'backpack';
-    if (equippedInput) equippedInput.value = equipped ? 'true' : 'false';
-    if (equipmentInput) equipmentInput.value = 'true';
-    form?.requestSubmit();
-  }
-
-  async function runAutosave(form: HTMLFormElement) {
-    autosaveStatus = 'Autosaving';
-    const response = await fetch('?/autosave', {
-      method: 'POST',
-      body: new FormData(form)
-    });
-    lastAutosaveAt = Date.now();
-    autosaveStatus = response.ok ? 'Autosaved' : 'Autosave failed';
-  }
-
-  function scheduleAutosaveOnBlur(form: HTMLFormElement) {
-    const elapsed = Date.now() - lastAutosaveAt;
-    clearTimeout(autosaveTimer);
-    autosaveStatus = 'Unsaved';
-
-    if (elapsed >= autosaveIntervalMs) {
-      void runAutosave(form);
-      return;
-    }
-
-    const wait = autosaveIntervalMs - elapsed;
-    autosaveStatus = `Autosave queued (${Math.ceil(wait / 1000)}s)`;
-    autosaveTimer = setTimeout(() => {
-      void runAutosave(form);
-    }, wait);
+    const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    if (!inventoryId) return;
+    void runInventoryAction('setEquipped', { inventoryId, equipped });
   }
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
@@ -1269,20 +1363,34 @@
   }
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window onkeydown={handleGlobalKeydown} onbeforeunload={warnIfUnsaved} />
 
 <form
   method="POST"
   action="?/save"
   class="sheet-form"
   bind:this={sheetFormEl}
-  use:enhance={() => {
+  use:enhance={({ cancel }) => {
+    // Blocked while a content/inventory action is still in flight or refreshing - see
+    // runContentAction. Also covers a native submit from pressing Enter in a text field.
+    if (contentBusy) {
+      cancel();
+      return;
+    }
+    contentBusy = true;
     return async ({ update, result }) => {
-      await update({ reset: false });
-      autosaveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
+      contentBusy = false;
+      // invalidateAll: false - SvelteKit reruns this page's load() either way (it always does
+      // after a form action), but this keeps that rerun scoped to this route's own
+      // depends('app:character-sheet') rather than also re-running unrelated layout loads.
+      await update({ reset: false, invalidateAll: false });
+      if (result.type === 'success') hasUnsavedChanges = false;
+      saveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
+      await invalidate('app:character-sheet');
     };
   }}
-  onfocusout={(event) => scheduleAutosaveOnBlur(event.currentTarget)}
+  oninput={markUnsavedIfSheetField}
+  onchange={markUnsavedIfSheetField}
 >
   <section class="panel sheet-header compact">
     <div>
@@ -1310,8 +1418,8 @@
       <div class="save-cluster">
         <div class="save-command-row">
           <div class="save-button-col">
-            <button type="submit" class="compact-button">Save</button>
-            <span class="save-state">{autosaveStatus}</span>
+            <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
+            <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
             {#if result?.saved}
               <span class="save-state good">Saved</span>
             {/if}
@@ -1523,7 +1631,7 @@
                 min="0"
                 max="6"
                 value={selectedExhaustionLevel}
-                oninput={(event) => (selectedExhaustionLevel = Math.min(6, Math.max(0, Number(event.currentTarget.value) || 0)))}
+                oninput={(event) => setExhaustionLevel(event.currentTarget.value)}
               />
             </label>
             <div class="active-mods">
@@ -1600,7 +1708,7 @@
             </div>
           </div>
           <div class="structured-section">
-            <div class="catalogue-add-row"><select bind:value={selectedCatalogue.spell}><option value="">Add a spell...</option>{#each catalogue.filter((entry) => entry.type === 'spell') as entry}<option value={entry.id}>{entry.name} (level {entry.spell?.level ?? 0})</option>{/each}</select><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
+            <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
                 <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>Roll Damage</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
@@ -1640,10 +1748,7 @@
       <div class="panel-head"><h2>Structured Features</h2>{#if isAdmin}<a href="/catalogue">Create Homebrew</a>{/if}</div>
       {#each [['class_feature', 'Class Feature'], ['feat', 'Feat']] as option}
         <div class="catalogue-add-row">
-          <select value={selectedCatalogue[option[0] as ContentType]} onchange={(event) => (selectedCatalogue[option[0] as ContentType] = event.currentTarget.value)}>
-            <option value="">Add {option[1]}...</option>
-            {#each catalogue.filter((entry) => entry.type === option[0]) as entry}<option value={entry.id}>{entry.name}</option>{/each}
-          </select>
+          <CatalogueSearch type={option[0] as ContentType} placeholder={`Search ${option[1].toLowerCase()}s...`} disabled={contentBusy} onPick={(id) => (selectedCatalogue[option[0] as ContentType] = id)} />
           <button type="button" disabled={!selectedCatalogue[option[0] as ContentType] || contentBusy} onclick={() => addSelectedContent(option[0] as ContentType)}>Add</button>
         </div>
       {/each}
@@ -1666,7 +1771,7 @@
   {#if activeTab === 'inventory'}
     <section class="panel catalogue-add-panel">
       <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
-      <div class="catalogue-add-row"><select bind:value={selectedCatalogue.item}><option value="">Choose an item...</option>{#each catalogue.filter((entry) => entry.type === 'item') as entry}<option value={entry.id}>{entry.name}</option>{/each}</select><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
+      <div class="catalogue-add-row"><CatalogueSearch type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
     </section>
     <section class="inventory-layout">
       <section class="panel stack inventory-section">
@@ -2101,7 +2206,7 @@
             min="0"
             max="6"
             value={selectedExhaustionLevel}
-            oninput={(event) => (selectedExhaustionLevel = Math.min(6, Math.max(0, Number(event.currentTarget.value) || 0)))}
+            oninput={(event) => setExhaustionLevel(event.currentTarget.value)}
           />
         </label>
 

@@ -16,6 +16,22 @@ const pool = new pg.Pool({
 
 const migrationsDir = path.resolve('src/lib/server/db/migrations');
 
+// `--to <migration_id>` stops after applying that migration (inclusive), so
+// local dev can build the DB up to a point in schema history, run the
+// pre-content-unification seed/import scripts, then run the rest. See
+// docs/db-traffic-reduction Step B for why this ordering matters.
+function parseStopAtArg(argv: string[]): string | undefined {
+  const index = argv.indexOf('--to');
+  if (index === -1) return undefined;
+  const value = argv[index + 1];
+  if (!value) {
+    throw new Error('--to requires a migration id, e.g. --to 018_inventory_resource_backfill');
+  }
+  return value;
+}
+
+const stopAtId = parseStopAtArg(process.argv.slice(2));
+
 async function main() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -25,11 +41,20 @@ async function main() {
   `);
 
   const files = (await fs.readdir(migrationsDir)).filter((file) => file.endsWith('.sql')).sort();
+
+  if (stopAtId && !files.some((file) => file.replace(/\.sql$/, '') === stopAtId)) {
+    throw new Error(`--to ${stopAtId}: no such migration in ${migrationsDir}`);
+  }
+
   for (const file of files) {
     const id = file.replace(/\.sql$/, '');
     const existing = await pool.query('SELECT id FROM schema_migrations WHERE id = $1', [id]);
     if (existing.rowCount) {
       console.log(`skip ${file}`);
+      if (stopAtId && id === stopAtId) {
+        console.log(`stopping at --to ${stopAtId}`);
+        break;
+      }
       continue;
     }
 
@@ -43,6 +68,11 @@ async function main() {
     } catch (error) {
       await pool.query('ROLLBACK');
       throw error;
+    }
+
+    if (stopAtId && id === stopAtId) {
+      console.log(`stopping at --to ${stopAtId}`);
+      break;
     }
   }
 }

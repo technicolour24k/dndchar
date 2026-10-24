@@ -44,9 +44,25 @@ vtt/server/           - plain untyped JS (@ts-nocheck) by design: it has to be
                            broadcast(). State lives on globalThis so all three
                            loading paths above share the same Maps even if the
                            module itself gets loaded more than once.
+                           db-traffic-reduction Phase 5 added a second,
+                           unauthenticated subscription kind alongside a real
+                           session join: setWatches/removeWatcher/publish let a
+                           sheet tab "watch" a topic ("room:<sessionId>" or
+                           "game-session:<id>") without joining a session at
+                           all - broadcast() forwards a narrow allow-list of
+                           types (combat:state/combat:log/roll:log/
+                           game_session:state) to room:<sessionId> watchers
+                           automatically; game_session:note is published to
+                           its own topic explicitly (see gameSessions.ts) since
+                           a note can be posted with no room in scope.
   wsServer.js            - attachVttWebSocketServer(httpServer): hooks the
                             'upgrade' event for /vtt-ws, wires the three
-                            handlers below to each connection.
+                            handlers below to each connection, plus a
+                            'watch' case (see store.js above) and a 30s
+                            ping/pong heartbeat (dead sockets get terminated;
+                            a watcher-only socket also gets an app-level
+                            {type:'hb'} frame so a client with no other VTT
+                            traffic can still detect a dead path).
   handlers/
     join.js
     token.js              - add/remove/move/stat:update/hidden:toggle

@@ -7,6 +7,7 @@ import { resolveCharacterModifierSources } from '$lib/server/services/rule-engin
 import { applyCharacterEffect } from '$lib/server/services/effects';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { logCombatEvent } from '$lib/server/services/combatLog';
+import { cachedReference } from '$lib/server/cache/referenceData';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -277,13 +278,26 @@ export async function getCharacterForRoll(characterId: string): Promise<Characte
   return loadCharacterDetail(row);
 }
 
+// Shared, admin-edited-only reference data - see the module-level
+// listEffectDefinitions split below for why this is a throwing inner loader
+// plus an outer try/catch wrapper rather than one function.
+async function loadItemCategories(): Promise<ItemCategory[]> {
+  const result = await query<{ key: string; label: string }>(
+    'SELECT key, label FROM item_categories ORDER BY sort_order ASC, label ASC'
+  );
+  return result.rows;
+}
+
 export async function listItemCategories(): Promise<ItemCategory[]> {
   try {
-    const result = await query<{ key: string; label: string }>(
-      'SELECT key, label FROM item_categories ORDER BY sort_order ASC, label ASC'
-    );
-    return result.rows;
+    // structuredClone so a caller mutating the returned array/objects can't
+    // corrupt the cached copy for every other caller until the TTL expires.
+    return structuredClone(await cachedReference('item-categories', loadItemCategories));
   } catch {
+    // The fallback list must never be cached - see loadItemCategories above;
+    // cachedReference only ever stores a *resolved* promise, so returning
+    // this list here (outside cachedReference) rather than caching it is
+    // deliberate.
     return [
       { key: 'weapon', label: 'Weapon' },
       { key: 'armor', label: 'Armor' },
@@ -791,59 +805,77 @@ async function getProficiencies(characterId: string): Promise<CharacterProficien
   }
 }
 
-async function listEffectDefinitions(includeArchived=false): Promise<EffectDefinition[]> {
+// db-traffic-reduction Phase 2: this used to run twice per getCharacter call
+// (once with includeArchived=false for availableEffects, once with true
+// inside getActiveEffects) - each time re-reading every condition Container,
+// including the archived SRD imports with their full descriptions. Split
+// into a throwing inner loader (cached, keyed by includeArchived so the two
+// call shapes don't collide) and an outer wrapper that keeps the original
+// try/catch -> [] behaviour. A transient DB error must not get cached as an
+// empty list, hence the split rather than caching the wrapper's return value
+// directly.
+async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDefinition[]> {
+  // Primary path: conditions as unified Containers in content_definitions.
+  const effects = await query<{
+    id: string;
+    effect_key: string;
+    name: string;
+    description: string;
+    duration_type: string;
+    duration_rounds: number | null;
+    requires_concentration: boolean;
+    source_kind: string;
+    is_condition: boolean;
+  }>(
+    `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
+      cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
+      COALESCE(ed.is_condition, false) AS is_condition
+     FROM content_definitions cd
+     LEFT JOIN effect_definitions ed ON cd.content_key = 'condition:' || ed.effect_key
+     WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
+     ORDER BY cd.name ASC`,
+    [includeArchived]
+  );
+
+  const modifiers = await listEffectModifiers();
+  const modifiersByEffect = new Map<string, EffectModifier[]>();
+  for (const row of modifiers) {
+    const list = modifiersByEffect.get(row.effect_id) ?? [];
+    list.push({
+      target: row.target, modifierType: row.modifier_type, label: '',
+      valueExpression: row.value_expression || '',
+      defaultValueExpression: row.default_value_expression || '',
+      valueOverrideExpression: row.value_override_expression || '',
+      conditionExpression: row.condition_expression || '', priority: row.priority
+    });
+    modifiersByEffect.set(row.effect_id, list);
+  }
+
+  return effects.rows.map((row) => ({
+    id: row.id,
+    key: row.effect_key,
+    name: row.name,
+    sourceType: row.source_kind,
+    sourceRef: '',
+    sourceName: row.name,
+    description: row.description || '',
+    durationType: row.duration_type || '',
+    durationRounds: row.duration_rounds,
+    requiresConcentration: row.requires_concentration,
+    isCondition: row.is_condition,
+    isSelectable: true,
+    modifiers: modifiersByEffect.get(row.id) ?? []
+  }));
+}
+
+async function listEffectDefinitions(includeArchived = false): Promise<EffectDefinition[]> {
   try {
-    // Primary path: conditions as unified Containers in content_definitions.
-    const effects = await query<{
-      id: string;
-      effect_key: string;
-      name: string;
-      description: string;
-      duration_type: string;
-      duration_rounds: number | null;
-      requires_concentration: boolean;
-      source_kind: string;
-      is_condition: boolean;
-    }>(
-      `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
-        cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
-        COALESCE(ed.is_condition, false) AS is_condition
-       FROM content_definitions cd
-       LEFT JOIN effect_definitions ed ON cd.content_key = 'condition:' || ed.effect_key
-       WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
-       ORDER BY cd.name ASC`,
-      [includeArchived]
+    // structuredClone so a caller mutating the returned array/objects (e.g.
+    // pushing into .modifiers) can't corrupt the cached copy for every other
+    // caller until the TTL expires.
+    return structuredClone(
+      await cachedReference(`effects:${includeArchived}`, () => loadEffectDefinitions(includeArchived))
     );
-
-    const modifiers = await listEffectModifiers();
-    const modifiersByEffect = new Map<string, EffectModifier[]>();
-    for (const row of modifiers) {
-      const list = modifiersByEffect.get(row.effect_id) ?? [];
-      list.push({
-        target: row.target, modifierType: row.modifier_type, label: '',
-        valueExpression: row.value_expression || '',
-        defaultValueExpression: row.default_value_expression || '',
-        valueOverrideExpression: row.value_override_expression || '',
-        conditionExpression: row.condition_expression || '', priority: row.priority
-      });
-      modifiersByEffect.set(row.effect_id, list);
-    }
-
-    return effects.rows.map((row) => ({
-      id: row.id,
-      key: row.effect_key,
-      name: row.name,
-      sourceType: row.source_kind,
-      sourceRef: '',
-      sourceName: row.name,
-      description: row.description || '',
-      durationType: row.duration_type || '',
-      durationRounds: row.duration_rounds,
-      requiresConcentration: row.requires_concentration,
-      isCondition: row.is_condition,
-      isSelectable: true,
-      modifiers: modifiersByEffect.get(row.id) ?? []
-    }));
   } catch {
     return [];
   }
