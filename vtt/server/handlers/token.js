@@ -549,7 +549,8 @@ function handleTokenEvent(meta, msg, context) {
       {
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const targetName = target.name || 'something';
-        const damageTypeText = msg.damageType ? `${msg.damageType} ` : '';
+        // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
+        const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         if (!hit) {
           logCombatLine(context, session,
             pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName }),
@@ -557,11 +558,11 @@ function handleTokenEvent(meta, msg, context) {
         } else if (outcome === 'critical_hit') {
           logCombatLine(context, session,
             pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText }),
-            { kind: 'attack', outcome: 'critical', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageType || null, title: msg.title || null });
+            { kind: 'attack', outcome: 'critical', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         } else {
           logCombatLine(context, session,
             `${attackerName} hits ${targetName} for ${damage} ${damageTypeText}damage.`,
-            { kind: 'attack', outcome: 'hit', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageType || null, title: msg.title || null });
+            { kind: 'attack', outcome: 'hit', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         }
       }
       break;
@@ -661,10 +662,11 @@ function handleTokenEvent(meta, msg, context) {
 
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const spellTitle = msg.title || 'a spell';
-        const damageTypeText = msg.damageType ? `${msg.damageType} ` : '';
+        // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
+        const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         logCombatLine(context, session,
           `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage.`,
-          { kind: 'spell', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageType || null, title: msg.title || null });
+          { kind: 'spell', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
       }
       // Creature attack cue - casting the spell is the attack, so this fires
       // regardless of whether the save negated all damage (same rationale as
