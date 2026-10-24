@@ -17,5 +17,26 @@ export const POST: RequestHandler = async ({ request }) => {
     damageRolls: String(body?.damageRolls || ''),
     damageBonus: Number(body?.damageBonus) || 0
   });
-  return json(result);
+
+  // A manual stat-block spell (kind 'spell' on the token's action) - same
+  // result shape as roll-spell so the VTT's spell flow needs no special case.
+  // Only 'attack' resolution has a to-hit roll; save/auto spells drop it and
+  // carry the fixed DC instead.
+  const damageType = String(body?.damageType || '').trim().toLowerCase() || undefined;
+  const resolution = body?.resolution;
+  if (resolution === 'attack' || resolution === 'save' || resolution === 'auto') {
+    if (resolution === 'attack') return json({ ...result, resolution, damageType });
+    const { attack, attackTotal, attackNatural, outcomes, ...rest } = result;
+    void attack; void attackTotal; void attackNatural; void outcomes;
+    return json({
+      ...rest,
+      resolution,
+      damageType,
+      outcomes: [],
+      saveDc: resolution === 'save' ? Number(body?.saveDc) || 10 : undefined,
+      saveAbility: resolution === 'save' ? String(body?.saveAbility || 'dex') : undefined,
+      saveEffect: resolution === 'save' ? (body?.saveEffect === 'negate' ? 'negate' : 'half') : undefined
+    });
+  }
+  return json({ ...result, damageType });
 };

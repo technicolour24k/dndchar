@@ -1274,6 +1274,10 @@ async function rollManualAction(action) {
     body: JSON.stringify({
       name: action.name, toHitBonus: action.toHitBonus,
       damageRolls: action.damageRolls, damageBonus: action.damageBonus,
+      damageType: action.damageType,
+      // Only set on a manual stat-block spell (see gmAttacksHtml's Type select).
+      resolution: action.resolution,
+      saveDc: action.saveDc, saveAbility: action.saveAbility, saveEffect: action.saveEffect,
     }),
   });
   const body = await res.json().catch(() => ({}));
@@ -1282,6 +1286,9 @@ async function rollManualAction(action) {
 }
 
 async function rollPendingAction(action, source) {
+  // Manual stat-block spell: no character/slots behind it, just the numbers on the action.
+  if (action.kind === 'spell' && action.manual) return rollManualAction(action);
+
   if (action.kind === 'spell') {
     const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-spell', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1401,6 +1408,7 @@ async function resolveAttack() {
       damage: result.damageTotal,
       outcome,
       damageType: inferDamageType(action, result),
+      damageLabel: result.damageType || null,
       title: result.title || action.name || null,
     });
     return;
@@ -1490,6 +1498,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent =
     saveSuccess,
     saveEffect: result.saveEffect,
     damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic',
+    damageLabel: result.damageType || null,
     title: result.title || null,
   });
 }
@@ -2884,8 +2893,8 @@ function gmAttacksHtml(t) {
   const rows = (t.actions || [])
     .map((a, idx) => `
       <div class="mini-sheet-action gm-attack-row" data-action-index="${idx}">
-        <span>${escapeHtml(a.name || 'Attack')}</span>
-        <span style="color:#aaa;">${signedVtt(a.toHitBonus)}${a.damageRolls ? ` · ${escapeHtml(a.damageRolls)}${a.damageBonus ? ' ' + signedVtt(a.damageBonus) : ''}` : ''} <button type="button" class="gm-attack-del" title="Delete attack" data-action-index="${idx}">✕</button></span>
+        <span>${escapeHtml(a.name || 'Attack')}${a.damageType ? ` <span class="tag">${escapeHtml(a.damageType)}</span>` : ''}${a.manual ? ' <span class="tag">spell</span>' : ''}</span>
+        <span style="color:#aaa;">${a.resolution === 'save' ? `DC ${a.saveDc} ${escapeHtml(String(a.saveAbility || '').toUpperCase())}` : a.resolution === 'auto' ? 'auto' : signedVtt(a.toHitBonus)}${a.damageRolls ? ` · ${escapeHtml(a.damageRolls)}${a.damageBonus ? ' ' + signedVtt(a.damageBonus) : ''}` : ''} <button type="button" class="gm-attack-del" title="Delete attack" data-action-index="${idx}">✕</button></span>
       </div>
     `)
     .join('');
@@ -2897,6 +2906,19 @@ function gmAttacksHtml(t) {
       <input class="atkHit" type="number" placeholder="+hit" />
       <input class="atkDmg" placeholder="1d8" />
       <input class="atkDmgBonus" type="number" placeholder="+dmg" />
+      <select class="atkType" title="Weapon attack or spell">
+        <option value="">Weapon attack</option>
+        <option value="attack">Spell: attack roll</option>
+        <option value="save">Spell: saving throw</option>
+        <option value="auto">Spell: auto-hit</option>
+      </select>
+      <input class="atkDamageType" list="atkDamageTypeList" placeholder="type" title="Damage type (acid, fire, cold...)" style="width:60px;" />
+      <datalist id="atkDamageTypeList">${['acid', 'bludgeoning', 'cold', 'fire', 'force', 'lightning', 'necrotic', 'piercing', 'poison', 'psychic', 'radiant', 'slashing', 'thunder'].map((d) => `<option value="${d}"></option>`).join('')}</datalist>
+      <span class="atkSaveFields" style="display:none;">
+        <input class="atkSaveDc" type="number" placeholder="DC" style="width:44px;" />
+        <select class="atkSaveAbility">${['str', 'dex', 'con', 'int', 'wis', 'cha'].map((a) => `<option value="${a}"${a === 'dex' ? ' selected' : ''}>${a.toUpperCase()}</option>`).join('')}</select>
+        <select class="atkSaveEffect"><option value="half">Half on save</option><option value="negate">None on save</option></select>
+      </span>
       <button type="button" class="secondary addAttackBtn">Add attack</button>
     </div>
   `;
@@ -3685,6 +3707,12 @@ tokenManagerList.addEventListener('change', (e) => {
     // acFieldValue() keeps a blank field as null (unknown) rather than
     // coercing it to a real AC of 0 - see vtt-sheet-punch-list item 2.
     send({ type: 'token:stat:update', tokenId, stat: 'ac', value: acFieldValue(e.target.value) });
+  } else if (e.target.classList.contains('atkType')) {
+    // Show the spell-only fields (damage type, save DC etc) only for a spell.
+    const box = e.target.closest('.gm-attack-add');
+    const type = e.target.value;
+    box.querySelector('.atkSaveFields').style.display = type === 'save' ? '' : 'none';
+    box.querySelector('.atkHit').style.display = type === 'save' || type === 'auto' ? 'none' : '';
   } else if (e.target.classList.contains('conditionSelect')) {
     send({ type: 'token:stat:update', tokenId, stat: 'condition', value: e.target.value || null });
   } else if (e.target.classList.contains('soundFolderSelect')) {
@@ -3727,7 +3755,20 @@ tokenManagerList.addEventListener('click', (e) => {
       toHitBonus: Number(box.querySelector('.atkHit').value) || 0,
       damageRolls: box.querySelector('.atkDmg').value.trim(),
       damageBonus: Number(box.querySelector('.atkDmgBonus').value) || 0,
+      damageType: box.querySelector('.atkDamageType').value.trim().toLowerCase(),
     };
+    const resolution = box.querySelector('.atkType').value;
+    if (resolution) {
+      // Manual spell - resolution is 'attack' | 'save' | 'auto', same as a real spell's.
+      action.kind = 'spell';
+      action.manual = true;
+      action.resolution = resolution;
+      if (resolution === 'save') {
+        action.saveDc = Number(box.querySelector('.atkSaveDc').value) || 10;
+        action.saveAbility = box.querySelector('.atkSaveAbility').value;
+        action.saveEffect = box.querySelector('.atkSaveEffect').value;
+      }
+    }
     send({ type: 'token:stat:update', tokenId, stat: 'actions', value: [...(token?.actions || []), action] });
     return;
   }
