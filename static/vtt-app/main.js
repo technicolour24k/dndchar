@@ -927,6 +927,15 @@ document.getElementById('joinRoomBtn').addEventListener('click', () => {
 // Canvas rendering
 // ---------------------------------------------------------------------------
 
+// Grid colour/opacity is a per-browser GM preference (the grid is GM-only
+// anyway), kept in localStorage rather than on the shared map.
+const gridStyle = { colour: '#757575', opacity: 0.5 };
+try {
+  const saved = JSON.parse(localStorage.getItem('vtt_gridStyle') || 'null');
+  if (saved && /^#[0-9a-f]{6}$/i.test(saved.colour)) gridStyle.colour = saved.colour;
+  if (saved && Number.isFinite(saved.opacity)) gridStyle.opacity = Math.min(1, Math.max(0.05, saved.opacity));
+} catch { /* ignore bad/blocked storage */ }
+
 function render() {
   // Phase 10: an unrevealed map sends players a truthy-but-fieldless
   // session.map ({ revealed: false }, no imageUrl) rather than null, so this
@@ -972,7 +981,7 @@ function render() {
 
   if (role === 'gm') {
     updateMapLayers({ map, role, radii: null, zoomLevel });
-    drawGrid(ctx, map);
+    drawGrid(ctx, map, gridStyle);
     if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
     drawMarkers(ctx, visibleMarkers, map.gridSizePx);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage, null);
@@ -3077,6 +3086,23 @@ const mapWidthInput = document.getElementById('mapWidthInput');
 const mapHeightInput = document.getElementById('mapHeightInput');
 const mapThumb = document.getElementById('mapThumb');
 const mapGridSizeInput = document.getElementById('mapGridSizeInput');
+const gridColourInput = document.getElementById('gridColourInput');
+const gridOpacityInput = document.getElementById('gridOpacityInput');
+
+// Live preview: applies straight away and saves locally, no "Set map" needed.
+function applyGridStyleFromInputs() {
+  gridStyle.colour = gridColourInput.value;
+  gridStyle.opacity = Number(gridOpacityInput.value) / 100;
+  try { localStorage.setItem('vtt_gridStyle', JSON.stringify(gridStyle)); } catch { /* ignore */ }
+  render();
+}
+gridColourInput.addEventListener('input', applyGridStyleFromInputs);
+gridOpacityInput.addEventListener('input', applyGridStyleFromInputs);
+document.getElementById('gridStyleResetBtn').addEventListener('click', () => {
+  gridColourInput.value = '#757575';
+  gridOpacityInput.value = 50;
+  applyGridStyleFromInputs();
+});
 const mapBrightnessSelect = document.getElementById('mapBrightnessSelect');
 const mapMusicSelect = document.getElementById('mapMusicSelect');
 const mapMusicCustomField = document.getElementById('mapMusicCustomField');
@@ -3103,6 +3129,8 @@ function openMapSettingsModal() {
   // maps keep whatever gridSizePx they already have; no migration.
   mapGridSizeInput.value = map.gridSizePx || 96;
   mapBrightnessSelect.value = map.brightness || 'dark';
+  gridColourInput.value = gridStyle.colour;
+  gridOpacityInput.value = Math.round(gridStyle.opacity * 100);
 
   mapMusicSelect.innerHTML = `<option value="">No music</option>${musicOptionsHtml(map.musicUrl || null)}<option value="__custom__" ${isCustomMusic ? 'selected' : ''}>Custom track…</option>`;
   mapMusicCustomField.style.display = isCustomMusic ? '' : 'none';
