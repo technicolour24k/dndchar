@@ -2,11 +2,11 @@
 // existing /vtt-ws server (see vtt/server/wsServer.js's 'watch' handling and
 // store.js's setWatches/removeWatcher/publish) - replaces the four separate
 // 4s/10s polls that used to live in CharacterSheetForm.svelte and
-// SessionNotesModal.svelte (src/lib/stores/visiblePoll.ts, now unused).
+// SessionNotesModal.svelte.
 //
 // Deliberately NOT a Svelte store (no `subscribe`) - subscribeTopic() is a
 // plain function returning a plain cleanup function, so it drops straight
-// into a component's $effect the same way pollWhileVisible did.
+// into a component's $effect.
 //
 // Reconnect is the only "fallback" this has: on every (re)connect it resends
 // the full watch list and calls every subscriber's onResync, which is
@@ -65,7 +65,25 @@ function clearWatchdog(): void {
 function resetWatchdog(): void {
   clearWatchdog();
   watchdogTimer = setTimeout(() => {
-    if (ws) ws.close();
+    // On a half-dead connection the close handshake has nowhere to go, so the
+    // 'close' event (and its scheduleReconnect) could take a TCP timeout to
+    // arrive. Detach the old socket now and reconnect straight away. Its late
+    // open/message/close events are no-ops thanks to the `ws !== socket` guards.
+    const socket = ws;
+    if (!socket) return;
+    ws = null;
+    clearWatchdog();
+    try {
+      socket.close();
+    } catch {
+      // best effort - the socket is already detached
+    }
+    if (subscribersByTopic.size > 0) {
+      // 75s of silence has already cost enough, so no extra backoff delay.
+      // If this attempt fails, the normal close path backs off.
+      clearReconnectTimer();
+      connect();
+    }
   }, WATCHDOG_TIMEOUT_MS);
 }
 
@@ -89,11 +107,17 @@ function attachVisibilityListener(): void {
   if (visibilityListenerAttached || typeof document === 'undefined') return;
   visibilityListenerAttached = true;
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !isOpen() && subscribersByTopic.size > 0) {
+    if (document.visibilityState !== 'visible' || subscribersByTopic.size === 0) return;
+    if (!isOpen()) {
       // Don't wait out the backoff timer - a tab coming back into view wants
       // to be live again immediately, not up to 30s later.
       clearReconnectTimer();
       connect();
+    } else {
+      // Socket still reports OPEN but the tab may have been throttled and
+      // missed frames - an afterId resync is cheap. Deliberately no watchdog
+      // reset: becoming visible doesn't prove the socket is alive.
+      resyncAllSubscribers();
     }
   });
 }
@@ -161,9 +185,10 @@ function disconnect(): void {
 // becomes) open - on first subscribe if already connected, immediately after
 // connecting if not, and again on every reconnect - and is expected to do an
 // incremental (afterId-style) re-fetch to catch up on anything missed.
+// `onResync` is always asynchronous (never run inline inside the caller's
+// $effect), so whatever reactive state it reads isn't tracked as a dependency.
 //
-// Returns an unsubscribe function - call it from the owning $effect's
-// cleanup, same shape as visiblePoll.ts's pollWhileVisible.
+// Returns an unsubscribe function - call it from the owning $effect's cleanup.
 export function subscribeTopic(topic: string, { onMessage, onResync }: { onMessage: (msg: Record<string, unknown>) => void; onResync: () => void }): () => void {
   const sub: Subscriber = { topic, onMessage, onResync };
   let subs = subscribersByTopic.get(topic);
@@ -175,7 +200,12 @@ export function subscribeTopic(topic: string, { onMessage, onResync }: { onMessa
 
   if (isOpen()) {
     sendWatchList();
-    onResync();
+    // Microtask, not inline: a synchronous onResync would run inside the
+    // caller's $effect and Svelte would track whatever it reads. The guard
+    // skips a subscriber that was torn down before the microtask ran.
+    queueMicrotask(() => {
+      if (subscribersByTopic.get(topic)?.has(sub) && isOpen()) sub.onResync();
+    });
   } else {
     connect();
   }

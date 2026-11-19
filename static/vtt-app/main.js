@@ -115,6 +115,39 @@ function bringModalToFront(modalEl) {
   modalEl.style.zIndex = ++topModalZIndex;
 }
 
+// Backdrop close fires on PRESS, not click. A click event fires on the common
+// ancestor when you press inside a modal and release over the backdrop (e.g.
+// dragging to select text in an input), which used to close the modal by
+// accident. Pressing on the backdrop itself is unambiguous.
+// preventDefault() on pointerdown suppresses a touch tap's follow-up
+// mousedown/mouseup, and swallowNextClick() eats the compatibility click, so
+// neither lands on whatever is under the finger once the overlay has gone
+// (canvas pan, armed marker placement, sidebar buttons).
+// NOTE: the same swallowNextClick/backdrop-press logic is duplicated in
+// src/lib/ui/backdropPress.ts (this file is unbundled and can't import it).
+// Keep the two in step.
+function swallowNextClick() {
+  const swallow = (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    done();
+  };
+  const timer = setTimeout(() => done(), 500);
+  function done() {
+    clearTimeout(timer);
+    window.removeEventListener('click', swallow, true);
+  }
+  window.addEventListener('click', swallow, true);
+}
+function closeOnBackdropPress(overlayEl, closeFn) {
+  overlayEl.addEventListener('pointerdown', (e) => {
+    if (e.target !== overlayEl || e.button !== 0) return;
+    e.preventDefault();
+    swallowNextClick();
+    closeFn();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Ambient music - a map can carry a musicUrl (bundled library track or a
 // custom upload/URL, same choice as map/token images), synced to everyone
@@ -541,6 +574,10 @@ function connect(joinPayload) {
   ws.addEventListener('open', () => ws.send(JSON.stringify(joinPayload)));
   ws.addEventListener('message', (ev) => handleMessage(JSON.parse(ev.data)));
   ws.addEventListener('close', () => {
+    // Drop pending character-sync debounces: the reconnect's state:full runs a
+    // full syncOwnedCharacterTokens() catch-up anyway.
+    for (const timer of characterSyncDebounceTimers.values()) clearTimeout(timer);
+    characterSyncDebounceTimers.clear();
     // Only auto-retry after a successful join - a bad room code shouldn't loop.
     if (session) setTimeout(() => connect(joinPayload), 1500);
   });
@@ -705,7 +742,8 @@ function handleMessage(msg) {
         else { t.stats = t.stats || {}; t.stats[msg.stat] = msg.value; }
       }
       render();
-      renderSidebar();
+      // Coalesced: one sheet save can send up to 3 of these back-to-back.
+      scheduleSidebarRender();
       break;
     }
 
@@ -983,7 +1021,7 @@ function render() {
     updateMapLayers({ map, role, radii: null, zoomLevel });
     drawGrid(ctx, map, gridStyle);
     if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
-    drawMarkers(ctx, visibleMarkers, map.gridSizePx);
+    drawMarkers(ctx, visibleMarkers, map.gridSizePx, getImage);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage, null);
     drawTargetRings(ctx, currentTargetTokenIds, allTokens, map.gridSizePx);
     currentRenderedTokens = allTokens;
@@ -1002,7 +1040,7 @@ function render() {
     // far an enemy or another player's token can still move is tactical
     // information a player shouldn't see, same trust boundary as HP.
     drawMovementRange(ctx, ownedTokens, map.gridSizePx);
-    drawMarkers(ctx, visibleMarkers, map.gridSizePx);
+    drawMarkers(ctx, visibleMarkers, map.gridSizePx, getImage);
     drawTokens(ctx, visibleTokens, map.gridSizePx, getImage, playerId);
     drawTargetRings(ctx, currentTargetTokenIds, visibleTokens, map.gridSizePx);
     currentRenderedTokens = visibleTokens;
@@ -1013,7 +1051,7 @@ function render() {
   }
 
   if (shapeDrag) {
-    drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx);
+    drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx, getImage);
   }
 
   if (dragState) {
@@ -1565,6 +1603,7 @@ let panState = null; // { startClientX, startClientY, startScrollLeft, startScro
 
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); // avoid native text-selection/drag-ghost while panning
+  blurSidebarFocus();
 
   if (pendingActionTarget) {
     const { x, y } = canvasCoords(e);
@@ -1678,6 +1717,10 @@ function placeMarker(marker) {
   const fullMarker = { id, ownerId: role === 'player' ? playerId : null, ...marker };
   send({ type: 'marker:add', marker: fullMarker });
 
+  // A glyph is a placed rune/trap, not an instant area effect, so it never
+  // auto-targets the tokens standing on it.
+  if (fullMarker.shape === 'glyph') return;
+
   const pxPerFoot = (session?.map?.gridSizePx || 50) / 5;
   const caughtTokens = getTokensInShape(fullMarker, Object.values(session.tokens), pxPerFoot);
   if (caughtTokens.length) {
@@ -1730,6 +1773,7 @@ function findTouchById(touchList, id) {
 let activeTouch = null; // { id, kind: 'token' | 'shape' } - which touch owns whichever of dragState/shapeDrag is currently live
 
 canvas.addEventListener('touchstart', (e) => {
+  blurSidebarFocus();
   if (pendingActionTarget) return; // tap-to-target has no drag step, synthesized click already handles it
   if (e.touches.length !== 1) return; // multi-touch - not a drag gesture
 
@@ -2049,9 +2093,7 @@ pickerFileInput.addEventListener('change', async () => {
 });
 
 document.getElementById('pickerCancelBtn').addEventListener('click', closeImagePicker);
-imagePickerModal.addEventListener('click', (e) => {
-  if (e.target === imagePickerModal) closeImagePicker();
-});
+closeOnBackdropPress(imagePickerModal, closeImagePicker);
 
 // ---------------------------------------------------------------------------
 // Character picker (Phase 2, Section 1a) - a player selects one of their own
@@ -2100,9 +2142,7 @@ function closeCharacterPicker() {
 }
 
 document.getElementById('characterPickerCancelBtn').addEventListener('click', closeCharacterPicker);
-characterPickerModal.addEventListener('click', (e) => {
-  if (e.target === characterPickerModal) closeCharacterPicker();
-});
+closeOnBackdropPress(characterPickerModal, closeCharacterPicker);
 
 characterPickerList.addEventListener('click', async (e) => {
   const item = e.target.closest('.character-picker-item');
@@ -2269,9 +2309,7 @@ document.getElementById('visionModalSave').addEventListener('click', () => {
   send({ type: 'token:stat:update', tokenId, stat: 'visionDevilFt', value: Number(visionModalDevil.value) || 0 });
   closeVisionModal();
 });
-visionModal.addEventListener('click', (e) => {
-  if (e.target === visionModal) closeVisionModal(); // click on the overlay (outside the box) closes it
-});
+closeOnBackdropPress(visionModal, closeVisionModal);
 
 // ---------------------------------------------------------------------------
 // Conditions modal - standard 5e status conditions (Poisoned, Prone, etc.),
@@ -2324,9 +2362,56 @@ document.getElementById('conditionsModalSave').addEventListener('click', () => {
   send({ type: 'token:stat:update', tokenId, stat: 'conditions', value });
   closeConditionsModal();
 });
-conditionsModal.addEventListener('click', (e) => {
-  if (e.target === conditionsModal) closeConditionsModal();
+closeOnBackdropPress(conditionsModal, closeConditionsModal);
+
+// ---------------------------------------------------------------------------
+// Known AC modal - manual "this token's AC is at most X" note, for players
+// (via Other tokens in view) and the GM (via Token Manager). Sends the
+// dedicated token:knownAc:set event; the server never compares it against the
+// real AC. Wired once at top level like the Conditions modal.
+// ---------------------------------------------------------------------------
+
+const knownAcModal = document.getElementById('knownAcModal');
+const knownAcModalInput = document.getElementById('knownAcModalInput');
+let knownAcModalTokenId = null;
+
+function openKnownAcModal(tokenId) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  knownAcModalTokenId = tokenId;
+  knownAcModalInput.value = typeof token.knownAc === 'number' ? token.knownAc : '';
+  bringModalToFront(knownAcModal);
+  knownAcModal.classList.add('visible');
+  knownAcModalInput.focus();
+}
+
+function closeKnownAcModal() {
+  knownAcModal.classList.remove('visible');
+  knownAcModalTokenId = null;
+}
+
+// value: a number, or null to clear.
+function saveKnownAc(value) {
+  if (!knownAcModalTokenId) return;
+  send({ type: 'token:knownAc:set', tokenId: knownAcModalTokenId, value });
+  closeKnownAcModal();
+}
+
+function saveKnownAcFromInput() {
+  const raw = knownAcModalInput.value.trim();
+  saveKnownAc(raw === '' ? null : Number(raw));
+}
+
+document.getElementById('knownAcModalCancel').addEventListener('click', closeKnownAcModal);
+document.getElementById('knownAcModalClear').addEventListener('click', () => saveKnownAc(null));
+document.getElementById('knownAcModalSave').addEventListener('click', saveKnownAcFromInput);
+knownAcModalInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveKnownAcFromInput();
+  }
 });
+closeOnBackdropPress(knownAcModal, closeKnownAcModal);
 
 // ---------------------------------------------------------------------------
 // Soundboard modal - GM-only manual trigger, one button per
@@ -2354,9 +2439,7 @@ soundboardModalList.addEventListener('click', (e) => {
   send({ type: 'soundboard:play', folder: e.target.dataset.folder });
 });
 document.getElementById('soundboardModalCloseBtn').addEventListener('click', closeSoundboardModal);
-soundboardModal.addEventListener('click', (e) => {
-  if (e.target === soundboardModal) closeSoundboardModal();
-});
+closeOnBackdropPress(soundboardModal, closeSoundboardModal);
 
 // ---------------------------------------------------------------------------
 // Dice Roller modal (Phase 9) - freeform d4/d6/d8/d10/d12/d20 roller,
@@ -2384,9 +2467,7 @@ function closeDiceRollerModal() {
 }
 
 document.getElementById('diceRollerCancelBtn').addEventListener('click', closeDiceRollerModal);
-diceRollerModal.addEventListener('click', (e) => {
-  if (e.target === diceRollerModal) closeDiceRollerModal();
-});
+closeOnBackdropPress(diceRollerModal, closeDiceRollerModal);
 
 document.getElementById('diceRollerRollBtn').addEventListener('click', () => {
   const dice = [];
@@ -2459,9 +2540,7 @@ creatureLibraryModalList.addEventListener('click', async (e) => {
   if (template && onSelect) onSelect(template);
 });
 document.getElementById('creatureLibraryModalCloseBtn').addEventListener('click', closeCreatureLibraryModal);
-creatureLibraryModal.addEventListener('click', (e) => {
-  if (e.target === creatureLibraryModal) closeCreatureLibraryModal();
-});
+closeOnBackdropPress(creatureLibraryModal, closeCreatureLibraryModal);
 
 // ---------------------------------------------------------------------------
 // Movement quick-adjust - shared between the GM's card for any token and a
@@ -2498,9 +2577,106 @@ function recenterToken(tokenId) {
 // Sidebar
 // ---------------------------------------------------------------------------
 
+// True for controls where the user can be mid-edit (typing, picking a colour).
+// Buttons and checkboxes keep focus after a click, so deferring on them would
+// stall renders for no benefit.
+function isEditableControl(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag !== 'INPUT') return false;
+  return !['checkbox', 'radio', 'button', 'submit'].includes(el.type);
+}
+
+// Set when a rebuild was skipped because an editable sidebar control had focus;
+// the focusout handler below runs the catch-up render.
+let sidebarRenderDeferred = false;
+
+// True while a mouse/touch/pen press that started inside the sidebar is still
+// down. Rebuilding mid-press would detach the pressed button before mouseup,
+// so its click would never fire (e.g. type a note, then press Post).
+let sidebarPointerDown = false;
+
+// Runs the deferred rebuild once it is safe: no editable sidebar control has
+// focus and no press inside the sidebar is in progress.
+function catchUpSidebarRender() {
+  if (!sidebarRenderDeferred || sidebarPointerDown) return;
+  const active = document.activeElement;
+  if (sidebarEl.contains(active) && isEditableControl(active)) return;
+  sidebarRenderDeferred = false;
+  renderSidebar();
+}
+
+sidebarEl.addEventListener('pointerdown', () => { sidebarPointerDown = true; }, true);
+// Wait a tick after release so the click handler has run before the DOM is replaced.
+window.addEventListener('pointerup', () => {
+  if (!sidebarPointerDown) return;
+  sidebarPointerDown = false;
+  setTimeout(catchUpSidebarRender, 0);
+});
+window.addEventListener('pointercancel', () => {
+  if (!sidebarPointerDown) return;
+  sidebarPointerDown = false;
+  setTimeout(catchUpSidebarRender, 0);
+});
+
+// Wait a tick so document.activeElement is the NEW focus target. If focus just
+// moved to another editable sidebar field, stay deferred.
+sidebarEl.addEventListener('focusout', () => setTimeout(catchUpSidebarRender, 0));
+
+// A <select> keeps focus after a change, which would hold the deferral open
+// well past the edit - blur it so the sidebar catches up.
+sidebarEl.addEventListener('change', (e) => {
+  if (e.target.tagName === 'SELECT') e.target.blur();
+});
+
+// Clicking/tapping the map should release any sidebar field the user was in,
+// otherwise the sidebar stays deferred (the canvas calls preventDefault, which
+// stops the browser blurring it for us).
+function blurSidebarFocus() {
+  const active = document.activeElement;
+  if (active && sidebarEl.contains(active) && typeof active.blur === 'function') active.blur();
+}
+
+// Coalesces bursts of renders (e.g. the up-to-3 token:stat:update broadcasts
+// one sheet save causes) into a single rebuild per animation frame.
+let sidebarRenderQueued = false;
+function scheduleSidebarRender() {
+  if (sidebarRenderQueued) return;
+  sidebarRenderQueued = true;
+  requestAnimationFrame(() => {
+    sidebarRenderQueued = false;
+    renderSidebar();
+  });
+}
+
 function renderSidebar() {
   if (!session) return;
+
+  // Don't yank the DOM out from under someone who is typing. The log updaters
+  // (appendCombatLogLine etc.) write into their own containers, so logs stay
+  // live; the rest of the sidebar catches up on blur.
+  if (sidebarEl.contains(document.activeElement) && isEditableControl(document.activeElement)) {
+    sidebarRenderDeferred = true;
+    refreshCombatActionsModal();
+    refreshTokenManagerModal();
+    return;
+  }
+
+  // Local-draft controls (session note box, marker form) don't mirror session
+  // state, so carry their values across the rebuild.
+  const drafts = {};
+  sidebarEl.querySelectorAll('[data-draft][id]').forEach((el) => { drafts[el.id] = el.value; });
+
   sidebarEl.innerHTML = role === 'gm' ? gmSidebarHtml() : playerSidebarHtml();
+
+  // Restore BEFORE wiring: wireMarkerForm() reads the shape select at wire time
+  // to show/hide the radius vs cone/cube fields.
+  for (const [id, value] of Object.entries(drafts)) {
+    const el = sidebarEl.querySelector('#' + id);
+    if (el) el.value = value;
+  }
+
   role === 'gm' ? wireGmSidebar() : wirePlayerSidebar();
   refreshCombatActionsModal();
   refreshTokenManagerModal();
@@ -2593,7 +2769,7 @@ function sessionNotesHtml() {
     <h2>Session Notes</h2>
     <div id="sessionNotes" class="combat-log">${lines}</div>
     <div class="field row">
-      <input type="text" id="sessionNoteInput" placeholder="Type a note and press Enter..." autocomplete="off" />
+      <input type="text" id="sessionNoteInput" data-draft placeholder="Type a note and press Enter..." autocomplete="off" />
       <button type="button" id="postSessionNoteBtn" class="secondary">Post</button>
     </div>
   `;
@@ -2716,6 +2892,7 @@ function wireSessionNotesControls() {
     if (event.key === 'Enter') {
       event.preventDefault();
       postSessionNoteFromVtt();
+      event.target.blur(); // release focus so the deferred sidebar rebuild can run
     }
   });
 }
@@ -2834,23 +3011,24 @@ function markerFormHtml() {
     <h2>Markers</h2>
     <div class="field">
       <label>Shape</label>
-      <select id="markerShapeSelect">
+      <select id="markerShapeSelect" data-draft>
         <option value="circle">Circle (token-anchored point)</option>
         <option value="sphere">Sphere/Burst (placed point)</option>
         <option value="cone">Cone</option>
         <option value="cube">Cube/Line</option>
+        <option value="glyph">Glyph (placed point)</option>
       </select>
     </div>
     <div class="field row" id="markerRadiusField">
-      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
-      <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
+      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" data-draft value="20" /></div>
+      <div><label>Color</label><input type="color" id="markerColorInput" data-draft value="#ff5252" /></div>
     </div>
     <div class="field row" id="markerShapeFields" style="display:none;">
-      <div><label>Width (ft)</label><input type="number" id="markerWidthInput" value="10" /></div>
-      <div><label>Cone angle (deg)</label><input type="number" id="markerConeAngleInput" value="60" /></div>
+      <div><label>Width (ft)</label><input type="number" id="markerWidthInput" data-draft value="10" /></div>
+      <div><label>Cone angle (deg)</label><input type="number" id="markerConeAngleInput" data-draft value="60" /></div>
     </div>
     <p id="markerShapeHint" style="color:#666;font-size:12px;display:none;">Click the map to place the origin, then drag to aim and set length - release to confirm.</p>
-    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
+    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" data-draft placeholder="Fireball" /></div>
     <button id="placeMarkerBtn">Place on Map</button>
   `;
 }
@@ -2869,6 +3047,9 @@ function wireMarkerForm() {
     radiusField.style.display = isDirectional ? 'none' : '';
     shapeFields.style.display = isDirectional ? '' : 'none';
     shapeHint.style.display = isDirectional ? '' : 'none';
+    // A glyph is a fixed 5 ft icon, so hide just the Radius input (the Colour
+    // input shares its row and still applies).
+    document.getElementById('markerRadiusInput').parentElement.style.display = shapeSelect.value === 'glyph' ? 'none' : '';
   }
   shapeSelect.addEventListener('change', syncShapeFields);
   syncShapeFields();
@@ -2958,6 +3139,7 @@ function tokenManagerRowsHtml(tokens) {
             <div><label>Max HP</label><input type="number" class="maxHpInput" value="${maxHp}" /></div>
             <div><label>AC</label><input type="number" class="acInput" value="${t.ac ?? ''}" /></div>
           </div>
+          <div class="field" style="font-size:12px;color:#aaa;">${typeof t.knownAc === 'number' ? `Known AC ≤ ${t.knownAc}` : 'Known AC: none'} <button type="button" class="secondary knownAcBtn">Known AC…</button></div>
           ${gmAttacksHtml(t)}
           <div class="field"><label>Condition</label>
             <select class="conditionSelect">
@@ -3003,6 +3185,7 @@ function tokenManagerRowsHtml(tokens) {
 function markerSizeLabel(marker) {
   if (marker.shape === 'cone') return `${marker.lengthFt}ft cone`;
   if (marker.shape === 'cube') return `${marker.lengthFt}x${marker.widthFt}ft`;
+  if (marker.shape === 'glyph') return 'glyph'; // fixed 5 ft, no size to report
   return `${marker.radiusFt} ft`;
 }
 
@@ -3171,9 +3354,7 @@ function closeMapSettingsModal() {
 }
 
 document.getElementById('mapSettingsCancelBtn').addEventListener('click', closeMapSettingsModal);
-mapSettingsModal.addEventListener('click', (e) => {
-  if (e.target === mapSettingsModal) closeMapSettingsModal();
-});
+closeOnBackdropPress(mapSettingsModal, closeMapSettingsModal);
 
 mapFileInput.addEventListener('change', async () => {
   const file = mapFileInput.files[0];
@@ -3430,9 +3611,7 @@ function closeAddTokenModal() {
 }
 
 document.getElementById('addTokenCancelBtn').addEventListener('click', closeAddTokenModal);
-addTokenModal.addEventListener('click', (e) => {
-  if (e.target === addTokenModal) closeAddTokenModal();
-});
+closeOnBackdropPress(addTokenModal, closeAddTokenModal);
 
 tokenTypeSelect.addEventListener('change', syncFieldVisibilityForType);
 
@@ -3675,9 +3854,7 @@ tokenManagerList.addEventListener('focusout', () => {
 
 document.getElementById('tokenManagerCloseBtn').addEventListener('click', closeTokenManagerModal);
 document.getElementById('tokenManagerAddBtn').addEventListener('click', () => openAddTokenModal('create'));
-tokenManagerModal.addEventListener('click', (e) => {
-  if (e.target === tokenManagerModal) closeTokenManagerModal();
-});
+closeOnBackdropPress(tokenManagerModal, closeTokenManagerModal);
 
 tokenManagerSearchInput.addEventListener('input', renderTokenManagerList);
 tokenManagerTypeFilter.addEventListener('change', renderTokenManagerList);
@@ -3736,6 +3913,10 @@ tokenManagerList.addEventListener('click', (e) => {
 
   if (e.target.classList.contains('editTokenBtn')) {
     openAddTokenModal('edit', tokenId);
+    return;
+  }
+  if (e.target.classList.contains('knownAcBtn')) {
+    openKnownAcModal(tokenId);
     return;
   }
   // --- Manual stat-block attacks (checked before the row, since the delete
@@ -3957,10 +4138,18 @@ function otherTokenListHtml(tokens) {
         : t.condition
           ? `Condition: ${escapeHtml(t.condition)}`
           : 'No status known';
+      // Known AC controls only when no true AC reached us (same rule as
+      // render/tokens.js's drawAcIndicator) - allies' real AC is just shown.
+      const trueAc = typeof t.ac === 'number' ? t.ac
+        : (t.stats && typeof t.stats.ac === 'number' ? t.stats.ac : null);
+      const knownAcHtml = trueAc === null && t.type !== 'prop'
+        ? `<div style="font-size:12px;color:#aaa;">${typeof t.knownAc === 'number' ? `<span style="color:#ffa726;">Known AC ≤ ${t.knownAc}</span> ` : ''}<button type="button" class="secondary knownAcBtn">Known AC…</button></div>`
+        : '';
       return `
-        <div class="token-card">
+        <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title"><span>${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>
           <div style="font-size:12px;color:#aaa;">${detail}</div>
+          ${knownAcHtml}
           ${t.conditions && t.conditions.length ? `<div class="field">${conditionTagsHtml(t.conditions)}</div>` : ''}
         </div>
       `;
@@ -4194,6 +4383,14 @@ function wirePlayerSidebar() {
   document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
   wireSessionNotesControls();
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
+
+  // Delegated, so it keeps working when updateOtherTokensInViewList swaps the
+  // list's innerHTML on token:move.
+  document.getElementById('otherTokenList')?.addEventListener('click', (e) => {
+    if (!e.target.classList.contains('knownAcBtn')) return;
+    const card = e.target.closest('.token-card');
+    if (card?.dataset.tokenId) openKnownAcModal(card.dataset.tokenId);
+  });
 
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;

@@ -63,6 +63,7 @@ export function isPointInShape(px, py, marker, pxPerFoot) {
       return pointInCube(px, py, marker, pxPerFoot);
     case 'circle':
     case 'sphere':
+    case 'glyph': // fixed 5 ft wide, radiusFt is stored as 2.5 by the server
     default:
       return pointInCircle(px, py, marker, pxPerFoot);
   }

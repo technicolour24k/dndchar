@@ -28,22 +28,24 @@ function logCombatLine(context, session, message, details) {
 // doesn't read as a flat, repetitive damage ticker. {attacker}/{target} are
 // always token names; {damage}/{damageType} only apply to the critical-hit
 // pool (a miss deals no damage, so there's nothing to interpolate there).
+// {roll} is the attacker's to-hit total as " (17)" (or " (natural 1)"), or an
+// empty string if the total is missing - it sits right after the attack verb.
 // damageType already carries its own trailing space when present (see
 // damageTypeText below) so "{damageType}damage" reads correctly either way.
 const MISS_PHRASES = [
-  '{attacker} attacks {target}, but is parried!',
-  '{target} dodges an attack from {attacker}.',
-  "{attacker}'s attack glances off {target}'s armour.",
-  '{target} narrowly avoids a strike from {attacker}!',
-  '{attacker} swings at {target} and misses completely.',
-  "{target} deflects {attacker}'s attack at the last moment.",
+  '{attacker} attacks{roll} {target}, but is parried!',
+  '{target} dodges an attack{roll} from {attacker}.',
+  "{attacker}'s attack{roll} glances off {target}'s armour.",
+  '{target} narrowly avoids a strike{roll} from {attacker}!',
+  '{attacker} swings{roll} at {target} and misses completely.',
+  "{target} deflects {attacker}'s attack{roll} at the last moment.",
 ];
 
 const CRITICAL_HIT_PHRASES = [
-  "[Critical] {attacker}'s attack strikes true! Dealing {damage} {damageType}damage!",
-  "[Critical] {attacker} strikes just between the folds of {target}'s armour, dealing {damage} {damageType}damage!",
-  '[Critical] A devastating blow from {attacker} tears into {target} for {damage} {damageType}damage!',
-  '[Critical] {attacker} finds the perfect opening, striking {target} for a brutal {damage} {damageType}damage!',
+  "[Critical] {attacker}'s attack{roll} strikes true! Dealing {damage} {damageType}damage!",
+  "[Critical] {attacker} strikes{roll} just between the folds of {target}'s armour, dealing {damage} {damageType}damage!",
+  '[Critical] A devastating blow{roll} from {attacker} tears into {target} for {damage} {damageType}damage!',
+  '[Critical] {attacker} finds the perfect opening, striking{roll} {target} for a brutal {damage} {damageType}damage!',
 ];
 
 function pickLine(pool, vars) {
@@ -87,8 +89,10 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
-  // The lowest attack roll that has actually hit this token - server-set only
-  // (attack:resolve), never written directly by a client. Top-level so it
+  // The lowest attack roll that has actually hit this token. Set by
+  // attack:resolve, or manually via the dedicated token:knownAc:set event (any
+  // role, any visible token - deliberately not in PLAYER_EDITABLE_FIELDS, so
+  // the generic token:stat:update path still can't write it). Top-level so it
   // survives filterTokenForPlayer (unlike the real `ac`, which is stripped for
   // enemy/npc) - it's the deliberately-revealed upper bound players discover.
   'knownAc',
@@ -388,6 +392,38 @@ function handleTokenEvent(meta, msg, context) {
       break;
     }
 
+    // Manual known AC: any player or the GM can note "this token's AC is at
+    // most X" for a visible token (the table's own bookkeeping, no ownership
+    // check). IMPORTANT: this case must never read token.ac / token.stats.ac.
+    // No clamping against it, no rejection, no reply that differs by it -
+    // any of those would turn this endpoint into an oracle for the hidden AC.
+    case 'token:knownAc:set': {
+      const token = session.tokens[msg.tokenId];
+      if (!token) return;
+      // A player can't act on a token they can't see (never knew it existed).
+      if (meta.role !== 'gm' && (token.hidden || (session.map && !session.map.revealed))) return;
+
+      let value = null;
+      if (msg.value !== null) {
+        const n = typeof msg.value === 'number' || typeof msg.value === 'string' ? Number(msg.value) : NaN;
+        value = Math.round(n);
+        if (msg.value === '' || (typeof msg.value === 'string' && msg.value.trim() === '') || !Number.isFinite(n) || value < 0 || value > 99) {
+          meta.ws.send(JSON.stringify({
+            type: 'token:stat:update:error',
+            tokenId: msg.tokenId,
+            stat: 'knownAc',
+            reason: 'invalid_value',
+          }));
+          return;
+        }
+      }
+      token.knownAc = value;
+      broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+        tokenId: token.id, stat: 'knownAc', value,
+      });
+      break;
+    }
+
     // token:update (Phase 10) - the Token Manager's multi-field edit form,
     // GM-only. Deliberately gated on role alone, not canEditToken - that
     // helper also passes for a token's own owner, which would let a player
@@ -547,22 +583,28 @@ function handleTokenEvent(meta, msg, context) {
       // the same reason - a hit landing is worth announcing regardless of how
       // much HP was actually left to remove.
       {
+        // To-hit total for the log. Never the target's real AC. A nat 1 shows
+        // "(natural 1)" rather than the total, since e.g. "(25)" on a fumble
+        // would read as "AC is above 25".
+        const toHitTotal = typeof msg.toHit === 'number' && Number.isFinite(msg.toHit) ? msg.toHit : null;
+        const rollText = outcome === 'critical_miss' ? ' (natural 1)'
+          : toHitTotal !== null ? ` (${toHitTotal})` : '';
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const targetName = target.name || 'something';
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
         const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         if (!hit) {
           logCombatLine(context, session,
-            pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName }),
-            { kind: 'attack', outcome: 'miss', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
+            pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName, roll: rollText }),
+            { kind: 'attack', outcome: 'miss', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
         } else if (outcome === 'critical_hit') {
           logCombatLine(context, session,
-            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText }),
-            { kind: 'attack', outcome: 'critical', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText, roll: rollText }),
+            { kind: 'attack', outcome: 'critical', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         } else {
           logCombatLine(context, session,
-            `${attackerName} hits ${targetName} for ${damage} ${damageTypeText}damage.`,
-            { kind: 'attack', outcome: 'hit', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            `${attackerName} hits${rollText} ${targetName} for ${damage} ${damageTypeText}damage.`,
+            { kind: 'attack', outcome: 'hit', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         }
       }
       break;
