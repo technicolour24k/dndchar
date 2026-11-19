@@ -8,6 +8,7 @@ import { getActiveEncounterForCharacter } from '$lib/server/services/encounters'
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
 import { getRoomGameSessionId, logSessionNote } from '$lib/server/services/gameSessions';
 import { sessions } from '$vtt/store.js';
+import { poolSummary } from '$lib/rules/attackRoll';
 
 // db-traffic-reduction Phase 4: load() only carries what the sheet renders on every
 // view - versions (VersionList.svelte) and the Activity Log's Past Encounters/Past
@@ -233,6 +234,30 @@ export const actions = {
     const natural = Number(form.get('natural'));
     if (!label || !Number.isFinite(total)) return fail(400, { logRollError: 'Invalid roll.' });
 
+    // Optional d20 pool fields (older clients don't send them, and get today's plain message).
+    // Anything out of range is dropped rather than rejected: the pool only words the log line.
+    const intField = (name: string) => {
+      const raw = form.get(name);
+      return raw === null || raw === '' ? NaN : Number(raw);
+    };
+    const poolSize = intField('poolSize');
+    const poolNet = intField('poolNet');
+    const poolKept = intField('poolKept');
+    const poolManualAdv = intField('poolManualAdv');
+    const poolManualDis = intField('poolManualDis');
+    const poolValid = [poolSize, poolNet, poolKept, poolManualAdv, poolManualDis].every(Number.isInteger)
+      && poolSize >= 1 && poolSize <= 11 && Math.abs(poolNet) === poolSize - 1
+      && poolKept >= 1 && poolKept <= 20
+      && poolManualAdv >= 0 && poolManualAdv <= 5 && poolManualDis >= 0 && poolManualDis <= 5;
+    const pool = poolValid ? {
+      size: poolSize, net: poolNet, direction: poolNet > 0 ? 'highest' as const : poolNet < 0 ? 'lowest' as const : 'flat' as const,
+      advantage: 0, disadvantage: 0, manualAdvantage: poolManualAdv, manualDisadvantage: poolManualDis, rolls: [], kept: poolKept
+    } : null;
+    const summary = pool ? poolSummary(pool) : '';
+    // INTERIM: the manual damage-dice delta (weapon attacks only), kept in details for reference.
+    const manualDamageDiceRaw = intField('manualDamageDice');
+    const manualDamageDice = Number.isInteger(manualDamageDiceRaw) && Math.abs(manualDamageDiceRaw) <= 5 ? manualDamageDiceRaw : 0;
+
     const sessionId = await getUserVttSessionId(locals.user!.id);
     if (!sessionId) return { loggedRoll: false }; // not in a room - nothing to log, not an error
 
@@ -241,7 +266,8 @@ export const actions = {
       [params.id, locals.user!.id]
     );
     const name = nameRow.rows[0]?.name || 'A character';
-    await logRoll(sessionId, `${name} rolled a ${total} on ${label}.`, { label, total, breakdown, natural });
+    await logRoll(sessionId, `${name} rolled a ${total} on ${label}${summary ? ` (${summary})` : ''}.`,
+      { label, total, breakdown, natural, ...(pool ? { pool } : {}), ...(manualDamageDice ? { manualDamageDice } : {}) });
     return { loggedRoll: true };
   },
   postSessionNote: async ({ request, locals }) => {

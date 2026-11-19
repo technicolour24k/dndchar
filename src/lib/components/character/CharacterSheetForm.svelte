@@ -3,11 +3,15 @@
   import { invalidate } from '$app/navigation';
   import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
   import { backdropPress } from '$lib/ui/backdropPress';
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
-  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown } from '$lib/rules/dnd5e';
-  import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
+  import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
+  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
+  import {
+    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, defaultRollChoices, poolSummary,
+    rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
+  } from '$lib/rules/attackRoll';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { CharacterContentInstance, ContentType } from '$lib/types/content';
@@ -608,6 +612,55 @@
     markUnsaved();
   }
 
+  // Rolls a death save through the shared panel/dice-pool path, then applies the suggested result
+  // exactly like a manual icon click would (local state + markUnsaved), so the player can still
+  // click the icons to correct it. Rolling is never blocked (not at 3 successes/failures, not above
+  // 0 HP) - it only adds a gentle note.
+  function rollDeathSave(choices: RollChoices = defaultRollChoices()) {
+    // Modifier 0: a death save has no ability modifier (5e RAW); only saving_throw.all style
+    // modifiers (Bless, flat save bonuses) apply. The success/failure is the TOTAL against 10;
+    // a natural 1 and a natural 20 are judged on the KEPT die (see resolveDeathSave).
+    const result = rollText(0, deathSaveCandidates, [], false, choices);
+    const outcome = resolveDeathSave(result.natural, result.total, deathSaveSuccesses, deathSaveFailures);
+    deathSaveSuccesses = outcome.successes;
+    deathSaveFailures = outcome.failures;
+    markUnsaved();
+
+    const notes = [
+      outcome.kind === 'revived' ? 'Natural 20: regain 1 HP, both counters reset.'
+        : outcome.kind === 'critical_failure' ? 'Natural 1: two failures.'
+        : outcome.kind === 'success' ? 'Success.' : 'Failure.'
+    ];
+    if (outcome.regainHp) notes.push(regainOneHp());
+    if (currentHpOnScreen() > 0) notes.push('Note: current HP is above 0, so a death save is not normally needed.');
+    simpleRollResult = { title: 'Death Saving Throw', lines: [{ label: 'Death Save', ...result }], passiveNote: notes.join(' ') };
+    void logRoll('Death Save', result);
+  }
+
+  // Natural 20 on a death save: adds 1 to the Current HP box the same way typing in it would (the
+  // box is an uncontrolled form field, so set it and fire its input event - that flags unsaved
+  // changes through the form's own oninput). Falls back to a text note if the box isn't on screen.
+  // The Current HP box's live value (what the player sees, including unsaved edits), falling back to
+  // the server value when the box isn't on screen.
+  function currentHpOnScreen(): number {
+    const input = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpCurrent"]');
+    return input ? Number(input.value) || 0 : hp.currentValue;
+  }
+
+  function regainOneHp(): string {
+    const input = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpCurrent"]');
+    if (!input) return 'Regain 1 HP (set it by hand).';
+    const before = Number(input.value) || 0;
+    // Cap against the Max HP box (unsaved edits included), falling back to the server max, and
+    // never lower HP (e.g. if the box is already above max).
+    const maxInput = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpMax"]');
+    const max = Math.max(maxInput ? Number(maxInput.value) || 0 : hp.maxValue, 1);
+    const after = Math.max(before, Math.min(max, before + 1));
+    input.value = String(after);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return `HP ${before} -> ${after}.`;
+  }
+
   // Both effects below resync local edit state from the server only when the server value actually
   // changed (same guard as statOverrides/hitDicePools above). Without autosave, an unrelated
   // invalidate('app:character-sheet') - a GM's Next Turn, adding content - would otherwise silently
@@ -705,6 +758,61 @@
     ];
   }
 
+  // The shared pre-roll options panel (RollOptionsModal.svelte), shown before every d20 roll on the
+  // sheet. It only collects choices (unticked advantage sources, the manual adv/dis counters, and
+  // the INTERIM manual damage-dice delta); `run` then does the real roll with them. Every caller
+  // builds its candidates here (askRoll/askAttackRoll), and the roll function uses the very same
+  // candidate lists, so the panel's preview can't drift from what actually rolls.
+  type RollOptionsSpec = {
+    title: string;
+    advantage: { effects: typeof character.modifierSources; candidates: string[]; context: ModifierContext; batch?: boolean } | null;
+    damageDice: { baseExpression: string } | null;
+    run: (choices: RollChoices) => void;
+  };
+  let rollOptions = $state<RollOptionsSpec | null>(null);
+
+  // Focus restore: remember the button that opened the panel, and give it focus back once the panel
+  // AND the result modal that follows it have both closed (so keyboard users land where they were).
+  let rollTrigger: HTMLElement | null = null;
+  function rememberRollTrigger() {
+    const active = document.activeElement;
+    rollTrigger = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+  $effect(() => {
+    if (rollOptions || simpleRollResult || rollResult || !rollTrigger) return;
+    const trigger = rollTrigger;
+    rollTrigger = null;
+    void tick().then(() => { if (trigger.isConnected) trigger.focus(); });
+  });
+
+  function submitRollOptions(choices: RollChoices) {
+    const spec = rollOptions;
+    rollOptions = null;
+    spec?.run(choices);
+  }
+
+  // A plain d20 roll (save, skill, ability check, initiative, death save).
+  function askRoll(title: string, candidates: string[], run: (choices: RollChoices) => void, ability?: AbilityKey) {
+    rememberRollTrigger();
+    rollOptions = { title, advantage: { effects: character.modifierSources, candidates, context: { classes: classRows, ability } }, damageDice: null, run };
+  }
+
+  // "Roll all ...": counters only, applied to every line in the batch (the sources differ per line,
+  // so there are no per-source tick boxes). Batches are not logged, as before.
+  function askBatchRoll(title: string, run: (choices: RollChoices) => void) {
+    rememberRollTrigger();
+    rollOptions = { title, advantage: { effects: [], candidates: [], context: {}, batch: true }, damageDice: null, run };
+  }
+
+  // Candidate lists, shared by the panel and the roll functions.
+  const saveCandidates = (key: AbilityKey) => [`saving_throw.${key}`];
+  const skillCandidates = (skill: { key: string; ability: AbilityKey }) => [`ability_check.${skill.ability}`, `ability_check.${skill.key}`];
+  const abilityCheckCandidates = (key: AbilityKey) => [`ability_check.${key}`];
+  const initiativeCandidates = ['initiative'];
+  // There is no death-save target in the rules model yet, so a death save counts as a saving throw:
+  // saving_throw.all advantage/disadvantage (and Bless-style bonuses) apply, nothing else does.
+  const deathSaveCandidates = ['saving_throw.death'];
+
   // Thin wrapper over the shared, pure rollWithModifiers (src/lib/rules/attackRoll.ts) - the
   // component just supplies its own reactive modifierSources and RNG. The VTT's server endpoint
   // calls the exact same function, so saves/skills/attacks can't drift between the two surfaces.
@@ -712,32 +820,50 @@
   // folded in (saves, skills, initiative - all of which go through resolvedAdditiveModifiers()/
   // resolveCharacterStats() before calling this), otherwise rollWithModifiers would add them a
   // second time (see attackRoll.ts's flatModifiersIncluded comment).
-  function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = [], flatModifiersIncluded = false) {
-    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie, { flatModifiersIncluded });
+  //
+  // `choices` are the user's picks from the roll-options panel (unticked sources and the manual
+  // situational counters). The sheet has no target or token, so only the attacker's own sources and
+  // the situational counters can apply here.
+  function rollText(
+    modifier: number,
+    candidates: string[] = [],
+    modifierBreakdown: Array<{ label: string; value: number }> = [],
+    flatModifiersIncluded = false,
+    choices: RollChoices = defaultRollChoices(),
+    // The roll's ability (a save's ability, a skill's ability, 'dex' for initiative), so
+    // "ability:dex" gated modifiers apply. Undefined for rolls with no ability (death saves).
+    ability?: AbilityKey
+  ) {
+    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie, {
+      flatModifiersIncluded,
+      context: { classes: classRows, ability },
+      extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+      disabledSourceIds: choices.disabledSourceIds
+    });
   }
 
-  function rollAllSavingThrows() {
+  function rollAllSavingThrows(choices: RollChoices = defaultRollChoices()) {
     simpleRollResult = {
       title: 'Saving Throws',
-      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`], [], true) }))
+      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), saveCandidates(key), [], true, choices, key) }))
     };
   }
 
-  function rollAllSkillChecks() {
+  function rollAllSkillChecks(choices: RollChoices = defaultRollChoices()) {
     simpleRollResult = {
       title: 'Skill Checks',
-      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], [], true) }))
+      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), skillCandidates(skill), [], true, choices, skill.ability) }))
     };
   }
 
-  function rollSingleSavingThrow(key: AbilityKey) {
+  function rollSingleSavingThrow(key: AbilityKey, choices: RollChoices = defaultRollChoices()) {
     const label = `${key.toUpperCase()} Save`;
-    const result = rollText(savingThrowTotal(key), [`saving_throw.${key}`], [], true);
+    const result = rollText(savingThrowTotal(key), saveCandidates(key), [], true, choices, key);
     simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label, ...result }] };
     void logRoll(label, result);
   }
 
-  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
+  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }, choices: RollChoices = defaultRollChoices()) {
     const passiveScores: Record<string, number> = {
       perception: stats.passivePerception.value,
       insight: stats.passiveInsight.value,
@@ -746,7 +872,7 @@
     const passiveNote = skill.key in passiveScores
       ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
       : undefined;
-    const result = rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], [], true);
+    const result = rollText(skillCheckTotal(skill), skillCandidates(skill), [], true, choices, skill.ability);
     simpleRollResult = {
       title: skill.name,
       lines: [{ label: skill.name, ...result }],
@@ -755,17 +881,17 @@
     void logRoll(skill.name, result);
   }
 
-  function rollAbilityCheck(key: AbilityKey) {
+  function rollAbilityCheck(key: AbilityKey, choices: RollChoices = defaultRollChoices()) {
     const label = `${key.toUpperCase()} Check`;
     // Deliberately flatModifiersIncluded: false (the default) - rollAbilityCheck passes the raw
     // ability mod only, with no bonus/penalty modifiers folded in first.
-    const result = rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]);
+    const result = rollText(abilityModifier(abilityScores[key]), abilityCheckCandidates(key), [], false, choices, key);
     simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label, ...result }] };
     void logRoll(label, result);
   }
 
-  function rollInitiative() {
-    const result = rollText(stats.initiative.value, ['initiative'], [], true);
+  function rollInitiative(choices: RollChoices = defaultRollChoices()) {
+    const result = rollText(stats.initiative.value, initiativeCandidates, [], true, choices, 'dex');
     simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...result }] };
     void logRoll('Initiative', result);
   }
@@ -964,13 +1090,27 @@
   // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
   // itself. Skipped entirely when the character hasn't joined a VTT room, same
   // "nothing to log against" gate the server action itself also applies.
-  async function logRoll(label: string, result: { text: string; natural: number; total: number }) {
+  async function logRoll(
+    label: string,
+    result: { text: string; natural: number; total: number; pool?: AttackPool },
+    extras: { manualDamageDice?: number } = {}
+  ) {
     if (!activeVttSessionId) return;
     const body = new FormData();
     body.set('label', label);
     body.set('total', String(result.total));
     body.set('breakdown', result.text);
     body.set('natural', String(result.natural));
+    // The d20 pool (for the "(3d20 adv x2, keeps 17)" suffix). The server validates these.
+    if (result.pool) {
+      body.set('poolSize', String(result.pool.size));
+      body.set('poolNet', String(result.pool.net));
+      body.set('poolKept', String(result.pool.kept));
+      body.set('poolManualAdv', String(result.pool.manualAdvantage));
+      body.set('poolManualDis', String(result.pool.manualDisadvantage));
+    }
+    // INTERIM: manual damage-dice delta (weapon attacks).
+    if (extras.manualDamageDice) body.set('manualDamageDice', String(extras.manualDamageDice));
     await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
   }
 
@@ -1205,14 +1345,37 @@
     return sharedBattleDamageBonuses(character.modifierSources, item, classRows, outcomes);
   }
 
-  function rollBattleAction(item: InventoryItem) {
-    rollResult = rollAttack(item, {
+  // Opens the shared panel for a weapon attack: advantage sources plus the INTERIM damage-dice control.
+  function askAttackRoll(item: InventoryItem) {
+    rememberRollTrigger();
+    rollOptions = {
+      title: item.name || 'Attack',
+      advantage: {
+        effects: character.modifierSources,
+        candidates: attackCandidatesFor(item),
+        context: { classes: classRows, ability: item.attackAbility, attackType: 'melee_weapon' }
+      },
+      damageDice: { baseExpression: item.damageRolls },
+      run: (choices) => rollBattleAction(item, choices)
+    };
+  }
+
+  function rollBattleAction(item: InventoryItem, choices: RollChoices = defaultRollChoices()) {
+    const attackResult = rollAttack(item, {
       modifierSources: character.modifierSources,
       abilityScores,
       proficiencyBonus: prof,
       classes: classRows,
-      rollDie
+      rollDie,
+      extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+      disabledSourceIds: choices.disabledSourceIds,
+      manualDamageDice: choices.manualDamageDice // INTERIM
     });
+    rollResult = attackResult;
+    // Sheet attacks now log like the other sheet rolls (once, here, after the panel).
+    void logRoll(`${item.name || 'Attack'} attack`,
+      { text: attackResult.attack, natural: attackResult.attackNatural, total: attackResult.attackTotal, pool: attackResult.attackPool },
+      { manualDamageDice: attackResult.manualDamageDice });
   }
 
   // Per vtt-phase-3-magic-spec.md: the character sheet just displays what a spell resolves
@@ -1220,27 +1383,105 @@
   // job). Runs resolveSpellDamage() client-side (unlike the VTT's vanilla client, this
   // component can import $lib directly) - same function, same Modifier-aware damage the
   // VTT's roll-spell endpoint produces.
-  function rollSpellDamage(spell: { name: string; spellLevel: number | null; spellDamage?: NonNullable<CharacterContentInstance['spellDamage']> }) {
+  type SheetSpell = { name: string; spellLevel: number | null; spellDamage?: NonNullable<CharacterContentInstance['spellDamage']> };
+
+  // A spell's resolved damage at the character's level (cantrips scale with character level; levelled
+  // spells are shown at their own base level). `outcomes` lets a crit-gated modifier apply once the
+  // to-hit is known. Null when the spell has no damage dice.
+  function spellProfile(spell: SheetSpell, outcomes: string[] = []) {
     const damage = spell.spellDamage;
-    if (!damage || !damage.baseDice) return;
-    const profile = resolveSpellDamage(
+    if (!damage || !damage.baseDice) return null;
+    return resolveSpellDamage(
       { name: spell.name, spellLevel: spell.spellLevel ?? 0, resolutionType: damage.resolutionType, damageType: damage.damageType,
         baseDice: damage.baseDice, saveAbility: damage.saveAbility, saveEffect: damage.saveEffect, scaling: damage.scaling },
-      { castAtSlotLevel: spell.spellLevel ?? 0, casterLevel: level, modifierSources: character.modifierSources }
+      { castAtSlotLevel: spell.spellLevel ?? 0, casterLevel: level, modifierSources: character.modifierSources, outcomes }
     );
-    const rolled = rollDamage(profile.diceExpression, 0, 0, '', profile.flatBonuses, profile.extraDice, rollDie);
-    const resolutionText = profile.resolution === 'save'
-      ? `Save (${(profile.saveAbility || '').toUpperCase()}, ${profile.saveEffect === 'negate' ? 'negate' : 'half'} on success)`
-      : profile.resolution === 'attack' ? 'Spell Attack' : 'Automatic';
-    rollResult = { title: spell.name, attack: '', damage: rolled.lines, effects: `${resolutionText}${profile.damageType ? ` · ${profile.damageType}` : ''}` };
   }
 
+  // The spell's damage dice and the INTERIM damage-dice delta, rolled. Shared by the damage-only
+  // spells and the attack spells (which add a to-hit roll first).
+  function rollSpellDice(spell: SheetSpell, profile: NonNullable<ReturnType<typeof spellProfile>>, choices: RollChoices, critical = false) {
+    const adjusted = adjustPrimaryDamageDice(profile.diceExpression, choices.manualDamageDice);
+    const rolled = rollDamage(adjusted.expression, 0, 0, '', profile.flatBonuses, profile.extraDice, rollDie, critical);
+    const scalingLine = profile.scalingNote ? [`Dice: ${profile.diceExpression} (${profile.scalingNote})`] : [];
+    return { adjusted, lines: [...(adjusted.auditLine ? [adjusted.auditLine] : []), ...scalingLine, ...rolled.lines] };
+  }
+
+  // Per vtt-phase-3-magic-spec.md: the sheet rolls a spell for reference - no target/application
+  // concept here (that's the VTT's job). Same resolveSpellDamage() the VTT's roll-spell endpoint uses.
+  // Attack spells get the full roll-options panel and roll to-hit first (like weapon attacks);
+  // save and automatic spells stay damage-only, with just the INTERIM damage-dice control.
+  function rollSpellDamage(spell: SheetSpell) {
+    const profile = spellProfile(spell);
+    if (!profile) return;
+    // Computed once, before the panel opens, so its preview and the roll agree.
+    rememberRollTrigger();
+    const spellContext = { classes: classRows, ability: spellcastingAbility, attackType: 'spell' } as const;
+
+    if (profile.resolution === 'attack') {
+      rollOptions = {
+        title: spell.name,
+        advantage: { effects: character.modifierSources, candidates: spellAttackCandidates, context: spellContext },
+        damageDice: { baseExpression: profile.diceExpression },
+        run: (choices) => {
+          // Same to-hit path as the VTT's roll-spell: stats.spellAttackBonus already folds in
+          // spell attack modifiers and any manual override, so the flat sum is skipped.
+          const bonus = stats.spellAttackBonus.value;
+          const attackRoll = rollWithModifiers(character.modifierSources, bonus, spellAttackCandidates,
+            [{ label: 'Spell Attack', value: bonus }], rollDie, {
+              flatModifiersIncluded: true,
+              context: spellContext,
+              extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+              disabledSourceIds: choices.disabledSourceIds
+            });
+          const outcomes = resolveD20Outcomes(attackRoll.natural, resolveCritThreshold(character.modifierSources, { attackType: 'spell' }));
+          // Re-resolve with the outcomes so crit-gated damage modifiers apply, as a weapon crit does.
+          const hitProfile = spellProfile(spell, outcomes) ?? profile;
+          const dice = rollSpellDice(spell, hitProfile, choices, outcomes.includes('critical_hit'));
+          rollResult = {
+            title: spell.name,
+            attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` - ${outcomes.join(', ')}` : ''}`,
+            damage: dice.lines,
+            effects: `Spell Attack${hitProfile.damageType ? ` · ${hitProfile.damageType}` : ''}`
+          };
+          void logRoll(`${spell.name} attack`,
+            { text: attackRoll.text, natural: attackRoll.natural, total: attackRoll.total, pool: attackRoll.pool },
+            { manualDamageDice: dice.adjusted.applied });
+        }
+      };
+      return;
+    }
+
+    // Save / automatic: no d20 here, so only the INTERIM damage-dice control.
+    rollOptions = {
+      title: spell.name,
+      advantage: null,
+      damageDice: { baseExpression: profile.diceExpression },
+      run: (choices) => {
+        const dice = rollSpellDice(spell, profile, choices);
+        const resolutionText = profile.resolution === 'save'
+          ? `Save (${(profile.saveAbility || '').toUpperCase()}, ${profile.saveEffect === 'negate' ? 'negate' : 'half'} on success)`
+          : 'Automatic';
+        rollResult = {
+          title: spell.name,
+          attack: '',
+          damage: dice.lines,
+          effects: `${resolutionText}${profile.damageType ? ` · ${profile.damageType}` : ''}`
+        };
+      }
+    };
+  }
+
+  // Spell list row summary: the SCALED dice at the character's level (levelled spells at their base
+  // level), merged ("2d10"), not the raw base dice. Save details only show for save spells - a
+  // stored save ability on an attack spell is ignored here.
   function spellDamageSummary(spell: CharacterContentInstance): string {
     const damage = spell.spellDamage;
-    if (!damage || !damage.baseDice) return '';
+    const profile = spellProfile(spell);
+    if (!damage || !profile) return '';
     const resolutionLabel = damage.resolutionType === 'save' ? `Save (${damage.saveAbility.toUpperCase()})`
       : damage.resolutionType === 'attack' ? 'Attack' : 'Auto';
-    return `${resolutionLabel} · ${damage.baseDice}${damage.damageType ? ` ${damage.damageType}` : ''}`;
+    return `${resolutionLabel} · ${profile.diceExpression}${damage.damageType ? ` ${damage.damageType}` : ''}`;
   }
 
   function findInventoryRow(event: MouseEvent) {
@@ -1358,6 +1599,7 @@
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
   function closeOpenModal() {
+    if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
     if (simpleRollResult) { simpleRollResult = null; return; }
     if (inventoryMessage) { inventoryMessage = null; return; }
@@ -1539,7 +1781,7 @@
               </span>
               <span class="summary-input-roll">
                 <input type="text" inputmode="numeric" value={statFmt.initiative(stats.initiative.value)} onchange={(event) => commitStatInput('initiative', event)} />
-                <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={rollInitiative}>
+                <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={() => askRoll('Initiative', initiativeCandidates, rollInitiative, 'dex')}>
                   <img src={d20Icon} alt="" />
                 </button>
               </span>
@@ -1560,12 +1802,15 @@
               </span>
               <input type="text" inputmode="numeric" value={statFmt.passiveInsight(stats.passiveInsight.value)} onchange={(event) => commitStatInput('passiveInsight', event)} />
             </label>
-            <div class="death-save-grid" aria-label="Death saves">
+            <div class="death-save-grid" role="group" aria-label="Death saves">
               <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
               <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
-              <div class="death-save-row success">
-                <span>Successes</span>
-                <div class="death-save-icons">
+              <span class="death-save-label" aria-hidden="true"><span>Death</span><span>Saves</span></span>
+              <button type="button" class="dice-icon-button death-save-roll" aria-label="Roll death save" title="Roll death save" onclick={() => askRoll('Death Saving Throw', deathSaveCandidates, rollDeathSave)}>
+                <img src={d20Icon} alt="" />
+              </button>
+              <div class="death-save-rows">
+                <div class="death-save-icons" role="group" aria-label="Death save successes">
                   {#each [1, 2, 3] as value}
                     <button
                       type="button"
@@ -1577,10 +1822,7 @@
                     ></button>
                   {/each}
                 </div>
-              </div>
-              <div class="death-save-row failure">
-                <span>Failures</span>
-                <div class="death-save-icons">
+                <div class="death-save-icons" role="group" aria-label="Death save failures">
                   {#each [1, 2, 3] as value}
                     <button
                       type="button"
@@ -1626,7 +1868,7 @@
                   </span>
                   <span class="modifier-line">
                     Mod: {abilityModifier(abilityScores[key])}
-                    <button type="button" class="dice-icon-button small" aria-label={`Roll ${key.toUpperCase()} ability check`} title={`Roll ${key.toUpperCase()} ability check`} onclick={() => rollAbilityCheck(key)}>
+                    <button type="button" class="dice-icon-button small" aria-label={`Roll ${key.toUpperCase()} ability check`} title={`Roll ${key.toUpperCase()} ability check`} onclick={() => askRoll(`${key.toUpperCase()} Ability Check`, abilityCheckCandidates(key), (choices) => rollAbilityCheck(key, choices), key)}>
                       <img src={d20Icon} alt="" />
                     </button>
                   </span>
@@ -1702,7 +1944,7 @@
                 <span>{signed(item.toHitBonus)}</span>
                 <span>{damageSummary(item)}</span>
                 <span>{item.notes || '-'}</span>
-                <button type="button" class="compact-button dice-button" onclick={() => rollBattleAction(item)}>
+                <button type="button" class="compact-button dice-button" onclick={() => askAttackRoll(item)}>
                   <img src={d20Icon} alt="" />
                   Roll
                 </button>
@@ -1732,7 +1974,7 @@
             <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
-                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>Roll Damage</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
+                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
               {/each}
             </div>
           </div>
@@ -2140,7 +2382,7 @@
         <div class="panel-head">
           <h2 id="saving-throws-title">Saving Throws</h2>
           <div class="actions">
-            <button type="button" class="compact-button dice-button" onclick={rollAllSavingThrows}>
+            <button type="button" class="compact-button dice-button" onclick={() => askBatchRoll('Roll all saving throws', rollAllSavingThrows)}>
               <img src={d20Icon} alt="" />
               Roll All Saves
             </button>
@@ -2159,7 +2401,7 @@
                 <b>{signed(savingThrowTotal(key))}</b>
               </label>
               <button type="button" class="formula-help-button" title={helpTitle(savingThrowFormula(key))} aria-label={`${key.toUpperCase()} saving throw breakdown`} onclick={() => openFormulaHelp(`${key.toUpperCase()} Saving Throw`, savingThrowFormula(key))}>?</button>
-              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => rollSingleSavingThrow(key)}>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => askRoll(`${key.toUpperCase()} Saving Throw`, saveCandidates(key), (choices) => rollSingleSavingThrow(key, choices), key)}>
                 <img src={d20Icon} alt="" />
               </button>
             </div>
@@ -2178,7 +2420,7 @@
         <div class="panel-head">
           <h2 id="skill-checks-title">Skill Checks</h2>
           <div class="actions">
-            <button type="button" class="compact-button dice-button" onclick={rollAllSkillChecks}>
+            <button type="button" class="compact-button dice-button" onclick={() => askBatchRoll('Roll all skill checks', rollAllSkillChecks)}>
               <img src={d20Icon} alt="" />
               Roll All Skills
             </button>
@@ -2197,7 +2439,7 @@
                 <b>{signed(skillCheckTotal(skill))}</b>
               </label>
               <button type="button" class="formula-help-button" title={helpTitle(skillCheckFormula(skill))} aria-label={`${skill.name} breakdown`} onclick={() => openFormulaHelp(skill.name, skillCheckFormula(skill))}>?</button>
-              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => rollSingleSkillCheck(skill)}>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => askRoll(skill.name, skillCandidates(skill), (choices) => rollSingleSkillCheck(skill, choices), skill.ability)}>
                 <img src={d20Icon} alt="" />
               </button>
             </div>
@@ -2355,6 +2597,16 @@
         {/if}
       </div>
     </div>
+  {/if}
+
+  {#if rollOptions}
+    <RollOptionsModal
+      title={rollOptions.title}
+      advantage={rollOptions.advantage}
+      damageDice={rollOptions.damageDice}
+      onroll={submitRollOptions}
+      oncancel={() => (rollOptions = null)}
+    />
   {/if}
 
   {#if rollResult}

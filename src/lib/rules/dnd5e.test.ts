@@ -9,6 +9,7 @@ import {
   proficiencyBonus,
   resolveCritThreshold,
   resolveD20Outcomes,
+  resolveDeathSave,
   resolveDicePool,
   resolveExtraDiceRolls,
   resolveModifierNumericValue,
@@ -395,9 +396,9 @@ describe('D&D 5e helpers', () => {
     };
     const ctx = (casterLevel: number) => ({ castAtSlotLevel: 0, casterLevel, modifierSources: [] });
     expect(resolveSpellDamage(fireBolt, ctx(1)).diceExpression).toBe('1d10');
-    expect(resolveSpellDamage(fireBolt, ctx(5)).diceExpression).toBe('1d10 + 1d10');
-    expect(resolveSpellDamage(fireBolt, ctx(11)).diceExpression).toBe('1d10 + 1d10 + 1d10');
-    expect(resolveSpellDamage(fireBolt, ctx(17)).diceExpression).toBe('1d10 + 1d10 + 1d10 + 1d10');
+    expect(resolveSpellDamage(fireBolt, ctx(5)).diceExpression).toBe('2d10');
+    expect(resolveSpellDamage(fireBolt, ctx(11)).diceExpression).toBe('3d10');
+    expect(resolveSpellDamage(fireBolt, ctx(17)).diceExpression).toBe('4d10');
   });
 
   it('scales a leveled spell by slot levels cast above its minimum (upcasting), per vtt-phase-3-magic-spec.md', () => {
@@ -408,7 +409,7 @@ describe('D&D 5e helpers', () => {
     };
     const ctx = (castAtSlotLevel: number) => ({ castAtSlotLevel, casterLevel: 5, modifierSources: [] });
     expect(resolveSpellDamage(fireball, ctx(3)).diceExpression).toBe('8d6');
-    expect(resolveSpellDamage(fireball, ctx(5)).diceExpression).toBe('8d6 + 1d6 + 1d6');
+    expect(resolveSpellDamage(fireball, ctx(5)).diceExpression).toBe('10d6');
     expect(resolveSpellDamage(fireball, ctx(3)).saveAbility).toBe('dex');
     expect(resolveSpellDamage(fireball, ctx(3)).saveEffect).toBe('half');
   });
@@ -430,7 +431,7 @@ describe('D&D 5e helpers', () => {
       ]
     };
     const profile = resolveSpellDamage(sleep, { castAtSlotLevel: 1, casterLevel: 5, modifierSources: [doublingItem] });
-    expect(profile.diceExpression).toBe('5d8 + 5d8');
+    expect(profile.diceExpression).toBe('10d8');
     expect(profile.flatBonuses).toEqual([{ label: 'Somnolent Rod', value: 3 }]);
   });
 });
@@ -637,6 +638,31 @@ describe('rollWithModifiers flatModifiersIncluded', () => {
     const rollDie = () => 10;
     expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie).total).toBe(17);
     expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie, { flatModifiersIncluded: true }).total).toBe(15);
+  });
+});
+
+describe('resolveDeathSave', () => {
+  it('counts a total of 10 as a success', () => {
+    expect(resolveDeathSave(10, 10, 0, 0)).toEqual({ successes: 1, failures: 0, kind: 'success', regainHp: false });
+  });
+  it('counts a total of 9 as a failure', () => {
+    expect(resolveDeathSave(9, 9, 1, 1)).toEqual({ successes: 1, failures: 2, kind: 'failure', regainHp: false });
+  });
+  it('compares the TOTAL, so bonuses count: natural 8 + 3 = 11 is a success', () => {
+    expect(resolveDeathSave(8, 11, 0, 0).kind).toBe('success');
+    expect(resolveDeathSave(8, 5, 0, 0).kind).toBe('failure');
+  });
+  it('counts a natural 1 as two failures even with bonuses', () => {
+    expect(resolveDeathSave(1, 12, 0, 0)).toEqual({ successes: 0, failures: 2, kind: 'critical_failure', regainHp: false });
+  });
+  it('resets both counters and regains 1 HP on a natural 20, whatever the total', () => {
+    expect(resolveDeathSave(20, 20, 2, 2)).toEqual({ successes: 0, failures: 0, kind: 'revived', regainHp: true });
+    expect(resolveDeathSave(20, 18, 1, 1).kind).toBe('revived');
+  });
+  it('caps at 3 rather than blocking the roll', () => {
+    expect(resolveDeathSave(15, 15, 3, 0).successes).toBe(3);
+    expect(resolveDeathSave(1, 1, 0, 2).failures).toBe(3);
+    expect(resolveDeathSave(5, 5, 0, 3).failures).toBe(3);
   });
 });
 

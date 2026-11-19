@@ -1495,27 +1495,49 @@ input.hit-dice-pool-input {
   text-align: center;
 }
 
+/* One compact block, left to right: two-line label, d20 roll button, then the icons stacked in
+   two rows (successes on top, failures underneath). */
 .death-save-grid {
   grid-column: 1 / 3;
   grid-row: 3;
-  display: grid;
-  gap: 7px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   align-self: end;
 }
 
-.death-save-row {
+.death-save-label {
   display: grid;
-  grid-template-columns: 76px max-content;
-  gap: 12px;
-  align-items: center;
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
+  line-height: 1.15;
+}
+
+button.death-save-roll {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-dark);
+}
+
+button.death-save-roll img {
+  width: 18px;
+  height: 18px;
+}
+
+.death-save-rows {
+  display: grid;
+  gap: 4px;
 }
 
 .death-save-icons {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 
 button.death-save-icon {
@@ -2020,6 +2042,85 @@ button.death-save-icon.failure.active {
   color: var(--muted);
   font-size: 13px;
   font-weight: 900;
+}
+
+/* Shared pre-roll options panel (RollOptionsModal.svelte). Tap targets are 44px or more. */
+.roll-options {
+  width: min(420px, 100%);
+}
+
+.roll-options-section {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel-dark);
+}
+
+.roll-options-section h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.roll-options-section p {
+  margin: 0;
+}
+
+.roll-options-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  font-size: 14px;
+}
+
+.roll-options-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.roll-options-row > span {
+  min-width: 100px;
+}
+
+.roll-options-row button {
+  width: 44px;
+  min-height: 44px;
+  padding: 0;
+  font-size: 20px;
+}
+
+.roll-options-row strong {
+  min-width: 28px;
+  text-align: center;
+}
+
+.roll-options-readout {
+  font-weight: 800;
+}
+
+.roll-options-manual {
+  margin-left: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
+.roll-options-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.roll-options-actions button {
+  min-width: 96px;
+  min-height: 44px;
 }
 
 .roll-result {

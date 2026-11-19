@@ -86,6 +86,9 @@ export type ActiveCharacterEffect = {
   isCondition: boolean;
   isSelectable: boolean;
   remainingRounds: number | null;
+  // content_key of the Container this source came from (e.g. 'condition:condition_poisoned'),
+  // used to avoid counting the same condition twice (sheet + token). Absent on legacy sources.
+  containerKey?: string;
   modifiers: EffectModifier[];
 };
 

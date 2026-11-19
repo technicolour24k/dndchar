@@ -2,6 +2,7 @@
 import { filterTokenForPlayer } from '../store.js';
 import { TARGET_WINDOW_MS } from './target.js';
 import { pickRandomCreatureSoundFile, creatureSoundUrl } from '../creatureSoundLibrary.js';
+import { postRollLog } from './dice.js';
 
 // Must match the fallback in src/routes/vtt/api/log/+server.ts - see that
 // file's comment for why this is a shared-secret header rather than a normal
@@ -24,6 +25,59 @@ function logCombatLine(context, session, message, details) {
   }).catch((err) => console.error('[VTT] combat log write failed', err));
 }
 
+// The client sends back the d20 pool the server rolled (attackPool from the roll endpoints). It is
+// only used to word the logs, so it is validated hard: anything odd and it is dropped, and the log
+// falls back to the plain to-hit text. Never trusted for anything mechanical.
+function validatePool(pool) {
+  if (!pool || typeof pool !== 'object') return null;
+  const { size, net, rolls, kept, manualAdvantage, manualDisadvantage } = pool;
+  if (!Number.isInteger(size) || size < 1 || size > 11) return null;
+  if (!Array.isArray(rolls) || rolls.length !== size) return null;
+  if (!rolls.every((roll) => Number.isInteger(roll) && roll >= 1 && roll <= 20)) return null;
+  if (!Number.isInteger(kept) || !rolls.includes(kept)) return null;
+  if (!Number.isInteger(net) || Math.abs(net) !== size - 1) return null;
+  if (!Number.isInteger(manualAdvantage) || manualAdvantage < 0 || manualAdvantage > 5) return null;
+  if (!Number.isInteger(manualDisadvantage) || manualDisadvantage < 0 || manualDisadvantage > 5) return null;
+  return { size, net, rolls: [...rolls], kept, manualAdvantage, manualDisadvantage };
+}
+
+// JS twin of poolSummary() in src/lib/rules/attackRoll.ts - keep the wording in step. Empty for a
+// plain single die with no manual points.
+function poolSummaryText(pool) {
+  const manual = [
+    pool.manualAdvantage ? `manual +${pool.manualAdvantage} adv` : '',
+    pool.manualDisadvantage ? `manual +${pool.manualDisadvantage} dis` : '',
+  ].filter(Boolean);
+  if (pool.size <= 1 && manual.length === 0) return '';
+  const base = pool.size <= 1 ? '1d20 flat' : `${pool.size}d20 ${pool.net > 0 ? 'adv' : 'dis'} x${Math.abs(pool.net)}, keeps ${pool.kept}`;
+  return manual.length ? `${base}; ${manual.join(', ')}` : base;
+}
+
+// The " (21: 3d20 adv x2, keeps 17)" part of an attack's combat-log line. Without a (valid) pool,
+// or for a plain single die, this is the old text: " (21)" or " (natural 1)". A natural 1 never
+// shows the total (e.g. "(25)" on a fumble would read as "AC is above 25"). AC is never used here.
+export function formatAttackRollText(outcome, toHit, pool) {
+  const valid = validatePool(pool);
+  const summary = valid ? poolSummaryText(valid) : '';
+  const total = typeof toHit === 'number' && Number.isFinite(toHit) ? toHit : null;
+  const lead = outcome === 'critical_miss' ? 'natural 1' : total !== null ? String(total) : '';
+  if (!summary) return lead ? ` (${lead})` : '';
+  return ` (${lead ? `${lead}: ` : ''}${summary})`;
+}
+
+// INTERIM: clamps the client-sent manual damage-dice delta to a whole number in -5..5 (anything
+// else is 0). Done once at the top of each handler so the stored log details always match the text.
+function clampManualDamage(value) {
+  return Number.isInteger(value) ? Math.max(-5, Math.min(5, value)) : 0;
+}
+
+// INTERIM: the manual damage-dice delta, appended after the damage in hit/crit and spell lines.
+// Only the server-returned (already clamped) value is meaningful; anything else is ignored.
+export function formatManualDamageText(delta) {
+  if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 5) return '';
+  return ` (manual ${delta > 0 ? '+' : ''}${delta} damage ${Math.abs(delta) === 1 ? 'die' : 'dice'})`;
+}
+
 // Flavor-text pools for the combat log, picked at random each time so it
 // doesn't read as a flat, repetitive damage ticker. {attacker}/{target} are
 // always token names; {damage}/{damageType} only apply to the critical-hit
@@ -42,10 +96,10 @@ const MISS_PHRASES = [
 ];
 
 const CRITICAL_HIT_PHRASES = [
-  "[Critical] {attacker}'s attack{roll} strikes true! Dealing {damage} {damageType}damage!",
-  "[Critical] {attacker} strikes{roll} just between the folds of {target}'s armour, dealing {damage} {damageType}damage!",
-  '[Critical] A devastating blow{roll} from {attacker} tears into {target} for {damage} {damageType}damage!',
-  '[Critical] {attacker} finds the perfect opening, striking{roll} {target} for a brutal {damage} {damageType}damage!',
+  "[Critical] {attacker}'s attack{roll} strikes true! Dealing {damage} {damageType}damage{manual}!",
+  "[Critical] {attacker} strikes{roll} just between the folds of {target}'s armour, dealing {damage} {damageType}damage{manual}!",
+  '[Critical] A devastating blow{roll} from {attacker} tears into {target} for {damage} {damageType}damage{manual}!',
+  '[Critical] {attacker} finds the perfect opening, striking{roll} {target} for a brutal {damage} {damageType}damage{manual}!',
 ];
 
 function pickLine(pool, vars) {
@@ -551,6 +605,7 @@ function handleTokenEvent(meta, msg, context) {
       if (meta.role !== 'gm' && !targetWindowOk) return;
 
       const toHit = Number(msg.toHit) || 0;
+      const manualDamageDice = clampManualDamage(msg.manualDamageDice); // INTERIM
       const damage = Math.max(0, Number(msg.damage) || 0);
       const outcome = msg.outcome || null; // 'critical_hit' | 'critical_miss' | null
       const ac = typeof target.ac === 'number' ? target.ac
@@ -645,8 +700,10 @@ function handleTokenEvent(meta, msg, context) {
         // "(natural 1)" rather than the total, since e.g. "(25)" on a fumble
         // would read as "AC is above 25".
         const toHitTotal = typeof msg.toHit === 'number' && Number.isFinite(msg.toHit) ? msg.toHit : null;
-        const rollText = outcome === 'critical_miss' ? ' (natural 1)'
-          : toHitTotal !== null ? ` (${toHitTotal})` : '';
+        const pool = validatePool(msg.pool);
+        const rollText = formatAttackRollText(outcome, toHitTotal, pool);
+        const manualText = formatManualDamageText(manualDamageDice);
+        const logDetails = { pool, manualDamageDice };
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const targetName = target.name || 'something';
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
@@ -654,15 +711,35 @@ function handleTokenEvent(meta, msg, context) {
         if (!hit) {
           logCombatLine(context, session,
             pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName, roll: rollText }),
-            { kind: 'attack', outcome: 'miss', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
+            { ...logDetails, kind: 'attack', outcome: 'miss', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
         } else if (outcome === 'critical_hit') {
           logCombatLine(context, session,
-            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText, roll: rollText }),
-            { kind: 'attack', outcome: 'critical', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText, roll: rollText, manual: manualText }),
+            { ...logDetails, kind: 'attack', outcome: 'critical', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         } else {
           logCombatLine(context, session,
-            `${attackerName} hits${rollText} ${targetName} for ${damage} ${damageTypeText}damage.`,
-            { kind: 'attack', outcome: 'hit', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            `${attackerName} hits${rollText} ${targetName} for ${damage} ${damageTypeText}damage${manualText}.`,
+            { ...logDetails, kind: 'attack', outcome: 'hit', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+        }
+      }
+
+      // One PUBLIC roll-log line per VTT attack, whether or not an encounter is running (the
+      // combat log above only exists during combat). Dice only: no to-hit bonus breakdown and no
+      // hit/miss. A natural 1 says so instead of showing the total, for the same reason as above.
+      {
+        const toHitForLog = typeof msg.toHit === 'number' && Number.isFinite(msg.toHit) ? msg.toHit : null;
+        if (toHitForLog !== null) {
+          const pool = validatePool(msg.pool);
+          const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
+          const title = msg.title || 'an attack';
+          const poolPart = pool ? poolSummaryText(pool) : '';
+          const rolled = outcome === 'critical_miss' ? 'a natural 1' : String(toHitForLog);
+          postRollLog(
+            context, meta.sessionId,
+            `${attackerName} rolled ${rolled} to hit ${target.name || 'something'} with ${title}${poolPart ? ` (${poolPart})` : ''}.`,
+            { label: `${title} to hit`, pool, breakdown: pool ? `d20 [${pool.rolls.join(', ')}], kept ${pool.kept}` : undefined },
+            'public'
+          );
         }
       }
       break;
@@ -687,6 +764,8 @@ function handleTokenEvent(meta, msg, context) {
         && meta.lastTargetTokenIds.includes(target.id)
         && Date.now() - (meta.lastTargetAt || 0) < TARGET_WINDOW_MS;
       if (meta.role !== 'gm' && !targetWindowOk) return;
+
+      const manualDamageDice = clampManualDamage(msg.manualDamageDice); // INTERIM
 
       // Heal (Phase 8) - always lands (no save/attack layer), adds instead of
       // subtracts, and caps at maxHp instead of flooring at 0. Mirrors the
@@ -720,8 +799,8 @@ function handleTokenEvent(meta, msg, context) {
 
         const healerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         logCombatLine(context, session,
-          `${healerName} uses ${msg.title || 'a heal'} — ${target.name || 'something'} recovers ${reportedAmount} HP.`,
-          { kind: 'heal', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: reportedAmount, title: msg.title || null });
+          `${healerName} uses ${msg.title || 'a heal'} — ${target.name || 'something'} recovers ${reportedAmount} HP${formatManualDamageText(manualDamageDice)}.`,
+          { kind: 'heal', manualDamageDice, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: reportedAmount, title: msg.title || null });
 
         broadcastCreatureSound(context, session, meta.sessionId, msg.sourceTokenId);
         break;
@@ -765,8 +844,8 @@ function handleTokenEvent(meta, msg, context) {
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
         const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         logCombatLine(context, session,
-          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage.`,
-          { kind: 'spell', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage${formatManualDamageText(manualDamageDice)}.`,
+          { kind: 'spell', manualDamageDice, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
       }
       // Creature attack cue - casting the spell is the attack, so this fires
       // regardless of whether the save negated all damage (same rationale as

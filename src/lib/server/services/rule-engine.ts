@@ -18,6 +18,7 @@ type ModifierRow = {
   condition_expression: string;
   priority: number;
   runtime_supported: boolean;
+  container_key: string | null;
 };
 
 export async function resolveCharacterModifierSources(characterId: string): Promise<{
@@ -37,7 +38,8 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
         COALESCE(modifier.default_value_expression, '') AS default_value_expression,
         COALESCE(link.value_override_expression, '') AS value_override_expression,
         COALESCE(link.condition_expression, '') AS condition_expression, link.priority,
-        COALESCE(hook.runtime_supported, false) AS runtime_supported
+        COALESCE(hook.runtime_supported, false) AS runtime_supported,
+        container.content_key AS container_key
       FROM active_character_effects active
       JOIN content_definitions container ON container.id = active.container_id
       JOIN content_modifier_links link ON link.content_id = container.id
@@ -53,7 +55,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
         modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
       FROM active_character_effects active
       JOIN effect_definitions effect ON effect.id = active.effect_id
       JOIN effect_modifier_links link ON link.effect_id = effect.id
@@ -67,7 +69,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
         link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
       FROM character_content_instances instance
       JOIN content_definitions content ON content.id = instance.content_id
       JOIN content_modifier_links link ON link.content_id = content.id
@@ -84,7 +86,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
         modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
       FROM character_inventory_items inventory
       JOIN content_modifier_links link ON link.content_id = inventory.source_content_id
       JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
@@ -101,7 +103,7 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
         link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false)
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
       FROM character_inventory_items inventory
       JOIN content_grants grant_link ON grant_link.source_content_id = inventory.source_content_id
       JOIN content_definitions granted ON granted.id = grant_link.granted_content_id
@@ -124,7 +126,8 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
       id: key,
       effectId: '', effectKey: key, name: row.source_name, sourceType: row.source_type,
       sourceName: row.source_name, description: row.source_description, durationType: 'while_applicable',
-      requiresConcentration: false, isCondition: false, isSelectable: false, remainingRounds: null, modifiers: []
+      requiresConcentration: false, isCondition: false, isSelectable: false, remainingRounds: null, modifiers: [],
+      containerKey: row.container_key ?? undefined
     };
     source.modifiers.push(mapModifier(row));
     grouped.set(key, source);

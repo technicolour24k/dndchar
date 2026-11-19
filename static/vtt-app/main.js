@@ -1250,7 +1250,7 @@ document.getElementById('actionTargetCancelBtn').addEventListener('click', disar
 // ---------------------------------------------------------------------------
 const attackModal = document.getElementById('attackModal');
 const attackModalBody = document.getElementById('attackModalBody');
-let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName }
+let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName, options, stage }
 
 function closeAttackModal() {
   attackModal.classList.remove('visible');
@@ -1271,12 +1271,216 @@ function closeAttackModal() {
   pendingAttack = null;
 }
 
+// ---------------------------------------------------------------------------
+// Advantage / disadvantage panel + manual damage dice, on the confirm card.
+//
+// The SERVER does all the real work (it recomputes every source and rolls the dice pool). This
+// side only shows a preview of the sources, lets the user untick sources and set the manual
+// situational counters, and sends those CHOICES back with the roll. The live "Net" readout here is
+// display-only; the server's result is the authority.
+//
+// INTERIM: the "Damage dice" control is a manual per-roll stopgap until proper modifiers handle
+// extra damage dice. It is not part of the modifier model (see the vtt-combat-mechanics plan).
+// ---------------------------------------------------------------------------
+function newAttackOptions(action, intent) {
+  const isSpell = action.kind === 'spell';
+  const skipsPreview = intent === 'heal' || action.kind === 'item';
+  // Whether the advantage panel is shown: never for heals/items; manual spells only when they
+  // are attack-resolution; character spells start unknown ('maybe') until the preview decides.
+  let showAdvantage = true;
+  if (skipsPreview) showAdvantage = false;
+  else if (isSpell && action.manual && action.resolution !== 'attack') showAdvantage = false;
+  return {
+    showAdvantage,
+    // 'loading' | 'ready' | 'failed' | 'skipped'
+    status: skipsPreview ? 'skipped' : 'loading',
+    sources: [],          // non-situational sources from the preview
+    disabled: new Set(),  // ids the user unticked
+    adv: 0,               // situational advantage counter, 0-5
+    dis: 0,               // situational disadvantage counter, 0-5
+    damageDelta: 0,       // INTERIM: manual damage-dice delta, -5..+5
+    primaryDamageDice: '',
+  };
+}
+
+function advSourceLabel(source) {
+  const suffix = { attacker: '', target: ' (target)', attacker_condition: " (attacker's condition)", target_condition: " (target's condition)", situational: ' (manual)' }[source.origin] || '';
+  return `${source.kind === 'advantage' ? '+1 Advantage' : '+1 Disadvantage'}: ${source.label}${suffix}`;
+}
+
+// Display-only twin of mergeDiceTerms (src/lib/rules/dnd5e.ts): combines like dice terms, so
+// "1d10 + 1d10" reads as "2d10". Keep in step with the TypeScript version.
+function mergeDiceTermsJs(expression) {
+  const parts = String(expression || '').split('+').map((p) => p.trim()).filter(Boolean);
+  const parsed = parts.map((p) => p.match(/^(\d*)d(\d+)$/i));
+  if (!parsed.some((m) => m)) return String(expression || '');
+  const counts = new Map();
+  parsed.forEach((m) => { if (m) counts.set(Number(m[2]), (counts.get(Number(m[2])) || 0) + Math.max(1, Number(m[1]) || 1)); });
+  const emitted = new Set();
+  return parts.map((p, i) => {
+    const m = parsed[i];
+    if (!m) return p;
+    const sides = Number(m[2]);
+    if (emitted.has(sides)) return '';
+    emitted.add(sides);
+    return `${counts.get(sides)}d${sides}`;
+  }).filter(Boolean).join(' + ');
+}
+
+// Display-only twin of the server's adjustPrimaryDamageDice (src/lib/rules/attackRoll.ts): shows
+// "2d6 -> 3d6". The server's result is what actually applies.
+function previewPrimaryDice(expression, delta) {
+  const parts = String(expression || '').split('+').map((p) => p.trim()).filter(Boolean);
+  const parsed = parts.map((p) => p.match(/^(\d*)d(\d+)$/i));
+  const first = parsed.findIndex((m) => m);
+  if (first === -1 || !delta) return '';
+  const sides = Number(parsed[first][2]);
+  let total = 0;
+  parsed.forEach((m) => { if (m && Number(m[2]) === sides) total += Math.max(1, Number(m[1]) || 1); });
+  const count = Math.max(1, total + delta);
+  const rebuilt = parts.map((p, i) => {
+    const m = parsed[i];
+    if (!m || Number(m[2]) !== sides) return p;
+    return i === first ? `${count}d${sides}` : '';
+  }).filter(Boolean).join(' + ');
+  return `${mergeDiceTermsJs(parts.join(' + '))} \u2192 ${mergeDiceTermsJs(rebuilt)}`;
+}
+
+function advReadoutText(options) {
+  const ticked = options.sources.filter((src) => !options.disabled.has(src.id));
+  const adv = ticked.filter((src) => src.kind === 'advantage').length + options.adv;
+  const dis = ticked.filter((src) => src.kind === 'disadvantage').length + options.dis;
+  if (adv === 0 && dis === 0) return 'Flat roll';
+  const net = adv - dis;
+  const counts = `(${adv} adv, ${dis} dis)`;
+  if (net === 0) return `Net 0 ${counts}: flat roll`;
+  return `Net ${net > 0 ? '+' : ''}${net} ${counts}: roll ${1 + Math.abs(net)}d20, keep ${net > 0 ? 'highest' : 'lowest'}`;
+}
+
+function counterRowHtml(label, kind, value) {
+  return `
+    <div class="adv-row">
+      <span class="adv-row-label">${label}</span>
+      <button type="button" class="secondary adv-step" data-adv-kind="${kind}" data-adv-step="-1" aria-label="Fewer ${label.toLowerCase()}">-</button>
+      <span class="adv-value" data-adv-value="${kind}">${value}</span>
+      <button type="button" class="secondary adv-step" data-adv-kind="${kind}" data-adv-step="1" aria-label="More ${label.toLowerCase()}">+</button>
+    </div>`;
+}
+
+function advancedOptionsHtml(options) {
+  const advPanel = options.showAdvantage ? `
+    <div class="adv-panel" id="advPanel">
+      <h4>Advantage</h4>
+      <div id="advStatus" class="attack-subtext"></div>
+      <div id="advSources"></div>
+      ${counterRowHtml('Advantage', 'adv', options.adv)}
+      ${counterRowHtml('Disadvantage', 'dis', options.dis)}
+      <div class="attack-subtext">Each point counts as one source. Advantage and disadvantage cancel one for one.</div>
+      <div class="adv-readout" id="advReadout"></div>
+    </div>` : '';
+  const dmgPanel = `
+    <div class="adv-panel" id="dmgPanel">
+      <h4>Damage dice <span class="adv-manual">manual</span></h4>
+      <div class="adv-row">
+        <span class="adv-row-label">Dice</span>
+        <button type="button" class="secondary adv-step" data-adv-kind="dmg" data-adv-step="-1" aria-label="Fewer damage dice">-</button>
+        <span class="adv-value" data-adv-value="dmg">0</span>
+        <button type="button" class="secondary adv-step" data-adv-kind="dmg" data-adv-step="1" aria-label="More damage dice">+</button>
+      </div>
+      <div class="attack-subtext" id="dmgPreview"></div>
+    </div>`;
+  return advPanel + dmgPanel;
+}
+
+// Repaints the parts of the panel that depend on state (not the whole card, so focus is kept).
+function refreshAdvantagePanel() {
+  const options = pendingAttack?.options;
+  if (!options || pendingAttack.stage !== 'confirm') return;
+  const statusEl = document.getElementById('advStatus');
+  if (statusEl) {
+    statusEl.textContent = options.status === 'loading' ? 'Checking advantage\u2026'
+      : options.status === 'failed' ? "Couldn't check modifiers, the roll will still apply them" : '';
+  }
+  const sourcesEl = document.getElementById('advSources');
+  // Only rebuild the tick boxes when the source list itself changed (the preview arriving). Tick
+  // and counter changes just update the readout, so a focused checkbox keeps its focus.
+  const sourcesKey = options.sources.map((src) => src.id).join('|');
+  if (sourcesEl && sourcesEl.dataset.renderedKey !== sourcesKey) {
+    sourcesEl.dataset.renderedKey = sourcesKey;
+    sourcesEl.innerHTML = options.sources.map((src) => `
+      <label class="adv-source"><input type="checkbox" class="advSourceCheckbox" data-source-id="${escapeHtml(src.id)}" ${options.disabled.has(src.id) ? '' : 'checked'} /> ${escapeHtml(advSourceLabel(src))}</label>`).join('');
+  }
+  const readout = document.getElementById('advReadout');
+  if (readout) readout.textContent = advReadoutText(options);
+  for (const kind of ['adv', 'dis']) {
+    const el = document.querySelector(`[data-adv-value="${kind}"]`);
+    if (el) el.textContent = String(options[kind]);
+  }
+  const dmgValue = document.querySelector('[data-adv-value="dmg"]');
+  if (dmgValue) dmgValue.textContent = options.damageDelta > 0 ? `+${options.damageDelta}` : String(options.damageDelta);
+  const dmgPreview = document.getElementById('dmgPreview');
+  if (dmgPreview) dmgPreview.textContent = previewPrimaryDice(options.primaryDamageDice, options.damageDelta);
+  const advPanel = document.getElementById('advPanel');
+  if (advPanel && !options.showAdvantage) advPanel.remove();
+}
+
+// One delegated listener for the whole panel (the modal body is rebuilt as the flow moves on).
+attackModalBody.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-adv-kind]');
+  const options = pendingAttack?.options;
+  if (!button || !options || pendingAttack.stage !== 'confirm') return;
+  const step = Number(button.dataset.advStep);
+  const kind = button.dataset.advKind;
+  if (kind === 'dmg') options.damageDelta = Math.max(-5, Math.min(5, options.damageDelta + step));
+  else options[kind] = Math.max(0, Math.min(5, options[kind] + step));
+  refreshAdvantagePanel();
+});
+attackModalBody.addEventListener('change', (event) => {
+  const box = event.target.closest('.advSourceCheckbox');
+  const options = pendingAttack?.options;
+  if (!box || !options || pendingAttack.stage !== 'confirm') return;
+  if (box.checked) options.disabled.delete(box.dataset.sourceId);
+  else options.disabled.add(box.dataset.sourceId);
+  refreshAdvantagePanel();
+});
+
+// The choices sent with every roll/preview request. The server recomputes every source itself;
+// this is only what the user chose.
+function attackRollExtras(sourceTokenId, targetId, options, preview) {
+  return {
+    ...(preview ? { preview: true } : {}),
+    vtt: { sessionId, sourceTokenId, targetTokenId: targetId },
+    advantage: { disabled: [...options.disabled], situationalAdvantage: options.adv, situationalDisadvantage: options.dis },
+    manualDamageDice: options.damageDelta, // INTERIM
+  };
+}
+
+// Asks the server (same endpoint as the roll, preview mode: nothing is rolled or spent) which
+// sources apply. Never blocks the confirm button; a failure just leaves the counters.
+async function loadAttackPreview(pending) {
+  const { sourceTokenId, action, targetId, options } = pending;
+  try {
+    const preview = await rollPendingAction(action, session.tokens[sourceTokenId], attackRollExtras(sourceTokenId, targetId, options, true));
+    if (pendingAttack !== pending) return; // stale: the card was closed or replaced
+    options.status = 'ready';
+    options.primaryDamageDice = preview.primaryDamageDice || '';
+    if (preview.usesAttackRoll === false) options.showAdvantage = false;
+    options.sources = (preview.sources || []).filter((src) => src.origin !== 'situational');
+  } catch (err) {
+    if (pendingAttack !== pending) return;
+    console.warn('[VTT] advantage preview failed', err);
+    options.status = 'failed';
+  }
+  refreshAdvantagePanel();
+}
+
 // Step 2 -> 3: a target was clicked; show the confirm card with an explicit Attack/Cast button.
 // The chosen target gets ringed for everyone (target:select) as immediate visible feedback.
 function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   const isSpell = action.kind === 'spell';
   const isHeal = intent === 'heal';
-  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name };
+  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name, options: newAttackOptions(action, intent), stage: 'confirm' };
+  const pending = pendingAttack;
   send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
   currentTargetTokenIds = [target.id];
   render();
@@ -1285,6 +1489,7 @@ function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   attackModalBody.innerHTML = `
     <h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2>
     <div class="attack-target-name">${isHeal ? 'Healing' : isSpell ? 'Casting' : 'Attacking'} <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
+    ${advancedOptionsHtml(pending.options)}
     <div class="actions">
       <button type="button" class="secondary" id="attackCancelBtn">Cancel</button>
       <button type="button" id="attackConfirmBtn">${verb}</button>
@@ -1292,7 +1497,11 @@ function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   `;
   attackModal.classList.add('visible');
   document.getElementById('attackCancelBtn').addEventListener('click', closeAttackModal);
-  document.getElementById('attackConfirmBtn').addEventListener('click', resolveAttack);
+  const confirmBtn = document.getElementById('attackConfirmBtn');
+  confirmBtn.addEventListener('click', resolveAttack);
+  confirmBtn.focus(); // Enter confirms, same as the sheet's roll-options panel
+  refreshAdvantagePanel();
+  if (pending.options.status === 'loading') loadAttackPreview(pending);
 }
 
 function attackModalError(message) {
@@ -1309,10 +1518,11 @@ let awaitingSpellResult = null;
 // Rolls the armed action via whichever server endpoint applies: a character's
 // equipped weapon, a GM's manual stat-block attack, or (Phase 3) a character's
 // prepared spell.
-async function rollManualAction(action) {
+async function rollManualAction(action, extraBody = {}) {
   const res = await fetch('/vtt/api/roll-manual', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      ...extraBody,
       name: action.name, toHitBonus: action.toHitBonus,
       damageRolls: action.damageRolls, damageBonus: action.damageBonus,
       damageType: action.damageType,
@@ -1326,14 +1536,16 @@ async function rollManualAction(action) {
   return body;
 }
 
-async function rollPendingAction(action, source) {
+// extraBody carries the advantage choices (and `preview: true` for a preview) into whichever
+// endpoint applies; the item_not_found fallback covers previews too.
+async function rollPendingAction(action, source, extraBody = {}) {
   // Manual stat-block spell: no character/slots behind it, just the numbers on the action.
-  if (action.kind === 'spell' && action.manual) return rollManualAction(action);
+  if (action.kind === 'spell' && action.manual) return rollManualAction(action, extraBody);
 
   if (action.kind === 'spell') {
     const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-spell', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ instanceId: action.instanceId, slotLevel: action.slotLevel }),
+      body: JSON.stringify({ ...extraBody, instanceId: action.instanceId, slotLevel: action.slotLevel }),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
@@ -1343,18 +1555,18 @@ async function rollPendingAction(action, source) {
   if (action.kind === 'item') {
     const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-item', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inventoryId: action.inventoryId }),
+      body: JSON.stringify({ ...extraBody, inventoryId: action.inventoryId }),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
     return body;
   }
 
-  if (!source?.characterId) return rollManualAction(action); // enemy/npc stat-block attack
+  if (!source?.characterId) return rollManualAction(action, extraBody); // enemy/npc stat-block attack
 
   const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ itemName: action.name }),
+    body: JSON.stringify({ ...extraBody, itemName: action.name }),
   });
   const body = await res.json().catch(() => ({}));
   if (res.ok) return body;
@@ -1367,7 +1579,7 @@ async function rollPendingAction(action, source) {
   // stored on the action itself (same as an enemy/npc attack) - loses the
   // sheet's rich advantage/disadvantage-aware roll, but a homebrew extra
   // attack was never going to have that anyway.
-  if (body.error === 'item_not_found') return rollManualAction(action);
+  if (body.error === 'item_not_found') return rollManualAction(action, extraBody);
 
   // Any other reason (not_found, missing_item) is a real failure - surface
   // the server's actual reason rather than just a bare status code.
@@ -1399,7 +1611,8 @@ function deductLocalSpellSlot(tokenId, level) {
 // total; spell:resolve for save/auto spells, see renderSpellResolutionControls).
 async function resolveAttack() {
   if (!pendingAttack) return;
-  const { sourceTokenId, action, intent, targetId, targetName } = pendingAttack;
+  const { sourceTokenId, action, intent, targetId, targetName, options } = pendingAttack;
+  pendingAttack.stage = 'rolling'; // the panel's listeners ignore clicks from here on
   const source = session.tokens[sourceTokenId];
   const isSpell = action.kind === 'spell';
   const isHeal = intent === 'heal';
@@ -1407,7 +1620,7 @@ async function resolveAttack() {
   attackModalBody.innerHTML = `<h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isHeal ? 'Healing with' : isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
   let result;
   try {
-    result = await rollPendingAction(action, source);
+    result = await rollPendingAction(action, source, attackRollExtras(sourceTokenId, targetId, options, false));
   } catch (err) {
     console.error('[VTT] roll failed', err);
     attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
@@ -1451,6 +1664,9 @@ async function resolveAttack() {
       damageType: inferDamageType(action, result),
       damageLabel: result.damageType || null,
       title: result.title || action.name || null,
+      // The server-returned pool and damage delta (not the raw client choices), for the logs.
+      pool: result.attackPool || null,
+      manualDamageDice: result.manualDamageDice || 0, // INTERIM
     });
     return;
   }
@@ -1541,6 +1757,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent =
     damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic',
     damageLabel: result.damageType || null,
     title: result.title || null,
+    manualDamageDice: result.manualDamageDice || 0, // INTERIM: server-returned applied delta
   });
 }
 

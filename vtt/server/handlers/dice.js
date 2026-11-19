@@ -33,7 +33,7 @@ function isValidDiceRequest(dice, results) {
 // fire-and-forget loopback pattern as token.js's logCombatLine - a dropped
 // log write shouldn't block anything, and the live roll:log broadcast on the
 // public path happens inside logRoll itself (see rollLog.ts), not here.
-function postRollLog(context, sessionId, message, details, visibility) {
+export function postRollLog(context, sessionId, message, details, visibility) {
   fetch(`${context.internalApiBaseUrl()}/vtt/api/roll-log`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-vtt-internal-secret': INTERNAL_API_SECRET },
