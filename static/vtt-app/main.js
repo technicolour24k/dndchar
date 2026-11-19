@@ -28,6 +28,9 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
+  // Last sheet vision values the token took (see token:vision:sync). Client-side list only, so
+  // the generic token:stat:update path on the server can't write it.
+  'sheetVision',
 ]);
 
 // Shared cap for the three live log arrays (combat log, roll log, session
@@ -2170,6 +2173,8 @@ characterPickerList.addEventListener('click', async (e) => {
       visionDarkFt: snapshot.vision.darkFt,
       visionTrueFt: snapshot.vision.trueFt,
       visionDevilFt: snapshot.vision.devilFt,
+      // Remembered so later sheet changes can follow compare-and-follow (token:vision:sync).
+      sheetVision: { ...snapshot.vision },
       speedFt: snapshot.speedFt,
       speedRemainingFt: snapshot.speedFt,
       hidden: false,
@@ -2188,17 +2193,15 @@ characterPickerList.addEventListener('click', async (e) => {
 // Character resync - re-pulls a token's source character and pushes any
 // changed reference fields through the existing token:stat:update event, so
 // leveling up / re-equipping mid-session doesn't require removing and
-// re-adding the token. Only syncs fields with NO editable control anywhere in
-// the VTT session (ac, saves, actions, preparedSpells) - not just hp/
-// spellSlots as originally scoped. The first version also synced speedFt/
-// vision*/maxHp, which are each editable by the GM or player during a session
-// (the Speed field, the Darkvision checkbox, the Advanced Vision modal, Max
-// HP) - a sync landing after a GM manually granted a player temporary
-// darkvision (a spell, a potion) would silently revert it back to the
-// sheet's baseline, which is exactly the "reverts to unchecked and 0" bug
-// this was found from. The dividing line is simple: if a human can edit it
-// in the VTT, a sync must never touch it - only genuinely read-only-in-VTT
-// reference data is safe to auto-sync.
+// re-adding the token. The dividing line: if a human can edit it in the VTT, a
+// sync must never overwrite that edit. Fields with NO editable control (saves,
+// actions, preparedSpells) are simply pushed. Vision (darkvision etc.) IS
+// editable (the Darkvision checkbox, the Advanced Vision modal, the Token
+// Manager), so it uses compare-and-follow instead: the token remembers the
+// last sheet values it took in `sheetVision`, and the server (token:vision:sync)
+// only moves a vision field if its current value still equals that remembered
+// value. A hand-edited field is an override and stays put. hp, maxHp, ac and
+// speedFt are never synced - they stay session-authoritative once set.
 //
 // db-traffic-reduction Phase 6: this used to run on a 30s poll for every
 // owned token regardless of whether anything had actually changed. Now it
@@ -2251,13 +2254,10 @@ async function syncOwnedCharacterTokens(onlyCharacterId) {
 }
 
 function applyCharacterSyncFields(token, snapshot) {
-  // hp, maxHp, ac, speedFt, and all four vision fields are deliberately excluded -
-  // each now has an editable control somewhere in the VTT (HP/Max HP/Speed
-  // inputs, the mini-sheet AC input, the Darkvision checkbox, the Advanced
-  // Vision modal) and must stay session-authoritative once set, the same way
-  // hp/spellSlots already are. (ac joined this list when the mini-sheet AC field
-  // became editable - polling it would revert a manual in-session AC change on
-  // the next tick, the same clobber the vision fields hit earlier.)
+  // hp, maxHp, ac and speedFt are deliberately excluded - each has an editable
+  // control in the VTT (HP/Max HP/Speed inputs, the mini-sheet AC input) and
+  // must stay session-authoritative once set, the same way hp/spellSlots
+  // already are. Polling them would revert a manual in-session change.
   const updates = {
     saves: snapshot.saves,
     actions: snapshot.actions,
@@ -2267,6 +2267,21 @@ function applyCharacterSyncFields(token, snapshot) {
     if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
       send({ type: 'token:stat:update', tokenId: token.id, stat, value });
     }
+  }
+  // Vision: let the server decide per field whether it still follows the sheet
+  // (compare-and-follow, see the comment above). Only sent when the sheet's
+  // resolved vision differs from what the token last remembered.
+  // Round/clamp the same way the server does (0-1000 ft), otherwise a fractional
+  // or huge sheet value would never compare equal and re-send on every push.
+  const clampFt = (v) => Math.min(1000, Math.max(0, Math.round(Number(v) || 0)));
+  const vision = snapshot.vision && {
+    normalFt: clampFt(snapshot.vision.normalFt),
+    darkFt: clampFt(snapshot.vision.darkFt),
+    trueFt: clampFt(snapshot.vision.trueFt),
+    devilFt: clampFt(snapshot.vision.devilFt),
+  };
+  if (vision && JSON.stringify(token.sheetVision ?? null) !== JSON.stringify(vision)) {
+    send({ type: 'token:vision:sync', tokenId: token.id, vision });
   }
 }
 
@@ -2280,7 +2295,35 @@ const visionModalNormal = document.getElementById('visionModalNormal');
 const visionModalDark = document.getElementById('visionModalDark');
 const visionModalTrue = document.getElementById('visionModalTrue');
 const visionModalDevil = document.getElementById('visionModalDevil');
+const visionModalUseSheet = document.getElementById('visionModalUseSheet');
+const visionModalHint = document.getElementById('visionModalHint');
 let visionModalTokenId = null;
+
+// Shows the "won't auto-update" hint when any input differs from the sheet value the token
+// last remembered (only for sheet-linked tokens that have one).
+function updateVisionModalHint() {
+  const token = session.tokens[visionModalTokenId];
+  const sheet = token && token.sheetVision;
+  const differs = sheet && (
+    Number(visionModalNormal.value) !== sheet.normalFt ||
+    Number(visionModalDark.value) !== sheet.darkFt ||
+    Number(visionModalTrue.value) !== sheet.trueFt ||
+    Number(visionModalDevil.value) !== sheet.devilFt
+  );
+  visionModalHint.style.display = differs ? '' : 'none';
+}
+[visionModalNormal, visionModalDark, visionModalTrue, visionModalDevil].forEach((input) => input.addEventListener('input', updateVisionModalHint));
+
+// Fills the four inputs from the remembered sheet values. Doesn't save - Save does that.
+visionModalUseSheet.addEventListener('click', () => {
+  const sheet = session.tokens[visionModalTokenId]?.sheetVision;
+  if (!sheet) return;
+  visionModalNormal.value = sheet.normalFt;
+  visionModalDark.value = sheet.darkFt;
+  visionModalTrue.value = sheet.trueFt;
+  visionModalDevil.value = sheet.devilFt;
+  updateVisionModalHint();
+});
 
 function openVisionModal(tokenId) {
   const token = session.tokens[tokenId];
@@ -2290,6 +2333,8 @@ function openVisionModal(tokenId) {
   visionModalDark.value = token.visionDarkFt || 0;
   visionModalTrue.value = token.visionTrueFt || 0;
   visionModalDevil.value = token.visionDevilFt || 0;
+  visionModalUseSheet.disabled = !token.sheetVision;
+  updateVisionModalHint();
   bringModalToFront(visionModal);
   visionModal.classList.add('visible');
 }
@@ -3895,7 +3940,9 @@ tokenManagerList.addEventListener('change', (e) => {
   } else if (e.target.classList.contains('soundFolderSelect')) {
     send({ type: 'token:stat:update', tokenId, stat: 'soundFolder', value: e.target.value || null });
   } else if (e.target.classList.contains('darkvisionToggle')) {
-    send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
+    // On = the sheet's resolved darkvision if it has one, otherwise the usual 60ft.
+    const sheetDark = session.tokens[tokenId]?.sheetVision?.darkFt;
+    send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? (sheetDark > 0 ? sheetDark : 60) : 0 });
   } else if (e.target.classList.contains('speedInput')) {
     const value = Number(e.target.value) || 0;
     send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });

@@ -999,6 +999,19 @@ button.equipment-toggle .item-kind-icon {
   align-items: end;
 }
 
+/* Read-only senses line under the combat summary grid; wraps on narrow screens. */
+.senses-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  font-size: 12px;
+}
+
+.sense-chip {
+  white-space: nowrap;
+}
+
 .combat-stat-pp  { grid-column: 4; grid-row: 1; }
 .combat-stat-pi  { grid-column: 4; grid-row: 2; }
 .combat-stat-piv { grid-column: 4; grid-row: 3; }

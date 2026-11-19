@@ -6,7 +6,7 @@
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
-  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
+  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown } from '$lib/rules/dnd5e';
   import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -427,6 +427,17 @@
       ], stats.spellAttackBonus, statFmt.spellAttackBonus)
     };
   });
+
+  // Senses (vision, darkvision, ...) resolved from modifiers, read-only on the sheet. Each sense
+  // carries its own source-attributed breakdown lines (highest "at least" grant wins, bonuses add).
+  const senses = $derived(visionBreakdown(character.modifierSources, { classes: classRows }));
+  const senseRows = $derived([
+    { label: 'Vision', sense: senses.normalFt, always: true },
+    { label: 'Darkvision', sense: senses.darkFt, always: false },
+    { label: 'Truesight', sense: senses.trueFt, always: false },
+    { label: "Devil's Sight", sense: senses.devilFt, always: false }
+  ].filter((row) => row.always || row.sense.value > 0));
+  const senseHelpLines = $derived(senseRows.flatMap((row) => [`${row.label}:`, ...row.sense.lines.map((line) => `  ${line}`)]));
 
   function openFormulaHelp(title: string, lines: string[]) {
     formulaHelp = { title, lines };
@@ -1591,6 +1602,15 @@
               </span>
               <input type="text" inputmode="numeric" value={statFmt.passiveInvestigation(stats.passiveInvestigation.value)} onchange={(event) => commitStatInput('passiveInvestigation', event)} />
             </label>
+          </div>
+          <div class="senses-line" aria-label="Senses">
+            <span class="field-label-with-help">
+              Senses
+              <button type="button" class="formula-help-button" title={helpTitle(senseHelpLines)} aria-label="Senses breakdown" onclick={() => openFormulaHelp('Senses', senseHelpLines)}>?</button>
+            </span>
+            {#each senseRows as row}
+              <span class="sense-chip">{row.label} {row.sense.value} ft</span>
+            {/each}
           </div>
         </section>
 

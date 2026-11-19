@@ -424,6 +424,64 @@ function handleTokenEvent(meta, msg, context) {
       break;
     }
 
+    // token:vision:sync - pushes the character sheet's resolved vision (darkvision etc.) onto a
+    // token WITHOUT clobbering manual VTT edits. The token remembers the last sheet values it took
+    // in `sheetVision`; a vision field only follows the sheet if its current value still equals
+    // that remembered value. If a human changed it (Darkvision checkbox, Advanced Vision modal,
+    // Token Manager), it's an override and stays put. The remembered value is always updated.
+    // visionTrueFt/visionDevilFt stay out of PLAYER_EDITABLE_FIELDS, so the normal edit controls
+    // can't hand-set truesight. Note this path TRUSTS the client's resolved values (the VTT
+    // server can't fetch the character to check them) - an owner could send made-up numbers
+    // from the console. Accepted gap for a trusted group, same as token:add storing a player's
+    // own PC token verbatim. Gated on canEditToken (owner or GM) plus a linked character.
+    case 'token:vision:sync': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !token.characterId) return;
+      if (!canEditToken(meta, token)) return;
+
+      const incoming = msg.vision;
+      const keys = ['normalFt', 'darkFt', 'trueFt', 'devilFt'];
+      const vision = {};
+      for (const key of keys) {
+        const raw = incoming && (typeof incoming[key] === 'number' || typeof incoming[key] === 'string') ? incoming[key] : NaN;
+        const n = Math.round(Number(raw));
+        if (raw === '' || !Number.isFinite(n) || n < 0 || n > 1000) {
+          meta.ws.send(JSON.stringify({
+            type: 'token:stat:update:error',
+            tokenId: msg.tokenId,
+            stat: 'sheetVision',
+            reason: 'invalid_value',
+          }));
+          return;
+        }
+        vision[key] = n;
+      }
+
+      const fieldFor = { normalFt: 'visionNormalFt', darkFt: 'visionDarkFt', trueFt: 'visionTrueFt', devilFt: 'visionDevilFt' };
+      const previous = token.sheetVision;
+      // A token made before sheetVision existed has no baseline to compare against, so its
+      // fields are never touched (it just starts remembering from now on).
+      if (previous && typeof previous === 'object') {
+        for (const key of keys) {
+          const field = fieldFor[key];
+          if (token[field] === previous[key] && token[field] !== vision[key]) {
+            token[field] = vision[key];
+            broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+              tokenId: token.id, stat: field, value: vision[key],
+            });
+          }
+        }
+      }
+
+      if (JSON.stringify(previous ?? null) !== JSON.stringify(vision)) {
+        token.sheetVision = vision;
+        broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+          tokenId: token.id, stat: 'sheetVision', value: vision,
+        });
+      }
+      break;
+    }
+
     // token:update (Phase 10) - the Token Manager's multi-field edit form,
     // GM-only. Deliberately gated on role alone, not canEditToken - that
     // helper also passes for a token's own owner, which would let a player

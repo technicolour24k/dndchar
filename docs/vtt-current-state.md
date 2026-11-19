@@ -950,3 +950,16 @@ Plan: `vtt-fixes-batch-1`. Not browser-tested at the time of writing (see "Not v
 
 **Not verified:** everything that needs a browser - sidebar focus/draft behaviour, colour-picker popup, pointer/touch backdrop behaviour, glyph rendering, the Known AC modal UI, and the log wording in the three log views.
 
+### 2026-11-19 - VTT batch 2: darkvision
+Plan: `vtt-combat-mechanics` (Item 2). Branch `vttpoc`, not committed at time of writing.
+
+- **`minimum` op ("At least - highest wins (senses only)").** New `ModifierOperation`, registered in `rules-admin.ts`'s `operationRegistry`. Grants never sum, so a racial 60ft plus a 60ft feat is 60ft. Spec row added to `modifier-primacy.md` section 3.1 (user-approved 2026-11-19). Only senses honour it. Migration `031_vision_target_descriptions.sql` fills the blank descriptions on the four `vision.*_ft` targets.
+- **`resolveSense` / `visionBreakdown` (`src/lib/rules/dnd5e.ts`).** Order: last `set` (replaces baseline and minimums), otherwise highest of baseline and every `minimum`; then all `bonus`/`penalty`; floored at 0. Other ops are listed as "Not applied". `visionRadii` is now a thin map over `visionBreakdown`, same signature and return shape.
+- **Senses on the sheet.** Read-only Senses line under the Combat Summary grid (Vision always, Darkvision/Truesight/Devil's Sight when above 0) with one `?` breakdown modal.
+- **`sheetVision` compare-and-follow sync (refines the clobber rule).** Tokens remember the last sheet vision values in `token.sheetVision`. New `token:vision:sync` (`vtt/server/handlers/token.js`, in the `wsServer.js` dispatch list) moves a vision field only if its current value still equals the remembered one, so a hand edit (Darkvision checkbox, Advanced Vision modal, Token Manager) stays an override. Tokens made before this change (no `sheetVision`) are never touched. Gated on `canEditToken` plus a linked character; values validated 0-1000. `visionTrueFt`/`visionDevilFt` are still not in `PLAYER_EDITABLE_FIELDS`. `sheetVision` is in the client's `TOKEN_LEVEL_STAT_FIELDS` only.
+- **Manual controls.** The Darkvision checkbox turns on to the sheet's darkvision if it has any, else 60. The Advanced Vision modal has "Use sheet values" (fills inputs, doesn't save) and a "Differs from character sheet - won't auto-update." hint.
+- **Accepted gaps:** admin edits to a shared modifier definition don't push `character:changed`; a manual value that happens to equal the sheet value counts as following; GM-owned PC tokens don't sync (existing behaviour).
+
+**Verified:** `npx vitest run` (114 passed, including 9 new sense tests), `npm run check` (0 errors, 0 warnings), migration 031 applied to the local dev DB only, a throwaway node harness against `token:vision:sync` (follows when untouched, override survives, negative value gets the error reply, non-owner ignored).
+
+**Not verified:** everything that needs a browser - the Senses line and its `?` modal (including at 375px), the Advanced Vision modal hint and "Use sheet values" button, the Darkvision checkbox, and the end-to-end Owl Ring / Goggles of Night flow with the 2D test content.

@@ -545,25 +545,100 @@ export function passiveScore(
   return 10 + abilityModifier(abilityScore) + (proficient ? prof : 0) + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
 }
 
-// New for VTT Phase 2 - vision.*_ft aren't feats or race traits in this
-// codebase's data model, they're just Modifiers like everything else
-// (docs/architecture/modifier-primacy-architecture.md), resolved the same
-// way AC/speed are. Baselines are standard human vision (30ft normal, no
-// darkvision/truesight/devil's sight) with any granted Modifiers added on
-// top - deliberately additive ('bonus'), not 'set', since the tie-break rule
-// for 'set' operations is an explicitly open question in the architecture
-// doc and additive bonuses on a fixed baseline sidestep it entirely.
+export type SenseKey = 'normalFt' | 'darkFt' | 'trueFt' | 'devilFt';
+export type SenseResolution = { value: number; lines: string[] };
+
+const SENSE_TARGETS: Record<SenseKey, { target: string; baseline: number }> = {
+  normalFt: { target: 'vision.normal_ft', baseline: 30 },
+  darkFt: { target: 'vision.dark_ft', baseline: 0 },
+  trueFt: { target: 'vision.true_ft', baseline: 0 },
+  devilFt: { target: 'vision.devil_ft', baseline: 0 }
+};
+
+// Resolves one sense (darkvision, truesight, ...) with a source-attributed audit trail.
+// See docs/architecture/modifier-primacy.md section 3.1 for the stacking rules. Order:
+//   1. 'set'     - if any exists, the last one by priority is the base (mirrors speedPipeline),
+//                  replacing the baseline and every 'minimum'.
+//   2. 'minimum' - otherwise the base is the highest of the baseline and every 'minimum' grant.
+//                  Grants never sum, so a racial 60ft plus a 60ft feat is still 60ft.
+//   3. add       - every 'bonus' is added and every 'penalty' subtracted on top.
+//   4. floor     - never below 0.
+// Any other op on a sense target is listed as "Not applied" rather than silently dropped.
+export function resolveSense(
+  modifierSources: ActiveCharacterEffect[],
+  target: string,
+  baseline: number,
+  context: ModifierContext = {}
+): SenseResolution {
+  const lines: string[] = [];
+  const sets = resolvedNumericModifiers(modifierSources, [target], ['set'], context);
+  const minimums = resolvedNumericModifiers(modifierSources, [target], ['minimum'], context);
+  const activeSet = sets.length ? sets.at(-1) : undefined;
+
+  let base: number;
+  if (activeSet) {
+    base = activeSet.value;
+    lines.push(`Set by ${activeSet.label}: ${base} ft (replaces baseline and at-least grants)`);
+  } else {
+    lines.push(`Baseline: ${baseline} ft`);
+    // The first grant with the top value (by priority) is the one marked as used.
+    const top = minimums.reduce((best, entry) => (entry.value > best ? entry.value : best), Number.NEGATIVE_INFINITY);
+    let usedMarked = false;
+    for (const entry of minimums) {
+      const isUsed = !usedMarked && entry.value === top && entry.value > baseline;
+      if (isUsed) usedMarked = true;
+      lines.push(`${entry.label}: at least ${entry.value} ft ${isUsed ? '(highest)' : '(not the highest, not used)'}`);
+    }
+    base = Math.max(baseline, ...minimums.map((entry) => entry.value));
+  }
+
+  let total = base;
+  for (const bonus of resolvedAdditiveModifiers(modifierSources, [target], context)) {
+    total += bonus.value;
+    lines.push(`${bonus.label}: ${bonus.value >= 0 ? '+' : '-'}${Math.abs(bonus.value)} ft`);
+  }
+
+  // Ops senses don't understand (multiplier, advantage, ...) are shown, not silently ignored.
+  const handled = ['set', 'minimum', 'bonus', 'penalty'];
+  for (const effect of modifierSources) {
+    for (const modifier of effect.modifiers) {
+      if (handled.includes(modifier.modifierType)) continue;
+      if (!modifierTargetMatches(modifier.target, [target]) || !modifierConditionMatches(modifier.conditionExpression, context)) continue;
+      lines.push(`Not applied: ${modifier.label?.trim() || effect.name} (${modifier.modifierType} isn't supported for senses)`);
+    }
+  }
+
+  const value = Math.max(0, total);
+  lines.push(`Total: ${value} ft`);
+  return { value, lines };
+}
+
+export function visionBreakdown(
+  modifierSources: ActiveCharacterEffect[],
+  context: ModifierContext = {}
+): Record<SenseKey, SenseResolution> {
+  const entries = (Object.keys(SENSE_TARGETS) as SenseKey[]).map((key) => [
+    key,
+    resolveSense(modifierSources, SENSE_TARGETS[key].target, SENSE_TARGETS[key].baseline, context)
+  ]);
+  return Object.fromEntries(entries) as Record<SenseKey, SenseResolution>;
+}
+
+// vision.*_ft aren't feats or race traits in this codebase's data model, they're just Modifiers
+// like everything else (docs/architecture/modifier-primacy.md), resolved the same way AC/speed
+// are. Baselines are standard human vision (30ft normal, no darkvision/truesight/devil's sight).
+// Darkvision-style grants use the 'minimum' op ("At least - highest wins"), so overlapping
+// sources don't sum; 'bonus'/'penalty' still add on top. See resolveSense for the full order.
 export function visionRadii(
   modifierSources: ActiveCharacterEffect[],
   context: ModifierContext = {}
 ): { normalFt: number; darkFt: number; trueFt: number; devilFt: number } {
-  const bonusFor = (target: string) =>
-    resolvedAdditiveModifiers(modifierSources, [target], context).reduce((sum, bonus) => sum + bonus.value, 0);
+  const breakdown = visionBreakdown(modifierSources, context);
   return {
-    normalFt: 30 + bonusFor('vision.normal_ft'),
-    darkFt: bonusFor('vision.dark_ft'),
-    trueFt: bonusFor('vision.true_ft'),
-    devilFt: bonusFor('vision.devil_ft')
+    normalFt: breakdown.normalFt.value,
+    darkFt: breakdown.darkFt.value,
+    trueFt: breakdown.trueFt.value,
+    devilFt: breakdown.devilFt.value
   };
 }
 

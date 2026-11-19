@@ -128,6 +128,7 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:move:resetAll':
         case 'token:stat:update':
         case 'token:knownAc:set':
+        case 'token:vision:sync':
         case 'token:update':
         case 'token:hidden:toggle':
         case 'attack:resolve':

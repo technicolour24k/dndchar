@@ -26,7 +26,10 @@ import {
   spellAttackBonus,
   spellSaveDc,
   standardSpellSlotMaximums,
-  totalLevel
+  totalLevel,
+  resolveSense,
+  visionBreakdown,
+  visionRadii
 } from './dnd5e';
 import type { ActiveCharacterEffect, EffectModifier } from '$lib/types/character';
 import { rollWithModifiers } from './attackRoll';
@@ -634,5 +637,70 @@ describe('rollWithModifiers flatModifiersIncluded', () => {
     const rollDie = () => 10;
     expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie).total).toBe(17);
     expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie, { flatModifiersIncluded: true }).total).toBe(15);
+  });
+});
+
+describe('senses (minimum op)', () => {
+  const grant = (name: string, modifierType: string, value: string, target = 'vision.dark_ft', priority = 0): ActiveCharacterEffect => ({
+    id: name, effectId: name, effectKey: name, name, sourceType: 'condition', sourceName: name, description: '',
+    durationType: '', requiresConcentration: false, isCondition: false, isSelectable: true, remainingRounds: null,
+    modifiers: [{ target, modifierType, label: '', valueExpression: value, defaultValueExpression: value,
+      valueOverrideExpression: '', conditionExpression: '', priority }]
+  });
+  const dark = (sources: ActiveCharacterEffect[]) => resolveSense(sources, 'vision.dark_ft', 0);
+
+  it('does not sum two equal minimum grants', () => {
+    expect(dark([grant('Elf', 'minimum', '60'), grant('Feat', 'minimum', '60')]).value).toBe(60);
+  });
+
+  it('takes the highest of several minimum grants', () => {
+    const result = dark([grant('Elf', 'minimum', '60'), grant('Goggles', 'minimum', '120')]);
+    expect(result.value).toBe(120);
+    expect(result.lines).toContain('Goggles: at least 120 ft (highest)');
+    expect(result.lines).toContain('Elf: at least 60 ft (not the highest, not used)');
+  });
+
+  it('marks only the first tied grant as highest', () => {
+    const lines = dark([grant('Elf', 'minimum', '60'), grant('Goggles', 'minimum', '60')]).lines;
+    expect(lines).toContain('Elf: at least 60 ft (highest)');
+    expect(lines).toContain('Goggles: at least 60 ft (not the highest, not used)');
+  });
+
+  it('adds a bonus on top of the minimum', () => {
+    const result = dark([grant('Elf', 'minimum', '60'), grant('Owl Ring', 'bonus', '30')]);
+    expect(result.value).toBe(90);
+    expect(result.lines).toContain('Owl Ring: +30 ft');
+    expect(result.lines.at(-1)).toBe('Total: 90 ft');
+  });
+
+  it('floors at zero', () => {
+    expect(dark([grant('Curse', 'penalty', '100')]).value).toBe(0);
+  });
+
+  it('lets a set beat a minimum, with bonuses still applied after', () => {
+    expect(dark([grant('Elf', 'minimum', '60'), grant('Blind', 'set', '0')]).value).toBe(0);
+    expect(dark([grant('Elf', 'minimum', '60'), grant('Blind', 'set', '0'), grant('Ring', 'bonus', '10')]).value).toBe(10);
+  });
+
+  it('keeps normal vision at the 30ft baseline when the minimum is lower', () => {
+    const sources = [grant('Odd', 'minimum', '20', 'vision.normal_ft')];
+    expect(visionBreakdown(sources).normalFt.value).toBe(30);
+  });
+
+  it('lists unsupported ops as not applied', () => {
+    const result = dark([grant('Haste-ish', 'multiplier', '2')]);
+    expect(result.value).toBe(0);
+    expect(result.lines.some((line) => line.startsWith('Not applied: Haste-ish'))).toBe(true);
+  });
+
+  it('visionRadii matches visionBreakdown', () => {
+    const sources = [grant('Elf', 'minimum', '60'), grant('Ring', 'bonus', '30'), grant('Sight', 'minimum', '30', 'vision.true_ft')];
+    const radii = visionRadii(sources);
+    const breakdown = visionBreakdown(sources);
+    expect(radii).toEqual({
+      normalFt: breakdown.normalFt.value, darkFt: breakdown.darkFt.value,
+      trueFt: breakdown.trueFt.value, devilFt: breakdown.devilFt.value
+    });
+    expect(radii).toEqual({ normalFt: 30, darkFt: 90, trueFt: 30, devilFt: 0 });
   });
 });
