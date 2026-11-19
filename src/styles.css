@@ -2338,3 +2338,34 @@ button.death-save-icon.failure.active {
     overflow-y: auto;
   }
 }
+
+/* Forage find-table authoring (/forage/tables). */
+.forage-layout { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(0, 1.5fr); gap: 18px; align-items: start; }
+.forage-layout > * { min-width: 0; }
+.forage-layout input, .forage-layout select { min-width: 0; width: 100%; }
+.forage-list-panel, .forage-editor-panel { max-height: calc(100vh - 190px); overflow-y: auto; }
+.forage-group-label { margin: 8px 0 2px; padding: 0 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.forage-list-item { grid-template-columns: 34px minmax(0, 1fr) 14px; }
+.forage-entries { display: grid; gap: 4px; }
+.forage-entry { display: grid; grid-template-columns: minmax(0, 1fr) 86px 86px 56px max-content; gap: 8px; align-items: center; padding: 6px 4px; border-bottom: 1px solid color-mix(in srgb, var(--line) 32%, transparent); }
+.forage-entry-head { color: var(--muted); font-size: 11px; text-transform: uppercase; border-bottom-color: var(--line); }
+.forage-entry-dead .forage-entry-name strong { opacity: .6; }
+.forage-entry-name { display: grid; gap: 2px; min-width: 0; }
+.forage-entry-field { margin: 0; }
+.forage-entry-label { display: none; }
+.forage-empty { padding: 10px; border: 1px dashed var(--line); border-radius: 6px; }
+.forage-add { margin-top: 8px; }
+@media (max-width: 900px) {
+  .forage-layout { grid-template-columns: 1fr; }
+  .forage-list-panel, .forage-editor-panel { max-height: none; }
+}
+/* Below 600px each entry becomes a stacked card with 44px touch targets. */
+@media (max-width: 600px) {
+  .forage-entry-head { display: none; }
+  .forage-entry { grid-template-columns: 1fr 1fr; padding: 10px; border: 1px solid color-mix(in srgb, var(--line) 45%, transparent); border-radius: 6px; }
+  .forage-entry-name { grid-column: 1 / -1; }
+  .forage-entry-label { display: inline; font-size: 11px; color: var(--muted); }
+  .forage-entry-chance { align-self: center; }
+  .forage-entry input, .forage-entry button, .forage-add input, .forage-add button { min-height: 44px; }
+  .forage-entry button { grid-column: 1 / -1; }
+}
