@@ -1,5 +1,6 @@
 <script lang="ts">
   import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
+  import { backdropPress } from '$lib/ui/backdropPress';
 
   type GameSession = { id: string; name: string; isActive: boolean; createdAt: string };
   type Note = { id: string; displayName: string; message: string; createdAt: string };
@@ -113,7 +114,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div class="modal-backdrop" role="presentation" onpointerdown={onClose}>
+  <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(onClose)}>
     <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="session-notes-modal-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
       {#if notFound}
         <div class="panel-head">

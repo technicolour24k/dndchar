@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { CharacterVersion } from '$lib/types/character';
+  import { backdropPress } from '$lib/ui/backdropPress';
 
   let {
     characterId,
@@ -53,7 +54,7 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div class="modal-backdrop" role="presentation" onpointerdown={onClose}>
+  <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(onClose)}>
     <div class="panel version-modal" role="dialog" aria-modal="true" aria-labelledby="version-history-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
       <div class="panel-head">
         <div>

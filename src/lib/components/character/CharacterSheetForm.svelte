@@ -2,6 +2,7 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidate } from '$app/navigation';
   import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
+  import { backdropPress } from '$lib/ui/backdropPress';
   import { untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
@@ -2114,7 +2115,7 @@
   </div>
 
   {#if savingThrowsOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (savingThrowsOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (savingThrowsOpen = false))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="saving-throws-title">Saving Throws</h2>
@@ -2152,7 +2153,7 @@
   {/if}
 
   {#if skillChecksOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (skillChecksOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (skillChecksOpen = false))}>
       <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="skill-checks-title">Skill Checks</h2>
@@ -2190,7 +2191,7 @@
   {/if}
 
   {#if playerModificationsOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (playerModificationsOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (playerModificationsOpen = false))}>
       <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <div>
@@ -2295,7 +2296,7 @@
   {#if formulaHelp}
     {@const statKey = formulaHelp.statKey}
     {@const stat = statKey ? stats[statKey] : null}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (formulaHelp = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (formulaHelp = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="formula-help-title">{formulaHelp.title}</h2>
@@ -2337,7 +2338,7 @@
   {/if}
 
   {#if rollResult}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (rollResult = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (rollResult = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="roll-result-title">{rollResult.title}</h2>
@@ -2368,7 +2369,7 @@
   {/if}
 
   {#if activityLogOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (activityLogOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (activityLogOpen = false))}>
       <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="activity-log-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <div>
@@ -2498,7 +2499,7 @@
   {/if}
 
   {#if simpleRollResult}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleRollResult = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleRollResult = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="simple-roll-result-title">{simpleRollResult.title}</h2>
@@ -2520,7 +2521,7 @@
   {/if}
 
   {#if inventoryMessage}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (inventoryMessage = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (inventoryMessage = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-action-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="inventory-action-title">Inventory Action</h2>
@@ -2532,7 +2533,7 @@
   {/if}
 
   {#if simpleItemOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleItemOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleItemOpen = false))}>
       <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="simple-item-title">Add Item</h2>
@@ -2564,7 +2565,7 @@
   {/if}
 
   {#if newItemOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (newItemOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (newItemOpen = false))}>
       <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="new-item-title">Add Item</h2>
