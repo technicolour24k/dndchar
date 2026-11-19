@@ -3,6 +3,9 @@ import { drawTokens, TYPE_COLOR, CONDITION_COLOR } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed, computeLightRevealCircles } from './render/vision.js';
 import { updateMapLayers, hideMapLayers, isVideoUrl } from './render/mapLayers.js';
 import { drawMovementRange } from './render/movement.js';
+import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/movePath.js';
+// Shared with the Node server (vtt/server/handlers/token.js), so the label and the deduction agree.
+import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
 import { drawTargetRings } from './render/targeting.js';
 import { getTokensInShape } from './render/shapeGeometry.js';
@@ -61,7 +64,13 @@ let playerId = null;
 let playerName = null;
 let sessionId = null;
 let session = null; // local mirror of the (already role-filtered) session state
-let dragState = null; // { tokenId, originX, originY, x, y } - visual ghost only, see canvas handlers
+let dragState = null; // { tokenId, originX, originY, x, y, startClientX, startClientY, moved, fromPlan } - visual ghost only, see canvas handlers
+// Movement path planning (see the "Movement path planning" section below): the viewer's own plan,
+// and other people's plans received over the socket (tokenId -> points, origin is the token itself).
+// Time of the last touch, so the mouse events synthesised from a tap can be told from a real mouse.
+let lastTouchAt = 0;
+let movePlan = null; // { tokenId, points: [{x,y}], hover: {x,y} | null, broadcast: bool } or null
+const remoteMovePreviews = new Map();
 let currentRenderedTokens = []; // whichever token list render() last actually drew, for hit-testing
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
 let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
@@ -581,9 +590,37 @@ function connect(joinPayload) {
     // full syncOwnedCharacterTokens() catch-up anyway.
     for (const timer of characterSyncDebounceTimers.values()) clearTimeout(timer);
     characterSyncDebounceTimers.clear();
+    // The server clears our plan for everyone else on close; drop ours and everyone else's here.
+    clearAllMovePreviews();
     // Only auto-retry after a successful join - a bad room code shouldn't loop.
     if (session) setTimeout(() => connect(joinPayload), 1500);
   });
+}
+
+// Movement path previews: drop one token's preview (and abort our own plan for it, since the
+// token moved, changed or vanished under us), or everything (geometry/visibility may have changed).
+function dropMovePreview(tokenId) {
+  remoteMovePreviews.delete(tokenId);
+  if (movePlan && movePlan.tokenId === tokenId) {
+    abortMovePlan();
+    showMovePlanNotice('Plan cancelled - the token was moved');
+  }
+}
+
+// Brief message after our plan is aborted by someone else's change (there is no toast system).
+let movePlanNoticeTimer = null;
+function showMovePlanNotice(text) {
+  const notice = document.getElementById('movePlanNotice');
+  if (!notice) return;
+  notice.textContent = text;
+  notice.classList.add('visible');
+  clearTimeout(movePlanNoticeTimer);
+  movePlanNoticeTimer = setTimeout(() => notice.classList.remove('visible'), 2500);
+}
+
+function clearAllMovePreviews() {
+  remoteMovePreviews.clear();
+  abortMovePlan();
 }
 
 function handleMessage(msg) {
@@ -597,6 +634,7 @@ function handleMessage(msg) {
       break;
 
     case 'state:full':
+      clearAllMovePreviews();
       session = msg.session;
       session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
@@ -643,6 +681,7 @@ function handleMessage(msg) {
       break;
 
     case 'map:set':
+      clearAllMovePreviews();
       session.map = msg.map;
       render();
       renderSidebar();
@@ -655,6 +694,7 @@ function handleMessage(msg) {
     // state:full's combat-log/roll-log/session-notes backlog refetches,
     // which would be wasted round-trips on every single toggle click.
     case 'map:revealed':
+      clearAllMovePreviews();
       session = msg.session;
       session.markers = session.markers || {};
       render();
@@ -669,6 +709,7 @@ function handleMessage(msg) {
       break;
 
     case 'token:remove':
+      dropMovePreview(msg.tokenId);
       delete session.tokens[msg.tokenId];
       render();
       renderSidebar();
@@ -678,6 +719,8 @@ function handleMessage(msg) {
     // the broadcast token wholesale into the local mirror, same idea as
     // token:add but for an existing id.
     case 'token:update':
+      // Only a position change ends a preview - an unrelated Token Manager save must not.
+      if (session.tokens[msg.token.id]?.x !== msg.token.x || session.tokens[msg.token.id]?.y !== msg.token.y) dropMovePreview(msg.token.id);
       session.tokens[msg.token.id] = msg.token;
       render();
       renderSidebar();
@@ -686,12 +729,17 @@ function handleMessage(msg) {
     // token:remove:bulk (Phase 10, Token Manager's bulk-remove) - one message
     // instead of N token:remove events.
     case 'token:remove:bulk':
-      msg.tokenIds.forEach((id) => delete session.tokens[id]);
+      msg.tokenIds.forEach((id) => {
+        dropMovePreview(id);
+        delete session.tokens[id];
+      });
       render();
       renderSidebar();
       break;
 
     case 'token:move': {
+      // The move landed (ours or someone else's): any preview of it is finished.
+      dropMovePreview(msg.tokenId);
       const t = session.tokens[msg.tokenId];
       if (t) {
         t.x = msg.x;
@@ -735,7 +783,22 @@ function handleMessage(msg) {
       break;
     }
 
+    // Movement path preview relays (see the "Movement path planning" section). Render only - never
+    // renderSidebar()/scheduleSidebarRender(), so a plan being laid out cannot rebuild anyone's
+    // sidebar (batch 1's no-rebuild-storm guarantee).
+    case 'token:move:preview':
+      remoteMovePreviews.set(msg.tokenId, msg.points);
+      render();
+      break;
+
+    case 'token:move:preview:clear':
+      remoteMovePreviews.delete(msg.tokenId);
+      render();
+      break;
+
     case 'token:stat:update': {
+      // x/y are player-writable stat updates that move the token, so they end any preview too.
+      if (msg.stat === 'x' || msg.stat === 'y') dropMovePreview(msg.tokenId);
       const t = session.tokens[msg.tokenId];
       // value is omitted by the server for filtered fields (e.g. an enemy's
       // hp, per the server-side comment in handlers/token.js) - nothing to
@@ -751,6 +814,7 @@ function handleMessage(msg) {
     }
 
     case 'token:hidden:toggle': {
+      dropMovePreview(msg.tokenId);
       const t = session.tokens[msg.tokenId];
       if (t) t.hidden = msg.hidden;
       render();
@@ -1057,42 +1121,68 @@ function render() {
     drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx, getImage);
   }
 
+  // Other people's planned paths (drawn first so the viewer's own plan and drag ghost sit on top).
+  // Looked up in currentRenderedTokens, so a player never sees a path for a token outside their
+  // vision, while the GM sees everything. The token the viewer is planning themselves is skipped.
+  for (const [tokenId, points] of remoteMovePreviews) {
+    if (movePlan && movePlan.tokenId === tokenId) continue;
+    const token = currentRenderedTokens.find((t) => t.id === tokenId);
+    if (!token) continue;
+    const fullPoints = [{ x: token.x, y: token.y }, ...points];
+    const totalFt = pathFt(fullPoints, map.gridSizePx) ?? 0;
+    const remainingFt = token.speedRemainingFt ?? token.speedFt ?? null;
+    drawMovePath(ctx, {
+      points: fullPoints,
+      totalFt,
+      remainingFt,
+      // Budgets are tactical info: only the GM and the token's owner see "of N ft".
+      showBudget: role === 'gm' || token.ownerId === playerId,
+      overBudget: remainingFt !== null && totalFt > remainingFt,
+      gridSizePx: map.gridSizePx,
+      style: 'remote',
+    });
+  }
+
+  if (movePlan) {
+    const token = session.tokens[movePlan.tokenId];
+    if (token) {
+      const origin = { x: token.x, y: token.y };
+      const committed = [origin, ...movePlan.points];
+      // The hover leg (desktop only) is drawn locally and never broadcast.
+      const drawn = movePlan.hover ? [...committed, movePlan.hover] : committed;
+      const remainingFt = token.speedRemainingFt ?? token.speedFt ?? null;
+      const totalFt = pathFt(drawn, map.gridSizePx) ?? 0;
+      drawMovePath(ctx, {
+        points: drawn,
+        totalFt,
+        remainingFt,
+        showBudget: true,
+        overBudget: remainingFt !== null && totalFt > remainingFt,
+        gridSizePx: map.gridSizePx,
+        style: 'local',
+      });
+      // The banner uses the committed total only (no hover leg) so it does not jitter.
+      updateMovePlanBanner(token, pathFt(committed, map.gridSizePx) ?? 0, remainingFt);
+    }
+  }
+
   if (dragState) {
     const radius = map.gridSizePx * 0.4;
-    const pxPerFoot = map.gridSizePx / 5;
-    const distanceFt = Math.round(Math.hypot(dragState.x - dragState.originX, dragState.y - dragState.originY) / pxPerFoot);
+    const distanceFt = chebyshevFt(dragState.originX, dragState.originY, dragState.x, dragState.y, map.gridSizePx) ?? 0;
     const token = session.tokens[dragState.tokenId];
     const remainingFt = token ? token.speedRemainingFt ?? token.speedFt ?? null : null;
     const overBudget = remainingFt !== null && distanceFt > remainingFt;
 
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(dragState.x, dragState.y, radius, 0, Math.PI * 2);
-    ctx.strokeStyle = overBudget ? 'rgba(229,57,53,0.9)' : 'rgba(255,255,255,0.85)';
-    ctx.setLineDash([4, 4]);
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
     // A line back to the token's actual starting point makes "distance
     // between these two points" legible even after dragging far from it.
-    ctx.beginPath();
-    ctx.moveTo(dragState.originX, dragState.originY);
-    ctx.lineTo(dragState.x, dragState.y);
-    ctx.strokeStyle = overBudget ? 'rgba(229,57,53,0.6)' : 'rgba(255,255,255,0.5)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    ctx.restore();
-
-    const label = remainingFt !== null ? `${distanceFt} ft (of ${remainingFt} ft)` : `${distanceFt} ft`;
-    ctx.save();
-    ctx.font = 'bold 13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = overBudget ? '#ff8a80' : '#fff';
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 3;
-    ctx.strokeText(label, dragState.x, dragState.y - radius - 10);
-    ctx.fillText(label, dragState.x, dragState.y - radius - 10);
-    ctx.restore();
+    drawDistanceLine(ctx, { x: dragState.originX, y: dragState.originY }, { x: dragState.x, y: dragState.y }, overBudget);
+    drawDistanceGhost(ctx, {
+      x: dragState.x,
+      y: dragState.y,
+      radius,
+      label: remainingFt !== null ? `${distanceFt} ft (of ${remainingFt} ft)` : `${distanceFt} ft`,
+      overBudget,
+    });
   }
 
   ensureTokenVideoLoop();
@@ -1174,6 +1264,7 @@ const markerPlacementBanner = document.getElementById('markerPlacementBanner');
 let pendingMarkerPlacement = null; // { radiusFt, color, label } or null while armed
 
 function armMarkerPlacement(config) {
+  cancelMovePlan(); // only one click-the-map mode armed at a time
   disarmActionTargeting(); // only one click-the-map mode armed at a time
   pendingMarkerPlacement = config;
   markerPlacementBanner.classList.add('visible');
@@ -1212,6 +1303,7 @@ let pendingActionTarget = null; // { sourceTokenId, action, intent } while an ac
 // from - it's the [Attack]/[Heal] choice, not a property of the action itself (the same
 // weapon/spell/item can go down either tab).
 function armActionTargeting(sourceTokenId, action, intent = 'attack') {
+  cancelMovePlan(); // only one click-the-map mode armed at a time
   disarmMarkerPlacement();
   combatActionsModal.classList.remove('visible');
   spellPickerModal.classList.remove('visible');
@@ -1234,6 +1326,213 @@ function disarmActionTargeting() {
 }
 
 document.getElementById('actionTargetCancelBtn').addEventListener('click', disarmActionTargeting);
+
+// ---------------------------------------------------------------------------
+// Movement path planning - lay out a path as clicked waypoints, see the running
+// distance against remaining movement, then Move (the server deducts the summed
+// path distance) or Cancel. Everyone who can see the token watches the path live
+// (token:move:preview, relayed by the server - never stored). Free-form like
+// drag-to-move: no walls, terrain or pathfinding, it is a measuring/intent tool.
+// Same arm/disarm-banner pattern as marker placement and action targeting.
+// ---------------------------------------------------------------------------
+
+const movePlanBanner = document.getElementById('movePlanBanner');
+const movePlanBannerText = document.getElementById('movePlanBannerText');
+const movePlanUndoBtn = document.getElementById('movePlanUndoBtn');
+const movePlanMoveBtn = document.getElementById('movePlanMoveBtn');
+const movePlanPrivateLabel = document.getElementById('movePlanPrivateLabel');
+const movePlanPrivateInput = document.getElementById('movePlanPrivateInput');
+
+// A press that releases within this many screen pixels of where it started is a tap, not a drag.
+const TAP_SLOP_PX = 8;
+// GM-only "Private plan" toggle: remembered for this browser session, defaults to off.
+const MOVE_PLAN_PRIVATE_KEY = 'vttMovePlanPrivate';
+
+function isMovePlanPrivate() {
+  if (role !== 'gm') return false; // players never get the toggle, their plans are always visible
+  try {
+    return sessionStorage.getItem(MOVE_PLAN_PRIVATE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function armMovePlan(tokenId) {
+  const token = session?.tokens[tokenId];
+  if (!token || !session.map) return;
+  // Starting a plan on a different token drops the old one (and tells the others).
+  if (movePlan && movePlan.tokenId !== tokenId) cancelMovePlan();
+  disarmMarkerPlacement();
+  disarmActionTargeting();
+  movePlan = { tokenId, points: [], hover: null, broadcast: false };
+  movePlanPrivateLabel.style.display = role === 'gm' ? '' : 'none';
+  movePlanPrivateInput.checked = isMovePlanPrivate();
+  movePlanBanner.classList.add('visible');
+  canvas.style.cursor = 'crosshair';
+  render();
+}
+
+// Snaps to the centre of the grid square under the point, then keeps it on the map. Waypoints
+// snap, the token's own origin does not (so only the first leg can be a non-multiple of 5 ft).
+function snapWaypoint(x, y) {
+  const snapped = snapToSquareCentre(x, y, session.map.gridSizePx);
+  return clampToMapBounds(snapped.x, snapped.y);
+}
+
+function sameSquare(a, b) {
+  const g = session.map.gridSizePx;
+  return Math.floor(a.x / g) === Math.floor(b.x / g) && Math.floor(a.y / g) === Math.floor(b.y / g);
+}
+
+function addMoveWaypoint(x, y) {
+  if (!movePlan || !session?.map) return;
+  const token = session.tokens[movePlan.tokenId];
+  if (!token) return;
+  const point = snapWaypoint(x, y);
+  // Ignore a click in the same square as the previous point (the token itself, for the first
+  // waypoint) so there are no zero-length legs.
+  const previous = movePlan.points.length ? movePlan.points[movePlan.points.length - 1] : token;
+  if (sameSquare(point, previous)) return;
+  movePlan.points.push(point);
+  movePlan.hover = null; // a stale hover leg (e.g. from a touch tap) must not linger
+  render();
+  sendMovePreview();
+}
+
+function undoMoveWaypoint() {
+  if (!movePlan || !movePlan.points.length) return;
+  movePlan.points.pop();
+  movePlan.hover = null;
+  if (movePlan.points.length) {
+    sendMovePreview();
+  } else if (movePlan.broadcast) {
+    send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
+    movePlan.broadcast = false;
+  }
+  render();
+}
+
+// Sends the whole waypoint list (idempotent, so a dropped frame self-heals on the next one).
+// A GM's "private" flag makes the server relay it to GM-role sockets only.
+function sendMovePreview() {
+  const msg = { type: 'token:move:preview', tokenId: movePlan.tokenId, points: movePlan.points };
+  if (isMovePlanPrivate()) msg.private = true;
+  send(msg);
+  movePlan.broadcast = true;
+}
+
+function commitMovePlan() {
+  if (!movePlan || !movePlan.points.length) return;
+  const final = movePlan.points[movePlan.points.length - 1];
+  send({
+    type: 'token:move',
+    tokenId: movePlan.tokenId,
+    x: final.x,
+    y: final.y,
+    waypoints: movePlan.points.slice(0, -1),
+  });
+  // No clear message needed: every client drops the preview on the token:move broadcast.
+  endMovePlan();
+}
+
+function cancelMovePlan() {
+  if (!movePlan) return;
+  if (movePlan.broadcast) send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
+  endMovePlan();
+}
+
+// The token moved, vanished or the socket closed - everyone else already knows, so no message.
+function abortMovePlan() {
+  if (movePlan) endMovePlan();
+}
+
+function endMovePlan() {
+  movePlan = null;
+  movePlanBanner.classList.remove('visible');
+  canvas.style.cursor = '';
+  render();
+}
+
+// Called from render() so the banner stays correct when Remaining changes mid-plan (+5/-5, GM
+// reset). Cheap textContent updates only - never touches the sidebar.
+function updateMovePlanBanner(token, totalFt, remainingFt) {
+  const name = token.name || 'token';
+  const hasPoints = movePlan.points.length > 0;
+  if (!hasPoints) {
+    movePlanBannerText.textContent = `Planning ${name}'s move - tap the map to add waypoints`;
+    movePlanBannerText.classList.remove('over-budget');
+  } else {
+    movePlanBannerText.textContent = remainingFt !== null
+      ? `${name}: ${totalFt} ft of ${remainingFt} ft`
+      : `${name}: ${totalFt} ft`;
+    movePlanBannerText.classList.toggle('over-budget', remainingFt !== null && totalFt > remainingFt);
+  }
+  movePlanUndoBtn.disabled = !hasPoints;
+  movePlanMoveBtn.disabled = !hasPoints;
+}
+
+movePlanUndoBtn.addEventListener('click', undoMoveWaypoint);
+movePlanMoveBtn.addEventListener('click', commitMovePlan);
+document.getElementById('movePlanCancelBtn').addEventListener('click', cancelMovePlan);
+
+// Toggling mid-plan: wipe whatever the other side currently shows, then re-send in the new mode.
+movePlanPrivateInput.addEventListener('change', () => {
+  try {
+    sessionStorage.setItem(MOVE_PLAN_PRIVATE_KEY, movePlanPrivateInput.checked ? '1' : '0');
+  } catch {
+    // sessionStorage unavailable - the toggle just won't be remembered.
+  }
+  if (!movePlan) return;
+  if (movePlan.broadcast) {
+    send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
+    movePlan.broadcast = false;
+  }
+  if (movePlan.points.length) sendMovePreview();
+});
+
+canvas.addEventListener('contextmenu', (e) => {
+  if (movePlan) e.preventDefault();
+});
+
+// Keyboard shortcuts, only while planning and never while typing in a control (so Backspace in
+// a text box does not undo a waypoint).
+window.addEventListener('keydown', (e) => {
+  if (!movePlan || isEditableControl(document.activeElement)) return;
+  // A focused button keeps its own Enter/Space behaviour, and a visible modal owns the keyboard.
+  if (document.activeElement && document.activeElement.tagName === 'BUTTON') return;
+  if (document.querySelector('.modal-overlay.visible')) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    cancelMovePlan();
+  } else if (e.key === 'Enter') {
+    if (movePlan.points.length) {
+      e.preventDefault();
+      commitMovePlan();
+    }
+  } else if (e.key === 'Backspace') {
+    e.preventDefault(); // stop the browser treating it as "back"
+    undoMoveWaypoint();
+  }
+});
+
+// Desktop hover leg: drawn locally only, never broadcast. Cleared when the pointer leaves.
+canvas.addEventListener('mousemove', (e) => {
+  if (!movePlan || dragState || panState || !session?.map) return;
+  // A tap makes the browser synthesise a mousemove: ignore it so touch leaves no phantom leg.
+  if (Date.now() - lastTouchAt < 800) return;
+  const raw = canvasCoords(e);
+  const point = snapWaypoint(raw.x, raw.y);
+  const token = session.tokens[movePlan.tokenId];
+  const previous = movePlan.points.length ? movePlan.points[movePlan.points.length - 1] : token;
+  movePlan.hover = previous && sameSquare(point, previous) ? null : point;
+  render();
+});
+canvas.addEventListener('mouseleave', () => {
+  if (movePlan && movePlan.hover) {
+    movePlan.hover = null;
+    render();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Attack/spell confirm + roll-result modal (Phase 2.5, extended in Phase 3 for
@@ -1820,6 +2119,7 @@ function drawArmedTargetHighlights(ctx, tokens, gridSizePx, sourceTokenId, inten
 // token you don't control) pans the map instead - same click-and-drag
 // gesture, disambiguated by what's under the cursor.
 let panState = null; // { startClientX, startClientY, startScrollLeft, startScrollTop }
+let planTap = null; // { clientX, clientY } - a press in path mode that becomes a waypoint if it does not travel
 
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); // avoid native text-selection/drag-ghost while panning
@@ -1865,14 +2165,40 @@ canvas.addEventListener('mousedown', (e) => {
 
   const { x, y } = canvasCoords(e);
   const token = hitTestToken(x, y);
-  const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
+  // Left button only: a right or middle press must not start a token drag (or arm planning), and
+  // on macOS/Linux a right-click opens the context menu on mousedown, which would leave it stuck.
+  const canDragToken = e.button === 0 && token && (role === 'gm' || token.ownerId === playerId);
+
+  // Path planning: a click adds a waypoint (on mouseup, so a drag pans instead), right-click
+  // undoes one. Pressing the planned token itself starts a normal drag as an escape hatch (a real
+  // drag cancels the plan on mouseup). Any other token is just a point on the map.
+  if (movePlan) {
+    if (e.button === 2) {
+      undoMoveWaypoint();
+      return;
+    }
+    if (e.button !== 0) return; // middle and other buttons do nothing while planning
+    if (canDragToken && token.id === movePlan.tokenId) {
+      dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y, startClientX: e.clientX, startClientY: e.clientY, moved: false, fromPlan: true };
+    } else {
+      planTap = { clientX: e.clientX, clientY: e.clientY };
+      panState = {
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startScrollLeft: mapWrap.scrollLeft,
+        startScrollTop: mapWrap.scrollTop,
+      };
+    }
+    canvas.classList.add('dragging');
+    return;
+  }
 
   if (canDragToken) {
     // originX/originY are the token's actual pre-drag position - that's the
     // true distance the token will travel, not the (possibly off-center)
     // point clicked within its radius. x/y track the live cursor for the
     // ghost circle.
-    dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y };
+    dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y, startClientX: e.clientX, startClientY: e.clientY, moved: false, fromPlan: false };
   } else {
     panState = {
       startClientX: e.clientX,
@@ -1897,6 +2223,7 @@ window.addEventListener('mousemove', (e) => {
     const { x, y } = clampToMapBounds(raw.x, raw.y);
     dragState.x = x;
     dragState.y = y;
+    if (Math.hypot(e.clientX - dragState.startClientX, e.clientY - dragState.startClientY) > TAP_SLOP_PX) dragState.moved = true;
     render();
   } else if (panState) {
     mapWrap.scrollLeft = panState.startScrollLeft - (e.clientX - panState.startClientX);
@@ -1957,14 +2284,30 @@ window.addEventListener('mouseup', (e) => {
     return;
   }
   if (dragState) {
-    const raw = canvasCoords(e);
-    const { x, y } = clampToMapBounds(raw.x, raw.y);
-    const { tokenId } = dragState;
-    send({ type: 'token:move', tokenId, x, y });
-    // dragState itself is cleared once the server echoes the move back (see
-    // handleMessage's token:move case) - the token doesn't actually move on
-    // screen until then, per the "server is the only writer" rule.
+    const { tokenId, moved, fromPlan } = dragState;
+    if (!moved) {
+      // A tap, not a drag. It used to send a pointless micro-nudge token:move; now it arms path
+      // planning for the token instead (or does nothing if it was the planned token itself).
+      dragState = null;
+      if (!fromPlan) armMovePlan(tokenId);
+      render();
+    } else {
+      if (fromPlan) cancelMovePlan(); // dragging the planned token abandons the plan
+      const raw = canvasCoords(e);
+      const { x, y } = clampToMapBounds(raw.x, raw.y);
+      send({ type: 'token:move', tokenId, x, y });
+      // dragState itself is cleared once the server echoes the move back (see
+      // handleMessage's token:move case) - the token doesn't actually move on
+      // screen until then, per the "server is the only writer" rule.
+    }
+  } else if (planTap && movePlan) {
+    // A press that stayed put is a waypoint; one that travelled was a pan.
+    if (Math.hypot(e.clientX - planTap.clientX, e.clientY - planTap.clientY) <= TAP_SLOP_PX) {
+      const { x, y } = canvasCoords(e);
+      addMoveWaypoint(x, y);
+    }
   }
+  planTap = null;
   panState = null;
   canvas.classList.remove('dragging');
 });
@@ -1993,6 +2336,7 @@ function findTouchById(touchList, id) {
 let activeTouch = null; // { id, kind: 'token' | 'shape' } - which touch owns whichever of dragState/shapeDrag is currently live
 
 canvas.addEventListener('touchstart', (e) => {
+  lastTouchAt = Date.now();
   blurSidebarFocus();
   if (pendingActionTarget) return; // tap-to-target has no drag step, synthesized click already handles it
   if (e.touches.length !== 1) return; // multi-touch - not a drag gesture
@@ -2014,10 +2358,14 @@ canvas.addEventListener('touchstart', (e) => {
 
   const token = hitTestToken(x, y);
   const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
+  // Path planning: only the planned token itself starts a drag (escape hatch). Anything else is
+  // left alone, so native scroll pans and a plain tap reaches the mouse handlers as synthesised
+  // mousedown/mouseup, which add the waypoint.
+  if (movePlan && !(canDragToken && token.id === movePlan.tokenId)) return;
   if (!canDragToken) return; // miss - let native pan handle it, unchanged
 
   e.preventDefault(); // now that we know it's a token drag, opt this gesture out of native scroll
-  dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y };
+  dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y, startClientX: touch.clientX, startClientY: touch.clientY, moved: false, fromPlan: !!movePlan };
   activeTouch = { id: touch.identifier, kind: 'token' };
   canvas.classList.add('dragging');
 }, { passive: false });
@@ -2044,6 +2392,7 @@ window.addEventListener('touchmove', (e) => {
     const { x, y } = clampToMapBounds(raw.x, raw.y);
     dragState.x = x;
     dragState.y = y;
+    if (Math.hypot(touch.clientX - dragState.startClientX, touch.clientY - dragState.startClientY) > TAP_SLOP_PX) dragState.moved = true;
   } else {
     shapeDrag.currentX = raw.x;
     shapeDrag.currentY = raw.y;
@@ -2057,12 +2406,20 @@ function endTouchDrag(e, commit) {
   if (!touch) return;
 
   if (commit && activeTouch.kind === 'token') {
-    const raw = canvasCoords(touch);
-    const { x, y } = clampToMapBounds(raw.x, raw.y);
-    const { tokenId } = dragState;
-    send({ type: 'token:move', tokenId, x, y });
-    // dragState itself clears once the server echoes the move back (see
-    // handleMessage's token:move case), same as the mouse path above.
+    const { tokenId, moved, fromPlan } = dragState;
+    if (!moved) {
+      // A tap: arm path planning rather than sending a micro-nudge (same rule as the mouse path).
+      dragState = null;
+      if (!fromPlan) armMovePlan(tokenId);
+      render();
+    } else {
+      if (fromPlan) cancelMovePlan();
+      const raw = canvasCoords(touch);
+      const { x, y } = clampToMapBounds(raw.x, raw.y);
+      send({ type: 'token:move', tokenId, x, y });
+      // dragState itself clears once the server echoes the move back (see
+      // handleMessage's token:move case), same as the mouse path above.
+    }
   } else if (commit && activeTouch.kind === 'shape') {
     const { x, y } = canvasCoords(touch);
     shapeDrag.currentX = x;
@@ -2079,7 +2436,10 @@ function endTouchDrag(e, commit) {
   canvas.classList.remove('dragging');
 }
 
-window.addEventListener('touchend', (e) => endTouchDrag(e, true));
+window.addEventListener('touchend', (e) => {
+  lastTouchAt = Date.now();
+  endTouchDrag(e, true);
+});
 window.addEventListener('touchcancel', (e) => endTouchDrag(e, false));
 
 // ---------------------------------------------------------------------------
@@ -2824,15 +3184,14 @@ function resetTokenSpeedRemaining(tokenId) {
 }
 
 // Rescue for a token dragged somewhere unreachable (see clampToMapBounds's
-// comment) - a plain token:move to the map's center, same as any other
-// drag-drop, so a token stuck from before that fix shipped (or however else
+// comment) - so a token stuck from before that fix shipped (or however else
 // it might end up off-canvas) can be recovered with a click instead of
-// needing a database edit.
+// needing a database edit. A dedicated token:recenter event: the server picks
+// the map centre itself and does not charge movement for it (a plain
+// token:move would deduct speedRemainingFt like any other move).
 function recenterToken(tokenId) {
-  const token = session.tokens[tokenId];
-  const map = session?.map;
-  if (!token || !map) return;
-  send({ type: 'token:move', tokenId, x: map.widthPx / 2, y: map.heightPx / 2 });
+  if (!session?.tokens[tokenId] || !session.map) return;
+  send({ type: 'token:recenter', tokenId });
 }
 
 // ---------------------------------------------------------------------------
@@ -3423,6 +3782,7 @@ function tokenManagerRowsHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
@@ -4237,6 +4597,10 @@ tokenManagerList.addEventListener('click', (e) => {
     saveTokenAsTemplate(token);
   } else if (e.target.classList.contains('recenterTokenBtn')) {
     recenterToken(tokenId);
+  } else if (e.target.classList.contains('planMoveBtn')) {
+    // The modal would cover the map, so close it first.
+    closeTokenManagerModal();
+    armMovePlan(tokenId);
   } else if (e.target.classList.contains('speedMinusBtn')) {
     adjustTokenSpeedRemaining(tokenId, -5);
   } else if (e.target.classList.contains('speedPlusBtn')) {
@@ -4337,6 +4701,7 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
@@ -4688,6 +5053,8 @@ function wirePlayerSidebar() {
       openConditionsModal(tokenId);
     } else if (e.target.classList.contains('recenterTokenBtn')) {
       recenterToken(tokenId);
+    } else if (e.target.classList.contains('planMoveBtn')) {
+      armMovePlan(tokenId);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {

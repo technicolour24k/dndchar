@@ -3,6 +3,12 @@ import { filterTokenForPlayer } from '../store.js';
 import { TARGET_WINDOW_MS } from './target.js';
 import { pickRandomCreatureSoundFile, creatureSoundUrl } from '../creatureSoundLibrary.js';
 import { postRollLog } from './dice.js';
+// Shared with the browser client (static/vtt-app/main.js) so the drag ghost, the path label and
+// this server deduction can never disagree. See that file's header.
+import { pathFt, chebyshevFt } from '../../../static/vtt-app/shared/gridDistance.js';
+
+// A path move is at most 50 points including the final one, so 49 intermediate waypoints.
+const MAX_MOVE_WAYPOINTS = 49;
 
 // Must match the fallback in src/routes/vtt/api/log/+server.ts - see that
 // file's comment for why this is a shared-secret header rather than a normal
@@ -258,6 +264,46 @@ function broadcastCreatureSound(context, session, sessionId, sourceTokenId) {
   }));
 }
 
+// Validates a client-supplied list of points: an array of minLen..maxLen entries, each with
+// finite x and y. Returns a fresh array of plain { x, y } (nothing else copied), or null.
+function parsePoints(list, minLen, maxLen) {
+  if (!Array.isArray(list) || list.length < minLen || list.length > maxLen) return null;
+  const out = [];
+  for (const p of list) {
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return null;
+    out.push({ x: p.x, y: p.y });
+  }
+  return out;
+}
+
+// Relays a move-preview payload ({ type, tokenId, points? } only - never the token object, so no
+// stat filtering is needed). Same two visibility gates as broadcastToken: GM-role recipients
+// always get it, everyone else gets nothing if the token is hidden or the map unrevealed.
+// `gmOnly` (a private GM plan) drops every non-GM recipient. The sender is skipped, it already
+// draws its own plan. The builder is also called with { role: 'watcher', playerId: null } (no
+// ws), so it must not touch recipient.ws. These types are deliberately NOT in store.js's
+// WATCHABLE_BROADCAST_TYPES, so watchers never receive them anyway.
+function broadcastMovePreview(broadcast, session, sessionId, token, payload, senderMeta, gmOnly) {
+  const mapHidden = session.map && !session.map.revealed;
+  broadcast(sessionId, (recipient) => {
+    if (recipient === senderMeta) return null;
+    if (recipient.role === 'gm') return payload;
+    if (gmOnly || token.hidden || mapHidden) return null;
+    return payload;
+  });
+}
+
+// Called when a socket closes: if it had a plan in progress, tell everyone else to drop it.
+export function clearMovePreviewForSocket(meta, session, broadcast) {
+  const tokenId = meta.movePreviewTokenId;
+  meta.movePreviewTokenId = null;
+  const token = tokenId ? session.tokens[tokenId] : null;
+  if (!token) return;
+  // A private plan was never sent to players, so a clear to them is a harmless no-op.
+  broadcastMovePreview(broadcast, session, meta.sessionId, token,
+    { type: 'token:move:preview:clear', tokenId }, meta, false);
+}
+
 function handleTokenEvent(meta, msg, context) {
   const session = context.sessions.get(meta.sessionId);
   if (!session) return;
@@ -292,16 +338,26 @@ function handleTokenEvent(meta, msg, context) {
     case 'token:move': {
       const token = session.tokens[msg.tokenId];
       if (!token || !canEditToken(meta, token)) return;
+      // Reject malformed coordinates outright (a NaN would poison speedRemainingFt).
+      if (!Number.isFinite(msg.x) || !Number.isFinite(msg.y)) return;
+      // Optional intermediate waypoints for a planned path move. Absent means a plain drag
+      // (a one-leg path). Anything malformed rejects the whole move.
+      let waypoints = [];
+      if (msg.waypoints !== undefined) {
+        const parsed = parsePoints(msg.waypoints, 0, MAX_MOVE_WAYPOINTS);
+        if (!parsed) return;
+        waypoints = parsed;
+      }
       const prevX = token.x;
       const prevY = token.y;
       token.x = msg.x;
       token.y = msg.y;
-      // Decrement speedRemainingFt to match the drag ghost label's distance
-      // (main.js's dragState rendering) - same Euclidean formula and
-      // rounding, so the two never disagree. Never blocks the move (product
-      // philosophy: automate/suggest, never hard-enforce) - just clamps the
-      // remaining budget at 0 and lets the overage show visually client-side.
-      // Rides on the existing token:move broadcast rather than a separate
+      // Decrement speedRemainingFt by the path's distance: Chebyshev (a diagonal square costs
+      // 5 ft), nearest foot per leg, legs summed - the same shared helper the client drag ghost
+      // and path label use, so they never disagree. Never blocks the move (product philosophy:
+      // automate/suggest, never hard-enforce) - just clamps the remaining budget at 0 and lets
+      // the overage show visually client-side. Waypoints are only used for the sum, they are not
+      // echoed in the broadcast. Rides on the existing token:move broadcast rather than a separate
       // token:stat:update, which would trigger a full sidebar rebuild on
       // every connected client on every single drag (see item 7).
       // Props omit speed fields entirely (see main.js's readTokenFormFields),
@@ -309,16 +365,72 @@ function handleTokenEvent(meta, msg, context) {
       // the decrement rather than deriving a bogus number in either case.
       const gridSizePx = session.map?.gridSizePx;
       if (typeof token.speedRemainingFt === 'number' && typeof gridSizePx === 'number' && gridSizePx > 0) {
-        const pxPerFoot = gridSizePx / 5;
-        const distanceFt = Math.round(Math.hypot(token.x - prevX, token.y - prevY) / pxPerFoot);
-        token.speedRemainingFt = Math.max(0, token.speedRemainingFt - distanceFt);
+        const pathDistanceFt = pathFt([{ x: prevX, y: prevY }, ...waypoints, { x: msg.x, y: msg.y }], gridSizePx);
+        // Never charge less than the straight start-to-end distance: per-leg rounding means a
+        // spam of sub-foot waypoints would otherwise round every leg down to 0 ft.
+        const straightFt = chebyshevFt(prevX, prevY, msg.x, msg.y, gridSizePx);
+        const distanceFt = pathDistanceFt === null || straightFt === null ? null : Math.max(pathDistanceFt, straightFt);
+        if (distanceFt !== null) token.speedRemainingFt = Math.max(0, token.speedRemainingFt - distanceFt);
       }
+      if (meta.movePreviewTokenId === token.id) meta.movePreviewTokenId = null;
       broadcastToken(context, session, meta.sessionId, 'token:move', token, {
         tokenId: token.id,
         x: token.x,
         y: token.y,
         speedRemainingFt: token.speedRemainingFt,
       });
+      break;
+    }
+
+    // Recenter on Map: a rescue for a token stuck somewhere unreachable. A dedicated event
+    // (not a flag on token:move) so a client can never make an arbitrary free move - the server
+    // picks the target (the map centre) itself and does NOT deduct speedRemainingFt. Same
+    // permission rule as token:move. Broadcasts as a normal token:move so every client's
+    // existing handler just works.
+    case 'token:recenter': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !canEditToken(meta, token)) return;
+      const map = session.map;
+      if (!map || !Number.isFinite(map.widthPx) || !Number.isFinite(map.heightPx)) return;
+      token.x = map.widthPx / 2;
+      token.y = map.heightPx / 2;
+      if (meta.movePreviewTokenId === token.id) meta.movePreviewTokenId = null;
+      broadcastToken(context, session, meta.sessionId, 'token:move', token, {
+        tokenId: token.id,
+        x: token.x,
+        y: token.y,
+        speedRemainingFt: token.speedRemainingFt,
+      });
+      break;
+    }
+
+    // Movement path preview (ephemeral, never stored in session). The sender plans a path
+    // client-side and we just relay it to everyone who could see the token. See
+    // broadcastMovePreview for the visibility rules. A GM may flag a preview `private`, which
+    // then reaches GM-role recipients only (enforced here, not just in the client).
+    case 'token:move:preview': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !canEditToken(meta, token) || !session.map) return;
+      const points = parsePoints(msg.points, 1, MAX_MOVE_WAYPOINTS + 1);
+      if (!points) return;
+      // One plan per socket: starting on a different token clears the old one first.
+      const previous = meta.movePreviewTokenId;
+      if (previous && previous !== token.id && session.tokens[previous]) {
+        broadcastMovePreview(context.broadcast, session, meta.sessionId, session.tokens[previous],
+          { type: 'token:move:preview:clear', tokenId: previous }, meta, false);
+      }
+      meta.movePreviewTokenId = token.id;
+      broadcastMovePreview(context.broadcast, session, meta.sessionId, token,
+        { type: 'token:move:preview', tokenId: token.id, points }, meta, msg.private === true && meta.role === 'gm');
+      break;
+    }
+
+    case 'token:move:preview:clear': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !canEditToken(meta, token)) return;
+      broadcastMovePreview(context.broadcast, session, meta.sessionId, token,
+        { type: 'token:move:preview:clear', tokenId: token.id }, meta, false);
+      if (meta.movePreviewTokenId === token.id) meta.movePreviewTokenId = null;
       break;
     }
 

@@ -2,7 +2,7 @@
 import { WebSocketServer } from 'ws';
 import { sessions, socketsBySession, broadcast, setWatches, removeWatcher } from './store.js';
 import handleJoin from './handlers/join.js';
-import handleTokenEvent from './handlers/token.js';
+import handleTokenEvent, { clearMovePreviewForSocket } from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
 import handleMarkerEvent from './handlers/marker.js';
 import handleTargetEvent from './handlers/target.js';
@@ -89,7 +89,7 @@ export function attachVttWebSocketServer(httpServer) {
   wss.on('close', () => clearInterval(heartbeatInterval));
 
   wss.on('connection', (ws) => {
-    const meta = { ws, sessionId: null, role: null, playerId: null, playerName: null, watchTopics: new Set() };
+    const meta = { ws, sessionId: null, role: null, playerId: null, playerName: null, watchTopics: new Set(), movePreviewTokenId: null };
     ws.vttMeta = meta;
     ws.isAlive = true;
     ws.on('pong', () => {
@@ -125,6 +125,9 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:remove':
         case 'token:remove:bulk':
         case 'token:move':
+        case 'token:recenter':
+        case 'token:move:preview':
+        case 'token:move:preview:clear':
         case 'token:move:resetAll':
         case 'token:stat:update':
         case 'token:knownAc:set':
@@ -170,6 +173,10 @@ export function attachVttWebSocketServer(httpServer) {
 
       const session = sessions.get(meta.sessionId);
       if (!session) return;
+
+      // Drop any movement-path preview this socket was planning (also covers the heartbeat
+      // terminate(), which ends in this same close event).
+      clearMovePreviewForSocket(meta, session, broadcast);
 
       if (meta.role === 'player' && meta.playerId && session.players[meta.playerId]) {
         // Don't delete the player outright - they should reappear correctly

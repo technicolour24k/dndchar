@@ -57,6 +57,9 @@ export function parseAttackOptions(body: unknown): ParsedAttackOptions {
 }
 
 // Chebyshev squares x 5 ft (a diagonal counts as one square), rounded to the nearest square.
+// Deliberately NOT the movement helper (static/vtt-app/shared/gridDistance.js, which rounds to the
+// nearest foot): adjacency for prone wants forgiveness for freely placed tokens, so 1.3 squares
+// apart still counts as 5 ft.
 function distanceBetweenTokensFt(attacker: any, target: any, gridSizePx: number): number | undefined {
   if (![attacker?.x, attacker?.y, target?.x, target?.y].every((n) => Number.isFinite(n))) return undefined;
   const px = Math.max(Math.abs(attacker.x - target.x), Math.abs(attacker.y - target.y));
