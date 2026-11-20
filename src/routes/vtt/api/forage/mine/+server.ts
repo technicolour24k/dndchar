@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { sessions, dmPresent, forageViewForPlayer } from '$vtt/store.js';
+import { query } from '$lib/server/db';
 import { getUnmarkedSelfFind } from '$lib/server/services/forage';
 import { findPendingForUser, resolveForageRoom } from '$lib/server/vttForage';
 import { loadOwnedCharacter, playerUnmarked, shortText } from '$lib/server/vttForageApi';
@@ -14,7 +15,10 @@ import { loadOwnedCharacter, playerUnmarked, shortText } from '$lib/server/vttFo
 //   dmPresent    a DM-mode forage would be used right now (live account GM)
 //   pending      the caller's in-flight DM request, player view only (never choice or preview)
 //   lastDm       the last closed DM-mode result, until dismissed
-//   unmarkedSelf a self-serve check waiting to be marked
+//   unmarkedSelf a self-serve check waiting to be marked (with its character's name)
+//   pendingCharacter the character the pending request is for, so a sheet can tell "mine" from
+//                a different character's (one forage in flight per USER, not per character)
+//   serverNow    the server clock, so a client can compare lastDm.closedAt without trusting its own clock
 export const GET: RequestHandler = async ({ locals, url }) => {
   const userId = locals.user!.id;
   const characterId = url.searchParams.get('characterId');
@@ -36,13 +40,22 @@ export const GET: RequestHandler = async ({ locals, url }) => {
     }
   }
 
+  const unmarked = playerUnmarked(await getUnmarkedSelfFind(userId));
+  let unmarkedSelf = null;
+  if (unmarked) {
+    const named = await query<{ name: string }>('SELECT name FROM characters WHERE id = $1', [unmarked.characterId]);
+    unmarkedSelf = { ...unmarked, characterName: named.rows[0]?.name ?? 'your character' };
+  }
+
   return json({
+    serverNow: Date.now(),
     roomId: session?.id ?? null,
     inRoom: !!session,
     dmPresent: session ? dmPresent(session) : false,
     pending: pending ? forageViewForPlayer(pending.request) : null,
     pendingRoomId: pending?.session.id ?? null,
+    pendingCharacter: pending ? { id: pending.request.characterId, name: pending.request.characterName } : null,
     lastDm,
-    unmarkedSelf: playerUnmarked(await getUnmarkedSelfFind(userId))
+    unmarkedSelf
   });
 };

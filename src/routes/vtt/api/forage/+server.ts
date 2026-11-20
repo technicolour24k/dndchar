@@ -23,7 +23,7 @@ import { isUuid, loadOwnedCharacter, parseAdvantage, parseSelfChoice, playerUnma
 // Who picks what (Rev 4): in DM mode the player sends ONLY their adv/dis counters, and the DM picks
 // the skill, area, category and table. Anything else in the body is ignored. In self-serve mode the
 // player picks from a short skill list plus an area and category (never a table: the server resolves
-// it), and gets a neutral 'nothing_here' for a combination with nothing to find.
+// it). A combination with nothing to find rolls and marks like any other, and a pass finds nothing.
 //
 // Statuses: 400 bad input, 403 not allowed in that room, 404 not your character, 409 a conflict the
 // client can act on ('resume' carries the existing in-flight forage so the popup can reopen it).
@@ -119,7 +119,7 @@ async function startAction(userId: string, displayName: string, body: any) {
     characterId, skillKey: picked.choice.skillKey, token: room.token, sessionId: session?.id ?? null, body
   });
   const started = await startSelfFind({
-    characterId, finderUserId: userId, tableId: picked.choice.tableId, check,
+    characterId, finderUserId: userId, tableId: picked.choice.tableId, areaType: picked.choice.areaType, category: picked.choice.category, check,
     roomCode: session?.id ?? null, gameSessionId: session?.gameSessionId ?? null
   });
   if ('conflict' in started) return err('resume', 409, { unmarkedSelf: playerUnmarked(started.existing) });

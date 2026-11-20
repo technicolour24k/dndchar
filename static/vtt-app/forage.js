@@ -17,8 +17,8 @@
 import {
   addLine, addableEntries, areaOptions, canApprove, canSubmitPicks, canSubmitSelf, categoryOptions, chosenTable,
   defaultPicks, defaultSelfPicks, dmResult, errorText, forageButtonLabel, LAST_GM_PICKS_KEY, LAST_PICKS_KEY,
-  linesPayload, natBadgeText, NOTHING_HERE_TEXT, parseQty, parseSavedPicks, pickableTables, queueLabel,
-  removeLine, requestSignature, resolveTable, resultHeadline, selfAreas, selfCategories, selfPairExists,
+  linesPayload, natBadgeText, canShareRecent, recentFindItemsText, recentFindStatusText, parseQty, parseSavedPicks, pickableTables, queueLabel,
+  removeLine, requestSignature, resolveTable, resultHeadline, selfAreas, selfCategories,
   selfResult, setLineQty, sortedRequests, tagLabel, tableLineText
 } from './shared/forageView.js';
 
@@ -135,8 +135,8 @@ export function createForage(deps) {
   }
 
   // The SELF-SERVE player's pickers (Rev 4): a short skill list, plus an area and a category as plain
-  // labels. No table name, no counts, no table picker. An area + category with nothing to find just
-  // gets a vague line and a disabled Forage button.
+  // labels. No table name, no counts, no table picker. Any area + category can be foraged: one with
+  // nothing to find looks exactly the same here, and a pass just finds nothing.
   function selfPickerHtml(cur) {
     const areas = selfAreas(cur.options);
     const categories = selfCategories(cur.options);
@@ -149,13 +149,10 @@ export function createForage(deps) {
         <div class="field"><label>Looking for</label>
           <select class="forage-select" data-fg-field="category">${optionsHtml(categories, cur.picks.category, tagLabel)}</select></div>
       </div>
-      <div class="forage-table-line forage-warn" data-fg="tableLine"></div>
       ${advPanelHtml(cur.adv)}`;
   }
 
   function refreshSelfPicker(root, cur) {
-    const line = root.querySelector('[data-fg="tableLine"]');
-    if (line) line.textContent = selfPairExists(cur.options, cur.picks.areaType, cur.picks.category) ? '' : NOTHING_HERE_TEXT;
     const submit = root.querySelector('[data-fg="submit"]');
     if (submit) submit.disabled = !canSubmitSelf(cur.options, cur.picks) || !!cur.busy || cur.adv?.status === 'loading';
   }
@@ -254,7 +251,8 @@ export function createForage(deps) {
   function resetPf(tokenId, characterId) {
     Object.assign(pf, {
       open: true, loading: true, tokenId, characterId, options: null, skills: null, mine: null,
-      picks: null, adv: null, self: null, forceForm: false, busy: false, message: '', previewSeq: 0
+      picks: null, adv: null, self: null, forceForm: false, busy: false, message: '', previewSeq: 0,
+      recent: { status: 'idle', finds: [], message: '' }, recentOpen: false
     });
   }
 
@@ -299,13 +297,13 @@ export function createForage(deps) {
   // A DM is present and will run the check (the server still decides at submit time).
   const dmMode = () => pf.mine?.dmPresent === true;
 
-  // The self-serve pickers' data: a short skill list and the area + category pairs worth foraging.
-  // The server sends no table names, ids or counts to a player.
+  // The self-serve pickers' data: a short skill list and separate area and category tag lists (never
+  // pairs). The server sends no table names, ids or counts to a player.
   async function loadSelfOptions() {
     const res = await api('GET', `${PLAYER_API}/tables?roomId=${encodeURIComponent(deps.getSessionId())}`);
     if (!res.ok) { pf.message = errorText(res.data); return; }
     pf.skills = res.data.skills;
-    pf.options = res.data.options;
+    pf.options = { areas: res.data.areas || [], categories: res.data.categories || [] };
     pf.picks = defaultSelfPicks(pf.skills, pf.options, readPicks(LAST_PICKS_KEY));
   }
 
@@ -383,7 +381,7 @@ export function createForage(deps) {
       const dm = dmMode();
       if (!dm && !(pf.options && pf.picks)) {
         // No DM and the pickers' data didn't load (or there is nothing to forage for).
-        html += `${msg}<div class="actions">${closeBtn()}</div>`;
+        html += `${msg}${recentHtml()}<div class="actions">${closeBtn()}</div>`;
       } else {
         // `busy` is a getter so the refresh functions always see the current value.
         playerCur = dm
@@ -397,7 +395,7 @@ export function createForage(deps) {
         html += dm
           ? `<p>The DM will call the check.</p>${advPanelHtml(pf.adv)}`
           : `<p class="attack-subtext">No DM connected, you will mark the check yourself.</p>${selfPickerHtml(playerCur)}`;
-        html += `${msg}<div class="actions">${closeBtn()}<button type="button" data-fg="submit" data-fg-act="submit">Forage</button></div>`;
+        html += `${msg}${recentHtml()}<div class="actions">${closeBtn()}<button type="button" data-fg="submit" data-fg-act="submit">Forage</button></div>`;
       }
     }
 
@@ -410,6 +408,63 @@ export function createForage(deps) {
     } else {
       playerBody.querySelector('[data-fg="primary"]:not(:disabled)')?.focus();
     }
+    if (phase === 'form' && pf.recentOpen && pf.recent.status === 'idle') loadRecent();
+  }
+
+  // "Recent finds": the finder's own last few finds, collapsed by default and fetched only when it is
+  // opened. It lets a find be shared after its result card is gone (a self-serve find with no game
+  // session has no other way). Rows carry no table names (Rev 4).
+  function recentHtml() {
+    return `<details class="forage-recent" data-fg="recentBox" ${pf.recentOpen ? 'open' : ''}>
+      <summary>Recent finds</summary><div data-fg="recent">${recentInnerHtml()}</div></details>`;
+  }
+
+  function recentInnerHtml() {
+    const r = pf.recent;
+    const note = r.message ? `<div class="forage-msg">${esc(r.message)}</div>` : '';
+    if (r.status === 'idle' || r.status === 'loading') return '<p class="attack-subtext">Loading…</p>';
+    if (r.status === 'failed') return `${note || `<div class="forage-msg">${esc(errorText({ error: 'network' }))}</div>`}`;
+    if (!r.finds.length) return `${note}<p class="attack-subtext">Nothing found yet.</p>`;
+    return `${note}<ul class="forage-recent-list">${r.finds.map((find) => `
+      <li><div><strong>${esc(recentFindItemsText(find))}</strong>
+        <div class="attack-subtext">${esc(new Date(find.createdAt).toLocaleString())} · ${esc(recentFindStatusText(find))}</div></div>
+        ${canShareRecent(find) ? `<button type="button" class="secondary" data-fg-act="shareRecent" data-find-id="${esc(find.id)}" ${pf.busy ? 'disabled' : ''}>Share</button>` : ''}</li>`).join('')}</ul>`;
+  }
+
+  function paintRecent() {
+    const box = playerBody.querySelector('[data-fg="recent"]');
+    if (box) box.innerHTML = recentInnerHtml();
+  }
+
+  async function loadRecent() {
+    if (!pf.open || pf.recent.status === 'loading') return;
+    const characterId = pf.characterId;
+    pf.recent.status = 'loading';
+    paintRecent();
+    const res = await api('GET', `${PLAYER_API}/recent?characterId=${encodeURIComponent(characterId)}`);
+    if (!pf.open || pf.characterId !== characterId) return;
+    if (res.ok) { pf.recent.status = 'ready'; pf.recent.finds = res.data.finds || []; pf.recent.message = ''; }
+    else { pf.recent.status = 'failed'; pf.recent.message = errorText(res.data); }
+    paintRecent();
+  }
+
+  async function shareRecent(findId) {
+    if (pf.busy || !findId) return;
+    pf.busy = true;
+    pf.recent.message = '';
+    paintRecent();
+    const res = await api('POST', `/vtt/api/finds/${encodeURIComponent(findId)}/share`);
+    pf.busy = false;
+    if (!pf.open) return;
+    if (res.ok) {
+      const row = pf.recent.finds.find((find) => find.id === findId);
+      if (row) row.shared = true;
+      const server = myServerResult();
+      if (server && server.findId === findId) server.shared = true;
+    } else {
+      pf.recent.message = errorText(res.data);
+    }
+    paintRecent();
   }
 
   // The result step, for both modes. "Share with party" shows for a standing haul (it has a findId and
@@ -520,6 +575,7 @@ export function createForage(deps) {
     if (res.ok) {
       pf.localResult = selfResult(res.data, findId, pf.characterId); // characterId: only that token's button says (result)
       pf.self = null;
+      pf.recent.status = 'idle'; // the list is stale now (it refetches when next shown)
     } else if (res.data.error === 'stale') {
       pf.self = null; // already marked elsewhere
       pf.message = errorText(res.data);
@@ -607,9 +663,16 @@ export function createForage(deps) {
     else if (act === 'recheck') recheckDm(true);
     else if (act === 'dismiss') dismissResult();
     else if (act === 'share') shareResult();
+    else if (act === 'shareRecent') shareRecent(event.target.closest('[data-find-id]')?.dataset.findId);
     else if (act === 'again') { pf.forceForm = true; pf.message = ''; renderPlayer(); }
   });
   attachPickerEvents(playerBody, () => playerCur);
+  // <details> doesn't bubble 'toggle', so listen in the capture phase.
+  playerBody.addEventListener('toggle', (event) => {
+    if (!event.target.matches('[data-fg="recentBox"]')) return;
+    pf.recentOpen = event.target.open;
+    if (pf.recentOpen && pf.recent.status === 'idle') loadRecent();
+  }, true);
   // Closing a player popup loses nothing (a request stays in flight), so backdrop and Escape are fine.
   deps.closeOnBackdropPress(playerModal, closePlayer);
   window.addEventListener('keydown', (event) => {

@@ -55,3 +55,20 @@ export type ForageCheck = {
 
 /** One haul line once it has reached an inventory row. `qty` is what this find added. */
 export type FindResult = { item_id: string; qty: number; inventory_id: string };
+
+/** GET /vtt/api/forage/mine: the finder's private forage state (what the character sheet reads). */
+export type ForageMine = {
+  /** Server clock at response time (ms), for comparing lastDm.closedAt without trusting the client clock. */
+  serverNow?: number;
+  roomId: string | null;
+  inRoom: boolean;
+  dmPresent: boolean;
+  pending: { id: string; stage: string; source: string; check: ForageCheck | null } | null;
+  pendingRoomId: string | null;
+  pendingCharacter?: { id: string; name: string } | null;
+  lastDm: {
+    requestId: string; characterId: string; outcome: 'failed' | 'approved' | 'cancelled'; check: ForageCheck | null;
+    lines?: Array<{ name: string; qty: number }>; findId?: string; shared?: boolean; closedAt: number;
+  } | null;
+  unmarkedSelf: { findId: string; characterId: string; characterName?: string; check: ForageCheck; roomCode: string | null } | null;
+};

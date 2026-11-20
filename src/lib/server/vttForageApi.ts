@@ -80,18 +80,22 @@ export function parseAdvantage(body: any): ForageChoice['advantage'] {
 
 /**
  * A SELF-SERVE player's picks. The skill must be on the short list, and the table is resolved HERE
- * from area + category: the player never names a table (a tableId in the body is ignored), and an
- * area + category with no pickable table gets the same neutral 'nothing_here' as an empty one, so a
- * player can't probe which tables exist.
+ * from area + category: the player never names a table (a tableId in the body is ignored). Any area
+ * + category is accepted, with or without a table behind it: one with no pickable table gets a null
+ * tableId, rolls and marks exactly like any other, and a pass just finds nothing. So a player can't
+ * tell from the popup which combinations have a table.
  */
-export async function parseSelfChoice(body: any): Promise<{ choice: ForageChoice } | { error: 'skill_not_allowed' | 'nothing_here' }> {
+export async function parseSelfChoice(body: any): Promise<
+  { choice: Omit<ForageChoice, 'tableId'> & { tableId: string | null } } | { error: 'skill_not_allowed' | 'bad_pick' }
+> {
   const skillKey = shortText(body?.skillKey, 40);
   if (!FORAGE_SELF_SKILLS.includes(skillKey)) return { error: 'skill_not_allowed' };
   const areaType = normaliseTag(shortText(body?.areaType, 80));
   const category = normaliseTag(shortText(body?.category, 80));
+  if (!areaType || !category) return { error: 'bad_pick' };
   const table = resolveTable(await loadForageCatalogue(), areaType, category);
-  if (!table || table.pickableCount === 0) return { error: 'nothing_here' };
-  return { choice: { skillKey, areaType, category, tableId: table.id, advantage: parseAdvantage(body) } };
+  const tableId = table && table.pickableCount > 0 ? table.id : null;
+  return { choice: { skillKey, areaType, category, tableId, advantage: parseAdvantage(body) } };
 }
 
 /** The `advantage` part of a stored choice, shaped as a request body for parseAttackOptions. */

@@ -7,6 +7,9 @@
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
   import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
+  import ForageModal from '$lib/components/character/ForageModal.svelte';
+  import { forageBadgeText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
+  import type { ForageMine } from '$lib/types/forage';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
     adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, defaultRollChoices, poolSummary,
@@ -25,6 +28,7 @@
     activeEncounterId = null,
     activeVttSessionId = null,
     activeGameSessionId = null,
+    currentUserId = null,
     onVersionHistory
   }: {
     character: CharacterDetail;
@@ -34,6 +38,7 @@
     activeEncounterId?: string | null;
     activeVttSessionId?: string | null;
     activeGameSessionId?: string | null;
+    currentUserId?: string | null;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -166,6 +171,73 @@
   let deathSaveFailures = $state(0);
   let savingThrowsOpen = $state(false);
   let skillChecksOpen = $state(false);
+
+  // Forage (vtt-forage unit E). The sheet owns the latest `mine` (the finder's private forage state)
+  // so the button badge stays right while the popup is closed. It is fetched: once on load when there
+  // is no room to watch (a room's first resync does it otherwise), when a detail-free `forage:ping`
+  // arrives on the room topic, on a reconnect resync, and whenever the popup opens. Nothing polls.
+  let forageOpen = $state(false);
+  // Forage is for the character's owner only. The user wants player stand-ins (someone acting for an
+  // absent player's character) later: widen THIS one flag (e.g. `|| standInFor(character)`) and the
+  // server's loadOwnedCharacter check, and the button, the on-load fetch and the pings all follow.
+  const forageOwner = $derived(!!currentUserId && currentUserId === character.ownerUserId);
+  let forageMine = $state<ForageMine | null>(null);
+  const forageBadge = $derived(forageBadgeText(forageMine, character.id));
+  // A find landed while the sheet had unsaved edits, so the new rows wait for Save (see haulLanded).
+  let haulWaitingForSave = $state(false);
+  // DM-approved hauls already dealt with (by request id), so one result never reloads the sheet twice.
+  const handledHauls = new Set<string>();
+  // When this sheet mounted, on the server's clock (learned from the first successful `mine`). A DM
+  // result closed BEFORE this counts as pre-existing: it is already in the rows the sheet loaded, so it
+  // must not reload. One closed after it is new, even if the first fetch failed or came late.
+  const mountedAtClient = Date.now();
+  let serverOffsetMs: number | null = null;
+  // Only the latest response may update state (a slow older one must not overwrite a newer one).
+  // The parent keys this component on the character id, so none of this leaks between characters.
+  let forageSeq = 0;
+
+  async function refreshForage() {
+    if (!forageOwner) return;
+    const characterId = character.id;
+    const seq = ++forageSeq;
+    try {
+      const response = await fetch(`/vtt/api/forage/mine?characterId=${encodeURIComponent(characterId)}`);
+      if (!response.ok) return;
+      const mine = (await response.json()) as ForageMine;
+      if (seq !== forageSeq || characterId !== character.id) return;
+      forageMine = mine;
+      if (serverOffsetMs === null && typeof mine.serverNow === 'number') serverOffsetMs = mine.serverNow - Date.now();
+      const decision = haulDecision({
+        mine, characterId, mountedAt: mountedAtClient + (serverOffsetMs ?? 0), handled: handledHauls, hasUnsavedChanges
+      });
+      if (decision.key) handledHauls.add(decision.key);
+      if (decision.action === 'reload') haulLanded();
+      else if (decision.action === 'defer') haulWaitingForSave = true;
+    } catch {
+      // Offline or the server hiccuped: the badge just stays as it was.
+    }
+  }
+
+  // New items from a forage (self-serve pass, or a DM approval) are already in the database. With no
+  // unsaved edits the sheet reloads so the new or stacked rows show. With unsaved edits it must NOT
+  // reload (that could re-render rows mid-edit, see the notes by runInventoryAction), so it says the
+  // find will appear on Save. The changes-only Save leaves rows the user didn't touch alone, so that
+  // Save keeps the find and the post-save load then shows it.
+  function haulLanded() {
+    if (hasUnsavedChanges) {
+      haulWaitingForSave = true;
+    } else {
+      void invalidate('app:character-sheet');
+    }
+  }
+
+  // With no room, nothing else will fetch it for the badge. (In a room the subscription's first resync
+  // does, so this doesn't double up.) Keyed on the id only, so a reload doesn't refetch.
+  const forageCharacterId = $derived(character.id);
+  $effect(() => {
+    if (!forageCharacterId || activeVttSessionId || !forageOwner) return;
+    untrack(() => void refreshForage());
+  });
   let playerModificationsOpen = $state(false);
   let activityLogOpen = $state(false);
   let sessionNotesModalId = $state<string | null>(null);
@@ -1031,6 +1103,7 @@
     const unsubscribe = subscribeTopic(`room:${sessionId}`, {
       onResync: () => {
         refreshActivityStatus();
+        void refreshForage();
         fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
         if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
       },
@@ -1041,6 +1114,10 @@
           combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
         } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
           refreshActivityStatus();
+        } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
+          // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
+          // nothing read in here can become a dependency of this effect (Review 3).
+          untrack(() => void refreshForage());
         }
       }
     });
@@ -1219,7 +1296,7 @@
     } catch {
       // Non-JSON error page (e.g. a 500) - treat as a failed save.
     }
-    if (ok) hasUnsavedChanges = false;
+    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; }
     saveStatus = ok ? 'Saved' : 'Save failed';
     return ok;
   }
@@ -1597,6 +1674,7 @@
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
   function closeOpenModal() {
+    if (forageOpen) { forageOpen = false; return; }
     if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
     if (simpleRollResult) { simpleRollResult = null; return; }
@@ -1636,7 +1714,7 @@
       // after a form action), but this keeps that rerun scoped to this route's own
       // depends('app:character-sheet') rather than also re-running unrelated layout loads.
       await update({ reset: false, invalidateAll: false });
-      if (result.type === 'success') hasUnsavedChanges = false;
+      if (result.type === 'success') { hasUnsavedChanges = false; haulWaitingForSave = false; }
       saveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
       await invalidate('app:character-sheet');
     };
@@ -1673,6 +1751,9 @@
           <div class="save-button-col">
             <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
             <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
+            {#if haulWaitingForSave && hasUnsavedChanges}
+              <span class="forage-pending-note">Your find will appear when you save.</span>
+            {/if}
             {#if result?.saved}
               <span class="save-state good">Saved</span>
             {/if}
@@ -1877,6 +1958,12 @@
             <div class="ability-popup-links">
               <button type="button" class="text-button" onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
               <button type="button" class="text-button" onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
+              <!-- Always enabled: the server decides DM vs self-serve when Forage is pressed. -->
+              {#if forageOwner}
+                <button type="button" class="text-button" onclick={() => (forageOpen = true)}>
+                  <span>Forage</span>{#if forageBadge}<span class="forage-status-badge">{forageBadge}</span>{/if}
+                </button>
+              {/if}
             </div>
           </div>
         </section>
@@ -2596,6 +2683,17 @@
         {/if}
       </div>
     </div>
+  {/if}
+
+  {#if forageOpen && forageOwner}
+    <ForageModal
+      characterId={character.id}
+      mine={forageMine}
+      haulWaiting={haulWaitingForSave && hasUnsavedChanges}
+      onRefresh={refreshForage}
+      onHaul={() => haulLanded()}
+      onClose={() => (forageOpen = false)}
+    />
   {/if}
 
   {#if rollOptions}

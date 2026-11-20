@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest';
 // The same file the browser loads (the VTT client is unbundled), tested from here.
 import { FORAGE_SELF_SKILLS } from '$lib/rules/skills';
 import {
-  SELF_SKILL_KEYS, canSubmitSelf, defaultSelfPicks, selfAreas, selfCategories, selfPairExists, tagLabel,
+  SELF_SKILL_KEYS, canSubmitSelf, defaultSelfPicks, selfAreas, selfCategories, tagLabel,
   addLine, addableEntries, areaOptions, canApprove, canSubmitPicks, categoryOptions, chosenTable, defaultPicks,
   errorText, forageButtonLabel, parseQty, parseSavedPicks, removeLine, requestSignature, resolveTable,
-  resultHeadline, selfResult, setLineQty, sortedRequests, tableLineText
+  resultHeadline, selfResult, setLineQty, sortedRequests, tableLineText,
+  approvedHaulKey, forageBlocker, haulDecision, canShareRecent, forageAdvReadout, forageBadgeText, lastDmFor, recentFindItemsText, recentFindStatusText
 } from '../../../static/vtt-app/shared/forageView.js';
 
 const tables = [
@@ -102,8 +103,8 @@ describe('results, labels and errors', () => {
 
   it('words each outcome', () => {
     expect(resultHeadline({ outcome: 'cancelled' })).toBe('The DM cancelled the forage.');
-    expect(resultHeadline({ outcome: 'failed' })).toBe('You find nothing of note.');
-    expect(resultHeadline({ outcome: 'approved', lines: [] })).toBe('You find nothing of note.');
+    expect(resultHeadline({ outcome: 'failed' })).toBe("You didn't find anything.");
+    expect(resultHeadline({ outcome: 'approved', lines: [] })).toBe("You didn't find anything.");
     expect(resultHeadline({ outcome: 'approved', lines: [{}] })).toBe('You found something.');
   });
 
@@ -136,7 +137,7 @@ describe('GM queue', () => {
 });
 
 describe('self-serve pickers (Rev 4)', () => {
-  const options = [{ areaType: 'meadow', category: 'plant' }, { areaType: 'cave', category: 'ore' }];
+  const options = { areas: ['cave', 'meadow'], categories: ['ore', 'plant'] };
   const skills = [{ key: 'nature', name: 'Nature' }, { key: 'survival', name: 'Survival' }];
 
   it('keeps the client skill shortlist in step with the server constant', () => {
@@ -150,21 +151,111 @@ describe('self-serve pickers (Rev 4)', () => {
     expect(tagLabel('dark_forest')).toBe('Dark Forest');
   });
 
-  it('builds areas and categories from the pairs, and knows which combinations exist', () => {
+  it('reads the area and category lists as given', () => {
     expect(selfAreas(options)).toEqual(['cave', 'meadow']);
     expect(selfCategories(options)).toEqual(['ore', 'plant']);
-    expect(selfPairExists(options, 'cave', 'ore')).toBe(true);
-    expect(selfPairExists(options, 'cave', 'plant')).toBe(false);
+    expect(selfAreas(null)).toEqual([]);
   });
 
-  it('starts from saved picks where valid, else the first area with a paired category', () => {
+  it('starts from saved picks where still listed, else the first of each list', () => {
     expect(defaultSelfPicks(skills, options, { skillKey: 'survival', areaType: 'meadow', category: 'plant' })).toEqual({ skillKey: 'survival', areaType: 'meadow', category: 'plant' });
-    expect(defaultSelfPicks(skills, options, {})).toEqual({ skillKey: 'nature', areaType: 'cave', category: 'ore' });
+    expect(defaultSelfPicks(skills, options, { areaType: 'swamp' })).toEqual({ skillKey: 'nature', areaType: 'cave', category: 'ore' });
   });
 
-  it('only submits a shortlisted skill with an existing area + category', () => {
+  it('submits any listed area + category with a shortlisted skill, whether or not a table is behind it', () => {
     expect(canSubmitSelf(options, { skillKey: 'nature', areaType: 'cave', category: 'ore' })).toBe(true);
+    expect(canSubmitSelf(options, { skillKey: 'nature', areaType: 'cave', category: 'plant' })).toBe(true);
     expect(canSubmitSelf(options, { skillKey: 'stealth', areaType: 'cave', category: 'ore' })).toBe(false);
-    expect(canSubmitSelf(options, { skillKey: 'nature', areaType: 'cave', category: 'plant' })).toBe(false);
+    expect(canSubmitSelf(options, { skillKey: 'nature', areaType: '', category: 'ore' })).toBe(false);
+  });
+});
+
+// Unit E: the character sheet's helpers (the badge, which DM result is this character's, and the list).
+describe('character sheet forage helpers', () => {
+  const lastDm = { requestId: 'r1', characterId: 'c1', outcome: 'approved', check: null, lines: [{ name: 'Moonleaf', qty: 2 }], closedAt: 1 };
+
+  it('badges waiting, then mark check, then result, else nothing', () => {
+    expect(forageBadgeText(null, 'c1')).toBe('');
+    expect(forageBadgeText({ pending: { id: 'p' }, unmarkedSelf: { findId: 'f', characterId: 'c1' }, lastDm }, 'c1')).toBe('waiting');
+    expect(forageBadgeText({ pending: null, unmarkedSelf: { findId: 'f', characterId: 'c1' }, lastDm }, 'c1')).toBe('mark check');
+    expect(forageBadgeText({ pending: null, unmarkedSelf: null, lastDm }, 'c1')).toBe('result');
+    expect(forageBadgeText({ pending: null, unmarkedSelf: null, lastDm: null }, 'c1')).toBe('');
+  });
+
+  it('only treats a DM result as belonging to the character it was for', () => {
+    expect(lastDmFor({ lastDm }, 'c1')).toBe(lastDm);
+    expect(lastDmFor({ lastDm }, 'c2')).toBeNull();
+    expect(forageBadgeText({ pending: null, unmarkedSelf: null, lastDm }, 'c2')).toBe('');
+  });
+
+  it('keys an approved haul with items by request id, and nothing else', () => {
+    expect(approvedHaulKey({ lastDm }, 'c1')).toBe('r1');
+    expect(approvedHaulKey({ lastDm: { ...lastDm, lines: [] } }, 'c1')).toBeNull();
+    expect(approvedHaulKey({ lastDm: { ...lastDm, outcome: 'failed' } }, 'c1')).toBeNull();
+    expect(approvedHaulKey({ lastDm }, 'c2')).toBeNull();
+    expect(approvedHaulKey(null, 'c1')).toBeNull();
+  });
+
+  it('reads the net adv/dis the same way the VTT panel does', () => {
+    const sources = [{ id: 'a', kind: 'advantage' }, { id: 'b', kind: 'disadvantage' }];
+    expect(forageAdvReadout({ sources: [], disabled: [], adv: 0, dis: 0 })).toBe('Flat roll');
+    expect(forageAdvReadout({ sources, disabled: [], adv: 0, dis: 0 })).toBe('Net 0 (1 adv, 1 dis): flat roll');
+    expect(forageAdvReadout({ sources, disabled: ['b'], adv: 1, dis: 0 })).toBe('Net +2 (2 adv, 0 dis): roll 3d20, keep highest');
+    expect(forageAdvReadout({ sources, disabled: ['a'], adv: 0, dis: 1 })).toBe('Net -2 (0 adv, 2 dis): roll 3d20, keep lowest');
+  });
+
+  it('words the recent finds list and only offers Share on an unshared standing find', () => {
+    const find = { id: 'f', status: 'found', mode: 'self', shared: false, items: [{ name: 'Moonleaf', qty: 3 }, { name: 'Iron Ore', qty: 2 }], revertNote: '' };
+    expect(recentFindItemsText(find)).toBe('3x Moonleaf, 2x Iron Ore');
+    expect(recentFindItemsText({ items: [] })).toBe('Nothing recorded');
+    expect(canShareRecent(find)).toBe(true);
+    expect(canShareRecent({ ...find, shared: true })).toBe(false);
+    expect(canShareRecent({ ...find, status: 'reverted' })).toBe(false);
+    expect(recentFindStatusText(find)).toBe('self-served');
+    expect(recentFindStatusText({ ...find, shared: true, mode: 'dm' })).toBe('DM-approved · shared with the party');
+    expect(recentFindStatusText({ ...find, status: 'reverted', revertNote: 'Moonleaf: reduced 5 -> 2' })).toBe('self-served · undone by the DM (Moonleaf: reduced 5 -> 2)');
+  });
+
+  it('scopes the badge to this character, and names the character that is blocking', () => {
+    const other = { pending: { id: 'p' }, pendingCharacter: { id: 'c2', name: 'Thorne' }, unmarkedSelf: null, lastDm: null };
+    expect(forageBadgeText(other, 'c1')).toBe('');
+    expect(forageBlocker(other, 'c1')).toMatchObject({ kind: 'pending', characterName: 'Thorne', isThisCharacter: false });
+    expect(forageBadgeText(other, 'c2')).toBe('waiting');
+    const unmarked = { pending: null, unmarkedSelf: { findId: 'f', characterId: 'c2', characterName: 'Thorne' }, lastDm: null };
+    expect(forageBadgeText(unmarked, 'c1')).toBe('');
+    expect(forageBlocker(unmarked, 'c1')).toMatchObject({ kind: 'unmarked', characterName: 'Thorne', isThisCharacter: false });
+    expect(forageBlocker({ pending: null, unmarkedSelf: null }, 'c1')).toBeNull();
+  });
+
+  describe('haulDecision (should a DM approval reload the sheet)', () => {
+    const mine = (closedAt: number, requestId = 'r1') => ({ lastDm: { requestId, characterId: 'c1', outcome: 'approved', lines: [{ name: 'Moonleaf', qty: 2 }], closedAt } });
+    const base = { characterId: 'c1', mountedAt: 1000, hasUnsavedChanges: false };
+
+    it('does not reload for a result that closed before the sheet mounted', () => {
+      expect(haulDecision({ ...base, mine: mine(999), handled: new Set() })).toEqual({ key: 'r1', action: 'none' });
+    });
+
+    it('reloads a new result exactly once', () => {
+      const handled = new Set<string>();
+      const first = haulDecision({ ...base, mine: mine(2000), handled });
+      expect(first).toEqual({ key: 'r1', action: 'reload' });
+      handled.add(first.key as string);
+      expect(haulDecision({ ...base, mine: mine(2000), handled })).toEqual({ key: null, action: 'none' });
+    });
+
+    it('defers with unsaved edits', () => {
+      expect(haulDecision({ ...base, hasUnsavedChanges: true, mine: mine(2000), handled: new Set() }).action).toBe('defer');
+    });
+
+    it('still reloads for an approval after a failed first fetch (nothing was ever recorded)', () => {
+      // The first fetch failed, so no baseline was taken. The later one sees an approval closed after mount.
+      expect(haulDecision({ ...base, mine: mine(5000), handled: new Set() }).action).toBe('reload');
+    });
+
+    it('ignores other characters, failed outcomes and empty hauls', () => {
+      expect(haulDecision({ ...base, characterId: 'c2', mine: mine(2000), handled: new Set() }).action).toBe('none');
+      expect(haulDecision({ ...base, mine: { lastDm: { ...mine(2000).lastDm, outcome: 'failed' } }, handled: new Set() }).action).toBe('none');
+      expect(haulDecision({ ...base, mine: null, handled: new Set() }).action).toBe('none');
+    });
   });
 });

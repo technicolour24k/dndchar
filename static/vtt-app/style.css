@@ -438,6 +438,13 @@ body {
 .forage-lines .forage-line-name { flex: 1 1 auto; min-width: 0; }
 .forage-lines .forage-qty { width: 80px; flex: 0 0 80px; }
 .forage-lines .forage-qty.invalid { border-color: #e57373; }
+/* "Recent finds" (collapsible, player popup form step) */
+.forage-recent { margin: 10px 0; border: 1px solid #2c2f36; border-radius: 6px; padding: 0 10px; }
+.forage-recent summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-size: 14px; }
+.forage-recent-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.forage-recent-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; font-size: 13px; border-top: 1px solid #2c2f36; }
+.forage-recent-list li > div { flex: 1 1 auto; min-width: 0; }
+.forage-recent-list button { min-height: 44px; min-width: 64px; flex: 0 0 auto; }
 .forage-queue { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .forage-queue button { padding: 6px 10px; border: none; border-radius: 4px; color: #fff; background: #3a3d44; cursor: pointer; font-size: 13px; }
 .forage-queue button.active { background: #4a7fff; }

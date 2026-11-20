@@ -17,9 +17,6 @@ export const LAST_GM_PICKS_KEY = 'vtt_forage_last_gm';
  */
 export const SELF_SKILL_KEYS = ['nature', 'survival', 'arcana', 'perception', 'investigation', 'religion'];
 
-/** Shown to a self-serve player for an area + category with nothing to find. Deliberately vague. */
-export const NOTHING_HERE_TEXT = "You don't think you'll find anything like that here.";
-
 const CATEGORY_LABELS = { plant: 'Plants', ore: 'Ores', gem: 'Gems', scroll: 'Scrolls', misc: 'Miscellaneous' };
 
 /** Plain-language label for an area type or category tag: "cave" -> "Cave", "ore" -> "Ores". */
@@ -29,34 +26,35 @@ export function tagLabel(tag) {
 }
 
 // ===============================================================================================
-// SELF-SERVE PLAYER helpers: a player never gets table names, ids or counts, only plain area +
-// category pairs, so nothing here may take or show a table.
+// SELF-SERVE PLAYER helpers: a player never gets table names, ids or counts, only plain area and
+// category tags, so nothing here may take or show a table.
 // ===============================================================================================
-// `options` is the server's list of { areaType, category } pairs that have something pickable.
+// `options` is { areas, categories }: two separate tag lists from the server, never pairs, so they
+// say nothing about which combinations have something to find. Any area + category can be foraged;
+// one with nothing behind it rolls and marks like any other and a pass just finds nothing.
 
 export function selfAreas(options) {
-  return unique((options || []).map((o) => o.areaType)).sort();
+  return [...(options?.areas || [])];
 }
 export function selfCategories(options) {
-  return unique((options || []).map((o) => o.category)).sort();
-}
-export function selfPairExists(options, areaType, category) {
-  return (options || []).some((o) => o.areaType === areaType && o.category === category);
+  return [...(options?.categories || [])];
 }
 
-/** Starting self-serve picks: saved ones where valid, else the first area and a category that pairs with it. */
+/** Starting self-serve picks: saved ones where still listed, else the first of each list. */
 export function defaultSelfPicks(skills, options, saved) {
   const areas = selfAreas(options);
-  const areaType = areas.includes(saved?.areaType) ? saved.areaType : areas[0] || '';
   const categories = selfCategories(options);
-  const pairedFirst = (options || []).find((o) => o.areaType === areaType)?.category || '';
-  const category = categories.includes(saved?.category) ? saved.category : pairedFirst;
   const skillKeys = (skills || []).map((skill) => skill.key);
-  return { skillKey: skillKeys.includes(saved?.skillKey) ? saved.skillKey : skillKeys[0] || '', areaType, category };
+  return {
+    skillKey: skillKeys.includes(saved?.skillKey) ? saved.skillKey : skillKeys[0] || '',
+    areaType: areas.includes(saved?.areaType) ? saved.areaType : areas[0] || '',
+    category: categories.includes(saved?.category) ? saved.category : categories[0] || ''
+  };
 }
 
 export function canSubmitSelf(options, picks) {
-  return SELF_SKILL_KEYS.includes(picks.skillKey) && selfPairExists(options, picks.areaType, picks.category);
+  return SELF_SKILL_KEYS.includes(picks.skillKey) && selfAreas(options).includes(picks.areaType)
+    && selfCategories(options).includes(picks.category);
 }
 
 const unique = (values) => [...new Set(values)];
@@ -176,8 +174,8 @@ export function dmResult(result) {
 export function resultHeadline(result) {
   if (!result) return '';
   if (result.outcome === 'cancelled') return 'The DM cancelled the forage.';
-  if (result.outcome === 'failed') return 'You find nothing of note.';
-  return result.lines && result.lines.length ? 'You found something.' : 'You find nothing of note.';
+  if (result.outcome === 'failed') return "You didn't find anything.";
+  return result.lines && result.lines.length ? 'You found something.' : "You didn't find anything.";
 }
 
 // --- Button labels -------------------------------------------------------------------------
@@ -250,6 +248,103 @@ export function linesPayload(lines) {
   return lines.map((line) => ({ itemId: line.itemId, qty: line.qty }));
 }
 
+// --- Character sheet helpers (unit E) --------------------------------------------------------------
+// `mine` is the GET /vtt/api/forage/mine response. A closed DM-mode result belongs to one character, so
+// the sheet only treats it as its own when characterId matches. The unmarked self check is per user.
+
+/** The result of the last DM-mode forage, if it is this character's. */
+export function lastDmFor(mine, characterId) {
+  const last = mine && mine.lastDm;
+  return last && last.characterId === characterId ? last : null;
+}
+
+/**
+ * The forage blocking this user (one in flight per USER, not per character): a pending DM request or an
+ * unmarked self-serve check. `mine` says whose it is, so a sheet can tell its own from another character's.
+ * Returns { kind: 'pending' | 'unmarked', characterId, characterName, isThisCharacter } or null.
+ */
+export function forageBlocker(mine, characterId) {
+  if (!mine) return null;
+  if (mine.pending) {
+    const who = mine.pendingCharacter || {};
+    // An older response with no character info is treated as this character's.
+    return { kind: 'pending', characterId: who.id || characterId, characterName: who.name || 'your character', isThisCharacter: !who.id || who.id === characterId };
+  }
+  if (mine.unmarkedSelf) {
+    const u = mine.unmarkedSelf;
+    return { kind: 'unmarked', characterId: u.characterId, characterName: u.characterName || 'your character', isThisCharacter: u.characterId === characterId };
+  }
+  return null;
+}
+
+/** Badge on the sheet's Forage button: 'waiting', 'mark check', 'result' or ''. Only for THIS character's forage. */
+export function forageBadgeText(mine, characterId) {
+  const blocker = forageBlocker(mine, characterId);
+  if (blocker && blocker.isThisCharacter) return blocker.kind === 'pending' ? 'waiting' : 'mark check';
+  if (lastDmFor(mine, characterId)) return 'result';
+  return '';
+}
+
+/** A key for a DM-approved haul that put items in this character's inventory, else null. */
+export function approvedHaulKey(mine, characterId) {
+  const last = lastDmFor(mine, characterId);
+  return last && last.outcome === 'approved' && last.lines && last.lines.length ? String(last.requestId) : null;
+}
+
+/**
+ * Should a DM-approved haul reload the sheet? Pure, so the rules are testable:
+ *   - no approved haul for this character, or one already handled: nothing
+ *   - closed before the sheet mounted (`mountedAt`, on the SERVER clock): it is already in the rows the
+ *     sheet loaded, so nothing (the caller still records the key)
+ *   - otherwise 'reload', or 'defer' when there are unsaved edits (the rows then show on Save)
+ * `handled` is a Set of keys the caller has already acted on. Returns { key, action }.
+ */
+export function haulDecision({ mine, characterId, mountedAt, handled, hasUnsavedChanges }) {
+  const key = approvedHaulKey(mine, characterId);
+  if (!key || handled.has(key)) return { key: null, action: 'none' };
+  const closedAt = lastDmFor(mine, characterId).closedAt;
+  if (typeof closedAt === 'number' && closedAt < mountedAt) return { key, action: 'none' };
+  return { key, action: hasUnsavedChanges ? 'defer' : 'reload' };
+}
+
+/** The net adv/dis readout for the sheet popup (the VTT draws the same sentence in main.js). */
+export function forageAdvReadout({ sources, disabled, adv, dis }) {
+  const off = new Set(disabled || []);
+  const ticked = (sources || []).filter((source) => !off.has(source.id));
+  const advantage = ticked.filter((source) => source.kind === 'advantage').length + adv;
+  const disadvantage = ticked.filter((source) => source.kind === 'disadvantage').length + dis;
+  if (advantage === 0 && disadvantage === 0) return 'Flat roll';
+  const net = advantage - disadvantage;
+  const counts = `(${advantage} adv, ${disadvantage} dis)`;
+  if (net === 0) return `Net 0 ${counts}: flat roll`;
+  return `Net ${net > 0 ? '+' : ''}${net} ${counts}: roll ${1 + Math.abs(net)}d20, keep ${net > 0 ? 'highest' : 'lowest'}`;
+}
+
+// --- "Recent finds" (the owner's own list, shared by the VTT popup and the character sheet) -------
+// Rows come from GET /vtt/api/forage/recent: { id, createdAt, status: 'found' | 'reverted', mode,
+// shared, items: [{ name, qty }], revertNote }. There is no table name anywhere in them (Rev 4).
+
+/** "3x Moonleaf, 2x Iron Ore", or a plain note when the haul is empty. */
+export function recentFindItemsText(find) {
+  const items = (find && find.items) || [];
+  return items.length ? items.map((item) => `${item.qty}x ${item.name}`).join(', ') : 'Nothing recorded';
+}
+
+/** Share is offered only on a standing find that hasn't been shared yet. */
+export function canShareRecent(find) {
+  return !!find && find.status === 'found' && !find.shared;
+}
+
+/** Short status words for a row: shared, undone (with the note), self-served. Empty parts are dropped. */
+export function recentFindStatusText(find) {
+  if (!find) return '';
+  const parts = [];
+  parts.push(find.mode === 'self' ? 'self-served' : 'DM-approved');
+  if (find.status === 'reverted') parts.push(find.revertNote ? `undone by the DM (${find.revertNote})` : 'undone by the DM');
+  else if (find.shared) parts.push('shared with the party');
+  return parts.join(' · ');
+}
+
 // --- Errors --------------------------------------------------------------------------------
 
 const ERROR_TEXT = {
@@ -257,7 +352,7 @@ const ERROR_TEXT = {
   bad_skill: 'Pick a skill.',
   bad_table: "That table isn't available any more.",
   table_empty: "You don't think you'll find anything like that here.",
-  nothing_here: "You don't think you'll find anything like that here.",
+  bad_pick: 'Pick an area and a category.',
   skill_not_allowed: 'Pick one of the listed skills.',
   not_in_room: "You aren't in that room.",
   bad_token: "That token isn't yours.",

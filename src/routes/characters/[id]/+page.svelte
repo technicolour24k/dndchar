@@ -7,7 +7,10 @@
 </script>
 
 <section class="sheet-grid single">
-  <CharacterSheetForm character={data.character} itemCategories={data.itemCategories} result={form ?? undefined} isAdmin={data.user?.role === 'admin'} activeEncounterId={data.activeEncounterId} activeVttSessionId={data.activeVttSessionId} activeGameSessionId={data.activeGameSessionId} onVersionHistory={() => (versionHistoryOpen = true)} />
+  <!-- Keyed on the character: the sheet keeps per-character state (forage badge, handled hauls), which must not carry over. -->
+  {#key data.character.id}
+  <CharacterSheetForm currentUserId={data.user?.id ?? null} character={data.character} itemCategories={data.itemCategories} result={form ?? undefined} isAdmin={data.user?.role === 'admin'} activeEncounterId={data.activeEncounterId} activeVttSessionId={data.activeVttSessionId} activeGameSessionId={data.activeGameSessionId} onVersionHistory={() => (versionHistoryOpen = true)} />
+  {/key}
 </section>
 
 <VersionList characterId={data.character.id} open={versionHistoryOpen} onClose={() => (versionHistoryOpen = false)} />

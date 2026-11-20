@@ -83,16 +83,19 @@ beforeEach(() => {
 });
 
 describe('forage/tables', () => {
-  it('gives a player only skills on the short list and plain area + category pairs, nothing else', async () => {
+  it('gives a player only skills on the short list and separate area and category tag lists, nothing else', async () => {
     room(true);
     const body = await (await getTables('u1', 'ROOM')).json();
     expect(body.skills.map((s: { key: string }) => s.key).sort()).toEqual([...FORAGE_SELF_SKILLS].sort());
     expect(body.skills.every((s: object) => Object.keys(s).sort().join() === 'key,name')).toBe(true);
-    // Swamp has nothing pickable, so it isn't offered at all.
-    expect(body.options).toEqual([{ areaType: 'meadow', category: 'plant' }, { areaType: 'cave', category: 'ore' }]);
+    // Swamp has nothing pickable but is still offered, and categories include the defaults, so the
+    // lists say nothing about which combinations have something to find. Never pairs.
+    expect(body.areas).toEqual(['cave', 'meadow', 'swamp']);
+    expect(body.categories).toEqual(['gem', 'misc', 'ore', 'plant', 'scroll']);
+    expect(body.options).toBeUndefined();
     expect(body.tables).toBeUndefined();
     const text = JSON.stringify(body);
-    for (const leak of ['Meadow - plants', 'Cave - ores', 'Swamp', 'pickable', 'suggested', 'Nature DC', 't-meadow']) {
+    for (const leak of ['Meadow - plants', 'Cave - ores', 'Swamp - gems', 'pickable', 'suggested', 'Nature DC', 't-meadow']) {
       expect(text).not.toContain(leak);
     }
   });
@@ -102,7 +105,7 @@ describe('forage/tables', () => {
     const body = await (await getTables('gm-user', 'ROOM')).json();
     expect(body.skills).toHaveLength(18);
     expect(body.tables.find((t: { id: string }) => t.id === 't-meadow')).toMatchObject({ name: 'Meadow - plants', pickableCount: 4, suggestedCheck: 'Nature DC 12' });
-    expect(body.options).toBeUndefined();
+    expect(body.areas).toBeUndefined();
   });
 
   it('treats a GM with no live socket like any other player', async () => {
@@ -147,13 +150,25 @@ describe('start in self-serve mode', () => {
     expect(startSelfFind).not.toHaveBeenCalled();
   });
 
-  it('answers a missing, empty or unknown area + category the same neutral way', async () => {
+  it('rolls an empty, missing or unknown area + category like any other, with no table behind it', async () => {
     room(false);
     for (const where of [{ areaType: 'swamp', category: 'gem' }, { areaType: 'cave', category: 'plant' }, { areaType: 'nowhere', category: 'x' }]) {
+      startSelfFind.mockClear();
       const res = await post({ ...picks, ...where });
-      expect(res.status).toBe(400);
-      expect((await res.json()).error).toBe('nothing_here');
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.mode).toBe('self');
+      expect(JSON.stringify(body)).not.toContain('tableId');
+      expect(startSelfFind).toHaveBeenCalledWith(expect.objectContaining({ tableId: null, ...where }));
     }
+  });
+
+  it('needs an area and a category', async () => {
+    room(false);
+    const res = await post({ ...picks, areaType: '', category: 'gem' });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('bad_pick');
+    expect(startSelfFind).not.toHaveBeenCalled();
   });
 
   it('resolves the table itself and ignores a tableId from the player', async () => {

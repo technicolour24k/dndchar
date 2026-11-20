@@ -137,6 +137,29 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       const stale = await call(playerRoute.POST, user(), { body: { action: 'self_mark', findId: first.body.findId, passed: true } });
       expect(stale.status).toBe(409);
       expect(stale.body.error).toBe('stale');
+      const stored = await query('SELECT area_type, category, find_table_id FROM finds WHERE id = $1', [first.body.findId]);
+      expect(stored.rows[0]).toMatchObject({ area_type: 'meadow', category: 'plant', find_table_id: meadowId });
+    });
+
+    it('an area + category with no table rolls and marks like any other, and a pass finds nothing', async () => {
+      await resetFinds();
+      const start = await call(playerRoute.POST, user(), { body: startBody({ areaType: tag, category: 'gem', tableId: undefined }) });
+      expect(start.status).toBe(200);
+      expect(start.body.mode).toBe('self');
+      const row = await query('SELECT status, find_table_id, area_type, category FROM finds WHERE id = $1', [start.body.findId]);
+      expect(row.rows[0]).toMatchObject({ status: 'checked', find_table_id: null, area_type: tag, category: 'gem' });
+
+      await query(`UPDATE finds SET check_json = jsonb_set(check_json, '{nat1}', 'false') WHERE id = $1`, [start.body.findId]);
+      const marked = await call(playerRoute.POST, user(), { body: { action: 'self_mark', findId: start.body.findId, passed: true } });
+      expect(marked.status).toBe(200);
+      expect(marked.body.status).toBe('failed');
+      expect(marked.body.lines).toEqual([]);
+      expect(await inventory()).toEqual([]);
+
+      // The admin review still lists it, naming what was searched for.
+      const admin = await forage.listFindsForAdmin({ characterId });
+      expect(admin[0]).toMatchObject({ id: start.body.findId, status: 'failed', tableName: `No table (${tag}, gem)` });
+      expect(admin[0].revertNote).toMatch(/No table/);
     });
 
     it('a nat 1 marked as a pass is stored as failed, with no items', async () => {
@@ -344,10 +367,12 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
   describe('tables endpoint (Q9)', () => {
     it('suggestedCheck is absent for a player and present for the room GM', async () => {
       const player = await call(tablesRoute.GET, user(), { search: `?roomId=${ROOM}` });
-      // Rev 4: a player gets the short skill list and area + category pairs, no table names or counts.
+      // Rev 4: a player gets the short skill list and separate area / category lists, no table names or counts.
       expect(player.body.skills).toHaveLength(6);
       expect(player.body.tables).toBeUndefined();
-      expect(player.body.options.some((o: any) => o.areaType === 'meadow' && o.category === 'plant')).toBe(true);
+      expect(player.body.options).toBeUndefined();
+      expect(player.body.areas).toContain('meadow');
+      expect(player.body.categories).toContain('plant');
       expect(JSON.stringify(player.body)).not.toContain('Nature DC');
       const gmView = await call(tablesRoute.GET, gmUser(), { search: `?roomId=${ROOM}` });
       expect(gmView.body.tables.find((t: any) => t.id === meadowId).suggestedCheck).toBe('Nature DC 12');
@@ -651,6 +676,55 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect(undone.status).toBe(200);
       const logged = await query<{ message: string }>('SELECT message FROM roll_log_entries WHERE session_id = $1', [ROOM]);
       expect(logged.rows.map((row) => row.message)).toEqual(["The DM undid Thorne's find."]);
+    });
+  });
+
+  describe('recent finds (unit E)', () => {
+    const recentRoute = () => import('../../routes/vtt/api/forage/recent/+server');
+    const get = async (who: any) => call((await recentRoute()).GET, who, { search: `?characterId=${characterId}` });
+    const check = { skillKey: 'nature', skillLabel: 'Nature', total: 15, natural: 12, nat20: false, nat1: false, text: '', poolSummary: '' };
+
+    it('lists the owner finds: found and undone finds, newest first, with no table fields, and leaves out failed and unmarked', async () => {
+      await resetFinds();
+      const first = await forage.approveDmFind({
+        characterId, finderUserId: userId, tableId: meadowId, lines: [{ itemId: itemIds.moonleaf, qty: 3 }], nat20: false, check, gameSessionId: null, roomCode: null
+      });
+      const second = await forage.approveDmFind({
+        characterId, finderUserId: userId, tableId: meadowId, lines: [{ itemId: itemIds.bitterroot, qty: 2 }], nat20: false, check, gameSessionId: null, roomCode: null
+      });
+      await forage.revertFind({ findId: second.findId, adminUserId: otherUserId });
+      await query(`INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id) VALUES ('self', 'failed', $1, $2, $3)`, [characterId, userId, meadowId]);
+      await query(`INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id) VALUES ('self', 'checked', $1, $2, $3)`, [characterId, userId, meadowId]);
+
+      const res = await get(user());
+      expect(res.status).toBe(200);
+      expect(res.body.finds.map((f: any) => f.id)).toEqual([second.findId, first.findId]);
+      expect(res.body.finds[0]).toMatchObject({ status: 'reverted', mode: 'dm', shared: false, items: [{ name: 'Bitterroot', qty: 2 }] });
+      expect(res.body.finds[0].revertNote).toContain('Bitterroot');
+      expect(res.body.finds[1]).toMatchObject({ status: 'found', items: [{ name: 'Moonleaf', qty: 3 }] });
+      // Rev 4: nothing about tables, and no inventory row ids either.
+      expect(JSON.stringify(res.body)).not.toMatch(/table|suggested|Meadow|Nature DC|inventory|find_table/i);
+      expect(Object.keys(res.body.finds[0]).sort()).toEqual(['createdAt', 'id', 'items', 'mode', 'revertNote', 'shared', 'status']);
+    });
+
+    it('is owner-checked and capped at ten', async () => {
+      await resetFinds();
+      expect((await get({ id: otherUserId, displayName: 'IT Other', role: 'user' })).status).toBe(404);
+      for (let i = 0; i < 12; i++) {
+        await query(`INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id) VALUES ('self', 'found', $1, $2, $3)`, [characterId, userId, meadowId]);
+      }
+      expect((await get(user())).body.finds.length).toBe(10);
+    });
+
+    it('a self-serve find with no game session can be shared from the list', async () => {
+      await resetFinds();
+      const saved = await forage.approveDmFind({
+        characterId, finderUserId: userId, tableId: meadowId, lines: [{ itemId: itemIds.moonleaf, qty: 1 }], nat20: false, check, gameSessionId: null, roomCode: null
+      });
+      const shareRoute = await import('../../routes/vtt/api/finds/[id]/share/+server');
+      const shared = await shareRoute.POST({ locals: { user: user() }, params: { id: saved.findId } } as any);
+      expect(shared.status).toBe(200);
+      expect((await get(user())).body.finds[0]).toMatchObject({ id: saved.findId, shared: true });
     });
   });
 });

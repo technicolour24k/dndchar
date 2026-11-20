@@ -360,7 +360,8 @@ export async function approveDmFind(input: {
   });
 }
 
-export type UnmarkedSelfFind = { findId: string; characterId: string; tableId: string; check: ForageCheck; roomCode: string | null };
+/** tableId is null for a self-serve forage of an area + category with no table (it can only find nothing). */
+export type UnmarkedSelfFind = { findId: string; characterId: string; tableId: string | null; check: ForageCheck; roomCode: string | null };
 
 function mapUnmarked(row: any): UnmarkedSelfFind {
   return { findId: row.id, characterId: row.character_id, tableId: row.find_table_id, check: row.check_json, roomCode: row.room_code };
@@ -380,16 +381,18 @@ export async function getUnmarkedSelfFind(userId: string): Promise<UnmarkedSelfF
  * inserted, and the existing one comes back so the caller can reopen it at the mark step.
  */
 export async function startSelfFind(input: {
-  characterId: string; finderUserId: string; tableId: string; check: ForageCheck;
+  characterId: string; finderUserId: string; tableId: string | null; areaType: string; category: string; check: ForageCheck;
   roomCode: string | null; gameSessionId: string | null;
 }): Promise<{ findId: string } | { conflict: 'unmarked_check'; existing: UnmarkedSelfFind | null }> {
   const existing = await getUnmarkedSelfFind(input.finderUserId);
   if (existing) return { conflict: 'unmarked_check', existing };
   try {
     const result = await query<{ id: string }>(
-      `INSERT INTO finds (mode, status, game_session_id, room_code, character_id, finder_user_id, find_table_id, nat20, check_json)
-       VALUES ('self', 'checked', $1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [input.gameSessionId, input.roomCode, input.characterId, input.finderUserId, input.tableId, input.check.nat20, JSON.stringify(input.check)]
+      `INSERT INTO finds (mode, status, game_session_id, room_code, character_id, finder_user_id, find_table_id,
+         area_type, category, nat20, check_json)
+       VALUES ('self', 'checked', $1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [input.gameSessionId, input.roomCode, input.characterId, input.finderUserId, input.tableId, input.areaType, input.category,
+        input.check.nat20, JSON.stringify(input.check)]
     );
     return { findId: result.rows[0].id };
   } catch (error) {
@@ -413,9 +416,10 @@ export type MarkedSelfFind = {
  * Self-serve: the player marks the check pass or fail. A nat 1 forces a fail. A pass rolls the haul
  * (two runs on a nat 20), validates it like a DM's approval, and inserts it, all in one transaction
  * with the find row locked, so a double tap can only ever mark once ('stale' the second time).
- * The table is the one fixed at start (the player never picks or changes it). If it has since been
- * archived or has nothing pickable, a pass can't pay out, so the find closes as 'failed' with empty
- * results and a note, rather than leaving the player stuck on an unmarked check.
+ * The table is the one fixed at start (the player never picks or changes it). If there was none (an
+ * area + category with no table), or it has since been archived or has nothing pickable, a pass
+ * can't pay out, so the find closes as 'failed' with empty results and a note. The player just sees
+ * that they found nothing, exactly as for a failed check.
  */
 export async function markSelfFind(input: {
   findId: string; userId: string; passed: boolean; rollDie?: RollDie;
@@ -437,18 +441,17 @@ export async function markSelfFind(input: {
       return { ok: true as const, result: { status: 'failed' as const, ...base, lines: [] } };
     }
 
-    const tableId: string = find.find_table_id;
-    const closeNothingToFind = async () => {
-      await client.query(
-        `UPDATE finds SET status = 'failed', resolved_at = now(), revert_note = $2 WHERE id = $1`,
-        [find.id, 'Table empty or archived at mark time, nothing was added.']
-      );
+    const tableId: string | null = find.find_table_id;
+    const closeNothingToFind = async (note: string) => {
+      await client.query(`UPDATE finds SET status = 'failed', resolved_at = now(), revert_note = $2 WHERE id = $1`, [find.id, note]);
       return { ok: true as const, result: { status: 'failed' as const, ...base, lines: [] } };
     };
+    if (!tableId) return closeNothingToFind('No table for this area and category, so there was nothing to find.');
+    const gone = 'Table empty or archived at mark time, nothing was added.';
     const table = await client.query<{ type_die: number }>('SELECT type_die FROM find_tables WHERE id = $1 AND is_archived = false', [tableId]);
-    if (!table.rowCount) return closeNothingToFind();
+    if (!table.rowCount) return closeNothingToFind(gone);
     const entries = (await client.query<EntryRow>(`${ENTRY_SELECT} WHERE e.find_table_id = $1`, [tableId])).rows.map(mapEntry);
-    if (pickableEntries(entries).length === 0) return closeNothingToFind();
+    if (pickableEntries(entries).length === 0) return closeNothingToFind(gone);
 
     const rolled = rollFind(entries, table.rows[0].type_die, !!find.nat20, input.rollDie ?? defaultRollDie);
     // The server's own haul goes through the same validator as a DM's approval.
@@ -613,6 +616,36 @@ export async function shareFind(findId: string, userId: string): Promise<ShareOu
   });
 }
 
+/** One row of a player's own "Recent finds" list. Deliberately carries NO table name, id or suggested check (Rev 4). */
+export type RecentFind = {
+  id: string; createdAt: string; status: 'found' | 'reverted'; mode: FindMode; shared: boolean;
+  items: Array<{ name: string; qty: number }>; revertNote: string;
+};
+
+export const RECENT_FINDS_LIMIT = 10;
+
+/**
+ * A character's last few standing or undone finds, newest first, so the owner can share a find after
+ * its result card is gone (a self-serve find made outside any game session had no other way).
+ * Failed and unmarked checks are left out: they have nothing to show or share. The caller must have
+ * owner-checked the character. The query never touches find_tables, so a table can't leak.
+ */
+export async function listRecentFindsForCharacter(characterId: string, limit = RECENT_FINDS_LIMIT): Promise<RecentFind[]> {
+  if (!UUID_PATTERN.test(characterId)) return [];
+  const rows = await query<{ id: string; created_at: string; status: 'found' | 'reverted'; mode: FindMode; shared: boolean; results: FindResult[] | null; revert_note: string }>(
+    `SELECT id, created_at, status, mode, shared, results, revert_note FROM finds
+     WHERE character_id = $1 AND status IN ('found', 'reverted') ORDER BY created_at DESC LIMIT $2`,
+    [characterId, Math.max(1, Math.min(limit, 50))]
+  );
+  const ids = new Set<string>();
+  for (const row of rows.rows) for (const line of Array.isArray(row.results) ? row.results : []) ids.add(line.item_id);
+  const names = await itemNamesFor({ query: (sql, params) => query(sql, params) }, [...ids]);
+  return rows.rows.map((row) => ({
+    id: row.id, createdAt: row.created_at, status: row.status, mode: row.mode, shared: row.shared,
+    items: namedLines(Array.isArray(row.results) ? row.results : [], names), revertNote: row.revert_note
+  }));
+}
+
 type FindListRow = {
   id: string; created_at: string; status: FindStatus; mode: FindMode; shared: boolean; results: FindResult[] | null;
   check_json: ForageCheck | null; revert_note: string; finder_user_id: string; character_id: string;
@@ -624,11 +657,12 @@ const FIND_LIST_SELECT = `
   SELECT f.id, f.created_at, f.status, f.mode, f.shared, f.results, f.check_json, f.revert_note, f.finder_user_id,
          f.character_id, f.game_session_id, f.room_code, f.nat20,
          c.name AS character_name, c.owner_user_id AS character_owner_id, u.display_name AS owner_name,
-         t.name AS table_name, g.name AS game_session_name
+         -- A self-serve find of an area + category with no table names what was searched for instead.
+         COALESCE(t.name, 'No table (' || f.area_type || ', ' || f.category || ')') AS table_name, g.name AS game_session_name
   FROM finds f
   JOIN characters c ON c.id = f.character_id
   JOIN users u ON u.id = f.finder_user_id
-  JOIN find_tables t ON t.id = f.find_table_id
+  LEFT JOIN find_tables t ON t.id = f.find_table_id
   LEFT JOIN game_sessions g ON g.id = f.game_session_id`;
 
 const resultsOf = (row: FindListRow): FindResult[] => (Array.isArray(row.results) ? row.results : []);
