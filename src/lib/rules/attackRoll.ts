@@ -304,7 +304,13 @@ export function rollWithModifiers(
   const total = d20 + modifier + flat + extraTotal;
 
   const extras = extraDice.map((die) => `${die.label} ${die.expression} (${die.rolls.join(', ')})`).join(' + ');
-  const breakdownText = modifierBreakdown.length ? ` (${modifierBreakdown.map((entry) => `${entry.label} ${entry.value}`).join(' + ')})` : '';
+  // Every flat modifier that went into the total is listed too, so the breakdown adds up (audit trail).
+  const flatBreakdown = options.flatModifiersIncluded ? [] : relevant
+    .filter(({ entry }) => entry.modifierType === 'bonus' || entry.modifierType === 'penalty')
+    .map(({ effect, entry }) => ({ label: effect, value: (entry.modifierType === 'penalty' ? -1 : 1) * (Number(entry.valueExpression) || 0) }))
+    .filter((entry) => entry.value !== 0);
+  const allBreakdown = [...modifierBreakdown, ...flatBreakdown];
+  const breakdownText = allBreakdown.length ? ` (${allBreakdown.map((entry) => `${entry.label} ${entry.value}`).join(' + ')})` : '';
   const finalLine = `${d20} ${modifier + flat >= 0 ? '+' : '-'} ${Math.abs(modifier + flat)}${breakdownText}${extras ? ` + ${extras}` : ''} = ${total}`;
 
   let text: string;
@@ -404,7 +410,10 @@ export function rollDamage(
 }
 
 export function damageCandidatesFor(item: InventoryItem): string[] {
-  const canBeMeleeWeaponAttack = ['weapon', 'shield'].includes(item.category) && item.attackAbility === 'str';
+  // Same melee rule as attackCandidatesFor: the item's category, never its ability. The chosen
+  // ability (STR, DEX, ...) only decides which ability modifier is added; a DEX (finesse) melee
+  // weapon still gets melee-weapon damage bonuses.
+  const canBeMeleeWeaponAttack = ['weapon', 'shield'].includes(item.category);
   return [
     'damage_roll.all',
     'damage_roll.weapon',
@@ -431,6 +440,23 @@ export function battleDamageBonuses(
     ...resolvedNumericModifiers(modifierSources, candidates, ['bonus'], context),
     ...resolvedNumericModifiers(modifierSources, candidates, ['penalty'], context).map((penalty) => ({ ...penalty, value: -penalty.value }))
   ];
+}
+
+// The weapon's full to-hit bonus as rollAttack adds it up (proficiency, ability, the item's own
+// bonus, plus flat attack-roll Modifiers), for display in the sheet's Battle Actions list.
+export function weaponToHitBonus(
+  modifierSources: ActiveCharacterEffect[],
+  item: InventoryItem,
+  abilityScores: Record<string, number>,
+  proficiencyBonus: number,
+  classes: CharacterClass[]
+): number {
+  const base = (item.proficient ? proficiencyBonus : 0) + abilityModifier(abilityScores[item.attackAbility]) + (Number(item.toHitBonus) || 0);
+  const context = { classes, ability: item.attackAbility, attackType: 'melee_weapon' } as const;
+  const candidates = attackCandidatesFor(item);
+  const bonuses = resolvedNumericModifiers(modifierSources, candidates, ['bonus'], context).reduce((sum, b) => sum + b.value, 0);
+  const penalties = resolvedNumericModifiers(modifierSources, candidates, ['penalty'], context).reduce((sum, p) => sum + p.value, 0);
+  return base + bonuses - penalties;
 }
 
 // Attacker-side attack_roll candidates for a weapon attack. Shared by rollAttack, the VTT preview
