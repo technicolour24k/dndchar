@@ -2839,3 +2839,35 @@ button.text-button.danger-text:hover {
   flex-wrap: wrap;
   border: 1px solid var(--danger);
 }
+
+/* Read-only sheet (Unit D): each tab body is a wrapper locked by the readOnlyLock action. display:
+   contents keeps the tab's sections as direct children of the sheet form's grid, so layout is
+   unchanged. */
+.sheet-readonly {
+  display: contents;
+}
+
+/* Disabled fields stay readable: viewers are here to read the sheet. */
+[data-readonly-lock] :is(input, textarea, select):disabled {
+  color: var(--text);
+  -webkit-text-fill-color: var(--text);
+  opacity: 0.9;
+}
+
+[data-readonly-lock] button:disabled {
+  cursor: default;
+}
+
+/* Roster: other people's characters, grouped by campaign (Unit D) */
+.campaign-characters {
+  margin-top: 22px;
+}
+
+.campaign-characters h2 {
+  margin: 0 0 6px;
+}
+
+.campaign-characters-heading {
+  margin: 12px 0 8px;
+  font-size: 15px;
+}

@@ -2,7 +2,8 @@
   import type { CharacterListItem } from '$lib/types/character';
   import { totalLevel } from '$lib/rules/dnd5e';
 
-  let { character }: { character: CharacterListItem } = $props();
+  // ownerName is only passed for other people's characters (the roster's "Campaign characters").
+  let { character, ownerName = null }: { character: CharacterListItem; ownerName?: string | null } = $props();
 
   const classLine = $derived(character.classes.map((c) => c.className).join(' / ') || 'Adventurer');
 </script>
@@ -13,6 +14,7 @@
   <div class="character-card-body">
     <h3>{character.name}</h3>
     <p class="muted">{character.ancestry || 'Unknown ancestry'} - {classLine}</p>
+    {#if ownerName}<p class="muted">Played by {ownerName}</p>{/if}
   </div>
   <div class="character-card-foot">
     <span>Level <strong>{totalLevel(character.classes)}</strong></span>

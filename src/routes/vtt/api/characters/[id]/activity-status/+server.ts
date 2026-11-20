@@ -16,9 +16,9 @@ import { getRoomGameSessionId } from '$lib/server/services/gameSessions';
 // that builds the entire computed sheet (~15 queries, every effect definition,
 // all content), and this endpoint is polled on a timer by every open sheet.
 export const GET: RequestHandler = async ({ locals, params }) => {
-  // TEMPORARY (campaign system Unit C): canEdit, same as the sheet itself; Unit D switches to canView.
+  // canView, same as the sheet itself (viewers see the Activity Log too).
   const access = await getCharacterAccess({ query }, locals.user!.id, params.id!);
-  if (!access?.canEdit) return json({ error: 'not_found' }, { status: 404 });
+  if (!access?.canView) return json({ error: 'not_found' }, { status: 404 });
 
   return json({
     encounterId: await getActiveEncounterForCharacter(params.id!),

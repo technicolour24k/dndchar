@@ -1,4 +1,4 @@
-import type { CharacterClass } from '$lib/types/character';
+import type { CharacterClass, CharacterListItem } from '$lib/types/character';
 
 // 'dm' is the PRIMARY DM, 'co_dm' the single co-DM. Site admin is not a role (it is an override).
 export type CampaignRole = 'dm' | 'co_dm' | 'player';
@@ -49,6 +49,13 @@ export type CampaignListPage = {
   pageCount: number;
   q: string;
   includeArchived: boolean;
+};
+
+// Other people's characters in one of the user's campaigns, for the roster's "Campaign characters".
+export type CampaignCharacterGroup = {
+  campaignId: string;
+  campaignName: string;
+  characters: (CharacterListItem & { ownerName: string })[];
 };
 
 // One of the user's own characters in the "add your character" picker, with where it is now.

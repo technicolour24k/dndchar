@@ -21,9 +21,9 @@ import { poolSummary } from '$lib/rules/attackRoll';
 // re-running the whole page tree (see the Narrow refresh changes below/in the form).
 export async function load({ params, locals, depends }) {
   depends('app:character-sheet');
-  // Refuses anyone who can't edit (owner, campaign DM/co-DM, admin). The access flags tell the sheet
-  // WHY (owner / DM / admin override) so it can show an "Editing as ..." badge. Unit D widens this
-  // to viewers and uses the same flags for the read-only sheet.
+  // Lets in anyone who can VIEW (owner, any campaign member, admin). The access flags tell the sheet
+  // WHY (owner / DM / admin override / plain viewer) so it can show the right badge and go read-only
+  // when canEdit is false. Every write action below re-checks edit/act rights itself.
   const loaded = await getCharacterWithAccess(locals.user!.id, params.id);
   if (!loaded) throw error(404, 'Character not found.');
   const { character, access } = loaded;

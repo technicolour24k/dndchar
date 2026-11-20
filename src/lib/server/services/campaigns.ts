@@ -6,6 +6,7 @@ import { canLeave, canRemoveMember, canSetRole, decideCampaignAccess, getCampaig
 import type {
   Campaign,
   CampaignCharacter,
+  CampaignCharacterGroup,
   CampaignCharacterOption,
   CampaignListPage,
   CampaignMember,
@@ -279,6 +280,72 @@ export async function getCampaignPage(userId: string, campaignId: string): Promi
     characters,
     myCharacters: mine.rows.map((row) => ({ id: row.id, name: row.name, campaignId: row.campaign_id, campaignName: row.campaign_name }))
   };
+}
+
+// Other people's characters in the live campaigns the user is a member of, grouped by campaign, for
+// the roster's "Campaign characters". Membership only (an admin gets their own memberships too; the
+// full set is reachable through /campaigns). A member can open all of these in the read-only sheet.
+export async function listCampaignCharactersForUser(userId: string): Promise<CampaignCharacterGroup[]> {
+  const rows = await query<{
+    id: string; name: string; ancestry: string; background: string; system_key: string; updated_at: string;
+    party_active: boolean; campaign_id: string; campaign_name: string; owner_name: string;
+  }>(
+    `SELECT c.id, c.name, c.ancestry, c.background, c.system_key, c.updated_at, c.party_active,
+            cp.id AS campaign_id, cp.name AS campaign_name, u.display_name AS owner_name
+     FROM campaign_members m
+     JOIN campaigns cp ON cp.id = m.campaign_id AND NOT cp.is_archived
+     JOIN characters c ON c.campaign_id = cp.id AND c.owner_user_id <> $1
+     JOIN users u ON u.id = c.owner_user_id
+     WHERE m.user_id = $1
+     ORDER BY lower(cp.name), cp.id, lower(c.name), c.id`,
+    [userId]
+  );
+  if (rows.rows.length === 0) return [];
+
+  const ids = rows.rows.map((row) => row.id);
+  const classRows = await query<{ character_id: string; class_name: string; level: number; subclass_name: string }>(
+    'SELECT character_id, class_name, level, subclass_name FROM character_classes WHERE character_id = ANY($1::uuid[]) ORDER BY sort_order ASC',
+    [ids]
+  );
+  const hpRows = await query<{ character_id: string; current_value: number; max_value: number }>(
+    `SELECT character_id, current_value, max_value FROM character_resources WHERE resource_key = 'hp' AND character_id = ANY($1::uuid[])`,
+    [ids]
+  );
+
+  // Index by character id, so each row is O(1) rather than a scan of every class / HP row.
+  const classesById = new Map<string, CharacterClass[]>();
+  for (const cl of classRows.rows) {
+    const list = classesById.get(cl.character_id) ?? [];
+    list.push({ className: cl.class_name, level: cl.level, subclassName: cl.subclass_name });
+    classesById.set(cl.character_id, list);
+  }
+  const hpById = new Map(hpRows.rows.map((r) => [r.character_id, r]));
+
+  const groups: CampaignCharacterGroup[] = [];
+  for (const row of rows.rows) {
+    let group = groups[groups.length - 1];
+    if (!group || group.campaignId !== row.campaign_id) {
+      group = { campaignId: row.campaign_id, campaignName: row.campaign_name, characters: [] };
+      groups.push(group);
+    }
+    const hp = hpById.get(row.id);
+    group.characters.push({
+      id: row.id,
+      campaignId: row.campaign_id,
+      campaignName: row.campaign_name,
+      partyActive: row.party_active,
+      name: row.name,
+      ancestry: row.ancestry,
+      background: row.background,
+      systemKey: row.system_key,
+      classes: classesById.get(row.id) ?? [],
+      hpCurrent: hp?.current_value ?? 0,
+      hpMax: hp?.max_value ?? 0,
+      updatedAt: row.updated_at,
+      ownerName: row.owner_name
+    });
+  }
+  return groups;
 }
 
 // The user's own live campaigns (not archived), for the sheet's campaign picker. Unpaged: it is a

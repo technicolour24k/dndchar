@@ -8,6 +8,7 @@
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
   import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
   import ForageModal from '$lib/components/character/ForageModal.svelte';
+  import { readOnlyLock } from '$lib/ui/readOnlyLock';
   import { forageBadgeText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
   import type { ForageMine } from '$lib/types/forage';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
@@ -30,6 +31,7 @@
     activeGameSessionId = null,
     currentUserId = null,
     access = null,
+    readOnly = false,
     ownerName = null,
     onVersionHistory
   }: {
@@ -43,6 +45,9 @@
     currentUserId?: string | null;
     // Why this user may edit the sheet (owner, campaign DM or the admin override); drives the badge.
     access?: { isOwner: boolean; isCampaignDm: boolean; viaAdmin: boolean } | null;
+    // True for a campaign member who can view but not edit: every control in the tab bodies and in the editing modals
+    // is locked (readOnlyLock; the "?" breakdowns, read-out openers and Close stay usable) and Save / the unsaved-changes prompt / forage / Activity Log room controls are hidden.
+    readOnly?: boolean;
     ownerName?: string | null;
     onVersionHistory?: () => void;
   } = $props();
@@ -203,7 +208,7 @@
   // Forage is for the character's owner only. The user wants player stand-ins (someone acting for an
   // absent player's character) later: widen THIS one flag (e.g. `|| standInFor(character)`) and the
   // server's loadOwnedCharacter check, and the button, the on-load fetch and the pings all follow.
-  const forageOwner = $derived(!!currentUserId && currentUserId === character.ownerUserId);
+  const forageOwner = $derived(!readOnly && !!currentUserId && currentUserId === character.ownerUserId);
   let forageMine = $state<ForageMine | null>(null);
   const forageBadge = $derived(forageBadgeText(forageMine, character.id));
   // A find landed while the sheet had unsaved edits, so the new rows wait for Save (see haulLanded).
@@ -619,7 +624,7 @@
 
   // Browser's own "leave site?" prompt - the only safety net now autosave is gone.
   function warnIfUnsaved(event: BeforeUnloadEvent) {
-    if (!hasUnsavedChanges) return;
+    if (readOnly || !hasUnsavedChanges) return;
     event.preventDefault();
     event.returnValue = '';
   }
@@ -1775,14 +1780,18 @@
         {race || character.ancestry || 'Unknown origin'} - {classes.className} {classes.level}
       </p>
       {#if access && !access.isOwner}
-        <!-- Someone other than the owner is editing: say so, and whose sheet it is. -->
+        <!-- Someone other than the owner: either editing (DM / admin) or just viewing. Say which, and whose sheet it is. -->
         <p class="editing-as-line">
-          {#if access.isCampaignDm}
-            <span class="badge">Editing as DM</span>
-          {:else if access.viaAdmin}
-            <span class="badge badge-admin">Editing as site admin</span>
+          {#if readOnly}
+            <span class="muted">Viewing {ownerName ?? "someone else"}'s character. Only the owner and the DMs can change it.</span>
+          {:else}
+            {#if access.isCampaignDm}
+              <span class="badge">Editing as DM</span>
+            {:else if access.viaAdmin}
+              <span class="badge badge-admin">Editing as site admin</span>
+            {/if}
+            {#if ownerName}<span class="muted">{ownerName}'s character</span>{/if}
           {/if}
-          {#if ownerName}<span class="muted">{ownerName}'s character</span>{/if}
         </p>
       {/if}
       <p class="campaign-badge-line">
@@ -1804,24 +1813,26 @@
     <div class="actions sheet-header-actions">
       <div class="combat-clock">
         <span class="save-state combat-clock-status">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
-        <button type="button" class="compact-button combat-clock-full" disabled={contentBusy} onclick={() => runContentAction('newBattle')}>New Battle</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceRound')}>Next Round</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button>
+        <button type="button" class="compact-button combat-clock-full" disabled={contentBusy || readOnly} onclick={() => runContentAction('newBattle')}>New Battle</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceRound')}>Next Round</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button>
       </div>
       <div class="save-cluster">
         <div class="save-command-row">
-          <div class="save-button-col">
-            <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
-            <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
-            {#if haulWaitingForSave && hasUnsavedChanges}
-              <span class="forage-pending-note">Your find will appear when you save.</span>
-            {/if}
-            {#if result?.saved}
-              <span class="save-state good">Saved</span>
-            {/if}
-          </div>
+          {#if !readOnly}
+            <div class="save-button-col">
+              <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
+              <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
+              {#if haulWaitingForSave && hasUnsavedChanges}
+                <span class="forage-pending-note">Your find will appear when you save.</span>
+              {/if}
+              {#if result?.saved}
+                <span class="save-state good">Saved</span>
+              {/if}
+            </div>
+          {/if}
           <div class="history-links">
             {#if onVersionHistory}
               <button type="button" class="text-button" onclick={onVersionHistory}>Character History</button>
@@ -1834,6 +1845,7 @@
   </section>
 
   {#if activeTab === 'battle'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="battle-layout">
       <div class="battle-top-row">
         <section class="panel stack compact-panel">
@@ -2020,8 +2032,8 @@
               {/each}
             </div>
             <div class="ability-popup-links">
-              <button type="button" class="text-button" onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
-              <button type="button" class="text-button" onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
+              <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
+              <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
               <!-- Always enabled: the server decides DM vs self-serve when Forage is pressed. -->
               {#if forageOwner}
                 <button type="button" class="text-button" onclick={() => (forageOpen = true)}>
@@ -2035,7 +2047,7 @@
         <section class="panel stack compact-panel modifications-panel">
           <div class="panel-head compact-head">
             <h2>Player Modifications</h2>
-            <button type="button" class="compact-button" onclick={() => (playerModificationsOpen = true)}>Manage</button>
+            <button type="button" class="compact-button" data-viewer-ok onclick={() => (playerModificationsOpen = true)}>Manage</button>
           </div>
           <div class="mod-summary">
             <label>Exhaustion
@@ -2139,9 +2151,11 @@
         </section>
       </div>
     </section>
+  </div>
   {/if}
 
   {#if activeTab === 'traits'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="traits-layout">
     <section class="panel stack">
       <div class="panel-head">
@@ -2179,9 +2193,11 @@
       </div>
     </section>
     </section>
+  </div>
   {/if}
 
   {#if activeTab === 'inventory'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="panel catalogue-add-panel">
       <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
       <div class="catalogue-add-row"><CatalogueSearch type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
@@ -2348,9 +2364,11 @@
         {/each}
       </section>
     </section>
+  </div>
   {/if}
 
   {#if activeTab === 'character'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="sheet-columns character-layout">
       <section class="panel stack">
         <h2>Identity</h2>
@@ -2403,6 +2421,7 @@
         <label>Additional Notes <textarea name="additionalNotesNote">{notes.additional_notes ?? ''}</textarea></label>
       </section>
     </section>
+  </div>
   {/if}
 
   <div class="hidden-save-fields" aria-hidden="true">
@@ -2528,7 +2547,7 @@
 
   {#if savingThrowsOpen}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (savingThrowsOpen = false))}>
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="saving-throws-title">Saving Throws</h2>
           <div class="actions">
@@ -2536,7 +2555,7 @@
               <img src={d20Icon} alt="" />
               Roll All Saves
             </button>
-            <button type="button" class="text-button" onclick={() => (savingThrowsOpen = false)}>Close</button>
+            <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = false)}>Close</button>
           </div>
         </div>
         <div class="check-list">
@@ -2557,16 +2576,18 @@
             </div>
           {/each}
         </div>
-        <div class="modal-actions">
-          <button type="submit">Save Proficiencies</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Proficiencies</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if skillChecksOpen}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (skillChecksOpen = false))}>
-      <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="skill-checks-title">Skill Checks</h2>
           <div class="actions">
@@ -2574,7 +2595,7 @@
               <img src={d20Icon} alt="" />
               Roll All Skills
             </button>
-            <button type="button" class="text-button" onclick={() => (skillChecksOpen = false)}>Close</button>
+            <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = false)}>Close</button>
           </div>
         </div>
         <div class="check-list skill-list">
@@ -2595,22 +2616,24 @@
             </div>
           {/each}
         </div>
-        <div class="modal-actions">
-          <button type="submit">Save Proficiencies</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Proficiencies</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if playerModificationsOpen}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (playerModificationsOpen = false))}>
-      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <div>
             <h2 id="player-modifications-title">Player Modifications</h2>
             <p class="muted">Conditions, spells, combat states, and environment effects applied to this character.</p>
           </div>
-          <button type="button" class="text-button" onclick={() => (playerModificationsOpen = false)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (playerModificationsOpen = false)}>Close</button>
         </div>
 
         <label class="exhaustion-control">Exhaustion Level
@@ -2627,6 +2650,7 @@
           <div class="modifier-toolbar">
             <label class="modifier-search">Search
               <input
+                data-viewer-ok
                 value={modifierSearch}
                 placeholder="Search conditions, spells, features, states..."
                 oninput={(event) => (modifierSearch = event.currentTarget.value)}
@@ -2637,6 +2661,7 @@
               {#each modifierFilters as filter}
                 <button
                   type="button"
+                  data-viewer-ok
                   class:active={modifierFilter === filter.key}
                   onclick={() => (modifierFilter = filter.key)}
                 >
@@ -2698,9 +2723,11 @@
           </section>
         </div>
 
-        <div class="modal-actions">
-          <button type="submit">Save Modifications</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Modifications</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
@@ -2709,10 +2736,10 @@
     {@const statKey = formulaHelp.statKey}
     {@const stat = statKey ? stats[statKey] : null}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (formulaHelp = null))}>
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="formula-help-title">{formulaHelp.title}</h2>
-          <button type="button" class="text-button" onclick={() => (formulaHelp = null)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (formulaHelp = null)}>Close</button>
         </div>
         <div class="formula-breakdown">
           {#each (statKey ? statFormulaLines[statKey] : formulaHelp.lines) ?? [] as line}
@@ -2760,7 +2787,7 @@
     />
   {/if}
 
-  {#if rollOptions}
+  {#if rollOptions && !readOnly}
     <RollOptionsModal
       title={rollOptions.title}
       advantage={rollOptions.advantage}
@@ -2812,20 +2839,23 @@
           <button type="button" class="text-button" onclick={() => (activityLogOpen = false)}>Close</button>
         </div>
 
-        {#if activeVttSessionId}
-          <div class="combat-encounter-id">
-            <span>Room <code>{activeVttSessionId}</code></span>
-            <button type="button" class="text-button" disabled={leaveRoomBusy} onclick={leaveRoom}>Leave Room</button>
-          </div>
+        <!-- Joining or leaving a room is account state meant for the character's own player, so a viewer doesn't get it here. -->
+        {#if !readOnly}
+          {#if activeVttSessionId}
+            <div class="combat-encounter-id">
+              <span>Room <code>{activeVttSessionId}</code></span>
+              <button type="button" class="text-button" disabled={leaveRoomBusy} onclick={leaveRoom}>Leave Room</button>
+            </div>
+          {/if}
+          <label class="join-combat-label">
+            {activeVttSessionId ? 'Switch Room' : 'Join Room'}
+            <span class="summary-input-roll">
+              <input type="text" class="room-code-input" placeholder="Room code" bind:value={joinRoomIdInput} disabled={joinRoomBusy} />
+              <button type="button" class="compact-use-button" disabled={joinRoomBusy || !joinRoomIdInput.trim()} onclick={joinRoom}>Join</button>
+            </span>
+          </label>
+          {#if joinRoomError}<p class="combat-log-empty" style="color:#e57373;">{joinRoomError}</p>{/if}
         {/if}
-        <label class="join-combat-label">
-          {activeVttSessionId ? 'Switch Room' : 'Join Room'}
-          <span class="summary-input-roll">
-            <input type="text" class="room-code-input" placeholder="Room code" bind:value={joinRoomIdInput} disabled={joinRoomBusy} />
-            <button type="button" class="compact-use-button" disabled={joinRoomBusy || !joinRoomIdInput.trim()} onclick={joinRoom}>Join</button>
-          </span>
-        </label>
-        {#if joinRoomError}<p class="combat-log-empty" style="color:#e57373;">{joinRoomError}</p>{/if}
 
         <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
           <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
@@ -2883,7 +2913,7 @@
                 </div>
               </div>
             {:else}
-              <p class="muted">Join a room above to log rolls.</p>
+              <p class="muted">{readOnly ? 'You are not in a room.' : 'Join a room above to log rolls.'}</p>
             {/if}
           </section>
         {:else}
@@ -2967,10 +2997,10 @@
 
   {#if simpleItemOpen}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleItemOpen = false))}>
-      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="simple-item-title">Add Item</h2>
-          <button type="button" class="text-button" onclick={() => (simpleItemOpen = false)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (simpleItemOpen = false)}>Close</button>
         </div>
         <div class="new-item-grid">
           <label>Item <input bind:value={simpleItemName} placeholder="Gold watch, emerald ring, six cabbages" /></label>
@@ -2990,19 +3020,21 @@
           </label>
           <label>Notes <input bind:value={simpleItemNotes} /></label>
         </div>
-        <div class="modal-actions">
-          <button type="button" disabled={!simpleItemName.trim() || contentBusy} onclick={addSimpleItem}>Add Item</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="button" disabled={!simpleItemName.trim() || contentBusy} onclick={addSimpleItem}>Add Item</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if newItemOpen}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (newItemOpen = false))}>
-      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="new-item-title">Add Item</h2>
-          <button type="button" class="text-button" onclick={() => (newItemOpen = false)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (newItemOpen = false)}>Close</button>
         </div>
         <div class="new-item-grid">
           <input name="inventoryId" type="hidden" value="" />
@@ -3056,9 +3088,11 @@
           <label>Notes <input name="inventoryNotes" /></label>
         </div>
         <input name="inventoryEquipped" type="hidden" value={newItemLocation === 'equipped' ? 'true' : 'false'} />
-        <div class="modal-actions">
-          <button type="submit">Save Item</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Item</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}

@@ -255,11 +255,11 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   });
 }
 
-// Loads the full sheet for someone who may edit it: the owner, a DM (primary or co-DM) of the
-// character's campaign, or a site admin. TEMPORARY gate (campaign system Unit C): it is canEdit, so
-// plain campaign members still get null (the route turns that into a 404). Unit D widens this to
-// canView and adds the read-only sheet. Everything that loads a sheet (the VTT pull-through and
-// the encounter page included) goes through here, so they all follow.
+// Loads the full sheet for anyone who may VIEW it: the owner, any member of the character's
+// (live) campaign, or a site admin. Callers that show editing controls must also check
+// access.canEdit (the sheet page turns it into a read-only sheet). Everything that loads a sheet
+// (the VTT pull-through and the encounter page included) goes through here, so they all follow;
+// every write path still has its own edit/act check.
 export async function getCharacter(userId: string, characterId: string): Promise<CharacterDetail | null> {
   return (await getCharacterWithAccess(userId, characterId))?.character ?? null;
 }
@@ -268,7 +268,7 @@ export async function getCharacter(userId: string, characterId: string): Promise
 // load() does not run the access query a second time.
 export async function getCharacterWithAccess(userId: string, characterId: string): Promise<{ character: CharacterDetail; access: CharacterAccess } | null> {
   const access = await getCharacterAccess({ query }, userId, characterId);
-  if (!access?.canEdit) return null;
+  if (!access?.canView) return null;
   const result = await query<CharacterRow>(
     `
       SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
@@ -442,12 +442,11 @@ export async function updateCharacter(userId: string, characterId: string, form:
   return newVersion;
 }
 
-// TEMPORARY gate (campaign system Unit C): canEdit, so a DM or admin who can edit the sheet can see
-// and restore its versions, and plain members still get an empty list. Unit D switches this to
-// canView (viewers see the history, only editors may restore).
+// Anyone who can view the sheet can see its version list; only editors may restore (that has its
+// own edit check in restoreCharacterVersion).
 export async function listVersions(userId: string, characterId: string): Promise<CharacterVersion[]> {
   const access = await getCharacterAccess({ query }, userId, characterId);
-  if (!access?.canEdit) return [];
+  if (!access?.canView) return [];
   const result = await query<{
     id: string;
     character_id: string;

@@ -28,3 +28,17 @@
     </section>
   {/each}
 </div>
+
+{#if data.campaignCharacters.length > 0}
+  <section class="campaign-characters">
+    <h2>Campaign characters</h2>
+    {#each data.campaignCharacters as group (group.campaignId)}
+      <h3 class="campaign-characters-heading"><a class="text-button" href={`/campaigns/${group.campaignId}`}>{group.campaignName}</a></h3>
+      <div class="card-grid">
+        {#each group.characters as character (character.id)}
+          <CharacterCard {character} ownerName={character.ownerName} />
+        {/each}
+      </div>
+    {/each}
+  </section>
+{/if}

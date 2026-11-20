@@ -2,7 +2,8 @@ import crypto from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { env } from '$env/dynamic/private';
 
-// DB-backed tests for campaign Unit C: who may EDIT a character (owner, campaign DM / co-DM, site
+// DB-backed tests for campaign Units C and D: who may VIEW a character (D: also plain campaign
+// members), who may EDIT a character (owner, campaign DM / co-DM, site
 // admin), who may ACT for it (not admin), and the stale-save guard. SKIPPED unless
 // CAMPAIGN_DB_TEST=1, so the normal suite never touches a database. Local dev DB only: the host
 // guard runs before any query. Creates throwaway users (inserted into `users` only, never
@@ -19,6 +20,10 @@ const catalogue = await import('./services/catalogue');
 const pageRoute = await import('../../routes/characters/[id]/+page.server');
 const rollItemRoute = await import('../../routes/vtt/api/characters/[id]/roll-item/+server');
 const rollSpellRoute = await import('../../routes/vtt/api/characters/[id]/roll-spell/+server');
+const historyRoute = await import('../../routes/characters/[id]/history/+server');
+const versionsRoute = await import('../../routes/characters/[id]/versions/+server');
+const activityStatusRoute = await import('../../routes/vtt/api/characters/[id]/activity-status/+server');
+const vttCharacterRoute = await import('../../routes/vtt/api/characters/[id]/+server');
 
 const tag = `zzedit${crypto.randomBytes(4).toString('hex')}`;
 const ROOM = `ITEDIT${tag.slice(-4).toUpperCase()}`;
@@ -73,6 +78,9 @@ const serviceCalls: Record<string, (user: string, char: string) => Promise<unkno
   spendSpellSlot: (k, c) => catalogue.spendSpellSlot(u(k), charIds[c], 'standard', 1, -1),
   restoreCharacterVersion: (k, c) => characters.restoreCharacterVersion(u(k), charIds[c], FAKE)
 };
+
+// Who may VIEW cInCampaign: everyone who can edit it, plus a plain member of its campaign.
+const viewMatrix: Record<string, boolean> = { owner: true, dm: true, codm: true, admin: true, player: true, outsider: false, otherDm: false };
 
 // Who may edit which character. cInCampaign belongs to `owner` and sits in campaign A;
 // cLoose belongs to `owner` and has no campaign.
@@ -150,14 +158,16 @@ describe.skipIf(!enabled)('character edit access (Unit C) against the local dev 
     });
   }
 
-  it('getCharacter and listVersions follow edit access (members get nothing until Unit D)', async () => {
-    for (const [who, expected] of Object.entries(editMatrix)) {
-      expect(Boolean(await characters.getCharacter(u(who), charIds.cInCampaign)), `getCharacter ${who}`).toBe(expected.cInCampaign);
-      expect(Boolean(await characters.getCharacter(u(who), charIds.cLoose)), `getCharacter loose ${who}`).toBe(expected.cLoose);
+  it('getCharacter and listVersions follow VIEW access (a plain member sees the character; outsiders do not)', async () => {
+    for (const [who, expected] of Object.entries(viewMatrix)) {
+      expect(Boolean(await characters.getCharacter(u(who), charIds.cInCampaign)), `getCharacter ${who}`).toBe(expected);
+      // A campaign-less character is only visible to its owner and the admin.
+      expect(Boolean(await characters.getCharacter(u(who), charIds.cLoose)), `getCharacter loose ${who}`).toBe(editMatrix[who].cLoose);
     }
-    // The saves above left versions behind; a plain member sees none of them.
+    // The saves above left versions behind; a plain member can list them, an outsider cannot.
     expect((await characters.listVersions(u('dm'), charIds.cInCampaign)).length).toBeGreaterThan(0);
-    expect(await characters.listVersions(u('player'), charIds.cInCampaign)).toEqual([]);
+    expect((await characters.listVersions(u('player'), charIds.cInCampaign)).length).toBeGreaterThan(0);
+    expect(await characters.listVersions(u('outsider'), charIds.cInCampaign)).toEqual([]);
   });
 
   it('a DM or admin save is attributed to them in version history; restore works for a DM', async () => {
@@ -191,15 +201,17 @@ describe.skipIf(!enabled)('character edit access (Unit C) against the local dev 
       locals: { user: { id: u(who), role: who.startsWith('admin') ? 'admin' : 'user' } }
     });
 
-  it('sheet load: owner, DM, co-DM and admin open it (with the right access flags); member, outsider, other DM get 404', async () => {
+  it('sheet load: owner, DM, co-DM, admin and a plain member open it (with the right access flags); outsider and other DM get 404', async () => {
     const load = (who: string, charKey: string) =>
       (pageRoute.load as any)({ params: { id: charIds[charKey] }, locals: { user: { id: u(who) } }, depends: () => {} });
     for (const [who, expected] of Object.entries(editMatrix)) {
-      if (expected.cInCampaign) {
+      if (viewMatrix[who]) {
         const data = await load(who, 'cInCampaign');
-        expect(data.access.canEdit).toBe(true);
+        expect(data.access.canView).toBe(true);
+        expect(data.access.canEdit).toBe(expected.cInCampaign); // a plain member is read-only
+        expect(data.access.canAct).toBe(actors.includes(who));
         expect(data.access.isOwner).toBe(who === 'owner');
-        expect(data.access.viaAdmin).toBe(who === 'admin');
+        expect(data.access.viaAdmin).toBe(who === 'admin'); // a read-only member is NOT "via admin"
         expect(data.access.isCampaignDm).toBe(who === 'dm' || who === 'codm');
       } else {
         await expect(load(who, 'cInCampaign')).rejects.toMatchObject({ status: 404 });
@@ -364,5 +376,148 @@ describe.skipIf(!enabled)('character edit access (Unit C) against the local dev 
       characters.updateCharacter(u('owner'), charIds.cLoose, form({ name: 'X', sheetVersion: stale, inventoryBaseline: baseline }), 'stale inv')
     ).rejects.toBeInstanceOf(characters.StaleSheetError);
     expect((await query('SELECT 1 FROM character_inventory_items WHERE id = $1', [rows[0].id])).rows.length).toBe(1);
+  });
+});
+
+// ---- Unit D: member view access and the read-only sheet ----
+describe.skipIf(!enabled)('member view access (Unit D) against the local dev DB', () => {
+  const run = (action: any, who: string, charKey: string, fields: Record<string, string> = {}) =>
+    action({
+      request: { formData: async () => new URLSearchParams(fields) },
+      params: { id: charIds[charKey] },
+      locals: { user: { id: u(who), role: who.startsWith('admin') ? 'admin' : 'user' } }
+    });
+  const get = async (route: any, who: string, charKey: string) => {
+    try {
+      const response: Response = await route.GET({ params: { id: charIds[charKey] }, locals: { user: { id: u(who) } } });
+      return { status: response.status, body: await response.json() };
+    } catch (error: any) {
+      return { status: error?.status as number, body: null }; // SvelteKit error() throws
+    }
+  };
+
+  it('getCharacterAccess says a plain member can view but not edit or act', async () => {
+    const { getCharacterAccess } = await import('./services/access');
+    expect(await getCharacterAccess({ query }, u('player'), charIds.cInCampaign)).toMatchObject({
+      canView: true, canEdit: false, canAct: false, isOwner: false, isCampaignDm: false, viaAdmin: false
+    });
+    expect(await getCharacterAccess({ query }, u('outsider'), charIds.cInCampaign)).toMatchObject({ canView: false, canEdit: false });
+  });
+
+  it('a member loads the full sheet via getCharacter and getCharacterWithAccess', async () => {
+    const loaded = await characters.getCharacterWithAccess(u('player'), charIds.cInCampaign);
+    expect(loaded?.character.id).toBe(charIds.cInCampaign);
+    expect(loaded?.access.canEdit).toBe(false);
+    expect(await characters.getCharacter(u('outsider'), charIds.cInCampaign)).toBeNull();
+  });
+
+  it('a member cannot write: save, restore, content, inventory and play actions all refuse', async () => {
+    const version = (await query<{ id: string }>('SELECT id FROM character_versions WHERE character_id = $1 LIMIT 1', [charIds.cInCampaign])).rows[0];
+    const before = (await query<{ name: string; sheet_version: number }>('SELECT name, sheet_version FROM characters WHERE id = $1', [charIds.cInCampaign])).rows[0];
+    await expect(characters.updateCharacter(u('player'), charIds.cInCampaign, form({ name: 'Viewer wrote this' }), 'viewer')).rejects.toThrow('Character not found.');
+    await expect(characters.restoreCharacterVersion(u('player'), charIds.cInCampaign, version.id)).rejects.toThrow('Character not found.');
+    // Straight through the sheet page's own actions, as a devtools POST would.
+    await expect(run(pageRoute.actions.save, 'player', 'cInCampaign', { name: 'Viewer wrote this' })).rejects.toThrow('Character not found.');
+    await expect(run(pageRoute.actions.restoreVersion, 'player', 'cInCampaign', { versionId: version.id })).rejects.toThrow('Character not found.');
+    for (const [name, fields] of [
+      ['addContent', { contentId: FAKE }],
+      ['removeContent', { instanceId: FAKE }],
+      ['contentState', { instanceId: FAKE }],
+      ['contentResource', { resourceId: FAKE, delta: '-1' }],
+      ['inventoryResource', { resourceId: FAKE, delta: '-1' }],
+      ['spellSlot', { slotType: 'standard', slotLevel: '1', delta: '-1' }],
+      ['rest', { restType: 'long_rest' }],
+      ['advanceRound', {}],
+      ['advanceTurn', {}],
+      ['newBattle', {}],
+      ['useItem', { inventoryId: FAKE }],
+      ['triggerContent', { instanceId: FAKE }],
+      ['castSpell', { instanceId: FAKE }],
+      ['spendHitDice', { classIndex: '0', spent: '1' }]
+    ] as [string, Record<string, string>][]) {
+      expect(await refused(() => run((pageRoute.actions as any)[name], 'player', 'cInCampaign', fields)), `${name} by a member`).toBe(true);
+    }
+    for (const name of ['addInventoryItem', 'setEquipped', 'removeInventoryItem']) {
+      expect(await run((pageRoute.actions as any)[name], 'player', 'cInCampaign', { name: 'x', inventoryId: FAKE }), name).toMatchObject({ status: 403 });
+    }
+    // The campaign controls refuse a member too (not the owner, not a manager).
+    expect(await run(pageRoute.actions.setPartyActive, 'player', 'cInCampaign', { active: '0' })).toMatchObject({ status: 400 });
+    expect(await run(pageRoute.actions.leaveCampaign, 'player', 'cInCampaign')).toMatchObject({ status: 400 });
+    const after = (await query<{ name: string; sheet_version: number }>('SELECT name, sheet_version FROM characters WHERE id = $1', [charIds.cInCampaign])).rows[0];
+    expect(after).toEqual(before);
+  });
+
+  it('history, versions and activity-status are readable by a member and 404 for an outsider', async () => {
+    for (const route of [historyRoute, activityStatusRoute]) {
+      expect((await get(route, 'player', 'cInCampaign')).status).toBe(200);
+      expect((await get(route, 'outsider', 'cInCampaign')).status).toBe(404);
+      expect((await get(route, 'otherDm', 'cInCampaign')).status).toBe(404);
+    }
+    const versions = await get(versionsRoute, 'player', 'cInCampaign');
+    expect(versions.status).toBe(200);
+    expect(versions.body.versions.length).toBeGreaterThan(0);
+    expect((await get(versionsRoute, 'outsider', 'cInCampaign')).body.versions).toEqual([]);
+  });
+
+  it('archived campaign: members lose view, the owner and admin keep it', async () => {
+    const D = await campaigns.createCampaign(u('otherDm'), `${tag} D`, '');
+    campaignIds.push(D);
+    const code = (await query<{ invite_code: string }>('SELECT invite_code FROM campaigns WHERE id = $1', [D])).rows[0].invite_code;
+    for (const key of ['owner', 'player']) await campaigns.joinCampaignByInviteCode(u(key), code);
+    await makeCharacter('cInD', 'owner');
+    await campaigns.addCharacterToCampaign(u('owner'), charIds.cInD, D);
+    expect(await characters.getCharacter(u('player'), charIds.cInD)).not.toBeNull();
+    // Archive WITHOUT releasing the character, to prove the access rule itself (archiveCampaign also releases).
+    await query('UPDATE campaigns SET is_archived = true WHERE id = $1', [D]);
+    expect(await characters.getCharacter(u('player'), charIds.cInD)).toBeNull();
+    expect(await characters.getCharacter(u('otherDm'), charIds.cInD)).toBeNull();
+    expect(await characters.getCharacter(u('owner'), charIds.cInD)).not.toBeNull();
+    expect(await characters.getCharacter(u('admin'), charIds.cInD)).not.toBeNull();
+    expect((await campaigns.listCampaignCharactersForUser(u('player'))).some((g) => g.campaignId === D)).toBe(false);
+  });
+
+  it('a member can pull the character through GET /vtt/api/characters/[id]; an outsider gets 404', async () => {
+    const member = await get(vttCharacterRoute, 'player', 'cInCampaign');
+    expect(member.status).toBe(200);
+    expect(member.body).toHaveProperty('maxHp');
+    expect((await get(vttCharacterRoute, 'outsider', 'cInCampaign')).status).toBe(404);
+  });
+
+  // The roster tests build their own campaign and characters, so they do not depend on earlier tests.
+  const joinCode = async (campaignId: string) =>
+    (await query<{ invite_code: string }>('SELECT invite_code FROM campaigns WHERE id = $1', [campaignId])).rows[0].invite_code;
+
+  it("roster: other people's characters in the user's live campaigns, grouped by campaign, never your own or an outsider's", async () => {
+    const E = await campaigns.createCampaign(u('otherDm'), `${tag} E`, '');
+    campaignIds.push(E);
+    const code = await joinCode(E);
+    for (const key of ['owner', 'player']) await campaigns.joinCampaignByInviteCode(u(key), code);
+    await makeCharacter('rosterOwner', 'owner');
+    await makeCharacter('rosterPlayer', 'player');
+    await campaigns.addCharacterToCampaign(u('owner'), charIds.rosterOwner, E);
+    await campaigns.addCharacterToCampaign(u('player'), charIds.rosterPlayer, E);
+
+    const group = async (who: string) => (await campaigns.listCampaignCharactersForUser(u(who))).find((g) => g.campaignId === E);
+    // The player sees the owner's character (with its owner's name), never their own.
+    expect((await group('player'))?.characters.map((c) => c.id)).toEqual([charIds.rosterOwner]);
+    expect((await group('player'))?.characters[0].ownerName).toBe('IT owner');
+    expect((await group('owner'))?.characters.map((c) => c.id)).toEqual([charIds.rosterPlayer]);
+    // The DM sees both; an outsider (not a member) sees nothing from E.
+    expect((await group('otherDm'))?.characters.map((c) => c.id).sort()).toEqual([charIds.rosterOwner, charIds.rosterPlayer].sort());
+    expect(await group('outsider')).toBeUndefined();
+  });
+
+  it("roster: an admin only gets their own memberships (not every campaign), and archived campaigns are left out", async () => {
+    // 'admin' is a member of nothing, even though campaigns with characters exist.
+    expect(await campaigns.listCampaignCharactersForUser(u('admin'))).toEqual([]);
+    // 'adminDm' is the DM of campaign C only, so only C appears (with the player's character in it).
+    const C = (await query<{ id: string }>('SELECT id FROM campaigns WHERE name = $1', [`${tag} C`])).rows[0].id;
+    const forAdminDm = await campaigns.listCampaignCharactersForUser(u('adminDm'));
+    expect(forAdminDm.map((g) => g.campaignId)).toEqual([C]);
+    expect(forAdminDm[0].characters.map((c) => c.id)).toEqual([charIds.cInAdminDm]);
+    // Archiving (rows kept in place) drops the group.
+    await query('UPDATE campaigns SET is_archived = true WHERE id = $1', [C]);
+    expect(await campaigns.listCampaignCharactersForUser(u('adminDm'))).toEqual([]);
+    await query('UPDATE campaigns SET is_archived = false WHERE id = $1', [C]);
   });
 });
