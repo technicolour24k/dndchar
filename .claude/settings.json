@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsx *)",
+      "Bash(dos2unix src/lib/components/character/CharacterSheetForm.svelte)",
+      "Bash(unix2dos src/lib/components/character/CharacterSheetForm.svelte)",
+      "Bash(npx svelte-check *)",
+      "Bash(curl -s -o /dev/null -w \"dev server status: %{http_code}\\\\n\" http://localhost:5173/login)"
+    ]
+  }
+}

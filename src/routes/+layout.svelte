@@ -1,0 +1,50 @@
+<script lang="ts">
+  import '../styles.css';
+  import { env } from '$env/dynamic/public';
+
+  let { data, children } = $props();
+  const appName = env.PUBLIC_APP_NAME || 'D&D Character Manager';
+</script>
+
+<svelte:head>
+  <title>{appName}</title>
+</svelte:head>
+
+<!-- Theme colours are applied to <html> itself, not here - see
+     src/hooks.server.ts's transformPageChunk. Setting them on this div
+     never worked: :root's own derivations in src/styles.css only ever
+     resolve against :root, and this div is a descendant, not an ancestor,
+     of <body>, so it could never reach the page background either. -->
+<div class="app-frame">
+  {#if data.user}
+    <header class="topbar">
+      <a class="brand" href="/dashboard">
+        <span class="brand-mark">d20</span>
+        <span>{appName}</span>
+      </a>
+      <nav class="topnav" aria-label="Primary">
+        <a href="/dashboard">Dashboard</a>
+        <a href="/characters">Characters</a>
+        <a href="/catalogue">Catalogue</a>
+        <a href="/campaigns">Campaigns</a>
+        <a href="/encounters">Encounters</a>
+        <a href="/creatures">Creatures</a>
+        <a href="/forage/tables">Find Tables</a>
+        <a href="/vtt">VTT</a>
+        {#if data.user.role === 'admin'}
+          <a href="/admin/settings">Admin</a>
+        {/if}
+      </nav>
+      <div class="user-menu">
+        <a class="profile-link" href="/profile">{data.user.displayName}</a>
+        <form method="POST" action="/logout">
+          <button type="submit">Log out</button>
+        </form>
+      </div>
+    </header>
+  {/if}
+
+  <main class="page-shell">
+    {@render children()}
+  </main>
+</div>

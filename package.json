@@ -1,0 +1,42 @@
+{
+  "name": "dnd-character-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --host",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.js",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:migrate:prod": "tsx --env-file=.env.prod scripts/migrate.ts",
+    "db:seed:user": "tsx scripts/seed-user.ts",
+    "db:seed:forage-test": "tsx scripts/seed-forage-test.ts",
+    "db:seed:core-effects": "tsx scripts/seed-core-effects.ts",
+    "db:import:srd-effects": "tsx scripts/import-srd-effects.ts",
+    "db:import:srd-content": "tsx scripts/import-srd-content.ts",
+    "db:trim:effects": "tsx scripts/trim-effect-catalog.ts"
+  },
+  "dependencies": {
+    "@sveltejs/adapter-node": "^5.2.12",
+    "@sveltejs/kit": "^2.21.5",
+    "bcryptjs": "^3.0.2",
+    "pg": "^8.16.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "svelte": "^5.33.14",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.1.0",
+    "@types/node": "^22.15.29",
+    "@types/pg": "^8.15.4",
+    "svelte-check": "^4.2.1",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^4.1.8"
+  }
+}

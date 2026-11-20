@@ -1,0 +1,464 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #16181d;
+  color: #e6e6e6;
+}
+
+#login {
+  max-width: 420px;
+  margin: 10vh auto;
+  padding: 24px;
+  background: #22252c;
+  border-radius: 8px;
+}
+
+#login h1 { margin-top: 0; font-size: 20px; }
+#login .panel { border-top: 1px solid #333; padding-top: 16px; margin-top: 16px; }
+#login label { display: block; font-size: 13px; margin: 8px 0 4px; color: #aaa; }
+#login input, #login select { width: 100%; padding: 6px 8px; border-radius: 4px; border: 1px solid #444; background: #1a1c22; color: #eee; }
+#login button { margin-top: 10px; padding: 8px 14px; border: none; border-radius: 4px; background: #4a7fff; color: #fff; cursor: pointer; font-weight: 600; }
+#login button:hover { background: #3a6bee; }
+#login .hint { font-size: 12px; color: #888; margin-top: 4px; }
+#login .error { color: #e53935; font-size: 13px; min-height: 18px; }
+
+#app { display: none; height: 100vh; grid-template-columns: 300px 1fr; }
+#app.active { display: grid; }
+
+#sidebar {
+  overflow-y: auto;
+  padding: 12px;
+  background: #1c1e24;
+  border-right: 1px solid #2c2f36;
+}
+
+#sidebar h2 { font-size: 14px; text-transform: uppercase; color: #888; margin: 18px 0 8px; }
+#sidebar h2:first-child { margin-top: 0; }
+#sidebar .field { margin-bottom: 8px; }
+#sidebar label { display: block; font-size: 12px; color: #999; margin-bottom: 2px; }
+#sidebar input, #sidebar select { width: 100%; padding: 5px 6px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 13px; }
+#sidebar input[type="checkbox"] { width: auto; }
+#sidebar button { padding: 6px 10px; border: none; border-radius: 4px; background: #4a7fff; color: #fff; cursor: pointer; font-size: 13px; margin-top: 4px; }
+#sidebar button:hover { background: #3a6bee; }
+#sidebar button.danger { background: #e53935; }
+#sidebar button.secondary { background: #3a3d44; }
+/* .row is a general-purpose "lay these fields out side by side" utility -
+   not sidebar-specific despite the name's origin. It used to be scoped to
+   #sidebar only, which silently did nothing once fields with the same
+   "field row" markup moved into a modal (Map Settings/Add Token/Token
+   Manager, Phase 10) - every such row rendered as plain stacked blocks
+   instead of columns. */
+.row { display: flex; gap: 6px; align-items: center; }
+.row > * { flex: 1; }
+
+.combat-encounter-id { font-size: 11px; color: #999; margin-top: 6px; }
+.combat-encounter-id code { color: #eee; background: #14161b; padding: 1px 4px; border-radius: 3px; }
+.combat-log { max-height: 220px; overflow-y: auto; background: #14161b; border: 1px solid #2c2f36; border-radius: 4px; padding: 6px 8px; font-size: 12px; }
+.combat-log-line { padding: 3px 0; border-bottom: 1px solid #24272e; color: #ccc; }
+.combat-log-line:last-child { border-bottom: none; }
+.combat-log-line summary { cursor: pointer; }
+.combat-log-line pre { white-space: pre-wrap; color: #9dd7a5; font-size: 11px; margin: 4px 0 0; }
+
+#roomInfo { font-size: 13px; color: #ccc; margin-bottom: 12px; padding: 8px; background: #14161b; border-radius: 4px; }
+#roomInfo strong { color: #4a7fff; font-size: 16px; letter-spacing: 1px; }
+
+.token-card { background: #14161b; border: 1px solid #2c2f36; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+.token-card.clickable:hover { border-color: #4a7fff; cursor: pointer; }
+.token-card .title { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.token-card .title .tag { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: #333; color: #aaa; font-weight: normal; }
+.token-card .actions { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+.token-card .actions button { margin-top: 0; font-size: 11px; padding: 3px 6px; }
+
+.marker-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+
+#mapWrap { overflow: auto; position: relative; background: #0c0d10; }
+/* The in-flow canvas defines #mapStage's size (and the scroll extents);
+   position/z-index lift it above the absolutely-positioned map layers so it
+   stays the sole pointer-event/hit-test surface. */
+#mapStage { position: relative; }
+#canvas { display: block; cursor: grab; position: relative; z-index: 1; }
+#canvas.dragging { cursor: grabbing; }
+
+/* Layered map rendering (render/mapLayers.js). #mapLayers is laid out at the
+   map's NATIVE pixel size and carries the zoom as transform: scale() -
+   clip-path applies pre-transform, so vision-circle coordinates stay in plain
+   map pixels. The canvas above it carries its zoom via style.width/height
+   (unchanged from before); both derive from the same zoomLevel every render,
+   so they can't drift. */
+#mapLayers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  pointer-events: none;
+  z-index: 0;
+  overflow: hidden;
+}
+#mapBackdrop { position: absolute; inset: 0; background: #000; }
+.map-media-layer { position: absolute; inset: 0; }
+/* Stretch to the map's declared dimensions, exactly as ctx.drawImage(img, 0,
+   0, widthPx, heightPx) did - the GM's width/height inputs win over the
+   file's natural size. */
+.map-media-layer img,
+.map-media-layer video { display: block; width: 100%; height: 100%; object-fit: fill; }
+#mapLayerGray { filter: grayscale(1); clip-path: url(#vttGrayClip); }
+#mapLayerColor { clip-path: url(#vttColorClip); }
+
+#zoomControls {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  gap: 2px;
+  background: #1c1e24;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  z-index: 10;
+}
+#zoomControls button {
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px;
+  background: #2a2d34;
+  color: #eee;
+  cursor: pointer;
+  font-size: 13px;
+  min-width: 32px;
+}
+#zoomControls button:hover { background: #3a3d44; }
+#zoomResetBtn { min-width: 52px; font-size: 12px; color: #aaa; }
+
+.music-bar {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #1c1e24;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  padding: 6px 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  z-index: 10;
+}
+.music-bar button {
+  padding: 4px 8px;
+  border: none;
+  border-radius: 4px;
+  background: #2a2d34;
+  color: #eee;
+  cursor: pointer;
+  font-size: 12px;
+}
+.music-bar button:hover { background: #3a3d44; }
+.music-bar span { font-size: 12px; color: #ccc; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.music-bar input[type="range"] { width: 80px; }
+.music-bar input.music-volume-number {
+  width: 42px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid #3a3d44;
+  background: #14161b;
+  color: #eee;
+  font-size: 12px;
+}
+
+.marker-placement-banner {
+  display: none;
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  align-items: center;
+  gap: 10px;
+  background: #1c1e24;
+  border: 1px solid #4a7fff;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: #eee;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  z-index: 20;
+}
+.marker-placement-banner.visible { display: flex; }
+.marker-placement-banner button { padding: 4px 10px; border: none; border-radius: 4px; background: #3a3d44; color: #fff; cursor: pointer; font-size: 12px; }
+.marker-placement-banner button:disabled { opacity: .5; cursor: default; }
+#movePlanBannerText.over-budget { color: #ff8a80; }
+#movePlanPrivateLabel { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; white-space: nowrap; }
+
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal-overlay.visible { display: flex; }
+.modal {
+  background: #1c1e24;
+  border: 1px solid #3a3d44;
+  border-radius: 8px;
+  padding: 20px;
+  width: 280px;
+}
+.modal h2 { margin: 0 0 14px; font-size: 15px; color: #eee; }
+.modal .field { margin-bottom: 10px; }
+.modal label { display: block; font-size: 12px; color: #999; margin-bottom: 2px; }
+.modal input { width: 100%; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 13px; }
+/* Checkboxes shouldn't stretch to the input rule above - full-width makes a
+   checkbox render as an oversized square with its label text pushed onto the
+   next line (Conditions modal, Token Manager's Darkvision toggle). Mirrors
+   the existing #sidebar input[type="checkbox"] override below. */
+.modal input[type="checkbox"] { width: auto; }
+.modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal .actions button { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; background: #4a7fff; color: #fff; }
+.modal .actions button.secondary { background: #3a3d44; }
+
+.thumb { width: 100%; max-height: 90px; object-fit: contain; background: #000; border-radius: 4px; margin-top: 6px; display: none; }
+.thumb.visible { display: block; }
+
+.modal-wide { width: 520px; max-width: 90vw; }
+
+/* Soundboard/Creature Library modal lists - these grow unbounded (more sound
+   folders, more saved templates), so scroll inside a capped height rather
+   than the modal itself growing forever. */
+.scrollable-list { max-height: 360px; overflow-y: auto; padding-right: 4px; }
+
+.picker-tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid #3a3d44; }
+.picker-tabs .picker-tab {
+  padding: 8px 14px;
+  border: none;
+  background: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 2px solid transparent;
+}
+.picker-tabs .picker-tab.active { color: #eee; border-bottom-color: #4a7fff; }
+.picker-tabs .picker-tab:disabled { color: #555; cursor: not-allowed; }
+
+.picker-status { font-size: 12px; color: #888; margin: 8px 0; min-height: 16px; }
+
+.picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.picker-item {
+  background: #14161b;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 4px;
+  cursor: pointer;
+  text-align: center;
+}
+.picker-item:hover { border-color: #4a7fff; }
+.picker-item img, .picker-item video { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; background: #000; display: block; }
+.picker-item span { display: block; font-size: 10px; color: #aaa; margin-top: 4px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.token-thumb { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; vertical-align: middle; margin-right: 6px; background: #000; }
+
+.character-picker-item {
+  background: #14161b;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+.character-picker-item:hover { border-color: #4a7fff; }
+.character-picker-item .name { font-weight: 600; font-size: 13px; }
+.character-picker-item .summary { font-size: 11px; color: #aaa; margin-top: 2px; }
+
+.mini-sheet { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2c2f36; }
+.mini-sheet-action, .mini-sheet-slot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 0;
+}
+
+/* Combat Actions modal (Phase 8) section headings - was an inline-styled <label>
+   easy to miss next to the list items below it; now a real heading with a rule
+   under it so "Weapons"/"Spells"/"Items" reads as a section break, not filler text. */
+.combat-actions-heading {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  color: #ddd;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 16px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #3a3d44;
+}
+.combat-actions-heading:first-child { margin-top: 0; }
+
+/* Clickable action rows (weapon/item rows in the Combat Actions modal, spell
+   picker rows) - persistent card look + trailing chevron so "you can click
+   this" doesn't rely on noticing a hover-only cue, which testing showed people
+   were missing entirely. [data-item-id] included alongside [data-action-name]
+   so item rows get the same treatment (they were missing it before). */
+.mini-sheet-action[data-action-name], .mini-sheet-action[data-item-id], .spell-picker-row {
+  cursor: pointer;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  background: #14161b;
+}
+.mini-sheet-action[data-action-name]:hover, .mini-sheet-action[data-item-id]:hover, .spell-picker-row:hover {
+  border-color: #4a7fff;
+  background: #1c1f26;
+}
+.mini-sheet-action .row-chevron { color: #4a7fff; font-size: 15px; font-weight: 700; flex-shrink: 0; }
+
+/* Upcast indicator in the spell picker (a lower-level spell shown under a
+   higher slot row) - the spell's own level fades into #aaa like normal, the
+   arrow+target level is the accent color so the upcast reads as a deliberate
+   highlight, not just another number next to the name. */
+.spell-picker-upcast { color: #4a7fff; font-weight: 700; }
+
+.mini-sheet-slot button { margin-top: 0; font-size: 11px; padding: 2px 6px; }
+.mini-sheet-slot-label { border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }
+.mini-sheet-slot-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+/* The obvious, explicit "you can cast from here" affordance (Phase 8 follow-up) -
+   Use/Reset are plain secondary buttons for bookkeeping; Cast is the one that
+   actually opens the spell picker, so it gets the same accent color as other
+   primary actions in this app rather than looking like a third bookkeeping button. */
+.slotCastBtn { background: #4a7fff; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-top: 0; font-size: 11px; padding: 2px 8px; }
+.slotCastBtn:disabled { background: #3a3d44; color: #888; cursor: not-allowed; }
+
+/* Spell casting (Phase 3) - save-throw result prompt in the roll modal. */
+.spell-save-prompt { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.spell-save-prompt label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #ccc; }
+.spell-save-prompt input { width: 60px; }
+
+/* Attack flow modal (confirm + roll result). Reuses .modal shell; these style its inner body. */
+.attack-target-name { font-size: 15px; font-weight: 600; color: #eee; margin: 2px 0 12px; }
+.attack-weapon-name { color: #4a7fff; }
+.attack-roll-block {
+  background: #14161b;
+  border: 1px solid #2c2f36;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: #ddd;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.attack-roll-block h4 {
+  margin: 0 0 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  font-family: inherit;
+}
+/* Advantage panel + interim manual damage dice on the attack confirm card. */
+.adv-panel { background: #14161b; border: 1px solid #2c2f36; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.adv-panel h4 { margin: 0 0 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #888; }
+.adv-manual { margin-left: 6px; padding: 0 5px; border: 1px solid #555; border-radius: 8px; font-size: 9px; color: #aaa; }
+.adv-source { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #ddd; padding: 2px 0; }
+.adv-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12px; color: #ccc; }
+.adv-row-label { min-width: 90px; }
+.adv-step { width: 32px; height: 28px; padding: 0; border: none; border-radius: 4px; cursor: pointer; background: #3a3d44; color: #fff; font-size: 16px; }
+.adv-value { min-width: 24px; text-align: center; font-weight: 600; }
+.adv-readout { margin-top: 6px; font-size: 12px; font-weight: 600; color: #cfd8ff; }
+
+.attack-outcome { font-weight: 700; font-size: 15px; margin: 10px 0 4px; }
+.attack-outcome.hit { color: #66bb6a; }
+.attack-outcome.miss { color: #e57373; }
+.attack-outcome.crit { color: #ffb300; }
+.attack-outcome.unknown { color: #bbb; }
+.attack-subtext { font-size: 11px; color: #888; margin-bottom: 4px; }
+
+/* GM manual stat-block attack editor (per token card) */
+.gm-attack-row { cursor: pointer; border-radius: 4px; }
+.gm-attack-row:hover { background: #1c1f26; }
+.gm-attack-del {
+  border: none;
+  background: none;
+  color: #777;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+  margin-left: 4px;
+}
+.gm-attack-del:hover { color: #e57373; }
+.gm-attack-add { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin: 6px 0 2px; }
+.gm-attack-add input { padding: 3px 5px; border-radius: 4px; border: 1px solid #2c2f36; background: #14161b; color: #eee; font-size: 11px; }
+.gm-attack-add .atkName { flex: 1 1 70px; min-width: 60px; }
+.gm-attack-add .atkHit, .gm-attack-add .atkDmgBonus { width: 44px; }
+.gm-attack-add .atkDmg { width: 60px; }
+.gm-attack-add select { padding: 3px 5px; border-radius: 4px; border: 1px solid #2c2f36; background: #14161b; color: #eee; font-size: 11px; }
+.gm-attack-add .addAttackBtn { font-size: 11px; padding: 3px 8px; }
+
+/* Forage popups (vtt-forage unit C). Reuses .modal, .adv-panel and .adv-row. 44px tap targets. */
+.forage-modal { max-height: 92vh; overflow-y: auto; }
+.forage-modal .forage-select,
+.forage-modal .forage-qty { width: 100%; min-height: 44px; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 14px; box-sizing: border-box; }
+.forage-modal .actions { flex-wrap: wrap; }
+.forage-modal .actions button,
+.forage-modal .forage-row button,
+.forage-modal .forage-lines button,
+.forage-queue button,
+.forage-sidebar-line button,
+.forageBtn { min-height: 44px; min-width: 44px; }
+.forageBtn.forage-off { opacity: .55; }
+.forage-modal .adv-step { width: 44px; height: 44px; }
+.forage-modal .adv-source { min-height: 44px; }
+.forage-modal .adv-source input { width: 22px; height: 22px; }
+.forage-row { display: flex; gap: 8px; margin-bottom: 10px; align-items: flex-end; }
+.forage-row > * { flex: 1 1 0; min-width: 0; }
+.forage-row > button { flex: 0 0 auto; }
+.forage-table-line { font-size: 13px; color: #cfd8ff; margin: 2px 0 6px; }
+.forage-warn { color: #ffb300; }
+.forage-msg { color: #e57373; font-size: 13px; margin: 8px 0; }
+.forage-check { background: #14161b; border: 1px solid #2c2f36; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.forage-check-total { font-size: 15px; }
+.forage-badge { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; color: #111; }
+.forage-badge.good { background: #ffb300; }
+.forage-badge.bad { background: #e57373; }
+.forage-lines { list-style: none; margin: 8px 0; padding: 0; }
+.forage-lines li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 14px; }
+.forage-lines .forage-line-name { flex: 1 1 auto; min-width: 0; }
+.forage-lines .forage-qty { width: 80px; flex: 0 0 80px; }
+.forage-lines .forage-qty.invalid { border-color: #e57373; }
+/* "Recent finds" (collapsible, player popup form step) */
+.forage-recent { margin: 10px 0; border: 1px solid #2c2f36; border-radius: 6px; padding: 0 10px; }
+.forage-recent summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-size: 14px; }
+.forage-recent-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.forage-recent-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; font-size: 13px; border-top: 1px solid #2c2f36; }
+.forage-recent-list li > div { flex: 1 1 auto; min-width: 0; }
+.forage-recent-list button { min-height: 44px; min-width: 64px; flex: 0 0 auto; }
+.forage-queue { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.forage-queue button { padding: 6px 10px; border: none; border-radius: 4px; color: #fff; background: #3a3d44; cursor: pointer; font-size: 13px; }
+.forage-queue button.active { background: #4a7fff; }
+.forage-sidebar-line { margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; background: #2a2d36; border: 1px solid #4a7fff; border-radius: 6px; padding: 6px 8px; }
+@media (max-width: 600px) {
+  .forage-modal { width: 94vw; padding: 14px; }
+  .forage-row { flex-wrap: wrap; }
+}
+
+/* Campaign tables (campaign.js): the notice card sits above every other modal, the banner is a
+   passing message at the top of the screen. */
+#campaignNotice { z-index: 500; }
+#campaignNotice .modal { width: 340px; max-width: 92vw; }
+#campaignNotice .actions { flex-wrap: wrap; }
+#campaignBanner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; padding: 8px 14px; border-radius: 6px; background: #2a2d36; border: 1px solid #4a7fff; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+#campaignBanner[hidden] { display: none; }

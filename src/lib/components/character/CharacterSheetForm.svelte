@@ -1,0 +1,3107 @@
+<script lang="ts">
+  import { deserialize, enhance } from '$app/forms';
+  import { invalidate } from '$app/navigation';
+  import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
+  import { backdropPress } from '$lib/ui/backdropPress';
+  import { tick, untrack } from 'svelte';
+  import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
+  import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
+  import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
+  import ForageModal from '$lib/components/character/ForageModal.svelte';
+  import { readOnlyLock } from '$lib/ui/readOnlyLock';
+  import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
+  import type { ForageMine } from '$lib/types/forage';
+  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
+  import {
+    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
+    rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
+  } from '$lib/rules/attackRoll';
+  import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
+  import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
+  import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
+  import type { CharacterContentInstance, ContentType } from '$lib/types/content';
+
+  let {
+    character,
+    itemCategories = [],
+    result,
+    isAdmin = false,
+    activeEncounterId = null,
+    activeVttSessionId = null,
+    activeGameSessionId = null,
+    currentUserId = null,
+    access = null,
+    readOnly = false,
+    ownerName = null,
+    onVersionHistory
+  }: {
+    character: CharacterDetail;
+    itemCategories?: ItemCategory[];
+    result?: Record<string, unknown>;
+    isAdmin?: boolean;
+    activeEncounterId?: string | null;
+    activeVttSessionId?: string | null;
+    activeGameSessionId?: string | null;
+    currentUserId?: string | null;
+    // Why this user may edit the sheet (owner, campaign DM or the admin override); drives the badge.
+    access?: { isOwner: boolean; isCampaignDm: boolean; viaAdmin: boolean } | null;
+    // True for a campaign member who can view but not edit: every control in the tab bodies and in the editing modals
+    // is locked (readOnlyLock; the "?" breakdowns, read-out openers and Close stay usable) and Save / the unsaved-changes prompt / forage / Activity Log room controls are hidden.
+    readOnly?: boolean;
+    ownerName?: string | null;
+    onVersionHistory?: () => void;
+  } = $props();
+
+  let classRows = $state(untrack(() => character.classes.map((row) => ({ ...row }))));
+  const classes = $derived(classRows[0] ?? { className: 'Fighter', level: 1 });
+  const resources = $derived(Object.fromEntries(character.resources.map((resource) => [resource.key, resource])));
+  const hp = $derived(resources.hp ?? { currentValue: 10, maxValue: 10 });
+  const tempHp = $derived(resources.temp_hp ?? { currentValue: 0, maxValue: 0 });
+  const inspiration = $derived(resources.inspiration?.currentValue ?? 0);
+  const abilityScores = $derived(abilityMap(character.abilities));
+  const level = $derived(totalLevel(classRows));
+
+  // Overridable sheet stats (docs/architecture/modifier-primacy-status.md, "Deliberate
+  // deviations (accepted)"): manual adjustments/overrides live in metadata.statOverrides, not
+  // as Modifier grants. Local $state so edits are instant/local; resynced from the server below
+  // only when the server value actually changed, so an unrelated invalidate('app:character-sheet')
+  // (Next Turn, add content, etc.) can't clobber an override that hasn't been saved yet.
+  let statOverrides = $state<StatOverrides>(readStatOverrides(untrack(() => character.metadata)));
+  let lastServerOverridesJson = $state(untrack(() => JSON.stringify(readStatOverrides(character.metadata))));
+  $effect(() => {
+    const serverJson = JSON.stringify(readStatOverrides(character.metadata));
+    if (serverJson !== lastServerOverridesJson) {
+      lastServerOverridesJson = serverJson;
+      statOverrides = readStatOverrides(character.metadata);
+    }
+  });
+
+  // Per-class hit dice pools (current/max) are directly editable (overridable-sheet-stats), not
+  // just a read-only summary derived from the class level - so they're local $state, resynced
+  // from the server only when the server value actually changed (same guard pattern as
+  // statOverrides above), so an unrelated invalidate('app:character-sheet') can't clobber an
+  // unsaved edit.
+  function hitDicePoolFor(row: { level: number }, index: number) {
+    const resource = character.resources.find((r) => r.key === `hit_dice_${index}`);
+    return { current: resource?.currentValue ?? row.level, max: resource?.maxValue ?? row.level };
+  }
+  let hitDicePools = $state<Array<{ current: number; max: number }>>(
+    untrack(() => classRows.map((row, i) => hitDicePoolFor(row, i)))
+  );
+  let lastServerHitDiceJson = $state(untrack(() =>
+    JSON.stringify(character.resources.filter((r) => r.key.startsWith('hit_dice_')).map((r) => [r.key, r.currentValue, r.maxValue]))
+  ));
+  $effect(() => {
+    const serverJson = JSON.stringify(character.resources.filter((r) => r.key.startsWith('hit_dice_')).map((r) => [r.key, r.currentValue, r.maxValue]));
+    if (serverJson !== lastServerHitDiceJson) {
+      lastServerHitDiceJson = serverJson;
+      hitDicePools = classRows.map((row, i) => hitDicePoolFor(row, i));
+    }
+  });
+
+  const classHitDice = $derived(classRows.map((row, i) => ({
+    className: row.className || 'Class',
+    level: row.level,
+    dieSize: parseInt(hitDieForRow(row)) || 8,
+    remaining: hitDicePools[i]?.current ?? row.level,
+    max: hitDicePools[i]?.max ?? row.level
+  })));
+  const hitDiceRemainingTotal = $derived(classHitDice.reduce((s, c) => s + c.remaining, 0));
+  const hitDiceMaxTotal = $derived(classHitDice.reduce((s, c) => s + c.max, 0));
+  let hitDiceCount = $state(1);
+  let hitDiceClassIndex = $state(0);
+  const metadata = $derived(character.metadata ?? {});
+  const race = $derived(String(character.metadata?.race ?? ''));
+  const d20Icon = '/images/dice-twenty-faces-one-svgrepo-com.svg';
+  const emptyInventoryItem = {
+    name: '',
+    category: 'gear',
+    location: 'backpack' as const,
+    quantity: 1,
+    equipped: false,
+    isEquipment: false,
+    acBonus: 0,
+    toHitBonus: 0,
+    damageBonus: 0,
+    attackAbility: 'str' as AbilityKey,
+    proficient: true,
+    damageRolls: '',
+    effects: '',
+    abilityBonuses: {},
+    notes: ''
+  };
+  const categoryOptions = $derived(itemCategories.length ? itemCategories : [
+    { key: 'weapon', label: 'Weapon' },
+    { key: 'armor', label: 'Armor' },
+    { key: 'shield', label: 'Shield' },
+    { key: 'focus', label: 'Spell Focus' },
+    { key: 'consumable', label: 'Consumable' },
+    { key: 'tool', label: 'Tool' },
+    { key: 'gear', label: 'Adventuring Gear' },
+    { key: 'treasure', label: 'Treasure' },
+    { key: 'junk', label: 'Junk' },
+    { key: 'misc', label: 'Misc' }
+  ]);
+  // Stale-save guard: the sheet version this form last knew about, posted as a hidden field with
+  // Save. It follows the server's value on every reload, EXCEPT while there are unsaved local edits
+  // (then someone else's save must still be caught, so it stays at what the edits were made against).
+  // A successful save sets it straight from the save response, so the user's own earlier save never
+  // makes their next one look stale, including saves made through the in-place saveSheetNow path.
+  let sheetToken = $state(untrack(() => character.sheetVersion));
+  $effect(() => {
+    // Tracks ONLY the server's version: reading hasUnsavedChanges untracked stops this re-running (and
+    // briefly resetting the token to a not-yet-reloaded value) the moment a save clears that flag.
+    const serverVersion = character.sheetVersion;
+    if (!untrack(() => hasUnsavedChanges)) sheetToken = serverVersion;
+  });
+  // Set when the server refused a Save as stale; the banner offers a reload.
+  let staleSheet = $state(false);
+  function reloadSheet() {
+    hasUnsavedChanges = false; // so the beforeunload prompt does not ask about edits we are discarding
+    window.location.reload();
+  }
+  const inventoryRows = $derived(character.inventory);
+  // What the inventory looked like when this sheet was loaded (and after each reload). Posted with
+  // Save so the server can tell which rows and fields the user actually changed, and leave the rest
+  // alone (a forage haul, VTT item use or equip action may have changed them since). The form
+  // inputs render from the same rows, so "input differs from baseline" means "the user edited it".
+  const inventoryBaselineJson = $derived(JSON.stringify(inventoryRows.filter((item) => item.id).map((item) => ({
+    id: item.id, name: item.name, category: item.category, location: item.location, quantity: item.quantity,
+    equipped: item.equipped, isEquipment: item.isEquipment, acBonus: item.acBonus, toHitBonus: item.toHitBonus,
+    damageBonus: item.damageBonus, attackAbility: item.attackAbility, proficient: item.proficient,
+    sourceContentId: item.sourceContentId ?? null, attuned: item.attuned ?? false, damageRolls: item.damageRolls,
+    effects: item.effects, notes: item.notes
+  }))));
+  const equippedInventoryRows = $derived(equippedItems(inventoryRows));
+  const backpackInventoryRows = $derived(
+    inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
+  );
+  const miscInventoryRows = $derived(inventoryRows.filter((item) => item.location === 'misc'));
+  const battleActionItems = $derived(equippedAttackItems(inventoryRows));
+  const attack = $derived(character.attacks[0] ?? {
+    name: '',
+    attackAbility: 'str' as AbilityKey,
+    proficient: true,
+    damageDice: '',
+    notes: ''
+  });
+  const notes = $derived(Object.fromEntries(character.notes.map((note) => [note.key, note.content])));
+  const proficiencies = $derived(character.proficiencies ?? { savingThrows: [], skills: [], weapons: [] });
+
+  let activeTab = $state<'battle' | 'traits' | 'inventory' | 'character'>('battle');
+  let sheetFormEl: HTMLFormElement;
+  // No autosave - every save rewrote the whole sheet and wrote a full version snapshot, which
+  // burned through the DB's network quota. Saving is manual only; hasUnsavedChanges drives the
+  // status label and the leave-page warning below.
+  let saveStatus = $state('Ready');
+  let hasUnsavedChanges = $state(false);
+  let deathSaveSuccesses = $state(0);
+  let deathSaveFailures = $state(0);
+  let savingThrowsOpen = $state(false);
+  let skillChecksOpen = $state(false);
+
+  // Forage (vtt-forage unit E). The sheet owns the latest `mine` (the finder's private forage state)
+  // so the button badge stays right while the popup is closed. It is fetched: once on load when there
+  // is no room to watch (a room's first resync does it otherwise), when a detail-free `forage:ping`
+  // arrives on the room topic, on a reconnect resync, and whenever the popup opens. Nothing polls.
+  let forageOpen = $state(false);
+  // Forage is for the character's owner only. The user wants player stand-ins (someone acting for an
+  // absent player's character) later: widen THIS one flag (e.g. `|| standInFor(character)`) and the
+  // server's loadOwnedCharacter check, and the button, the on-load fetch and the pings all follow.
+  const forageOwner = $derived(!readOnly && !!currentUserId && currentUserId === character.ownerUserId);
+  let forageMine = $state<ForageMine | null>(null);
+  const forageBadge = $derived(forageBadgeText(forageMine, character.id));
+  // Find tables belong to campaigns: with no campaign, the wrong room, or a campaign with no tables the
+  // button looks off with a plain reason (never anything about tables); a click still opens the popup,
+  // which re-checks with the server and shows the reason or the form. A forage already in flight
+  // or a result waiting keeps it live so it can be finished.
+  const forageOff = $derived(forageUnavailableReason(forageMine, character.id));
+  // A find landed while the sheet had unsaved edits, so the new rows wait for Save (see haulLanded).
+  let haulWaitingForSave = $state(false);
+  // DM-approved hauls already dealt with (by request id), so one result never reloads the sheet twice.
+  const handledHauls = new Set<string>();
+  // When this sheet mounted, on the server's clock (learned from the first successful `mine`). A DM
+  // result closed BEFORE this counts as pre-existing: it is already in the rows the sheet loaded, so it
+  // must not reload. One closed after it is new, even if the first fetch failed or came late.
+  const mountedAtClient = Date.now();
+  let serverOffsetMs: number | null = null;
+  // Only the latest response may update state (a slow older one must not overwrite a newer one).
+  // The parent keys this component on the character id, so none of this leaks between characters.
+  let forageSeq = 0;
+
+  async function refreshForage() {
+    if (!forageOwner) return;
+    const characterId = character.id;
+    const seq = ++forageSeq;
+    try {
+      const response = await fetch(`/vtt/api/forage/mine?characterId=${encodeURIComponent(characterId)}`);
+      if (!response.ok) return;
+      const mine = (await response.json()) as ForageMine;
+      if (seq !== forageSeq || characterId !== character.id) return;
+      forageMine = mine;
+      if (serverOffsetMs === null && typeof mine.serverNow === 'number') serverOffsetMs = mine.serverNow - Date.now();
+      const decision = haulDecision({
+        mine, characterId, mountedAt: mountedAtClient + (serverOffsetMs ?? 0), handled: handledHauls, hasUnsavedChanges
+      });
+      if (decision.key) handledHauls.add(decision.key);
+      if (decision.action === 'reload') haulLanded();
+      else if (decision.action === 'defer') haulWaitingForSave = true;
+    } catch {
+      // Offline or the server hiccuped: the badge just stays as it was.
+    }
+  }
+
+  // New items from a forage (self-serve pass, or a DM approval) are already in the database. With no
+  // unsaved edits the sheet reloads so the new or stacked rows show. With unsaved edits it must NOT
+  // reload (that could re-render rows mid-edit, see the notes by runInventoryAction), so it says the
+  // find will appear on Save. The changes-only Save leaves rows the user didn't touch alone, so that
+  // Save keeps the find and the post-save load then shows it.
+  function haulLanded() {
+    if (hasUnsavedChanges) {
+      haulWaitingForSave = true;
+    } else {
+      void invalidate('app:character-sheet');
+    }
+  }
+
+  // With no room, nothing else will fetch it for the badge. (In a room the subscription's first resync
+  // does, so this doesn't double up.) Keyed on the id only, so a reload doesn't refetch.
+  const forageCharacterId = $derived(character.id);
+  $effect(() => {
+    if (!forageCharacterId || activeVttSessionId || !forageOwner) return;
+    untrack(() => void refreshForage());
+  });
+  let playerModificationsOpen = $state(false);
+  let activityLogOpen = $state(false);
+  let sessionNotesModalId = $state<string | null>(null);
+  let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
+
+  // db-traffic-reduction Phase 4: Past Encounters / Past Sessions used to arrive as props
+  // from load(), fetched on every single sheet view even though this modal is rarely
+  // opened. Fetched fresh from GET /characters/[id]/history every time the modal opens
+  // instead - same "own its data, fetch on open" idiom as SessionNotesModal.svelte.
+  let encounterHistory = $state<Array<{ id: string; name: string; isActive: boolean; createdAt: string }>>([]);
+  let gameSessionHistory = $state<Array<{ id: string; name: string; isActive: boolean; createdAt: string }>>([]);
+  $effect(() => {
+    if (!activityLogOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/characters/${character.id}/history`);
+        if (cancelled || !res.ok) return;
+        const body = await res.json();
+        encounterHistory = body.encounterHistory ?? [];
+        gameSessionHistory = body.gameSessionHistory ?? [];
+      } catch {
+        // best-effort - the history tabs just stay at whatever they last showed
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+  let selectedEffectKeys = $state<string[]>([]);
+  let selectedExhaustionLevel = $state(0);
+  let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
+  let selectedSkillProficiencies = $state<string[]>([]);
+  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
+  let contentBusy = $state(false);
+  let modifierSearch = $state('');
+  let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
+  let newItemOpen = $state(false);
+  let newItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
+  let simpleItemOpen = $state(false);
+  let simpleItemLocation = $state<'equipped' | 'backpack' | 'misc'>('backpack');
+  let simpleItemName = $state('');
+  let simpleItemQuantity = $state(1);
+  let simpleItemCategory = $state('gear');
+  let simpleItemNotes = $state('');
+  let rollResult = $state<{
+    title: string;
+    attack: string;
+    damage: string[];
+    effects: string;
+  } | null>(null);
+  let simpleRollResult = $state<{
+    title: string;
+    lines: Array<{ label: string; text: string; natural: number }>;
+    passiveNote?: string;
+  } | null>(null);
+  let formulaHelp = $state<{
+    title: string;
+    lines?: string[];
+    statKey?: OverridableStat;
+  } | null>(null);
+  let inventoryMessage = $state<string | null>(null);
+  const modifierFilters = [
+    { key: 'active', label: 'Active' },
+    { key: 'automated', label: 'Automated' },
+    { key: 'potential', label: 'Potential' },
+    { key: 'condition', label: 'Conditions' },
+    { key: 'spell', label: 'Spells' },
+    { key: 'combat', label: 'Combat' },
+    { key: 'class_feature', label: 'Class' },
+    { key: 'environment', label: 'Environment' },
+    { key: 'all', label: 'All' }
+  ] as const;
+  const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
+  // The 18-skill list and the check maths live in $lib/rules/skills (shared with the server).
+  const skillChecks = SKILL_CHECKS;
+
+  function meta(field: string, fallback = '') {
+    return String(metadata[field] ?? fallback);
+  }
+
+  const activeEffectDetails = $derived(
+    character.availableEffects.filter((effect) => selectedEffectKeys.includes(effect.key))
+  );
+  const allActiveEffectDetails = $derived(character.activeEffects);
+  const filteredModifierEffects = $derived(
+    character.availableEffects.filter((effect) => {
+      const query = modifierSearch.trim().toLowerCase();
+      const matchesSearch = !query || [effect.name, effect.description, effect.sourceRef, effect.sourceType]
+        .join(' ')
+        .toLowerCase()
+        .includes(query);
+      const matchesFilter =
+        (modifierFilter === 'all' && effect.isSelectable) ||
+        (modifierFilter === 'active' && selectedEffectKeys.includes(effect.key)) ||
+        (modifierFilter === 'automated' && effect.modifiers.length > 0) ||
+        (modifierFilter === 'potential' && effect.modifiers.length === 0 && !effect.isSelectable) ||
+        (modifierFilter === 'condition' && effect.isCondition && effect.isSelectable) ||
+        (modifierFilter === 'spell' && effect.sourceType === 'spell' && effect.isSelectable) ||
+        (modifierFilter === 'combat' && effect.sourceType === 'combat_state' && effect.isSelectable) ||
+        (modifierFilter === 'class_feature' && effect.sourceType === 'class_feature' && effect.isSelectable) ||
+        (modifierFilter === 'environment' && effect.sourceType === 'environment' && effect.isSelectable);
+
+      return matchesSearch && matchesFilter;
+    })
+  );
+  const visibleModifierEffects = $derived(filteredModifierEffects.slice(0, 50));
+  const activeModifierFilterLabel = $derived(
+    modifierFilters.find((filter) => filter.key === modifierFilter)?.label ?? 'Modifiers'
+  );
+  const equippedAcBonus = $derived(
+    equippedInventoryRows.reduce((sum, item) => sum + (Number(item.acBonus) || 0), 0)
+  );
+  const acModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ac'], { classes: classRows }));
+  const initiativeModifierBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['initiative'], { classes: classRows }));
+  const spellcastingAbility = $derived(resolveSpellcastingAbility(classRows, metadata));
+  const spellDcBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_save_dc'], { classes: classRows }));
+  const spellAttackBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['spell_attack_roll', 'attack_roll.spell'], { classes: classRows }));
+  const characterSpells = $derived(character.content.filter((entry) => entry.type === 'spell'));
+  const characterFeats = $derived(character.content.filter((entry) => entry.type === 'feat'));
+  const characterFeatures = $derived(character.content.filter((entry) => entry.type === 'class_feature'));
+  const passivePerceptionBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.perception', 'passive.perception'], { classes: classRows }));
+  const passiveInsightBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.insight', 'passive.insight'], { classes: classRows }));
+  const passiveInvestigationBonuses = $derived(resolvedAdditiveModifiers(character.modifierSources, ['ability_check.investigation', 'passive.investigation'], { classes: classRows }));
+  const savingThrowModifierBonuses = $derived(
+    Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>
+  );
+  const skillCheckModifierBonuses = $derived(
+    Object.fromEntries(skillChecks.map((skill) => [skill.key, skillModifierBonuses(character.modifierSources, classRows, skill)])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
+  );
+
+  // The single reusable resolver (src/lib/rules/characterStats.ts) for all 9 overridable
+  // combat-summary/magic stats. Proficiency is resolved first inside it, so an override/
+  // adjustment on it cascades into every dependent stat below - the exact same resolver the VTT
+  // server routes and roll endpoints now use, so the sheet and VTT can't drift on this math.
+  const stats = $derived(resolveCharacterStats({
+    classes: classRows,
+    abilityScores,
+    modifierSources: character.modifierSources,
+    inventory: inventoryRows,
+    savingThrowProficiencies: selectedSavingThrowProficiencies,
+    skillProficiencies: selectedSkillProficiencies,
+    spellcastingAbility,
+    overrides: statOverrides
+  }));
+  const prof = $derived(stats.proficiency.value);
+
+  const statFmt: Record<OverridableStat, (n: number) => string> = {
+    proficiency: signed,
+    armorClass: String,
+    initiative: signed,
+    speed: (n) => `${n} ft.`,
+    passivePerception: String,
+    passiveInsight: String,
+    passiveInvestigation: String,
+    spellSaveDc: String,
+    spellAttackBonus: signed
+  };
+
+  // The small text flag shown next to a field label: 'M' when overridden (the override wins
+  // regardless of any stored adjustment), or the signed adjustment when only an adjustment is
+  // set. One short token, so the tight combat-summary-grid doesn't reflow on mobile.
+  function statFlag(key: OverridableStat): string {
+    const stat = stats[key];
+    if (stat.isOverridden) return 'M';
+    if (stat.isAdjusted) return signed(stat.adjustment);
+    return '';
+  }
+
+  function statFlagTitle(key: OverridableStat): string {
+    const stat = stats[key];
+    const fmt = statFmt[key];
+    if (stat.adjustmentReplacedBy) return `${signed(stat.adjustment)} adjustment replaced by ${stat.adjustmentReplacedBy}`;
+    if (stat.isOverridden) return `Manual override (computed: ${fmt(stat.adjusted)}) - clear the field or open ? to reset`;
+    if (stat.isAdjusted) return `Manual adjustment (computed: ${fmt(stat.computed)}) - clear the field or open ? to reset`;
+    return '';
+  }
+
+  // "<X> proficiency"/"Proficiency" breakdown line shared by passives, spell DC/attack, saves
+  // and skills - labelled "(manual)" whenever the effective proficiency carries a manual
+  // adjustment/override, so the cascade is visible wherever proficiency shows up, not just on
+  // the Proficiency field's own breakdown.
+  function proficiencyLine(prefix: string, proficient: boolean) {
+    if (!proficient) return `${prefix}: +0`;
+    const manual = stats.proficiency.isAdjusted || stats.proficiency.isOverridden;
+    return `${prefix}${manual ? ' (manual)' : ''}: ${signed(prof)}`;
+  }
+
+  // Breakdown lines for the 9 overridable stats. Each entry's `Total:` line is computed with NO
+  // manual input (stats.X.computed), then withManualLines() (characterStats.ts) appends the
+  // Manual section when an adjustment/override is set, replacing that line with the real
+  // (overridden/adjusted) total - see manualOverrideLines' contract for the exact wording.
+  const statFormulaLines = $derived.by((): Record<OverridableStat, string[]> => {
+    const dexMod = abilityModifier(abilityScores.dex);
+    const wisMod = abilityModifier(abilityScores.wis);
+    const speedSetValues = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['set'], { classes: classRows });
+    const speedBonuses = resolvedAdditiveModifiers(character.modifierSources, ['speed.all', 'speed.walk'], { classes: classRows });
+    const speedMultipliers = resolvedNumericModifiers(character.modifierSources, ['speed.all', 'speed.walk'], ['multiplier'], { classes: classRows });
+    const speedBase = speedSetValues.length ? speedSetValues.at(-1)?.value ?? 30 : 30;
+
+    return {
+      proficiency: withManualLines(
+        [`Total level: ${level}`, `Formula: 2 + floor((level - 1) / 4)`, `Result: ${signed(stats.proficiency.computed)}`],
+        stats.proficiency, statFmt.proficiency
+      ),
+      armorClass: withManualLines([
+        'Base: 10',
+        `DEX modifier: ${signed(dexMod)}`,
+        `Equipped item AC bonuses: ${signed(equippedAcBonus)}`,
+        ...acModifierBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.armorClass(stats.armorClass.computed)}`
+      ], stats.armorClass, statFmt.armorClass),
+      initiative: withManualLines([
+        `DEX modifier: ${signed(dexMod)}`,
+        ...initiativeModifierBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${signed(stats.initiative.computed)}`
+      ], stats.initiative, statFmt.initiative),
+      speed: withManualLines([
+        speedSetValues.length ? `Base set by effect: ${speedBase} ft.` : 'Base walking speed: 30 ft.',
+        ...speedBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)} ft.`),
+        ...speedMultipliers.map((bonus) => `${bonus.label}: x${bonus.value}`),
+        `Total: ${statFmt.speed(stats.speed.computed)}`
+      ], stats.speed, statFmt.speed),
+      passivePerception: withManualLines([
+        'Base: 10',
+        `WIS modifier: ${signed(wisMod)}`,
+        proficiencyLine('Perception proficiency', isSkillProficient('perception')),
+        ...passivePerceptionBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.passivePerception(stats.passivePerception.computed)}`
+      ], stats.passivePerception, statFmt.passivePerception),
+      passiveInsight: withManualLines([
+        'Base: 10',
+        `WIS modifier: ${signed(wisMod)}`,
+        proficiencyLine('Insight proficiency', isSkillProficient('insight')),
+        ...passiveInsightBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.passiveInsight(stats.passiveInsight.computed)}`
+      ], stats.passiveInsight, statFmt.passiveInsight),
+      passiveInvestigation: withManualLines([
+        'Base: 10',
+        `INT modifier: ${signed(abilityModifier(abilityScores.int))}`,
+        proficiencyLine('Investigation proficiency', isSkillProficient('investigation')),
+        ...passiveInvestigationBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.passiveInvestigation(stats.passiveInvestigation.computed)}`
+      ], stats.passiveInvestigation, statFmt.passiveInvestigation),
+      spellSaveDc: withManualLines([
+        'Base: 8',
+        proficiencyLine('Proficiency', true),
+        `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`,
+        ...spellDcBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.spellSaveDc(stats.spellSaveDc.computed)}`
+      ], stats.spellSaveDc, statFmt.spellSaveDc),
+      spellAttackBonus: withManualLines([
+        proficiencyLine('Proficiency', true),
+        `${spellcastingAbility.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[spellcastingAbility] ?? 10))}`,
+        ...spellAttackBonuses.map((bonus) => `${bonus.label}: ${signed(bonus.value)}`),
+        `Total: ${statFmt.spellAttackBonus(stats.spellAttackBonus.computed)}`
+      ], stats.spellAttackBonus, statFmt.spellAttackBonus)
+    };
+  });
+
+  // Senses (vision, darkvision, ...) resolved from modifiers, read-only on the sheet. Each sense
+  // carries its own source-attributed breakdown lines (highest "at least" grant wins, bonuses add).
+  const senses = $derived(visionBreakdown(character.modifierSources, { classes: classRows }));
+  const senseRows = $derived([
+    { label: 'Vision', sense: senses.normalFt, always: true },
+    { label: 'Darkvision', sense: senses.darkFt, always: false },
+    { label: 'Truesight', sense: senses.trueFt, always: false },
+    { label: "Devil's Sight", sense: senses.devilFt, always: false }
+  ].filter((row) => row.always || row.sense.value > 0));
+  const senseHelpLines = $derived(senseRows.flatMap((row) => [`${row.label}:`, ...row.sense.lines.map((line) => `  ${line}`)]));
+
+  function openFormulaHelp(title: string, lines: string[]) {
+    formulaHelp = { title, lines };
+  }
+
+  // Opens the formula-help modal in "live" mode for one of the 9 overridable stats: lines are
+  // read from the reactive statFormulaLines map (so they update live as the manual
+  // adjustment/override inputs in the modal change) rather than a frozen snapshot.
+  function openStatHelp(title: string, key: OverridableStat) {
+    formulaHelp = { title, statKey: key };
+  }
+
+  function setStatOverride(key: OverridableStat, value: number | null) {
+    const current = statOverrides[key] ?? { adjustment: 0, override: null };
+    const next = { ...current, override: key === 'speed' && value !== null ? Math.max(0, value) : value };
+    applyStatOverrideEntry(key, next);
+  }
+
+  function setStatAdjustment(key: OverridableStat, adjustment: number) {
+    const current = statOverrides[key] ?? { adjustment: 0, override: null };
+    applyStatOverrideEntry(key, { ...current, adjustment });
+  }
+
+  function resetStat(key: OverridableStat) {
+    applyStatOverrideEntry(key, { adjustment: 0, override: null });
+  }
+
+  // Shared write path for the three helpers above - drops the entry entirely once it's back to
+  // default (adjustment 0, override null) so a reset genuinely clears statOverrides rather than
+  // leaving a no-op entry behind, then flags the sheet as unsaved (these hidden-field edits don't
+  // fire the form's own input event, so markUnsaved has to be called explicitly).
+  function applyStatOverrideEntry(key: OverridableStat, entry: { adjustment: number; override: number | null }) {
+    const { [key]: _dropped, ...rest } = statOverrides;
+    statOverrides = entry.adjustment === 0 && entry.override === null ? rest : { ...rest, [key]: entry };
+    markUnsaved();
+  }
+
+  function commitStatInput(key: OverridableStat, event: Event & { currentTarget: HTMLInputElement }) {
+    const parsed = parseStatInput(event.currentTarget.value);
+    if (parsed === 'blank') {
+      setStatOverride(key, null);
+      return;
+    }
+    if (parsed === 'invalid') {
+      event.currentTarget.value = statFmt[key](stats[key].value);
+      return;
+    }
+    // Typing back the already-effective value while not overridden is a no-op, so tabbing
+    // through the combat summary without any real edits never manufactures an override entry.
+    if (parsed === stats[key].value && !stats[key].isOverridden) return;
+    setStatOverride(key, parsed);
+  }
+
+  // Same parse rules as the field itself (commitStatInput), but for the Manual section's
+  // dedicated Override box in the formula-help modal - reverts to the current override's
+  // display text (not the effective field value) on invalid input, since this box only ever
+  // edits `override`, never the adjustment.
+  function commitStatOverrideInput(key: OverridableStat, event: Event & { currentTarget: HTMLInputElement }) {
+    const parsed = parseStatInput(event.currentTarget.value);
+    if (parsed === 'blank') {
+      setStatOverride(key, null);
+      return;
+    }
+    if (parsed === 'invalid') {
+      const current = stats[key].override;
+      event.currentTarget.value = current !== null ? statFmt[key](current) : '';
+      return;
+    }
+    setStatOverride(key, parsed);
+  }
+
+  function markUnsaved() {
+    hasUnsavedChanges = true;
+    saveStatus = 'Unsaved changes';
+  }
+
+  // Only named inputs are actually submitted with the sheet - unnamed ones (catalogue pickers,
+  // room code, hit-dice spend count, etc.) are UI-only and shouldn't flag the sheet as dirty.
+  // Edits that go through buttons or unnamed inputs but DO end up in a submitted hidden field
+  // (death saves, exhaustion, condition/proficiency toggles, class rows, attuned/proficient
+  // checkboxes) call markUnsaved() themselves.
+  function markUnsavedIfSheetField(event: Event) {
+    const target = event.target as HTMLInputElement | null;
+    if (target?.name) markUnsaved();
+  }
+
+  // Browser's own "leave site?" prompt - the only safety net now autosave is gone.
+  function warnIfUnsaved(event: BeforeUnloadEvent) {
+    if (readOnly || !hasUnsavedChanges) return;
+    event.preventDefault();
+    event.returnValue = '';
+  }
+
+  function helpTitle(lines: string[]) {
+    return lines.join('\n');
+  }
+
+  function formulaHelpButton(title: string, lines: string[]) {
+    return {
+      title: helpTitle(lines),
+      ariaLabel: `${title} formula breakdown`
+    };
+  }
+
+  function hitDieForRow(row: { className: string; level: number }) {
+    const summary = hitDiceSummary([row]);
+    return summary.includes('d') ? summary.split('d')[1] : '8';
+  }
+
+  const hitDiceFormulaLines = $derived(
+    [
+      ...classHitDice.map((c, i) => `${classHitDice.length > 1 ? `Class ${i + 1} (${c.className})` : c.className}: ${c.remaining}/${c.max}d${c.dieSize}`),
+      `Total: ${hitDiceRemainingTotal} / ${hitDiceMaxTotal}`
+    ]
+  );
+
+  function setHitDicePoolCurrent(index: number, raw: string) {
+    const pools = [...hitDicePools];
+    pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), current: Math.max(0, Number(raw) || 0) };
+    hitDicePools = pools;
+    markUnsaved();
+  }
+
+  function setHitDicePoolMax(index: number, raw: string) {
+    const pools = [...hitDicePools];
+    pools[index] = { ...(pools[index] ?? { current: 0, max: 0 }), max: Math.max(0, Number(raw) || 0) };
+    hitDicePools = pools;
+    markUnsaved();
+  }
+
+  function isEffectSelected(key: string) {
+    return selectedEffectKeys.includes(key);
+  }
+
+  function toggleEffect(key: string) {
+    selectedEffectKeys = isEffectSelected(key)
+      ? selectedEffectKeys.filter((selected) => selected !== key)
+      : [...selectedEffectKeys, key];
+    markUnsaved();
+  }
+
+  function categoryOptionsFor(category: string) {
+    if (!category || categoryOptions.some((option) => option.key === category)) return categoryOptions;
+    return [...categoryOptions, { key: category, label: category }];
+  }
+
+  function openNewItem(location: 'equipped' | 'backpack' | 'misc') {
+    if (!isAdmin) {
+      simpleItemLocation = location;
+      simpleItemCategory = location === 'misc' ? 'misc' : 'gear';
+      simpleItemOpen = true;
+    } else {
+      newItemLocation = location;
+      newItemOpen = true;
+    }
+  }
+
+  function clampDeathSave(value: unknown) {
+    return Math.min(3, Math.max(0, Number(value) || 0));
+  }
+
+  function setDeathSaves(kind: 'success' | 'failure', value: number) {
+    if (kind === 'success') {
+      deathSaveSuccesses = deathSaveSuccesses === value ? value - 1 : value;
+    } else {
+      deathSaveFailures = deathSaveFailures === value ? value - 1 : value;
+    }
+    markUnsaved();
+  }
+
+  // Rolls a death save through the shared panel/dice-pool path, then applies the suggested result
+  // exactly like a manual icon click would (local state + markUnsaved), so the player can still
+  // click the icons to correct it. Rolling is never blocked (not at 3 successes/failures, not above
+  // 0 HP) - it only adds a gentle note.
+  function rollDeathSave(choices: RollChoices = defaultRollChoices()) {
+    // Modifier 0: a death save has no ability modifier (5e RAW); only saving_throw.all style
+    // modifiers (Bless, flat save bonuses) apply. The success/failure is the TOTAL against 10;
+    // a natural 1 and a natural 20 are judged on the KEPT die (see resolveDeathSave).
+    const result = rollText(0, deathSaveCandidates, [], false, choices);
+    const outcome = resolveDeathSave(result.natural, result.total, deathSaveSuccesses, deathSaveFailures);
+    deathSaveSuccesses = outcome.successes;
+    deathSaveFailures = outcome.failures;
+    markUnsaved();
+
+    const notes = [
+      outcome.kind === 'revived' ? 'Natural 20: regain 1 HP, both counters reset.'
+        : outcome.kind === 'critical_failure' ? 'Natural 1: two failures.'
+        : outcome.kind === 'success' ? 'Success.' : 'Failure.'
+    ];
+    if (outcome.regainHp) notes.push(regainOneHp());
+    if (currentHpOnScreen() > 0) notes.push('Note: current HP is above 0, so a death save is not normally needed.');
+    simpleRollResult = { title: 'Death Saving Throw', lines: [{ label: 'Death Save', ...result }], passiveNote: notes.join(' ') };
+    void logRoll('Death Save', result);
+  }
+
+  // Natural 20 on a death save: adds 1 to the Current HP box the same way typing in it would (the
+  // box is an uncontrolled form field, so set it and fire its input event - that flags unsaved
+  // changes through the form's own oninput). Falls back to a text note if the box isn't on screen.
+  // The Current HP box's live value (what the player sees, including unsaved edits), falling back to
+  // the server value when the box isn't on screen.
+  function currentHpOnScreen(): number {
+    const input = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpCurrent"]');
+    return input ? Number(input.value) || 0 : hp.currentValue;
+  }
+
+  function regainOneHp(): string {
+    const input = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpCurrent"]');
+    if (!input) return 'Regain 1 HP (set it by hand).';
+    const before = Number(input.value) || 0;
+    // Cap against the Max HP box (unsaved edits included), falling back to the server max, and
+    // never lower HP (e.g. if the box is already above max).
+    const maxInput = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpMax"]');
+    const max = Math.max(maxInput ? Number(maxInput.value) || 0 : hp.maxValue, 1);
+    const after = Math.max(before, Math.min(max, before + 1));
+    input.value = String(after);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return `HP ${before} -> ${after}.`;
+  }
+
+  // Both effects below resync local edit state from the server only when the server value actually
+  // changed (same guard as statOverrides/hitDicePools above). Without autosave, an unrelated
+  // invalidate('app:character-sheet') - a GM's Next Turn, adding content - would otherwise silently
+  // wipe a death save or condition toggle the player hasn't hit Save on yet.
+  let lastServerDeathSavesJson = '';
+  $effect(() => {
+    const successes = clampDeathSave(metadata.deathSaveSuccesses);
+    const failures = clampDeathSave(metadata.deathSaveFailures);
+    const serverJson = JSON.stringify([successes, failures]);
+    if (serverJson === lastServerDeathSavesJson) return;
+    lastServerDeathSavesJson = serverJson;
+    deathSaveSuccesses = successes;
+    deathSaveFailures = failures;
+  });
+
+  let lastServerSelectionsJson = '';
+  $effect(() => {
+    const effectKeys = character.activeEffects.filter((effect) => !effect.id.startsWith('content:') && !effect.id.startsWith('item:')).map((effect) => effect.effectKey);
+    const exhaustion = character.exhaustionLevel ?? 0;
+    const savingThrows = [...proficiencies.savingThrows];
+    const skills = [...proficiencies.skills];
+    const serverJson = JSON.stringify([effectKeys, exhaustion, savingThrows, skills]);
+    if (serverJson === lastServerSelectionsJson) return;
+    lastServerSelectionsJson = serverJson;
+    selectedEffectKeys = effectKeys;
+    selectedExhaustionLevel = exhaustion;
+    selectedSavingThrowProficiencies = savingThrows;
+    selectedSkillProficiencies = skills;
+  });
+
+  function setExhaustionLevel(raw: string) {
+    selectedExhaustionLevel = Math.min(6, Math.max(0, Number(raw) || 0));
+    markUnsaved();
+  }
+
+  function signed(value: number) {
+    return value >= 0 ? `+${value}` : String(value);
+  }
+
+  function setSiblingHiddenBoolean(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const hidden = input.closest('label')?.querySelector<HTMLInputElement>('input[type="hidden"]');
+    if (hidden) hidden.value = input.checked ? 'true' : 'false';
+    markUnsaved();
+  }
+
+  function isSavingThrowProficient(key: AbilityKey) {
+    return selectedSavingThrowProficiencies.includes(key);
+  }
+
+  function isSkillProficient(key: string) {
+    return selectedSkillProficiencies.includes(key);
+  }
+
+  function toggleSavingThrowProficiency(key: AbilityKey) {
+    selectedSavingThrowProficiencies = isSavingThrowProficient(key)
+      ? selectedSavingThrowProficiencies.filter((value) => value !== key)
+      : [...selectedSavingThrowProficiencies, key];
+    markUnsaved();
+  }
+
+  function toggleSkillProficiency(key: string) {
+    selectedSkillProficiencies = isSkillProficient(key)
+      ? selectedSkillProficiencies.filter((value) => value !== key)
+      : [...selectedSkillProficiencies, key];
+    markUnsaved();
+  }
+
+  function savingThrowTotal(key: AbilityKey) {
+    return stats.savingThrows[key];
+  }
+
+  function savingThrowFormula(key: AbilityKey): string[] {
+    const bonuses = savingThrowModifierBonuses[key] ?? [];
+    return [
+      `${key.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[key]))}`,
+      ...(isSavingThrowProficient(key) ? [proficiencyLine('Proficiency', true)] : []),
+      ...bonuses.map((b) => `${b.label}: ${signed(b.value)}`),
+      `Total: ${signed(savingThrowTotal(key))}`
+    ];
+  }
+
+  function skillCheckTotal(skill: { key: string; ability: AbilityKey }) {
+    return skillCheckBonus({
+      abilityScores,
+      proficient: isSkillProficient(skill.key),
+      proficiencyBonus: prof,
+      modifierSources: character.modifierSources,
+      classes: classRows
+    }, skill).total;
+  }
+
+  function skillCheckFormula(skill: { key: string; ability: AbilityKey; name: string }): string[] {
+    const bonuses = skillCheckModifierBonuses[skill.key] ?? [];
+    return [
+      `${skill.ability.toUpperCase()} modifier: ${signed(abilityModifier(abilityScores[skill.ability]))}`,
+      ...(isSkillProficient(skill.key) ? [proficiencyLine('Proficiency', true)] : []),
+      ...bonuses.map((b) => `${b.label}: ${signed(b.value)}`),
+      `Total: ${signed(skillCheckTotal(skill))}`
+    ];
+  }
+
+  // The shared pre-roll options panel (RollOptionsModal.svelte), shown before every d20 roll on the
+  // sheet. It only collects choices (unticked advantage sources, the manual adv/dis counters, and
+  // the INTERIM manual damage-dice delta); `run` then does the real roll with them. Every caller
+  // builds its candidates here (askRoll/askAttackRoll), and the roll function uses the very same
+  // candidate lists, so the panel's preview can't drift from what actually rolls.
+  type RollOptionsSpec = {
+    title: string;
+    advantage: { effects: typeof character.modifierSources; candidates: string[]; context: ModifierContext; batch?: boolean } | null;
+    damageDice: { baseExpression: string } | null;
+    run: (choices: RollChoices) => void;
+  };
+  let rollOptions = $state<RollOptionsSpec | null>(null);
+
+  // Focus restore: remember the button that opened the panel, and give it focus back once the panel
+  // AND the result modal that follows it have both closed (so keyboard users land where they were).
+  let rollTrigger: HTMLElement | null = null;
+  function rememberRollTrigger() {
+    const active = document.activeElement;
+    rollTrigger = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+  $effect(() => {
+    if (rollOptions || simpleRollResult || rollResult || !rollTrigger) return;
+    const trigger = rollTrigger;
+    rollTrigger = null;
+    void tick().then(() => { if (trigger.isConnected) trigger.focus(); });
+  });
+
+  function submitRollOptions(choices: RollChoices) {
+    const spec = rollOptions;
+    rollOptions = null;
+    spec?.run(choices);
+  }
+
+  // A plain d20 roll (save, skill, ability check, initiative, death save).
+  function askRoll(title: string, candidates: string[], run: (choices: RollChoices) => void, ability?: AbilityKey) {
+    rememberRollTrigger();
+    rollOptions = { title, advantage: { effects: character.modifierSources, candidates, context: { classes: classRows, ability } }, damageDice: null, run };
+  }
+
+  // "Roll all ...": counters only, applied to every line in the batch (the sources differ per line,
+  // so there are no per-source tick boxes). Batches are not logged, as before.
+  function askBatchRoll(title: string, run: (choices: RollChoices) => void) {
+    rememberRollTrigger();
+    rollOptions = { title, advantage: { effects: [], candidates: [], context: {}, batch: true }, damageDice: null, run };
+  }
+
+  // Candidate lists, shared by the panel and the roll functions.
+  const saveCandidates = (key: AbilityKey) => [`saving_throw.${key}`];
+  const abilityCheckCandidates = (key: AbilityKey) => [`ability_check.${key}`];
+  const initiativeCandidates = ['initiative'];
+  // There is no death-save target in the rules model yet, so a death save counts as a saving throw:
+  // saving_throw.all advantage/disadvantage (and Bless-style bonuses) apply, nothing else does.
+  const deathSaveCandidates = ['saving_throw.death'];
+
+  // Thin wrapper over the shared, pure rollWithModifiers (src/lib/rules/attackRoll.ts) - the
+  // component just supplies its own reactive modifierSources and RNG. The VTT's server endpoint
+  // calls the exact same function, so saves/skills/attacks can't drift between the two surfaces.
+  // flatModifiersIncluded must be true whenever `modifier` already has bonus/penalty modifiers
+  // folded in (saves, skills, initiative - all of which go through resolvedAdditiveModifiers()/
+  // resolveCharacterStats() before calling this), otherwise rollWithModifiers would add them a
+  // second time (see attackRoll.ts's flatModifiersIncluded comment).
+  //
+  // `choices` are the user's picks from the roll-options panel (unticked sources and the manual
+  // situational counters). The sheet has no target or token, so only the attacker's own sources and
+  // the situational counters can apply here.
+  function rollText(
+    modifier: number,
+    candidates: string[] = [],
+    modifierBreakdown: Array<{ label: string; value: number }> = [],
+    flatModifiersIncluded = false,
+    choices: RollChoices = defaultRollChoices(),
+    // The roll's ability (a save's ability, a skill's ability, 'dex' for initiative), so
+    // "ability:dex" gated modifiers apply. Undefined for rolls with no ability (death saves).
+    ability?: AbilityKey
+  ) {
+    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie, {
+      flatModifiersIncluded,
+      context: { classes: classRows, ability },
+      extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+      disabledSourceIds: choices.disabledSourceIds
+    });
+  }
+
+  function rollAllSavingThrows(choices: RollChoices = defaultRollChoices()) {
+    simpleRollResult = {
+      title: 'Saving Throws',
+      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), saveCandidates(key), [], true, choices, key) }))
+    };
+  }
+
+  function rollAllSkillChecks(choices: RollChoices = defaultRollChoices()) {
+    simpleRollResult = {
+      title: 'Skill Checks',
+      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), skillCandidates(skill), [], true, choices, skill.ability) }))
+    };
+  }
+
+  function rollSingleSavingThrow(key: AbilityKey, choices: RollChoices = defaultRollChoices()) {
+    const label = `${key.toUpperCase()} Save`;
+    const result = rollText(savingThrowTotal(key), saveCandidates(key), [], true, choices, key);
+    simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label, ...result }] };
+    void logRoll(label, result);
+  }
+
+  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }, choices: RollChoices = defaultRollChoices()) {
+    const passiveScores: Record<string, number> = {
+      perception: stats.passivePerception.value,
+      insight: stats.passiveInsight.value,
+      investigation: stats.passiveInvestigation.value
+    };
+    const passiveNote = skill.key in passiveScores
+      ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
+      : undefined;
+    const result = rollText(skillCheckTotal(skill), skillCandidates(skill), [], true, choices, skill.ability);
+    simpleRollResult = {
+      title: skill.name,
+      lines: [{ label: skill.name, ...result }],
+      passiveNote
+    };
+    void logRoll(skill.name, result);
+  }
+
+  function rollAbilityCheck(key: AbilityKey, choices: RollChoices = defaultRollChoices()) {
+    const label = `${key.toUpperCase()} Check`;
+    // Deliberately flatModifiersIncluded: false (the default) - rollAbilityCheck passes the raw
+    // ability mod only, with no bonus/penalty modifiers folded in first.
+    const result = rollText(abilityModifier(abilityScores[key]), abilityCheckCandidates(key), [], false, choices, key);
+    simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label, ...result }] };
+    void logRoll(label, result);
+  }
+
+  function rollInitiative(choices: RollChoices = defaultRollChoices()) {
+    const result = rollText(stats.initiative.value, initiativeCandidates, [], true, choices, 'dex');
+    simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...result }] };
+    void logRoll('Initiative', result);
+  }
+
+  async function useHitDie() {
+    const idx = Math.min(hitDiceClassIndex, classHitDice.length - 1);
+    const hdc = classHitDice[idx];
+    if (!hdc || hdc.remaining <= 0) return;
+    const count = Math.min(Math.max(1, hitDiceCount), hdc.remaining);
+    const rolls = Array.from({ length: count }, () => rollDie(hdc.dieSize));
+    const totalRoll = rolls.reduce((sum, r) => sum + r, 0);
+    const conMod = abilityModifier(abilityScores.con);
+    const conTotal = conMod * count;
+    const rolled = Math.max(1, totalRoll + conTotal);
+    // Cap recovery by the actual HP headroom so the modal is honest
+    const hpHeadroom = hp.maxValue - hp.currentValue;
+    const hpGained = Math.min(rolled, Math.max(0, hpHeadroom));
+    const classLabel = classHitDice.length > 1 ? ` (${hdc.className})` : '';
+    const diceLabel = `${count}d${hdc.dieSize}${classLabel}`;
+    const rollPart = count > 1 ? `[${rolls.join(', ')}] = ${totalRoll}` : `${rolls[0]}`;
+    const conPart = conMod !== 0
+      ? ` + ${count > 1 ? `${count}×` : ''}CON (${conMod >= 0 ? '+' : ''}${conMod}${count > 1 ? ` = ${conTotal >= 0 ? '+' : ''}${conTotal}` : ''}) = ${rolled}`
+      : ` = ${rolled}`;
+    const passiveNote = hpHeadroom <= 0
+      ? `Already at full HP - hit ${count === 1 ? 'die' : 'dice'} spent.`
+      : `Recovered ${hpGained} HP (${hp.currentValue} → ${hp.currentValue + hpGained}).`;
+    simpleRollResult = {
+      title: 'Use Hit Dice',
+      lines: [{ label: diceLabel, text: `${rollPart}${conPart}`, natural: count === 1 ? rolls[0] : rolled }],
+      passiveNote
+    };
+    const body = new FormData();
+    body.set('classIndex', String(idx));
+    body.set('spent', String(count));
+    // Only used server-side to seed max_value if this pool has never been saved before - an
+    // existing pool's (now player-editable) max is left alone. See spendHitDice in characters.ts.
+    body.set('defaultMax', String(hdc.max));
+    body.set('hpGained', String(hpGained));
+    const response = await fetch('?/spendHitDice', { method: 'POST', body });
+    if (!response.ok) {
+      simpleRollResult = { ...simpleRollResult!, passiveNote: `Roll recorded, but save failed (${response.status}) - refresh the page.` };
+      return;
+    }
+    await invalidate('app:character-sheet');
+  }
+
+  // activeEncounterId/activeGameSessionId only ever reflect the load()-time
+  // snapshot otherwise - if a GM starts combat or a game session *after* this
+  // page was already open, nothing would pick that up without a full reload.
+  // These local copies get refreshed by the room-topic push subscription
+  // below so the Activity Log modal reflects what's actually live right now.
+  let liveEncounterId = $state<string | null>(null);
+  let liveGameSessionId = $state<string | null>(null);
+  $effect(() => {
+    liveEncounterId = activeEncounterId;
+  });
+  $effect(() => {
+    liveGameSessionId = activeGameSessionId;
+  });
+
+  // Cheap ownership-scoped re-derive of liveEncounterId/liveGameSessionId
+  // (see that endpoint's own comment for why it's not full getCharacter) -
+  // used to be polled every 10s; now only called from the room-topic
+  // subscription's onResync (below) and on a combat:state/game_session:state
+  // push, so it only ever runs when something might actually have changed.
+  async function refreshActivityStatus() {
+    try {
+      const res = await fetch(`/vtt/api/characters/${character.id}/activity-status`);
+      if (res.ok) {
+        const data = await res.json();
+        liveEncounterId = data.encounterId;
+        liveGameSessionId = data.gameSessionId;
+      }
+    } catch {
+      // best-effort - a missed refresh just means the modal lags until the next one
+    }
+  }
+
+  // db-traffic-reduction Phase 5: pushed live over /vtt-ws instead of polled
+  // (see src/lib/stores/liveUpdates.ts). The sheet has no other reason to
+  // reach the combat-log/roll-log endpoints now except an afterId catch-up
+  // fetch, either on first join or on every reconnect (onResync).
+  let combatLogEntries = $state<Array<{ id: string; message: string; createdAt: string }>>([]);
+  let rollLogEntries = $state<Array<{ id: string; message: string; details: Record<string, unknown>; createdAt: string }>>([]);
+
+  async function fetchCombatLogSince(encounterId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ encounterId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/log?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.entries?.length) combatLogEntries = mergeLogEntries(combatLogEntries, data.entries, 200);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the log lags until the next resync
+    }
+  }
+
+  async function fetchRollLogSince(sessionId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ sessionId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/roll-log?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.entries?.length) rollLogEntries = mergeLogEntries(rollLogEntries, data.entries, 200);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the log lags until the next resync
+    }
+  }
+
+  // Only (re)starts when liveEncounterId itself changes - a fresh/changed
+  // encounter has no locally-known backlog, so this clears and does one full
+  // fetch. Ongoing entries arrive via the room-topic push below instead.
+  $effect(() => {
+    const encounterId = liveEncounterId;
+    combatLogEntries = [];
+    if (!encounterId) return;
+    fetchCombatLogSince(encounterId, undefined);
+  });
+
+  // The one live transport for everything room-scoped: combat/roll log lines,
+  // and "something changed, re-check activity status" for combat/game-session
+  // start-stop. Gated on activeVttSessionId (same gate the old roll-log poll
+  // used) since there's nothing to watch before a room's been joined - the
+  // "Join Room" action already calls invalidate('app:character-sheet'), which
+  // reruns this effect the moment activeVttSessionId actually changes.
+  $effect(() => {
+    if (!activeVttSessionId) {
+      rollLogEntries = [];
+      return;
+    }
+    const sessionId = activeVttSessionId;
+    rollLogEntries = [];
+    fetchRollLogSince(sessionId, undefined);
+
+    const unsubscribe = subscribeTopic(`room:${sessionId}`, {
+      onResync: () => {
+        refreshActivityStatus();
+        void refreshForage();
+        fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
+        if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
+      },
+      onMessage: (msg) => {
+        if (msg.type === 'roll:log' && msg.entry) {
+          rollLogEntries = mergeLogEntries(rollLogEntries, [msg.entry as (typeof rollLogEntries)[number]], 200);
+        } else if (msg.type === 'combat:log' && msg.entry && (msg.entry as { encounterId: string }).encounterId === liveEncounterId) {
+          combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
+        } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
+          refreshActivityStatus();
+        } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
+          // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
+          // nothing read in here can become a dependency of this effect (Review 3).
+          untrack(() => void refreshForage());
+        }
+      }
+    });
+    return unsubscribe;
+  });
+
+  // The one join a player needs - covers combat, rolls, and session notes at
+  // once (see docs/vtt-current-state.md's room-join-unification write-up).
+  // Moved to the top of the Activity Log modal so it's visible regardless of
+  // which tab is open.
+  let joinRoomIdInput = $state('');
+  let joinRoomBusy = $state(false);
+  let joinRoomError = $state<string | null>(null);
+
+  async function joinRoom() {
+    const roomId = joinRoomIdInput.trim();
+    if (!roomId) return;
+    joinRoomBusy = true;
+    joinRoomError = null;
+    const body = new FormData();
+    body.set('roomId', roomId);
+    const response = await fetch('?/joinRoom', { method: 'POST', body });
+    joinRoomBusy = false;
+    if (response.ok) {
+      joinRoomIdInput = '';
+      await invalidate('app:character-sheet');
+    } else {
+      const actionResult = deserialize(await response.text()) as { data?: { joinRoomError?: string } };
+      joinRoomError = actionResult.data?.joinRoomError || 'Could not join room.';
+    }
+  }
+
+  let leaveRoomBusy = $state(false);
+
+  async function leaveRoom() {
+    leaveRoomBusy = true;
+    // SvelteKit's action invocation rejects a POST with no body/Content-Type
+    // ("Unsupported Media Type") before the action code even runs - needs a
+    // real (even empty) FormData body, same as every other action call here.
+    await fetch('?/leaveRoom', { method: 'POST', body: new FormData() });
+    leaveRoomBusy = false;
+    await invalidate('app:character-sheet');
+  }
+
+  // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
+  // itself. Skipped entirely when the character hasn't joined a VTT room, same
+  // "nothing to log against" gate the server action itself also applies.
+  async function logRoll(
+    label: string,
+    result: { text: string; natural: number; total: number; pool?: AttackPool },
+    extras: { manualDamageDice?: number } = {}
+  ) {
+    if (!activeVttSessionId) return;
+    const body = new FormData();
+    body.set('label', label);
+    body.set('total', String(result.total));
+    body.set('breakdown', result.text);
+    body.set('natural', String(result.natural));
+    // The d20 pool (for the "(3d20 adv x2, keeps 17)" suffix). The server validates these.
+    if (result.pool) {
+      body.set('poolSize', String(result.pool.size));
+      body.set('poolNet', String(result.pool.net));
+      body.set('poolKept', String(result.pool.kept));
+      body.set('poolManualAdv', String(result.pool.manualAdvantage));
+      body.set('poolManualDis', String(result.pool.manualDisadvantage));
+    }
+    // INTERIM: manual damage-dice delta (weapon attacks).
+    if (extras.manualDamageDice) body.set('manualDamageDice', String(extras.manualDamageDice));
+    await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
+  }
+
+  function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
+    const label = String(entry.details.label ?? 'Roll');
+    simpleRollResult = {
+      title: label,
+      lines: [{ label, text: String(entry.details.breakdown ?? ''), natural: Number(entry.details.natural) || 0 }]
+    };
+  }
+
+  // Session Notes - attributed to the signed-in player, not this character;
+  // joining is covered by the top-level "Join Room" action above (see
+  // gameSessions.ts's getActiveGameSessionForUser for how this is derived).
+  let sessionNoteInput = $state('');
+  let sessionNoteBusy = $state(false);
+
+  async function postSessionNote() {
+    const message = sessionNoteInput.trim();
+    if (!message) return;
+    sessionNoteBusy = true;
+    const body = new FormData();
+    body.set('message', message);
+    const response = await fetch('?/postSessionNote', { method: 'POST', body });
+    sessionNoteBusy = false;
+    if (response.ok) sessionNoteInput = '';
+  }
+
+  // Pushed live over the "game-session:<id>" topic (db-traffic-reduction
+  // Phase 5) - this panel only shows the most recent handful; the full log
+  // lives at /sessions/[id] (SessionNotesModal.svelte, same subscription
+  // shape). (Re)starts when liveGameSessionId changes, same "fresh id, no
+  // known backlog" reasoning as the combat-log effect above.
+  let sessionNoteEntries = $state<Array<{ id: string; displayName: string; message: string; createdAt: string }>>([]);
+
+  async function fetchSessionNotesSince(gameSessionId: string, afterId: string | undefined) {
+    const qs = new URLSearchParams({ gameSessionId });
+    if (afterId) qs.set('afterId', afterId);
+    try {
+      const res = await fetch(`/vtt/api/session-notes?${qs}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.notes?.length) sessionNoteEntries = mergeLogEntries(sessionNoteEntries, data.notes, 20);
+      }
+    } catch {
+      // best-effort - a missed fetch just means the panel lags until the next resync
+    }
+  }
+
+  $effect(() => {
+    if (!liveGameSessionId) {
+      sessionNoteEntries = [];
+      return;
+    }
+    const gameSessionId = liveGameSessionId;
+    sessionNoteEntries = [];
+    fetchSessionNotesSince(gameSessionId, undefined);
+
+    const unsubscribe = subscribeTopic(`game-session:${gameSessionId}`, {
+      onResync: () => fetchSessionNotesSince(gameSessionId, sessionNoteEntries.at(-1)?.id),
+      onMessage: (msg) => {
+        if (msg.type === 'game_session:note' && msg.note) {
+          sessionNoteEntries = mergeLogEntries(sessionNoteEntries, [msg.note as (typeof sessionNoteEntries)[number]], 20);
+        }
+      }
+    });
+    return unsubscribe;
+  });
+
+  // Rendered newest-first. The underlying entries arrays and their afterId poll
+  // cursors above stay oldest-first (ascending) untouched - only these render
+  // views are reversed.
+  let combatLogNewestFirst = $derived([...combatLogEntries].reverse());
+  let rollLogNewestFirst = $derived([...rollLogEntries].reverse());
+  let sessionNotesNewestFirst = $derived([...sessionNoteEntries].reverse());
+
+  // contentBusy stays true until the refreshed character has landed, not just until the action's
+  // own response - the whole-sheet Save is blocked while it's set (see the form's enhance below).
+  // Otherwise a Save clicked in that gap would submit the stale on-screen inventory, and
+  // replaceInventory (delete-all-then-upsert from the form) would quietly undo an equip toggle or
+  // bring a just-removed item back.
+  async function runContentAction(action: string, values: Record<string, string | number | boolean> = {}) {
+    contentBusy = true;
+    try {
+      const body = new FormData();
+      for (const [key, value] of Object.entries(values)) body.set(key, String(value));
+      const response = await fetch(`?/${action}`, { method: 'POST', body });
+      if (response.ok) await invalidate('app:character-sheet');
+      else inventoryMessage = `Could not update character content (${response.status}).`;
+    } finally {
+      contentBusy = false;
+    }
+  }
+
+  // Saves the whole sheet form in place (no navigation), for actions that need pending edits
+  // written first. Returns false if the save failed, so the caller can stop.
+  async function saveSheetNow(): Promise<boolean> {
+    if (!sheetFormEl) return false;
+    saveStatus = 'Saving';
+    const response = await fetch('?/save', {
+      method: 'POST',
+      body: new FormData(sheetFormEl),
+      headers: { 'x-sveltekit-action': 'true' }
+    });
+    let ok = false;
+    let stale = false;
+    try {
+      const parsed = deserialize(await response.text());
+      ok = parsed.type === 'success';
+      if (parsed.type === 'success') {
+        const next = (parsed.data as { sheetVersion?: number } | undefined)?.sheetVersion;
+        if (typeof next === 'number') sheetToken = next;
+      } else if (parsed.type === 'failure') {
+        stale = Boolean((parsed.data as { staleSheet?: boolean } | undefined)?.staleSheet);
+      }
+    } catch {
+      // Non-JSON error page (e.g. a 500) - treat as a failed save.
+    }
+    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; }
+    staleSheet = stale;
+    saveStatus = ok ? 'Saved' : stale ? 'Not saved' : 'Save failed';
+    return ok;
+  }
+
+  function addSelectedContent(type: ContentType) {
+    const contentId = selectedCatalogue[type];
+    if (contentId) void runContentAction('addContent', { contentId });
+  }
+
+  async function addSimpleItem() {
+    const name = simpleItemName.trim();
+    if (!name) return;
+    await runContentAction('addInventoryItem', {
+      name,
+      quantity: simpleItemQuantity,
+      category: simpleItemCategory,
+      location: simpleItemLocation,
+      notes: simpleItemNotes
+    });
+    simpleItemOpen = false;
+    simpleItemName = '';
+    simpleItemQuantity = 1;
+    simpleItemCategory = 'gear';
+    simpleItemLocation = 'backpack';
+    simpleItemNotes = '';
+  }
+
+  function addClassRow() {
+    classRows = [...classRows, { className: '', level: 1, subclassName: '', spellcastingAbility: null }];
+    hitDicePools = [...hitDicePools, { current: 1, max: 1 }];
+    markUnsaved();
+  }
+
+  function removeClassRow(index: number) {
+    if (classRows.length === 1) return;
+    classRows = classRows.filter((_, rowIndex) => rowIndex !== index);
+    // Index-based hit_dice_<i> keys stay aligned on the next save because the whole spliced
+    // array is what gets saved - removing a middle class re-keys the remaining pools server-side
+    // too, which is pre-existing behaviour this doesn't change.
+    hitDicePools = hitDicePools.filter((_, rowIndex) => rowIndex !== index);
+    markUnsaved();
+  }
+
+  // Snapshot of each class row's level as it stood BEFORE the current edit, keyed by row index -
+  // plain (non-reactive) bookkeeping, not $state, since nothing renders from it. Needed because
+  // the level input updates classRows live on every keystroke (so other derived stats stay in
+  // sync while typing), which means classRows[index].level can no longer be trusted as "the
+  // level before this edit" by the time the level-follow decision runs - see captureClassLevel.
+  const classLevelBeforeEdit = new Map<number, number>();
+
+  // Captured on focus, before any keystroke of this edit has touched classRows - this is what
+  // "the old level" must be compared against, not classRows[index].level read later (see below).
+  function captureClassLevel(index: number) {
+    classLevelBeforeEdit.set(index, classRows[index]?.level ?? 1);
+  }
+
+  // Runs on every keystroke so level-dependent stats (proficiency, spell slots, etc.) update
+  // live. Deliberately does NOT touch hitDicePools here - see commitClassLevel.
+  function updateClassLevelInput(index: number, raw: string) {
+    const clamped = Math.max(1, Math.min(20, Number(raw) || 1));
+    classRows = classRows.map((row, rowIndex) => (rowIndex === index ? { ...row, level: clamped } : row));
+  }
+
+  // Hit dice max follows class level unless it's been customised: if a pool's max still equals
+  // the class's OLD level, it shifts by the same delta as the level change (current shifts with
+  // it, clamped >= 0). If the max was already edited to something else, it's left alone - the
+  // player's custom max wins over the level-follow convenience.
+  //
+  // Runs once on blur/Enter (onchange), not per keystroke: a multi-digit level typed as separate
+  // input events (e.g. "1" then "12") would otherwise let the first keystroke's write to
+  // classRows.level get misread as "the old level" by the second keystroke, spuriously matching
+  // a customised pool.max and clobbering it. Comparing against the onfocus-captured snapshot
+  // instead of classRows[index].level avoids that regardless of how many input events fired.
+  function commitClassLevel(index: number) {
+    const newLevel = classRows[index]?.level ?? 1;
+    const oldLevel = classLevelBeforeEdit.get(index) ?? newLevel;
+    classLevelBeforeEdit.delete(index);
+    const pool = hitDicePools[index];
+    if (pool && pool.max === oldLevel && newLevel !== oldLevel) {
+      const delta = newLevel - oldLevel;
+      hitDicePools = hitDicePools.map((entry, rowIndex) =>
+        rowIndex === index ? { current: Math.max(0, entry.current + delta), max: newLevel } : entry
+      );
+    }
+  }
+
+  function damageSummary(item: InventoryItem) {
+    const rolls = item.damageRolls
+      .split('+')
+      .map((roll) => roll.trim())
+      .filter(Boolean);
+    const ability = abilityModifier(abilityScores[item.attackAbility]);
+    const modifierBonuses = battleDamageBonuses(item).reduce((sum, bonus) => sum + bonus.value, 0);
+    const flatBonus = Number(item.damageBonus || 0) + ability + modifierBonuses;
+    let summary = rolls.join(' + ');
+    if (flatBonus) {
+      summary = summary ? `${summary} ${flatBonus > 0 ? '+' : '-'} ${Math.abs(flatBonus)}` : String(flatBonus);
+    }
+    return summary || 'No damage';
+  }
+
+  function rollDie(sides: number) {
+    return Math.floor(Math.random() * sides) + 1;
+  }
+
+  // Thin wrappers over the shared, pure roll module (src/lib/rules/attackRoll.ts). The component
+  // supplies its own reactive modifierSources / classRows / ability scores / RNG; the identical
+  // functions run server-side for the VTT, so the two surfaces can never disagree on a roll.
+  function rollDamageExpression(
+    expression: string,
+    bonus: number,
+    abilityBonus = 0,
+    abilityLabel = '',
+    modifierBonuses: Array<{ label: string; value: number }> = [],
+    extraDice: ReturnType<typeof resolveExtraDiceRolls> = []
+  ) {
+    return rollDamage(expression, bonus, abilityBonus, abilityLabel, modifierBonuses, extraDice, rollDie);
+  }
+
+  function battleDamageBonuses(item: InventoryItem, outcomes: string[] = []) {
+    return sharedBattleDamageBonuses(character.modifierSources, item, classRows, outcomes);
+  }
+
+  // Opens the shared panel for a weapon attack: advantage sources plus the INTERIM damage-dice control.
+  function askAttackRoll(item: InventoryItem) {
+    rememberRollTrigger();
+    rollOptions = {
+      title: item.name || 'Attack',
+      advantage: {
+        effects: character.modifierSources,
+        candidates: attackCandidatesFor(item),
+        context: { classes: classRows, ability: item.attackAbility, attackType: 'melee_weapon' }
+      },
+      damageDice: { baseExpression: item.damageRolls },
+      run: (choices) => rollBattleAction(item, choices)
+    };
+  }
+
+  function rollBattleAction(item: InventoryItem, choices: RollChoices = defaultRollChoices()) {
+    const attackResult = rollAttack(item, {
+      modifierSources: character.modifierSources,
+      abilityScores,
+      proficiencyBonus: prof,
+      classes: classRows,
+      rollDie,
+      extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+      disabledSourceIds: choices.disabledSourceIds,
+      manualDamageDice: choices.manualDamageDice // INTERIM
+    });
+    rollResult = attackResult;
+    // Sheet attacks now log like the other sheet rolls (once, here, after the panel).
+    void logRoll(`${item.name || 'Attack'} attack`,
+      { text: attackResult.attack, natural: attackResult.attackNatural, total: attackResult.attackTotal, pool: attackResult.attackPool },
+      { manualDamageDice: attackResult.manualDamageDice });
+  }
+
+  // Per vtt-phase-3-magic-spec.md: the character sheet just displays what a spell resolves
+  // to and rolls it for reference - no target/application concept here (that's the VTT's
+  // job). Runs resolveSpellDamage() client-side (unlike the VTT's vanilla client, this
+  // component can import $lib directly) - same function, same Modifier-aware damage the
+  // VTT's roll-spell endpoint produces.
+  type SheetSpell = { name: string; spellLevel: number | null; spellDamage?: NonNullable<CharacterContentInstance['spellDamage']> };
+
+  // A spell's resolved damage at the character's level (cantrips scale with character level; levelled
+  // spells are shown at their own base level). `outcomes` lets a crit-gated modifier apply once the
+  // to-hit is known. Null when the spell has no damage dice.
+  function spellProfile(spell: SheetSpell, outcomes: string[] = []) {
+    const damage = spell.spellDamage;
+    if (!damage || !damage.baseDice) return null;
+    return resolveSpellDamage(
+      { name: spell.name, spellLevel: spell.spellLevel ?? 0, resolutionType: damage.resolutionType, damageType: damage.damageType,
+        baseDice: damage.baseDice, saveAbility: damage.saveAbility, saveEffect: damage.saveEffect, scaling: damage.scaling },
+      { castAtSlotLevel: spell.spellLevel ?? 0, casterLevel: level, modifierSources: character.modifierSources, outcomes }
+    );
+  }
+
+  // The spell's damage dice and the INTERIM damage-dice delta, rolled. Shared by the damage-only
+  // spells and the attack spells (which add a to-hit roll first).
+  function rollSpellDice(spell: SheetSpell, profile: NonNullable<ReturnType<typeof spellProfile>>, choices: RollChoices, critical = false) {
+    const adjusted = adjustPrimaryDamageDice(profile.diceExpression, choices.manualDamageDice);
+    const rolled = rollDamage(adjusted.expression, 0, 0, '', profile.flatBonuses, profile.extraDice, rollDie, critical);
+    const scalingLine = profile.scalingNote ? [`Dice: ${profile.diceExpression} (${profile.scalingNote})`] : [];
+    return { adjusted, lines: [...(adjusted.auditLine ? [adjusted.auditLine] : []), ...scalingLine, ...rolled.lines] };
+  }
+
+  // Per vtt-phase-3-magic-spec.md: the sheet rolls a spell for reference - no target/application
+  // concept here (that's the VTT's job). Same resolveSpellDamage() the VTT's roll-spell endpoint uses.
+  // Attack spells get the full roll-options panel and roll to-hit first (like weapon attacks);
+  // save and automatic spells stay damage-only, with just the INTERIM damage-dice control.
+  function rollSpellDamage(spell: SheetSpell) {
+    const profile = spellProfile(spell);
+    if (!profile) return;
+    // Computed once, before the panel opens, so its preview and the roll agree.
+    rememberRollTrigger();
+    const spellContext = { classes: classRows, ability: spellcastingAbility, attackType: 'spell' } as const;
+
+    if (profile.resolution === 'attack') {
+      rollOptions = {
+        title: spell.name,
+        advantage: { effects: character.modifierSources, candidates: spellAttackCandidates, context: spellContext },
+        damageDice: { baseExpression: profile.diceExpression },
+        run: (choices) => {
+          // Same to-hit path as the VTT's roll-spell: stats.spellAttackBonus already folds in
+          // spell attack modifiers and any manual override, so the flat sum is skipped.
+          const bonus = stats.spellAttackBonus.value;
+          const attackRoll = rollWithModifiers(character.modifierSources, bonus, spellAttackCandidates,
+            [{ label: 'Spell Attack', value: bonus }], rollDie, {
+              flatModifiersIncluded: true,
+              context: spellContext,
+              extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+              disabledSourceIds: choices.disabledSourceIds
+            });
+          const outcomes = resolveD20Outcomes(attackRoll.natural, resolveCritThreshold(character.modifierSources, { attackType: 'spell' }));
+          // Re-resolve with the outcomes so crit-gated damage modifiers apply, as a weapon crit does.
+          const hitProfile = spellProfile(spell, outcomes) ?? profile;
+          const dice = rollSpellDice(spell, hitProfile, choices, outcomes.includes('critical_hit'));
+          rollResult = {
+            title: spell.name,
+            attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` - ${outcomes.join(', ')}` : ''}`,
+            damage: dice.lines,
+            effects: `Spell Attack${hitProfile.damageType ? ` · ${hitProfile.damageType}` : ''}`
+          };
+          void logRoll(`${spell.name} attack`,
+            { text: attackRoll.text, natural: attackRoll.natural, total: attackRoll.total, pool: attackRoll.pool },
+            { manualDamageDice: dice.adjusted.applied });
+        }
+      };
+      return;
+    }
+
+    // Save / automatic: no d20 here, so only the INTERIM damage-dice control.
+    rollOptions = {
+      title: spell.name,
+      advantage: null,
+      damageDice: { baseExpression: profile.diceExpression },
+      run: (choices) => {
+        const dice = rollSpellDice(spell, profile, choices);
+        const resolutionText = profile.resolution === 'save'
+          ? `Save (${(profile.saveAbility || '').toUpperCase()}, ${profile.saveEffect === 'negate' ? 'negate' : 'half'} on success)`
+          : 'Automatic';
+        rollResult = {
+          title: spell.name,
+          attack: '',
+          damage: dice.lines,
+          effects: `${resolutionText}${profile.damageType ? ` · ${profile.damageType}` : ''}`
+        };
+      }
+    };
+  }
+
+  // Spell list row summary: the SCALED dice at the character's level (levelled spells at their base
+  // level), merged ("2d10"), not the raw base dice. Save details only show for save spells - a
+  // stored save ability on an attack spell is ignored here.
+  function spellDamageSummary(spell: CharacterContentInstance): string {
+    const damage = spell.spellDamage;
+    const profile = spellProfile(spell);
+    if (!damage || !profile) return '';
+    const resolutionLabel = damage.resolutionType === 'save' ? `Save (${damage.saveAbility.toUpperCase()})`
+      : damage.resolutionType === 'attack' ? 'Attack' : 'Auto';
+    return `${resolutionLabel} · ${profile.diceExpression}${damage.damageType ? ` ${damage.damageType}` : ''}`;
+  }
+
+  function findInventoryRow(event: MouseEvent) {
+    return (event.currentTarget as HTMLElement).closest<HTMLElement>('.inventory-row, .new-item-grid');
+  }
+
+  function setInventoryQuantity(event: MouseEvent, quantity: number) {
+    const input = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryQuantity"]');
+    if (!input) return;
+    input.value = String(Math.max(0, quantity));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function adjustInventoryQuantity(event: MouseEvent, delta: number) {
+    const input = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryQuantity"]');
+    if (!input) return;
+    const next = Math.max(0, (Number(input.value) || 0) + delta);
+    input.value = String(next);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function useInventoryItem(event: MouseEvent) {
+    const row = findInventoryRow(event);
+    const name = row?.querySelector<HTMLInputElement>('input[name="inventoryName"]')?.value || 'Item';
+    const damageRolls = row?.querySelector<HTMLInputElement>('input[name="inventoryDamageRolls"]')?.value || '';
+    const damageBonus = Number(row?.querySelector<HTMLInputElement>('input[name="inventoryDamageBonus"]')?.value) || 0;
+    const attackAbility = (row?.querySelector<HTMLInputElement | HTMLSelectElement>('input[name="inventoryAttackAbility"], select[name="inventoryAttackAbility"]')?.value || 'str') as AbilityKey;
+    const ability = abilityModifier(abilityScores[attackAbility]);
+    const effects = row?.querySelector<HTMLInputElement>('input[name="inventoryEffects"]')?.value || '';
+    const inventoryId = row?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    const sourceContentId = row?.querySelector<HTMLInputElement>('input[name="inventorySourceContentId"]')?.value || '';
+    const roll = damageRolls ? rollDamageExpression(damageRolls, damageBonus, ability, attackAbility.toUpperCase()) : null;
+    if (inventoryId && sourceContentId) {
+      void useCatalogueInventoryItem(inventoryId, name);
+      return;
+    }
+    adjustInventoryQuantity(event, -1);
+    inventoryMessage = roll
+      ? `${name} used. Quantity reduced by 1. Roll: ${roll.lines.join('; ')}${effects ? ` (${effects})` : ''}.`
+      : `${name} used. Quantity reduced by 1.`;
+  }
+
+  async function useCatalogueInventoryItem(inventoryId:string,name:string){
+    const body=new FormData();body.set('inventoryId',inventoryId);
+    await runResourceAction('useItem',body,`${name} used. Quantity reduced by 1.`);
+  }
+
+  async function triggerContentResourceAction(instanceId:string,name:string){
+    const body=new FormData();body.set('instanceId',instanceId);
+    await runResourceAction('triggerContent',body,`${name} used.`);
+  }
+
+  async function castSpell(spell:any){
+    const body=new FormData();
+    if(spell.spellAccessId){body.set('spellAccessId',spell.spellAccessId);body.set('inventoryItemId',spell.inventoryItemId||'');}
+    else body.set('instanceId',spell.id);
+    await runResourceAction('castSpell',body,`${spell.name} cast.`);
+  }
+
+  // db-traffic-reduction Phase 4: this used to stash its message in sessionStorage and do a
+  // full document reload (location.reload()) so the message would survive it - a full SSR
+  // reload of everything just to show what a potion/spell/item did. HP, resources, hit dice
+  // pools etc. are all plain $derived off the `character` prop (or resynced-on-change local
+  // $state - see statOverrides/hitDicePools above), so a narrow invalidate() refreshes every
+  // visible value exactly as well as a full reload did, without the round-trip cost.
+  async function runResourceAction(action:string,body:FormData,heading:string){
+    const response=await fetch(`?/${action}`,{method:'POST',body});
+    const actionResult=deserialize(await response.text());
+    if(actionResult.type!=='success'){
+      inventoryMessage='Could not apply the resource action.';
+      return;
+    }
+    const results=((actionResult.data as {itemResult?:Array<{label:string;target:string;expression:string;rolled:number;before:number|null;after:number|null;detail?:string}>})?.itemResult)||[];
+    const lines=[heading,...results.map(result=>
+      result.before===null?`${result.label}: ${result.detail||`${result.expression} rolled ${result.rolled}`} (${result.target})`:
+      `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
+    inventoryMessage=lines.join('\n');
+    await invalidate('app:character-sheet');
+  }
+
+  // db-traffic-reduction Phase 4: used to zero the quantity then requestSubmit() the whole
+  // sheet form - a full character rewrite plus a version snapshot just to delete one row, and
+  // it would also silently save any unrelated unsaved edit elsewhere on the sheet. Now a tiny
+  // standalone action (single DELETE, no version) via runContentAction, same as every other
+  // button-driven content action. Every rendered inventory row's id is always real (backed by
+  // character.inventory, i.e. already persisted) - only the separate "Add Item" modal below
+  // deals with not-yet-saved rows, and that still goes through the whole-sheet Save button.
+  // Equip/remove are tiny standalone actions, but if the sheet has unsaved edits they're saved
+  // first - an equipped/unequipped row moves between the Equipped and Backpack lists, which
+  // re-renders it from the server and would silently drop any unsaved edits on that row. This
+  // matches the old behaviour (equip/remove used to submit the whole sheet) only when needed.
+  async function runInventoryAction(action: 'setEquipped' | 'removeInventoryItem', values: Record<string, string | boolean>) {
+    if (contentBusy) return;
+    if (hasUnsavedChanges) {
+      contentBusy = true;
+      const saved = await saveSheetNow().finally(() => (contentBusy = false));
+      if (!saved) return;
+    }
+    await runContentAction(action, values);
+  }
+
+  function removeInventoryItem(event: MouseEvent) {
+    const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    if (!inventoryId) return;
+    void runInventoryAction('removeInventoryItem', { inventoryId });
+  }
+
+  // Same reasoning as removeInventoryItem above - a tiny standalone action (single UPDATE, no
+  // version) instead of flipping hidden fields and submitting the whole sheet form.
+  function toggleEquipped(event: MouseEvent, equipped: boolean) {
+    const inventoryId = findInventoryRow(event)?.querySelector<HTMLInputElement>('input[name="inventoryId"]')?.value || '';
+    if (!inventoryId) return;
+    void runInventoryAction('setEquipped', { inventoryId, equipped });
+  }
+
+  // Modals never stack in this UI, so closing whichever one is open is unambiguous.
+  function closeOpenModal() {
+    if (forageOpen) { forageOpen = false; return; }
+    if (rollOptions) { rollOptions = null; return; }
+    if (rollResult) { rollResult = null; return; }
+    if (simpleRollResult) { simpleRollResult = null; return; }
+    if (inventoryMessage) { inventoryMessage = null; return; }
+    if (simpleItemOpen) { simpleItemOpen = false; return; }
+    if (newItemOpen) { newItemOpen = false; return; }
+    if (formulaHelp) { formulaHelp = null; return; }
+    if (playerModificationsOpen) { playerModificationsOpen = false; return; }
+    if (activityLogOpen) { activityLogOpen = false; return; }
+    if (skillChecksOpen) { skillChecksOpen = false; return; }
+    if (savingThrowsOpen) { savingThrowsOpen = false; return; }
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape') closeOpenModal();
+  }
+</script>
+
+<svelte:window onkeydown={handleGlobalKeydown} onbeforeunload={warnIfUnsaved} />
+
+<form
+  method="POST"
+  action="?/save"
+  class="sheet-form"
+  bind:this={sheetFormEl}
+  use:enhance={({ cancel }) => {
+    // Blocked while a content/inventory action is still in flight or refreshing - see
+    // runContentAction. Also covers a native submit from pressing Enter in a text field.
+    if (contentBusy) {
+      cancel();
+      return;
+    }
+    contentBusy = true;
+    return async ({ update, result }) => {
+      contentBusy = false;
+      // invalidateAll: false - SvelteKit reruns this page's load() either way (it always does
+      // after a form action), but this keeps that rerun scoped to this route's own
+      // depends('app:character-sheet') rather than also re-running unrelated layout loads.
+      await update({ reset: false, invalidateAll: false });
+      if (result.type === 'success') {
+        hasUnsavedChanges = false; haulWaitingForSave = false; staleSheet = false;
+        const next = (result.data as { sheetVersion?: number } | undefined)?.sheetVersion;
+        if (typeof next === 'number') sheetToken = next;
+      }
+      staleSheet = result.type === 'failure' && Boolean((result.data as { staleSheet?: boolean } | undefined)?.staleSheet);
+      saveStatus = result.type === 'success' ? 'Saved' : staleSheet ? 'Not saved' : 'Save failed';
+      await invalidate('app:character-sheet');
+    };
+  }}
+  oninput={markUnsavedIfSheetField}
+  onchange={markUnsavedIfSheetField}
+>
+  <input name="inventoryBaseline" type="hidden" value={inventoryBaselineJson} />
+  <input name="sheetVersion" type="hidden" value={sheetToken} />
+  {#if staleSheet}
+    <div class="panel stale-sheet-banner" role="alert">
+      <span>Someone else saved this sheet. Reload to see their changes.</span>
+      <button type="button" class="compact-button" onclick={reloadSheet}>Reload</button>
+    </div>
+  {/if}
+  <section class="panel sheet-header compact">
+    <div>
+      <p class="eyebrow">D&D 5E 2014</p>
+      <h1>{character.name}</h1>
+      <p class="muted">
+        {race || character.ancestry || 'Unknown origin'} - {classes.className} {classes.level}
+      </p>
+      {#if access && !access.isOwner}
+        <!-- Someone other than the owner: either editing (DM / admin) or just viewing. Say which, and whose sheet it is. -->
+        <p class="editing-as-line">
+          {#if readOnly}
+            <span class="muted">Viewing {ownerName ?? "someone else"}'s character. Only the owner and the DMs can change it.</span>
+          {:else}
+            {#if access.isCampaignDm}
+              <span class="badge">Editing as DM</span>
+            {:else if access.viaAdmin}
+              <span class="badge badge-admin">Editing as site admin</span>
+            {/if}
+            {#if ownerName}<span class="muted">{ownerName}'s character</span>{/if}
+          {/if}
+        </p>
+      {/if}
+      <p class="campaign-badge-line">
+        {#if character.campaignId}
+          <a class="text-button" href={`/campaigns/${character.campaignId}`}>Campaign: {character.campaignName}</a>
+          <span class="badge" class:badge-muted={!character.partyActive}>{character.partyActive ? 'Active in party' : 'Not in party'}</span>
+        {:else}
+          <span class="muted">No campaign</span>
+          <a class="text-button" href="/campaigns">Add to campaign</a>
+        {/if}
+      </p>
+    </div>
+    <nav class="sheet-tabs in-header" aria-label="Character sheet sections">
+      <button type="button" class:active={activeTab === 'battle'} onclick={() => (activeTab = 'battle')}>Battle</button>
+      <button type="button" class:active={activeTab === 'inventory'} onclick={() => (activeTab = 'inventory')}>Inventory</button>
+      <button type="button" class:active={activeTab === 'traits'} onclick={() => (activeTab = 'traits')}>Traits</button>
+      <button type="button" class:active={activeTab === 'character'} onclick={() => (activeTab = 'character')}>Character</button>
+    </nav>
+    <div class="actions sheet-header-actions">
+      <div class="combat-clock">
+        <span class="save-state combat-clock-status">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
+        <button type="button" class="compact-button combat-clock-full" disabled={contentBusy || readOnly} onclick={() => runContentAction('newBattle')}>New Battle</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceRound')}>Next Round</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button>
+      </div>
+      <div class="save-cluster">
+        <div class="save-command-row">
+          {#if !readOnly}
+            <div class="save-button-col">
+              <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
+              <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
+              {#if haulWaitingForSave && hasUnsavedChanges}
+                <span class="forage-pending-note">Your find will appear when you save.</span>
+              {/if}
+              {#if result?.saved}
+                <span class="save-state good">Saved</span>
+              {/if}
+            </div>
+          {/if}
+          <div class="history-links">
+            {#if onVersionHistory}
+              <button type="button" class="text-button" onclick={onVersionHistory}>Character History</button>
+            {/if}
+            <button type="button" class="text-button" onclick={() => (activityLogOpen = true)}>Activity Log</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {#if activeTab === 'battle'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
+    <section class="battle-layout">
+      <div class="battle-top-row">
+        <section class="panel stack compact-panel">
+          <h2>Health & Resources</h2>
+          <div class="mini-grid compact-control-grid">
+            <label>Current HP <input name="hpCurrent" type="number" value={hp.currentValue} /></label>
+            <label>Max HP <input name="hpMax" type="number" value={hp.maxValue} /></label>
+            <label>Temp HP <input name="tempHp" type="number" value={tempHp.currentValue} /></label>
+            <label>Inspiration <input name="inspiration" type="number" min="0" value={inspiration} /></label>
+          </div>
+          <div class="hit-dice-label">
+            <span class="field-label-with-help">
+              Hit Dice
+              <button type="button" class="formula-help-button" title={helpTitle(hitDiceFormulaLines)} aria-label="Hit Dice formula breakdown" onclick={() => openFormulaHelp('Hit Dice', hitDiceFormulaLines)}>?</button>
+            </span>
+            <div class="hit-dice-pool-rows">
+              {#each classHitDice as hdc, i}
+                <span class="hit-dice-pool-row">
+                  {#if classHitDice.length > 1}<span class="hit-dice-pool-class">{hdc.className}</span>{/if}
+                  <input
+                    type="number"
+                    min="0"
+                    inputmode="numeric"
+                    class="hit-dice-pool-input"
+                    value={hdc.remaining}
+                    oninput={(event) => setHitDicePoolCurrent(i, event.currentTarget.value)}
+                    aria-label={`${hdc.className} hit dice current`}
+                  />
+                  <span>/</span>
+                  <input
+                    type="number"
+                    min="0"
+                    inputmode="numeric"
+                    class="hit-dice-pool-input"
+                    value={hdc.max}
+                    oninput={(event) => setHitDicePoolMax(i, event.currentTarget.value)}
+                    aria-label={`${hdc.className} hit dice max`}
+                  />
+                  <span>d{hdc.dieSize}</span>
+                </span>
+              {/each}
+            </div>
+            <span class="summary-input-roll">
+              {#if classHitDice.length > 1}
+                <select bind:value={hitDiceClassIndex} aria-label="Hit die type" class="hit-dice-class-select">
+                  {#each classHitDice as hdc, i}
+                    <option value={i} disabled={hdc.remaining <= 0}>{hdc.remaining}d{hdc.dieSize}</option>
+                  {/each}
+                </select>
+              {/if}
+              <input type="number" class="hit-dice-count-input" min="1" max={classHitDice[hitDiceClassIndex]?.remaining ?? 1} bind:value={hitDiceCount} aria-label="Number of hit dice to use" />
+              <button type="button" class="compact-use-button" disabled={(classHitDice[hitDiceClassIndex]?.remaining ?? 0) <= 0} onclick={useHitDie}>Use</button>
+            </span>
+          </div>
+        </section>
+
+        <section class="panel stack compact-panel">
+          <h2>Combat Summary</h2>
+          <div class="combat-summary-grid">
+            <label class:stat-overridden={stats.proficiency.isOverridden} class:stat-adjusted={stats.proficiency.isAdjusted && !stats.proficiency.isOverridden}>
+              <span class="field-label-with-help">
+                Proficiency
+                {#if statFlag('proficiency')}<span class="stat-flag" title={statFlagTitle('proficiency')}>{statFlag('proficiency')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.proficiency)} aria-label="Proficiency formula breakdown" onclick={() => openStatHelp('Proficiency', 'proficiency')}>?</button>
+              </span>
+              <input type="text" inputmode="numeric" value={statFmt.proficiency(stats.proficiency.value)} onchange={(event) => commitStatInput('proficiency', event)} />
+            </label>
+            <label class:stat-overridden={stats.armorClass.isOverridden} class:stat-adjusted={stats.armorClass.isAdjusted && !stats.armorClass.isOverridden}>
+              <span class="field-label-with-help">
+                Armor Class
+                {#if statFlag('armorClass')}<span class="stat-flag" title={statFlagTitle('armorClass')}>{statFlag('armorClass')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.armorClass)} aria-label="Armor Class formula breakdown" onclick={() => openStatHelp('Armor Class', 'armorClass')}>?</button>
+              </span>
+              <input type="text" inputmode="numeric" value={statFmt.armorClass(stats.armorClass.value)} onchange={(event) => commitStatInput('armorClass', event)} />
+            </label>
+            <label class="combat-stat-pp" class:stat-overridden={stats.passivePerception.isOverridden} class:stat-adjusted={stats.passivePerception.isAdjusted && !stats.passivePerception.isOverridden}>
+              <span class="field-label-with-help">
+                Passive Perception
+                {#if statFlag('passivePerception')}<span class="stat-flag" title={statFlagTitle('passivePerception')}>{statFlag('passivePerception')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.passivePerception)} aria-label="Passive Perception formula breakdown" onclick={() => openStatHelp('Passive Perception', 'passivePerception')}>?</button>
+              </span>
+              <input type="text" inputmode="numeric" value={statFmt.passivePerception(stats.passivePerception.value)} onchange={(event) => commitStatInput('passivePerception', event)} />
+            </label>
+            <label class="initiative-control" class:stat-overridden={stats.initiative.isOverridden} class:stat-adjusted={stats.initiative.isAdjusted && !stats.initiative.isOverridden}>
+              <span class="field-label-with-help">
+                Initiative
+                {#if statFlag('initiative')}<span class="stat-flag" title={statFlagTitle('initiative')}>{statFlag('initiative')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.initiative)} aria-label="Initiative formula breakdown" onclick={() => openStatHelp('Initiative', 'initiative')}>?</button>
+              </span>
+              <span class="summary-input-roll">
+                <input type="text" inputmode="numeric" value={statFmt.initiative(stats.initiative.value)} onchange={(event) => commitStatInput('initiative', event)} />
+                <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={() => askRoll('Initiative', initiativeCandidates, rollInitiative, 'dex')}>
+                  <img src={d20Icon} alt="" />
+                </button>
+              </span>
+            </label>
+            <label class="speed-control" class:stat-overridden={stats.speed.isOverridden} class:stat-adjusted={stats.speed.isAdjusted && !stats.speed.isOverridden}>
+              <span class="field-label-with-help">
+                Speed
+                {#if statFlag('speed')}<span class="stat-flag" title={statFlagTitle('speed')}>{statFlag('speed')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.speed)} aria-label="Speed formula breakdown" onclick={() => openStatHelp('Speed', 'speed')}>?</button>
+              </span>
+              <input type="text" inputmode="numeric" value={statFmt.speed(stats.speed.value)} onchange={(event) => commitStatInput('speed', event)} />
+            </label>
+            <label class="combat-stat-pi" class:stat-overridden={stats.passiveInsight.isOverridden} class:stat-adjusted={stats.passiveInsight.isAdjusted && !stats.passiveInsight.isOverridden}>
+              <span class="field-label-with-help">
+                Passive Insight
+                {#if statFlag('passiveInsight')}<span class="stat-flag" title={statFlagTitle('passiveInsight')}>{statFlag('passiveInsight')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.passiveInsight)} aria-label="Passive Insight formula breakdown" onclick={() => openStatHelp('Passive Insight', 'passiveInsight')}>?</button>
+              </span>
+              <input type="text" inputmode="numeric" value={statFmt.passiveInsight(stats.passiveInsight.value)} onchange={(event) => commitStatInput('passiveInsight', event)} />
+            </label>
+            <div class="death-save-grid" role="group" aria-label="Death saves">
+              <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
+              <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
+              <span class="death-save-label" aria-hidden="true"><span>Death</span><span>Saves</span></span>
+              <button type="button" class="dice-icon-button death-save-roll" aria-label="Roll death save" title="Roll death save" onclick={() => askRoll('Death Saving Throw', deathSaveCandidates, rollDeathSave)}>
+                <img src={d20Icon} alt="" />
+              </button>
+              <div class="death-save-rows">
+                <div class="death-save-icons" role="group" aria-label="Death save successes">
+                  {#each [1, 2, 3] as value}
+                    <button
+                      type="button"
+                      class="death-save-icon success"
+                      class:active={deathSaveSuccesses >= value}
+                      aria-pressed={deathSaveSuccesses >= value}
+                      aria-label={`Death save success ${value}`}
+                      onclick={() => setDeathSaves('success', value)}
+                    ></button>
+                  {/each}
+                </div>
+                <div class="death-save-icons" role="group" aria-label="Death save failures">
+                  {#each [1, 2, 3] as value}
+                    <button
+                      type="button"
+                      class="death-save-icon failure"
+                      class:active={deathSaveFailures >= value}
+                      aria-pressed={deathSaveFailures >= value}
+                      aria-label={`Death save failure ${value}`}
+                      onclick={() => setDeathSaves('failure', value)}
+                    ></button>
+                  {/each}
+                </div>
+              </div>
+            </div>
+            <label class="combat-stat-piv" class:stat-overridden={stats.passiveInvestigation.isOverridden} class:stat-adjusted={stats.passiveInvestigation.isAdjusted && !stats.passiveInvestigation.isOverridden}>
+              <span class="field-label-with-help">
+                Passive Investigation
+                {#if statFlag('passiveInvestigation')}<span class="stat-flag" title={statFlagTitle('passiveInvestigation')}>{statFlag('passiveInvestigation')}</span>{/if}
+                <button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.passiveInvestigation)} aria-label="Passive Investigation formula breakdown" onclick={() => openStatHelp('Passive Investigation', 'passiveInvestigation')}>?</button>
+              </span>
+              <input type="text" inputmode="numeric" value={statFmt.passiveInvestigation(stats.passiveInvestigation.value)} onchange={(event) => commitStatInput('passiveInvestigation', event)} />
+            </label>
+          </div>
+          <div class="senses-line" aria-label="Senses">
+            <span class="field-label-with-help">
+              Senses
+              <button type="button" class="formula-help-button" title={helpTitle(senseHelpLines)} aria-label="Senses breakdown" onclick={() => openFormulaHelp('Senses', senseHelpLines)}>?</button>
+            </span>
+            {#each senseRows as row}
+              <span class="sense-chip">{row.label} {row.sense.value} ft</span>
+            {/each}
+          </div>
+        </section>
+
+        <section class="panel stack compact-panel">
+          <h2>Abilities</h2>
+          <div class="ability-panel-body">
+            <div class="ability-grid compact-ability-grid">
+              {#each abilityOrder as key}
+                <label class="ability-card">
+                  <span class="ability-line">
+                    <strong>{key.toUpperCase()}:</strong>
+                    <input name={`ability_${key}`} type="number" min="1" value={abilityScores[key]} />
+                  </span>
+                  <span class="modifier-line">
+                    Mod: {abilityModifier(abilityScores[key])}
+                    <button type="button" class="dice-icon-button small" aria-label={`Roll ${key.toUpperCase()} ability check`} title={`Roll ${key.toUpperCase()} ability check`} onclick={() => askRoll(`${key.toUpperCase()} Ability Check`, abilityCheckCandidates(key), (choices) => rollAbilityCheck(key, choices), key)}>
+                      <img src={d20Icon} alt="" />
+                    </button>
+                  </span>
+                </label>
+              {/each}
+            </div>
+            <div class="ability-popup-links">
+              <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
+              <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
+              <!-- Enabled unless the server says forage is unavailable; it decides DM vs self-serve when pressed. -->
+              {#if forageOwner}
+                <button type="button" class="text-button" class:forage-off={!!forageOff} title={forageOff ? forageUnavailableText(forageOff) : undefined} onclick={() => (forageOpen = true)}>
+                  <span>Forage</span>{#if forageBadge}<span class="forage-status-badge">{forageBadge}</span>{/if}
+                  {#if forageOff}<span class="forage-unavailable-note">{forageUnavailableText(forageOff)}</span>{/if}
+                </button>
+              {/if}
+            </div>
+          </div>
+        </section>
+
+        <section class="panel stack compact-panel modifications-panel">
+          <div class="panel-head compact-head">
+            <h2>Player Modifications</h2>
+            <button type="button" class="compact-button" data-viewer-ok onclick={() => (playerModificationsOpen = true)}>Manage</button>
+          </div>
+          <div class="mod-summary">
+            <label>Exhaustion
+              <input
+                type="number"
+                min="0"
+                max="6"
+                value={selectedExhaustionLevel}
+                oninput={(event) => setExhaustionLevel(event.currentTarget.value)}
+              />
+            </label>
+            <div class="active-mods">
+              {#each allActiveEffectDetails.slice(0, 5) as effect}
+                <button
+                  type="button"
+                  class:condition-chip={effect.isCondition}
+                  class="tooltip-chip"
+                  data-tooltip={effect.description || effect.name}
+                  aria-label={`${effect.name}: ${effect.description || 'No description available'}`}
+                >
+                  {effect.name}
+                </button>
+              {:else}
+                <span class="muted">No active effects</span>
+              {/each}
+              {#if allActiveEffectDetails.length > 5}
+                <span>+{allActiveEffectDetails.length - 5}</span>
+              {/if}
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="battle-main-row">
+        <section class="panel stack">
+          <h2>Battle Actions</h2>
+          <p class="muted">Read-only actions from equipped inventory rows given attack or damage values.</p>
+          <div class="action-table">
+            <div class="action-row header">
+              <span>Item</span>
+              <span>Ability</span>
+              <span>To Hit</span>
+              <span>Damage</span>
+              <span>Effects</span>
+              <span></span>
+            </div>
+            {#each battleActionItems as item}
+              <div class="action-row">
+                <span class="item-name">
+                  {#if item.isEquipment}
+                    <span class="item-kind-icon active" aria-hidden="true"></span>
+                  {/if}
+                  {item.name}
+                </span>
+                <span>{item.attackAbility.toUpperCase()}</span>
+                <span>{signed(weaponToHitBonus(character.modifierSources, item, abilityScores, prof, classRows))}</span>
+                <span>{damageSummary(item)}</span>
+                <span>{item.notes || '-'}</span>
+                <button type="button" class="compact-button dice-button" onclick={() => askAttackRoll(item)}>
+                  <img src={d20Icon} alt="" />
+                  Roll
+                </button>
+              </div>
+            {:else}
+              <p class="muted">No equipped combat items yet. Add one on the Inventory tab.</p>
+            {/each}
+          </div>
+        </section>
+
+        <section class="panel stack">
+          <h2>Magic & Battle Notes</h2>
+          <div class="mini-grid">
+            <label>Spellcasting Ability <select name="spellcastingAbility" value={spellcastingAbility}>{#each abilityOrder as key}<option value={key}>{key.toUpperCase()}</option>{/each}</select></label>
+            <label class:stat-overridden={stats.spellSaveDc.isOverridden} class:stat-adjusted={stats.spellSaveDc.isAdjusted && !stats.spellSaveDc.isOverridden}><span class="field-label-with-help">Spell Save DC{#if statFlag('spellSaveDc')}<span class="stat-flag" title={statFlagTitle('spellSaveDc')}>{statFlag('spellSaveDc')}</span>{/if}<button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.spellSaveDc)} onclick={() => openStatHelp('Spell Save DC', 'spellSaveDc')}>?</button></span><input type="text" inputmode="numeric" value={statFmt.spellSaveDc(stats.spellSaveDc.value)} onchange={(event) => commitStatInput('spellSaveDc', event)} /></label>
+            <label class:stat-overridden={stats.spellAttackBonus.isOverridden} class:stat-adjusted={stats.spellAttackBonus.isAdjusted && !stats.spellAttackBonus.isOverridden}><span class="field-label-with-help">Spell Attack Bonus{#if statFlag('spellAttackBonus')}<span class="stat-flag" title={statFlagTitle('spellAttackBonus')}>{statFlag('spellAttackBonus')}</span>{/if}<button type="button" class="formula-help-button" title={helpTitle(statFormulaLines.spellAttackBonus)} onclick={() => openStatHelp('Spell Attack Bonus', 'spellAttackBonus')}>?</button></span><input type="text" inputmode="numeric" value={statFmt.spellAttackBonus(stats.spellAttackBonus.value)} onchange={(event) => commitStatInput('spellAttackBonus', event)} /></label>
+          </div>
+          <div class="structured-section">
+            <div class="panel-head compact-head"><h3>Spell Slots</h3><div class="actions"><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button></div></div>
+            <div class="slot-grid">
+              {#each character.spellSlots as slot}
+                <div class="slot-counter"><strong>{slot.type === 'pact' ? 'Pact' : `Level ${slot.level}`}</strong><span>{slot.current} / {slot.max}</span><div><button type="button" onclick={() => runContentAction('spellSlot', { slotType: slot.type, slotLevel: slot.level, delta: -1 })}>-</button><button type="button" onclick={() => runContentAction('spellSlot', { slotType: slot.type, slotLevel: slot.level, delta: 1 })}>+</button></div></div>
+              {:else}<span class="muted">No spell slots for the current classes.</span>{/each}
+            </div>
+          </div>
+          <div class="structured-section">
+            <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
+            <div class="content-instance-list">
+              {#each characterSpells as spell}
+                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
+              {/each}
+            </div>
+          </div>
+          <label>Spellcasting <textarea name="spellcastingNote">{notes.spellcasting ?? ''}</textarea></label>
+          <label>Spell Slots <textarea name="spellSlotsNote">{notes.spell_slots ?? ''}</textarea></label>
+          <label>Prepared / Known Spells <textarea name="preparedSpellsNote">{notes.prepared_spells ?? ''}</textarea></label>
+          <label>Saving Throws <textarea name="savingThrowsNote">{notes.saving_throws ?? ''}</textarea></label>
+          <label>Skills <textarea name="skillsNote">{notes.skills ?? ''}</textarea></label>
+          <label>Conditions & Effects <textarea name="conditionsNote">{notes.conditions ?? ''}</textarea></label>
+          <label>Battle Notes <textarea name="battleNotes">{notes.battle_notes ?? ''}</textarea></label>
+          <label>Attacks Summary <textarea name="attacksNote">{notes.attacks ?? ''}</textarea></label>
+        </section>
+      </div>
+    </section>
+  </div>
+  {/if}
+
+  {#if activeTab === 'traits'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
+    <section class="traits-layout">
+    <section class="panel stack">
+      <div class="panel-head">
+        <h2>Traits & Features</h2>
+        <span>Useful, passive, limited-use, and situational abilities</span>
+      </div>
+      <div class="note-grid">
+        <label>Class Features <textarea name="classFeaturesNote">{notes.class_features ?? ''}</textarea></label>
+        <label>Feats <textarea name="featsNote">{notes.feats ?? ''}</textarea></label>
+        <label>Traits <textarea name="traitsNote">{notes.traits ?? ''}</textarea></label>
+        <label>Usable Traits <textarea name="usableTraitsNote">{notes.usable_traits ?? ''}</textarea></label>
+        <label>Proficiencies & Languages <textarea name="proficienciesLanguagesNote">{notes.proficiencies_languages ?? ''}</textarea></label>
+        <label>Limited Uses <textarea name="limitedUsesNote">{notes.limited_uses ?? ''}</textarea></label>
+      </div>
+    </section>
+    <section class="panel stack">
+      <div class="panel-head"><h2>Structured Features</h2>{#if isAdmin}<a href="/catalogue">Create Homebrew</a>{/if}</div>
+      {#each [['class_feature', 'Class Feature'], ['feat', 'Feat']] as option}
+        <div class="catalogue-add-row">
+          <CatalogueSearch type={option[0] as ContentType} placeholder={`Search ${option[1].toLowerCase()}s...`} disabled={contentBusy} onPick={(id) => (selectedCatalogue[option[0] as ContentType] = id)} />
+          <button type="button" disabled={!selectedCatalogue[option[0] as ContentType] || contentBusy} onclick={() => addSelectedContent(option[0] as ContentType)}>Add</button>
+        </div>
+      {/each}
+      <div class="content-instance-list">
+        {#each [...characterFeatures, ...characterFeats] as entry}
+          <article class="content-instance-card">
+            <div class="panel-head compact-head"><div><span class="eyebrow">{entry.type.replace('_', ' ')}{entry.grantedBy ? ` / granted by ${entry.grantedBy}` : ''}</span><h3>{entry.name}</h3></div>{#if !entry.grantedBy}<button type="button" class="danger compact-button" onclick={() => runContentAction('removeContent', { instanceId: entry.id })}>Remove</button>{/if}</div>
+            <p>{entry.description}</p>
+            {#if entry.hasResourceActions}<button type="button" class="compact-button" onclick={() => triggerContentResourceAction(entry.id,entry.name)}>Use Actions</button>{/if}
+            {#each entry.resources as resource}
+              <div class="resource-counter"><span>{resource.label}</span><strong>{resource.currentValue} / {resource.maxValue}</strong><div><button type="button" onclick={() => runContentAction('contentResource', { resourceId: resource.id, delta: -1 })}>-</button><button type="button" onclick={() => runContentAction('contentResource', { resourceId: resource.id, delta: 1 })}>+</button></div><small>{resource.rechargePeriod.replace('_', ' ')}</small></div>
+            {/each}
+          </article>
+        {:else}<p class="muted">No structured feats or class features added yet.</p>{/each}
+      </div>
+    </section>
+    </section>
+  </div>
+  {/if}
+
+  {#if activeTab === 'inventory'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
+    <section class="panel catalogue-add-panel">
+      <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
+      <div class="catalogue-add-row"><CatalogueSearch type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
+    </section>
+    <section class="inventory-layout">
+      <section class="panel stack inventory-section">
+        <div class="panel-head compact-head">
+          <h2>Equipment</h2>
+          <button type="button" class="compact-button" onclick={() => openNewItem('equipped')}>Add Item</button>
+        </div>
+        <p class="muted">Items here can become read-only Battle Actions when given attack or damage values.</p>
+        <div class="inventory-table equipped-table">
+          {#each equippedInventoryRows as item, index (item.id ?? `equipment-${item.name}-${index}`)}
+            <div class="inventory-row equipped-row">
+              <input name="inventoryId" type="hidden" value={item.id || ''} />
+              <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+              <div class="inventory-row-main">
+                <label>Item <input name="inventoryName" value={item.name} placeholder="Longsword" /></label>
+                <label>Category
+                  <select name="inventoryCategory">
+                    {#each categoryOptionsFor(item.category) as category}
+                      <option value={category.key} selected={item.category === category.key}>{category.label}</option>
+                    {/each}
+                  </select>
+                </label>
+                <div class="qty-equipment-control">
+                  <label class="qty-label">Quantity
+                    <span class="qty-control">
+                      <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, -1)}>-</button>
+                      <input name="inventoryQuantity" type="number" min="0" value={item.quantity} />
+                      <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, 1)}>+</button>
+                    </span>
+                  </label>
+                  <button type="button" class="equipment-toggle active" aria-label="Move to backpack" title="Move to backpack" onclick={(event) => toggleEquipped(event, false)}>
+                    <span class="item-kind-icon active" aria-hidden="true"></span>
+                  </button>
+                </div>
+              </div>
+              <div class="inventory-row-combat">
+                <label class="tiny-field">AC <input name="inventoryAcBonus" type="number" value={item.acBonus} /></label>
+                <label class="tiny-field">To Hit <input name="inventoryToHitBonus" type="number" value={item.toHitBonus} /></label>
+                <label class="tiny-field">Damage Bonus <input name="inventoryDamageBonus" type="number" value={item.damageBonus} /></label>
+                <label>Ability
+                  <select name="inventoryAttackAbility">
+                    {#each abilityOrder as ability}
+                      <option value={ability} selected={item.attackAbility === ability}>{ability.toUpperCase()}</option>
+                    {/each}
+                  </select>
+                </label>
+                <label class="inline compact-check">
+                  <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
+                  <input type="checkbox" checked={item.proficient} onchange={setSiblingHiddenBoolean} />
+                  Proficient
+                </label>
+                <label class="inline compact-check">
+                  <input name="inventoryAttuned" type="hidden" value={item.attuned ? 'true' : 'false'} />
+                  <input type="checkbox" checked={item.attuned} onchange={setSiblingHiddenBoolean} /> Attuned
+                </label>
+                <label>Damage Rolls <input name="inventoryDamageRolls" value={item.damageRolls} placeholder="1d8 + 1d4 + 1d6" /></label>
+                <label>Effects <input name="inventoryEffects" value={item.effects} placeholder="fire, poison, prone" /></label>
+                <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+              </div>
+              <input name="inventoryLocation" type="hidden" value="equipped" />
+              <input name="inventoryIsEquipment" type="hidden" value="true" />
+              <input name="inventoryEquipped" type="hidden" value="true" />
+              {#if item.resources?.length}<div class="inventory-item-resources">{#each item.resources as resource}<div class="resource-counter"><span>{resource.label}</span><strong>{resource.currentValue} / {resource.maxValue}</strong><div><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:-1})}>-</button><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:1})}>+</button></div></div>{/each}</div>{/if}
+            </div>
+          {:else}
+            <p class="muted">No equipment yet.</p>
+          {/each}
+        </div>
+      </section>
+
+      <section class="panel stack inventory-section">
+        <div class="panel-head compact-head">
+          <h2>Backpack</h2>
+          <button type="button" class="compact-button" onclick={() => openNewItem('backpack')}>Add Item</button>
+        </div>
+        <div class="inventory-table backpack-table">
+          {#each backpackInventoryRows as item, index (item.id ?? `backpack-${item.name}-${index}`)}
+            <div class="inventory-row simple">
+              <input name="inventoryId" type="hidden" value={item.id || ''} />
+              <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+              <input name="inventoryAttuned" type="hidden" value={item.attuned ? 'true' : 'false'} />
+              <label>Item <input name="inventoryName" value={item.name} placeholder="Potion, rope, gold ring" /></label>
+              <label>Category
+                <select name="inventoryCategory">
+                  {#each categoryOptionsFor(item.category) as category}
+                    <option value={category.key} selected={item.category === category.key}>{category.label}</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="qty-label">Qty
+                <span class="qty-equipment-control">
+                  <span class="qty-control">
+                    <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, -1)}>-</button>
+                    <input name="inventoryQuantity" type="number" min="0" value={item.quantity} />
+                    <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, 1)}>+</button>
+                  </span>
+                  <button type="button" class="equipment-toggle" aria-label="Equip item" title="Equip item" onclick={(event) => toggleEquipped(event, true)}>
+                    <span class="item-kind-icon" aria-hidden="true"></span>
+                  </button>
+                </span>
+              </label>
+              <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+              <div class="row-actions">
+                <button type="button" class="compact-button" onclick={useInventoryItem}>Use</button>
+                <button type="button" class="compact-button danger" onclick={removeInventoryItem}>Remove</button>
+              </div>
+              <input name="inventoryLocation" type="hidden" value="backpack" />
+              <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
+              <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
+              <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
+              <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+              <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
+              <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
+              <input name="inventoryEffects" type="hidden" value={item.effects} />
+              <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
+              <input name="inventoryEquipped" type="hidden" value="false" />
+              {#if item.resources?.length}<div class="inventory-item-resources">{#each item.resources as resource}<div class="resource-counter"><span>{resource.label}</span><strong>{resource.currentValue} / {resource.maxValue}</strong><div><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:-1})}>-</button><button type="button" onclick={() => runContentAction('inventoryResource',{resourceId:resource.id,delta:1})}>+</button></div></div>{/each}</div>{/if}
+            </div>
+          {:else}
+            <p class="muted">No backpack items yet.</p>
+          {/each}
+        </div>
+      </section>
+
+      <section class="panel stack inventory-section misc-section">
+        <div class="panel-head compact-head">
+          <h2>Misc</h2>
+          <button type="button" class="compact-button" onclick={() => openNewItem('misc')}>Add Item</button>
+        </div>
+        <div class="coin-grid">
+          <label>CP <input name="currencyCp" type="number" min="0" value={meta('currencyCp')} /></label>
+          <label>SP <input name="currencySp" type="number" min="0" value={meta('currencySp')} /></label>
+          <label>EP <input name="currencyEp" type="number" min="0" value={meta('currencyEp')} /></label>
+          <label>GP <input name="currencyGp" type="number" min="0" value={meta('currencyGp')} /></label>
+          <label>PP <input name="currencyPp" type="number" min="0" value={meta('currencyPp')} /></label>
+        </div>
+        <label>Treasure & Valuables <textarea name="treasureNote">{notes.treasure ?? ''}</textarea></label>
+        <label>General Inventory / Junk <textarea name="generalInventoryNote">{notes.general_inventory ?? ''}</textarea></label>
+        {#each miscInventoryRows as item, index (item.id ?? `misc-${item.name}-${index}`)}
+          <div class="inventory-row misc-row">
+            <input name="inventoryId" type="hidden" value={item.id || ''} />
+            <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+            <input name="inventoryAttuned" type="hidden" value="false" />
+            <label>Misc Item <input name="inventoryName" value={item.name} placeholder="Letter, gem, trinket" /></label>
+            <label>Qty <input name="inventoryQuantity" type="number" min="0" value={item.quantity} /></label>
+            <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
+            <input name="inventoryCategory" type="hidden" value={item.category || 'misc'} />
+            <input name="inventoryLocation" type="hidden" value="misc" />
+            <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
+            <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
+            <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
+            <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+            <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
+            <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
+            <input name="inventoryEffects" type="hidden" value={item.effects} />
+            <input name="inventoryIsEquipment" type="hidden" value="false" />
+            <input name="inventoryEquipped" type="hidden" value="false" />
+          </div>
+        {:else}
+          <p class="muted">No misc items yet.</p>
+        {/each}
+      </section>
+    </section>
+  </div>
+  {/if}
+
+  {#if activeTab === 'character'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
+    <section class="sheet-columns character-layout">
+      <section class="panel stack">
+        <h2>Identity</h2>
+        <label>Character Name <input name="name" value={character.name} required /></label>
+        <div class="class-list">
+          {#each classRows as classRow, index}
+            <div class="class-row">
+              <label>Class <input name="className" bind:value={classRow.className} /></label>
+              <label>Subclass <input name="subclassName" bind:value={classRow.subclassName} placeholder="Eldritch Knight" /></label>
+              <label>Level <input name="classLevel" type="number" min="1" max="20" value={classRow.level} onfocus={() => captureClassLevel(index)} oninput={(event) => updateClassLevelInput(index, event.currentTarget.value)} onchange={() => commitClassLevel(index)} /></label>
+              <label>Spellcasting Ability<select name="classSpellcastingAbility" bind:value={classRow.spellcastingAbility}><option value={null}>None</option>{#each abilityOrder as key}<option value={key}>{key.toUpperCase()}</option>{/each}</select></label>
+              <button type="button" class="compact-button danger" disabled={classRows.length === 1} onclick={() => removeClassRow(index)}>Remove</button>
+            </div>
+          {/each}
+          <button type="button" class="compact-button" onclick={addClassRow}>Add Class</button>
+        </div>
+        <label>Ancestry <input name="ancestry" value={character.ancestry} /></label>
+        <label>Race <input name="race" value={race} /></label>
+        <label>Background <input name="background" value={character.background} /></label>
+        <label>Alignment <input name="alignment" value={meta('alignment')} /></label>
+        <label>Player Name <input name="playerName" value={meta('playerName')} /></label>
+        <label>Experience Points <input name="experiencePoints" type="number" min="0" value={meta('experiencePoints')} /></label>
+      </section>
+
+      <section class="panel stack">
+        <h2>Roleplay</h2>
+        <label>Personality Traits <textarea name="personalityNote">{notes.personality ?? ''}</textarea></label>
+        <label>Ideals <textarea name="idealsNote">{notes.ideals ?? ''}</textarea></label>
+        <label>Bonds <textarea name="bondsNote">{notes.bonds ?? ''}</textarea></label>
+        <label>Flaws <textarea name="flawsNote">{notes.flaws ?? ''}</textarea></label>
+      </section>
+
+      <section class="panel stack">
+        <h2>Physical Description</h2>
+        <div class="mini-grid">
+          <label>Age <input name="age" value={meta('age')} /></label>
+          <label>Height <input name="height" value={meta('height')} /></label>
+          <label>Weight <input name="weight" value={meta('weight')} /></label>
+          <label>Eyes <input name="eyes" value={meta('eyes')} /></label>
+          <label>Skin <input name="skin" value={meta('skin')} /></label>
+          <label>Hair <input name="hair" value={meta('hair')} /></label>
+        </div>
+        <label>Appearance <textarea name="appearanceNote">{notes.appearance ?? ''}</textarea></label>
+      </section>
+
+      <section class="panel stack">
+        <h2>Backstory</h2>
+        <label>Backstory <textarea name="backstoryNote">{notes.backstory ?? ''}</textarea></label>
+        <label>Allies & Organizations <textarea name="alliesOrganizationsNote">{notes.allies_organizations ?? ''}</textarea></label>
+        <label>Additional Notes <textarea name="additionalNotesNote">{notes.additional_notes ?? ''}</textarea></label>
+      </section>
+    </section>
+  </div>
+  {/if}
+
+  <div class="hidden-save-fields" aria-hidden="true">
+    <!-- Always present regardless of tab - the one field statOverrides is submitted through
+         (see readStatOverrides()/parseStatOverridesField() on the server). -->
+    <input name="statOverridesJson" type="hidden" value={JSON.stringify(statOverrides)} />
+    <input name="exhaustionLevel" type="hidden" value={selectedExhaustionLevel} />
+    {#each selectedEffectKeys as effectKey}
+      <input name="activeEffectKey" type="hidden" value={effectKey} />
+    {/each}
+    {#if !savingThrowsOpen}
+      {#each selectedSavingThrowProficiencies as key}
+        <input name="savingThrowProficiency" type="hidden" value={key} />
+      {/each}
+    {/if}
+    {#if !skillChecksOpen}
+      {#each selectedSkillProficiencies as key}
+        <input name="skillProficiency" type="hidden" value={key} />
+      {/each}
+    {/if}
+    {#each proficiencies.weapons as key}
+      <input name="weaponProficiency" type="hidden" value={key} />
+    {/each}
+    {#each classHitDice as hdc, i}
+      <input name="hitDiceCurrent_{i}" type="hidden" value={hdc.remaining} />
+      <input name="hitDiceMax_{i}" type="hidden" value={hdc.max} />
+    {/each}
+
+    {#if activeTab !== 'battle'}
+      <input name="hpCurrent" type="hidden" value={hp.currentValue} />
+      <input name="hpMax" type="hidden" value={hp.maxValue} />
+      <input name="tempHp" type="hidden" value={tempHp.currentValue} />
+      <input name="inspiration" type="hidden" value={inspiration} />
+      <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
+      <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
+      {#each Object.entries(abilityScores) as [key, score]}
+        <input name={`ability_${key}`} type="hidden" value={score} />
+      {/each}
+      <input name="attackName" type="hidden" value={attack.name} />
+      <input name="attackAbility" type="hidden" value={attack.attackAbility} />
+      {#if attack.proficient}<input name="attackProficient" type="hidden" value="on" />{/if}
+      <input name="attackDamageDice" type="hidden" value={attack.damageDice} />
+      <input name="attackNotes" type="hidden" value={attack.notes} />
+      <input name="spellcastingAbility" type="hidden" value={spellcastingAbility} />
+      <input name="spellcastingNote" type="hidden" value={notes.spellcasting ?? ''} />
+      <input name="spellSlotsNote" type="hidden" value={notes.spell_slots ?? ''} />
+      <input name="preparedSpellsNote" type="hidden" value={notes.prepared_spells ?? ''} />
+      <input name="savingThrowsNote" type="hidden" value={notes.saving_throws ?? ''} />
+      <input name="skillsNote" type="hidden" value={notes.skills ?? ''} />
+      <input name="conditionsNote" type="hidden" value={notes.conditions ?? ''} />
+      <input name="battleNotes" type="hidden" value={notes.battle_notes ?? ''} />
+      <input name="attacksNote" type="hidden" value={notes.attacks ?? ''} />
+    {/if}
+
+    {#if activeTab !== 'traits'}
+      <input name="classFeaturesNote" type="hidden" value={notes.class_features ?? ''} />
+      <input name="featsNote" type="hidden" value={notes.feats ?? ''} />
+      <input name="traitsNote" type="hidden" value={notes.traits ?? ''} />
+      <input name="usableTraitsNote" type="hidden" value={notes.usable_traits ?? ''} />
+      <input name="proficienciesLanguagesNote" type="hidden" value={notes.proficiencies_languages ?? ''} />
+      <input name="limitedUsesNote" type="hidden" value={notes.limited_uses ?? ''} />
+    {/if}
+
+    {#if activeTab !== 'inventory'}
+      {#each inventoryRows as item, index (item.id ?? `hidden-inventory-${item.name}-${index}`)}
+        <input name="inventoryId" type="hidden" value={item.id || ''} />
+        <input name="inventorySourceContentId" type="hidden" value={item.sourceContentId || ''} />
+        <input name="inventoryAttuned" type="hidden" value={item.attuned ? 'true' : 'false'} />
+        <input name="inventoryName" type="hidden" value={item.name} />
+        <input name="inventoryCategory" type="hidden" value={item.category} />
+        <input name="inventoryLocation" type="hidden" value={item.location} />
+        <input name="inventoryQuantity" type="hidden" value={item.quantity} />
+        <input name="inventoryEquipped" type="hidden" value={item.equipped ? 'true' : 'false'} />
+        <input name="inventoryIsEquipment" type="hidden" value={item.isEquipment ? 'true' : 'false'} />
+        <input name="inventoryAcBonus" type="hidden" value={item.acBonus} />
+        <input name="inventoryToHitBonus" type="hidden" value={item.toHitBonus} />
+        <input name="inventoryDamageBonus" type="hidden" value={item.damageBonus} />
+        <input name="inventoryAttackAbility" type="hidden" value={item.attackAbility} />
+        <input name="inventoryProficient" type="hidden" value={item.proficient ? 'true' : 'false'} />
+        <input name="inventoryDamageRolls" type="hidden" value={item.damageRolls} />
+        <input name="inventoryEffects" type="hidden" value={item.effects} />
+        <input name="inventoryNotes" type="hidden" value={item.notes} />
+      {/each}
+      <input name="currencyCp" type="hidden" value={meta('currencyCp')} />
+      <input name="currencySp" type="hidden" value={meta('currencySp')} />
+      <input name="currencyEp" type="hidden" value={meta('currencyEp')} />
+      <input name="currencyGp" type="hidden" value={meta('currencyGp')} />
+      <input name="currencyPp" type="hidden" value={meta('currencyPp')} />
+      <input name="treasureNote" type="hidden" value={notes.treasure ?? ''} />
+      <input name="generalInventoryNote" type="hidden" value={notes.general_inventory ?? ''} />
+    {/if}
+
+    {#if activeTab !== 'character'}
+      <input name="name" type="hidden" value={character.name} />
+      {#each classRows as classRow}
+        <input name="className" type="hidden" value={classRow.className} />
+        <input name="subclassName" type="hidden" value={classRow.subclassName || ''} />
+        <input name="classSpellcastingAbility" type="hidden" value={classRow.spellcastingAbility || ''} />
+        <input name="classLevel" type="hidden" value={classRow.level} />
+      {/each}
+      <input name="ancestry" type="hidden" value={character.ancestry} />
+      <input name="race" type="hidden" value={race} />
+      <input name="background" type="hidden" value={character.background} />
+      <input name="alignment" type="hidden" value={meta('alignment')} />
+      <input name="playerName" type="hidden" value={meta('playerName')} />
+      <input name="experiencePoints" type="hidden" value={meta('experiencePoints')} />
+      <input name="personalityNote" type="hidden" value={notes.personality ?? ''} />
+      <input name="idealsNote" type="hidden" value={notes.ideals ?? ''} />
+      <input name="bondsNote" type="hidden" value={notes.bonds ?? ''} />
+      <input name="flawsNote" type="hidden" value={notes.flaws ?? ''} />
+      <input name="age" type="hidden" value={meta('age')} />
+      <input name="height" type="hidden" value={meta('height')} />
+      <input name="weight" type="hidden" value={meta('weight')} />
+      <input name="eyes" type="hidden" value={meta('eyes')} />
+      <input name="skin" type="hidden" value={meta('skin')} />
+      <input name="hair" type="hidden" value={meta('hair')} />
+      <input name="appearanceNote" type="hidden" value={notes.appearance ?? ''} />
+      <input name="backstoryNote" type="hidden" value={notes.backstory ?? ''} />
+      <input name="alliesOrganizationsNote" type="hidden" value={notes.allies_organizations ?? ''} />
+      <input name="additionalNotesNote" type="hidden" value={notes.additional_notes ?? ''} />
+    {/if}
+  </div>
+
+  {#if savingThrowsOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (savingThrowsOpen = false))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="saving-throws-title">Saving Throws</h2>
+          <div class="actions">
+            <button type="button" class="compact-button dice-button" onclick={() => askBatchRoll('Roll all saving throws', rollAllSavingThrows)}>
+              <img src={d20Icon} alt="" />
+              Roll All Saves
+            </button>
+            <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = false)}>Close</button>
+          </div>
+        </div>
+        <div class="check-list">
+          {#each abilityOrder as key}
+            <div class="check-row proficiency-row" class:proficient={isSavingThrowProficient(key)}>
+              <label class="proficiency-toggle">
+                <input name="savingThrowProficiency" type="checkbox" value={key} checked={isSavingThrowProficient(key)} onchange={() => toggleSavingThrowProficiency(key)} />
+                <span>
+                  <strong>{key.toUpperCase()}</strong>
+                  <small>{signed(abilityModifier(abilityScores[key]))}{isSavingThrowProficient(key) ? ` + ${prof} proficiency` : ''}{(savingThrowModifierBonuses[key] ?? []).length ? ' + modifiers' : ''}</small>
+                </span>
+                <b>{signed(savingThrowTotal(key))}</b>
+              </label>
+              <button type="button" class="formula-help-button" title={helpTitle(savingThrowFormula(key))} aria-label={`${key.toUpperCase()} saving throw breakdown`} onclick={() => openFormulaHelp(`${key.toUpperCase()} Saving Throw`, savingThrowFormula(key))}>?</button>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => askRoll(`${key.toUpperCase()} Saving Throw`, saveCandidates(key), (choices) => rollSingleSavingThrow(key, choices), key)}>
+                <img src={d20Icon} alt="" />
+              </button>
+            </div>
+          {/each}
+        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Proficiencies</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if skillChecksOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (skillChecksOpen = false))}>
+      <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="skill-checks-title">Skill Checks</h2>
+          <div class="actions">
+            <button type="button" class="compact-button dice-button" onclick={() => askBatchRoll('Roll all skill checks', rollAllSkillChecks)}>
+              <img src={d20Icon} alt="" />
+              Roll All Skills
+            </button>
+            <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = false)}>Close</button>
+          </div>
+        </div>
+        <div class="check-list skill-list">
+          {#each skillChecks as skill}
+            <div class="check-row proficiency-row" class:proficient={isSkillProficient(skill.key)}>
+              <label class="proficiency-toggle">
+                <input name="skillProficiency" type="checkbox" value={skill.key} checked={isSkillProficient(skill.key)} onchange={() => toggleSkillProficiency(skill.key)} />
+                <span>
+                  <strong>{skill.name}</strong>
+                  <small>{skill.ability.toUpperCase()} {signed(abilityModifier(abilityScores[skill.ability]))}{isSkillProficient(skill.key) ? ` + ${prof} proficiency` : ''}{(skillCheckModifierBonuses[skill.key] ?? []).length ? ' + modifiers' : ''}</small>
+                </span>
+                <b>{signed(skillCheckTotal(skill))}</b>
+              </label>
+              <button type="button" class="formula-help-button" title={helpTitle(skillCheckFormula(skill))} aria-label={`${skill.name} breakdown`} onclick={() => openFormulaHelp(skill.name, skillCheckFormula(skill))}>?</button>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => askRoll(skill.name, skillCandidates(skill), (choices) => rollSingleSkillCheck(skill, choices), skill.ability)}>
+                <img src={d20Icon} alt="" />
+              </button>
+            </div>
+          {/each}
+        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Proficiencies</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if playerModificationsOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (playerModificationsOpen = false))}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <div>
+            <h2 id="player-modifications-title">Player Modifications</h2>
+            <p class="muted">Conditions, spells, combat states, and environment effects applied to this character.</p>
+          </div>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (playerModificationsOpen = false)}>Close</button>
+        </div>
+
+        <label class="exhaustion-control">Exhaustion Level
+          <input
+            type="number"
+            min="0"
+            max="6"
+            value={selectedExhaustionLevel}
+            oninput={(event) => setExhaustionLevel(event.currentTarget.value)}
+          />
+        </label>
+
+        <div class="modifier-picker">
+          <div class="modifier-toolbar">
+            <label class="modifier-search">Search
+              <input
+                data-viewer-ok
+                value={modifierSearch}
+                placeholder="Search conditions, spells, features, states..."
+                oninput={(event) => (modifierSearch = event.currentTarget.value)}
+              />
+            </label>
+
+            <div class="modifier-tabs" role="tablist" aria-label="Modifier filters">
+              {#each modifierFilters as filter}
+                <button
+                  type="button"
+                  data-viewer-ok
+                  class:active={modifierFilter === filter.key}
+                  onclick={() => (modifierFilter = filter.key)}
+                >
+                  {filter.label}
+                </button>
+              {/each}
+            </div>
+          </div>
+
+          <section class="selected-modifier-summary">
+            <h3>Selected</h3>
+            <div class="selected-mods">
+              {#each activeEffectDetails as effect}
+                <button
+                  type="button"
+                  class:condition-chip={effect.isCondition}
+                  title={effect.description}
+                  onclick={() => toggleEffect(effect.key)}
+                >
+                  {effect.name}
+                </button>
+              {:else}
+                <span class="muted">No active effects selected.</span>
+              {/each}
+            </div>
+          </section>
+
+          <section class="modifier-results">
+            <div class="modifier-results-head">
+              <h3>{activeModifierFilterLabel}</h3>
+              <span class="muted">Showing {visibleModifierEffects.length} of {filteredModifierEffects.length}</span>
+            </div>
+
+            <div class="modifier-list compact">
+              {#each visibleModifierEffects as effect}
+                <label class="modifier-toggle">
+                  <input type="checkbox" checked={isEffectSelected(effect.key)} onchange={() => toggleEffect(effect.key)} />
+                  <span>
+                    <strong>{effect.name}</strong>
+                    <small>{effect.description}</small>
+                    <b>
+                      {effect.isCondition ? 'Condition' : effect.sourceType.replace('_', ' ')}
+                      {effect.requiresConcentration ? ' - Concentration' : ''}
+                      {effect.modifiers.length ? ' - Automated' : effect.isSelectable ? ' - Trackable' : ' - Catalogue'}
+                    </b>
+                    {#if effect.modifiers.length}
+                      <em>{effect.modifiers.map((modifier) => `${modifier.target}: ${modifier.modifierType}${modifier.valueExpression ? ` ${modifier.valueExpression}` : ''}`).join(', ')}</em>
+                    {/if}
+                  </span>
+                </label>
+              {:else}
+                <p class="muted">No modifiers match this filter.</p>
+              {/each}
+            </div>
+
+            {#if filteredModifierEffects.length > visibleModifierEffects.length}
+              <p class="muted">Showing the first 50 results. Search or filter to narrow the list.</p>
+            {/if}
+          </section>
+        </div>
+
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Modifications</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if formulaHelp}
+    {@const statKey = formulaHelp.statKey}
+    {@const stat = statKey ? stats[statKey] : null}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (formulaHelp = null))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="formula-help-title">{formulaHelp.title}</h2>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (formulaHelp = null)}>Close</button>
+        </div>
+        <div class="formula-breakdown">
+          {#each (statKey ? statFormulaLines[statKey] : formulaHelp.lines) ?? [] as line}
+            <p>{line}</p>
+          {/each}
+        </div>
+        {#if statKey && stat}
+          <div class="manual-stat-controls">
+            <h3>Manual</h3>
+            <div class="mini-grid">
+              <label>Adjustment
+                <input
+                  type="number"
+                  step="1"
+                  value={stat.adjustment || ''}
+                  oninput={(event) => setStatAdjustment(statKey, Number(event.currentTarget.value) || 0)}
+                />
+              </label>
+              <label>Override
+                <input
+                  type="text"
+                  inputmode="numeric"
+                  placeholder={`Auto (${statFmt[statKey](stat.adjusted)})`}
+                  value={stat.override !== null ? statFmt[statKey](stat.override) : ''}
+                  onchange={(event) => commitStatOverrideInput(statKey, event)}
+                />
+              </label>
+            </div>
+            <button type="button" class="compact-button" disabled={!stat.isAdjusted && !stat.isOverridden} onclick={() => resetStat(statKey)}>Reset to auto</button>
+            <p class="muted">Adjustment is added into the calculation (effects that set a value, like Grappled, still win). Override replaces the final value completely until you reset it.</p>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if forageOpen && forageOwner}
+    <ForageModal
+      characterId={character.id}
+      mine={forageMine}
+      haulWaiting={haulWaitingForSave && hasUnsavedChanges}
+      onRefresh={refreshForage}
+      onHaul={() => haulLanded()}
+      onClose={() => (forageOpen = false)}
+    />
+  {/if}
+
+  {#if rollOptions && !readOnly}
+    <RollOptionsModal
+      title={rollOptions.title}
+      advantage={rollOptions.advantage}
+      damageDice={rollOptions.damageDice}
+      onroll={submitRollOptions}
+      oncancel={() => (rollOptions = null)}
+    />
+  {/if}
+
+  {#if rollResult}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (rollResult = null))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="roll-result-title">{rollResult.title}</h2>
+          <button type="button" class="text-button" onclick={() => (rollResult = null)}>Close</button>
+        </div>
+        <div class="roll-result">
+          {#if rollResult.attack}
+            <div>
+              <span>To Hit</span>
+              <strong>{rollResult.attack}</strong>
+            </div>
+          {/if}
+          <div>
+            <span>Damage</span>
+            <div class="damage-lines">
+              {#each rollResult.damage as line}
+                <strong>{line}</strong>
+              {/each}
+            </div>
+          </div>
+          <div>
+            <span>Effects</span>
+            <strong>{rollResult.effects}</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if activityLogOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (activityLogOpen = false))}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="activity-log-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <div>
+            <h2 id="activity-log-title">Activity Log</h2>
+            <p class="muted">Combat, rolls, and table talk for this character.</p>
+          </div>
+          <button type="button" class="text-button" onclick={() => (activityLogOpen = false)}>Close</button>
+        </div>
+
+        <!-- Joining or leaving a room is account state meant for the character's own player, so a viewer doesn't get it here. -->
+        {#if !readOnly}
+          {#if activeVttSessionId}
+            <div class="combat-encounter-id">
+              <span>Room <code>{activeVttSessionId}</code></span>
+              <button type="button" class="text-button" disabled={leaveRoomBusy} onclick={leaveRoom}>Leave Room</button>
+            </div>
+          {/if}
+          <label class="join-combat-label">
+            {activeVttSessionId ? 'Switch Room' : 'Join Room'}
+            <span class="summary-input-roll">
+              <input type="text" class="room-code-input" placeholder="Room code" bind:value={joinRoomIdInput} disabled={joinRoomBusy} />
+              <button type="button" class="compact-use-button" disabled={joinRoomBusy || !joinRoomIdInput.trim()} onclick={joinRoom}>Join</button>
+            </span>
+          </label>
+          {#if joinRoomError}<p class="combat-log-empty" style="color:#e57373;">{joinRoomError}</p>{/if}
+        {/if}
+
+        <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
+          <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
+          <button type="button" class:active={activityLogTab === 'rolls'} onclick={() => (activityLogTab = 'rolls')}>Rolls</button>
+          <button type="button" class:active={activityLogTab === 'notes'} onclick={() => (activityLogTab = 'notes')}>Session Notes</button>
+        </div>
+
+        {#if activityLogTab === 'combat'}
+          <section class="stack">
+            {#if liveEncounterId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">Combat is active in this room</span>
+                <div class="combat-log-entries">
+                  {#each combatLogNewestFirst as entry (entry.id)}
+                    <div class="combat-log-line">{entry.message}</div>
+                  {:else}
+                    <span class="combat-log-empty">No combat activity yet.</span>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <p class="muted">No active combat in this room right now.</p>
+            {/if}
+
+            <h3>Past Encounters</h3>
+            <div class="stack version-list">
+              {#each encounterHistory as encounter}
+                <article class="version-row with-actions">
+                  <div>
+                    <strong>{encounter.name}</strong>
+                    <span>{new Date(encounter.createdAt).toLocaleString()} - {encounter.isActive ? 'Active' : 'Ended'}</span>
+                  </div>
+                  <a class="button-link" href="/characters/{character.id}/encounters/{encounter.id}">View</a>
+                </article>
+              {:else}
+                <p class="muted">No combat encounters yet.</p>
+              {/each}
+            </div>
+          </section>
+        {:else if activityLogTab === 'rolls'}
+          <section class="stack">
+            {#if activeVttSessionId}
+              <div class="combat-log-panel">
+                <div class="combat-log-entries">
+                  {#each rollLogNewestFirst as entry (entry.id)}
+                    <div class="combat-log-line">
+                      {entry.message}
+                      {#if entry.details?.breakdown}
+                        <button type="button" class="formula-help-button" aria-label="Roll breakdown" onclick={() => showRollLogBreakdown(entry)}>?</button>
+                      {/if}
+                    </div>
+                  {:else}
+                    <span class="combat-log-empty">No rolls yet.</span>
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <p class="muted">{readOnly ? 'You are not in a room.' : 'Join a room above to log rolls.'}</p>
+            {/if}
+          </section>
+        {:else}
+          <section class="stack">
+            {#if liveGameSessionId}
+              <div class="combat-log-panel">
+                <span class="field-label-with-help">
+                  Session notes are active
+                  <button type="button" class="text-button" onclick={() => (sessionNotesModalId = liveGameSessionId)}>Full log</button>
+                </span>
+                <div class="combat-log-entries">
+                  {#each sessionNotesNewestFirst as entry (entry.id)}
+                    <div class="combat-log-line"><strong>{entry.displayName}:</strong> {entry.message}</div>
+                  {:else}
+                    <span class="combat-log-empty">No notes yet.</span>
+                  {/each}
+                </div>
+                <span class="summary-input-roll">
+                  <input type="text" placeholder="Type a note and press Enter..." bind:value={sessionNoteInput} disabled={sessionNoteBusy}
+                    onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); postSessionNote(); } }} />
+                  <button type="button" class="compact-use-button" disabled={sessionNoteBusy || !sessionNoteInput.trim()} onclick={postSessionNote}>Post</button>
+                </span>
+              </div>
+            {:else}
+              <p class="muted">No active session notes for this room right now.</p>
+            {/if}
+
+            <h3>Past Sessions</h3>
+            <div class="stack version-list">
+              {#each gameSessionHistory as gameSession}
+                <article class="version-row with-actions">
+                  <div>
+                    <strong>{gameSession.name}</strong>
+                    <span>{new Date(gameSession.createdAt).toLocaleString()} - {gameSession.isActive ? 'Active' : 'Ended'}</span>
+                  </div>
+                  <button type="button" class="button-link" onclick={() => (sessionNotesModalId = gameSession.id)}>View</button>
+                </article>
+              {:else}
+                <p class="muted">No session notes yet.</p>
+              {/each}
+            </div>
+          </section>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if simpleRollResult}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleRollResult = null))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="simple-roll-result-title">{simpleRollResult.title}</h2>
+          <button type="button" class="text-button" onclick={() => (simpleRollResult = null)}>Close</button>
+        </div>
+        <div class="roll-result">
+          {#each simpleRollResult.lines as line}
+            <div>
+              <span>{line.label}</span>
+              <strong class:nat-one={line.natural === 1} class:nat-twenty={line.natural === 20}>{line.text}</strong>
+            </div>
+          {/each}
+          {#if simpleRollResult.passiveNote}
+            <p class="muted passive-note">{simpleRollResult.passiveNote}</p>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if inventoryMessage}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (inventoryMessage = null))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-action-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="inventory-action-title">Inventory Action</h2>
+          <button type="button" class="text-button" onclick={() => (inventoryMessage = null)}>Close</button>
+        </div>
+        <p class="muted inventory-action-result">{inventoryMessage}</p>
+      </div>
+    </div>
+  {/if}
+
+  {#if simpleItemOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleItemOpen = false))}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="simple-item-title">Add Item</h2>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (simpleItemOpen = false)}>Close</button>
+        </div>
+        <div class="new-item-grid">
+          <label>Item <input bind:value={simpleItemName} placeholder="Gold watch, emerald ring, six cabbages" /></label>
+          <label>Category
+            <select bind:value={simpleItemCategory}>
+              {#each categoryOptions as category}
+                <option value={category.key}>{category.label}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="qty-label">Quantity
+            <span class="qty-control">
+              <button type="button" class="qty-button" onclick={() => (simpleItemQuantity = Math.max(1, simpleItemQuantity - 1))}>-</button>
+              <input type="number" min="1" bind:value={simpleItemQuantity} />
+              <button type="button" class="qty-button" onclick={() => (simpleItemQuantity = simpleItemQuantity + 1)}>+</button>
+            </span>
+          </label>
+          <label>Notes <input bind:value={simpleItemNotes} /></label>
+        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="button" disabled={!simpleItemName.trim() || contentBusy} onclick={addSimpleItem}>Add Item</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if newItemOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (newItemOpen = false))}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head">
+          <h2 id="new-item-title">Add Item</h2>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (newItemOpen = false)}>Close</button>
+        </div>
+        <div class="new-item-grid">
+          <input name="inventoryId" type="hidden" value="" />
+          <input name="inventorySourceContentId" type="hidden" value="" />
+          <input name="inventoryAttuned" type="hidden" value="false" />
+          <label>Item <input name="inventoryName" placeholder="Longsword, potion, gold ring" /></label>
+          <label>Category
+            <select name="inventoryCategory">
+              {#each categoryOptions as category}
+                <option value={category.key} selected={category.key === (newItemLocation === 'misc' ? 'misc' : 'gear')}>{category.label}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="qty-label">Quantity
+            <span class="qty-control">
+              <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, -1)}>-</button>
+              <input name="inventoryQuantity" type="number" min="0" value="1" />
+              <button type="button" class="qty-button" onclick={(event) => adjustInventoryQuantity(event, 1)}>+</button>
+            </span>
+          </label>
+          <label>Section
+            <select name="inventoryLocation">
+              <option value="equipped" selected={newItemLocation === 'equipped'}>Equipment</option>
+              <option value="backpack" selected={newItemLocation === 'backpack'}>Backpack</option>
+              <option value="misc" selected={newItemLocation === 'misc'}>Misc</option>
+            </select>
+          </label>
+          <label class="equipment-select-label">Equipment
+            <select name="inventoryIsEquipment">
+              <option value="false" selected={newItemLocation !== 'equipped'}>No</option>
+              <option value="true" selected={newItemLocation === 'equipped'}>Yes</option>
+            </select>
+          </label>
+          <label class="tiny-field">AC <input name="inventoryAcBonus" type="number" value="0" /></label>
+          <label class="tiny-field">To Hit <input name="inventoryToHitBonus" type="number" value="0" /></label>
+          <label class="tiny-field">Damage Bonus <input name="inventoryDamageBonus" type="number" value="0" /></label>
+          <label>Ability
+            <select name="inventoryAttackAbility">
+              {#each abilityOrder as ability}
+                <option value={ability} selected={ability === 'str'}>{ability.toUpperCase()}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="inline compact-check">
+            <input name="inventoryProficient" type="hidden" value="true" />
+            <input type="checkbox" checked onchange={setSiblingHiddenBoolean} />
+            Proficient
+          </label>
+          <label>Damage Rolls <input name="inventoryDamageRolls" placeholder="1d8 + 1d4" /></label>
+          <label>Effects <input name="inventoryEffects" placeholder="fire, poison, prone" /></label>
+          <label>Notes <input name="inventoryNotes" /></label>
+        </div>
+        <input name="inventoryEquipped" type="hidden" value={newItemLocation === 'equipped' ? 'true' : 'false'} />
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Item</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+</form>
+
+<SessionNotesModal gameSessionId={sessionNotesModalId} open={sessionNotesModalId !== null} onClose={() => (sessionNotesModalId = null)} />

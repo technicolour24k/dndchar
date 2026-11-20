@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VTT POC</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/vtt-app/style.css" />
+</head>
+<body>
+
+  <div id="login">
+    <h1>VTT Proof of Concept</h1>
+
+    <div id="identityKnown" style="display:none;">
+      <label>Playing as</label>
+      <div id="identityName" style="padding:6px 8px;background:#1a1c22;border-radius:4px;border:1px solid #444;"></div>
+    </div>
+    <div id="identityUnknown">
+      <label>Your name</label>
+      <input id="nameInput" type="text" placeholder="Tony" />
+    </div>
+
+    <div class="panel">
+      <h2 style="font-size:14px;margin:0 0 8px;color:#888;">Game Master</h2>
+      <button id="createRoomBtn">Create room</button>
+    </div>
+
+    <div class="panel">
+      <h2 style="font-size:14px;margin:0 0 8px;color:#888;">Player</h2>
+      <label>Room code</label>
+      <input id="joinCodeInput" type="text" placeholder="ABCD12" maxlength="6" style="text-transform:uppercase" />
+      <button id="joinRoomBtn">Join room</button>
+    </div>
+
+    <div class="error" id="loginError"></div>
+
+    <!-- Campaign tables (campaign.js): opened from /vtt with ?campaignId=, so none of the above
+         applies. Create/Join and the name field are hidden and this status line shows instead. -->
+    <div id="campaignJoining" style="display:none;">
+      <p id="campaignJoiningText" style="margin:0;"></p>
+      <p class="hint"><a href="/vtt" style="color:#8fb0ff;">Back to the table lobby</a></p>
+    </div>
+  </div>
+
+  <!-- Campaign notices (campaign.js): errors, kicks and the seat takeover offer. A small card over
+       everything, with buttons the script fills in. -->
+  <div id="campaignNotice" class="modal-overlay">
+    <div class="modal">
+      <h2 id="campaignNoticeTitle"></h2>
+      <p id="campaignNoticeText" style="margin:0;font-size:13px;color:#ccc;line-height:1.4;"></p>
+      <div class="actions" id="campaignNoticeActions"></div>
+    </div>
+  </div>
+  <!-- A passing message that doesn't block play (e.g. "The DM has taken the GM seat."). -->
+  <div id="campaignBanner" hidden></div>
+
+  <div id="app">
+    <div id="sidebar"></div>
+    <div id="mapWrap">
+      <!-- Layered map rendering (see render/mapLayers.js): the map itself is
+           DOM layers (img/video + SVG clip-path vision mask) sitting BEHIND
+           the transparent canvas, which keeps all tokens/markers/interaction.
+           #mapStage exists so the absolutely-positioned layers track the
+           in-flow canvas's position/size; everything under #mapLayers is
+           pointer-events: none - the canvas stays the only hit-test surface. -->
+      <div id="mapStage">
+        <div id="mapLayers" aria-hidden="true" style="display:none;">
+          <div id="mapBackdrop"></div>
+          <div id="mapLayerGray" class="map-media-layer"></div>
+          <div id="mapLayerColor" class="map-media-layer"></div>
+          <!-- Renders nothing - only supplies the vision-circle clip geometry.
+               Circle children are managed by mapLayers.js. -->
+          <svg id="visionClipSvg" width="0" height="0">
+            <defs>
+              <clipPath id="vttGrayClip"></clipPath>
+              <clipPath id="vttColorClip"></clipPath>
+            </defs>
+          </svg>
+        </div>
+        <canvas id="canvas" width="800" height="600"></canvas>
+      </div>
+      <!-- Persistent regardless of map/sidebar re-renders (renderSidebar() replaces
+           #sidebar's innerHTML wholesale, which would otherwise restart playback). -->
+      <div id="musicBar" class="music-bar" style="display:none;">
+        <button type="button" id="musicToggleBtn" title="Play ambient music">&#9654;</button>
+        <span id="musicTrackName"></span>
+        <input type="range" id="musicVolumeInput" min="0" max="100" value="5" title="Music volume" />
+        <input type="number" id="musicVolumeNumberInput" min="0" max="100" value="5" title="Music volume (%)" class="music-volume-number" />
+      </div>
+      <!-- Two elements so a track swap can crossfade (old fading out while new
+           fades in simultaneously) rather than a fade-out-then-fade-in gap -
+           see activeAmbientAudio/crossfadeAmbientMusic in main.js, which ping-
+           pongs which one is "active" on every swap. -->
+      <audio id="ambientAudioA" loop></audio>
+      <audio id="ambientAudioB" loop></audio>
+      <div id="zoomControls">
+        <button id="zoomOutBtn" title="Zoom out">&minus;</button>
+        <button id="zoomResetBtn" title="Reset zoom">100%</button>
+        <button id="zoomInBtn" title="Zoom in">+</button>
+      </div>
+      <div id="markerPlacementBanner" class="marker-placement-banner">
+        <span>Click the map to place your marker</span>
+        <button type="button" id="markerPlacementCancelBtn" class="secondary">Cancel</button>
+      </div>
+      <div id="actionTargetBanner" class="marker-placement-banner">
+        <span id="actionTargetBannerText">Click a token to target</span>
+        <button type="button" id="actionTargetCancelBtn" class="secondary">Cancel</button>
+      </div>
+      <div id="movePlanNotice" class="marker-placement-banner"></div>
+      <div id="movePlanBanner" class="marker-placement-banner">
+        <span id="movePlanBannerText">Tap the map to add waypoints</span>
+        <label id="movePlanPrivateLabel" style="display:none" title="GM only: when on, players do not see this plan"><input type="checkbox" id="movePlanPrivateInput"> Private plan</label>
+        <button type="button" id="movePlanUndoBtn" class="secondary">Undo</button>
+        <button type="button" id="movePlanMoveBtn">Move</button>
+        <button type="button" id="movePlanCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="visionModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Advanced Vision Options</h2>
+      <div class="field"><label>Normal vision (ft)</label><input type="number" id="visionModalNormal" min="0" /></div>
+      <div class="field"><label>Darkvision (ft)</label><input type="number" id="visionModalDark" min="0" /></div>
+      <div class="field"><label>Truesight (ft)</label><input type="number" id="visionModalTrue" min="0" /></div>
+      <div class="field"><label>Devil's Sight (ft)</label><input type="number" id="visionModalDevil" min="0" /></div>
+      <div class="field">
+        <button type="button" id="visionModalUseSheet" class="secondary">Use sheet values</button>
+        <small id="visionModalHint" style="display:none">Differs from character sheet - won't auto-update.</small>
+      </div>
+      <div class="actions">
+        <button id="visionModalCancel" class="secondary">Cancel</button>
+        <button id="visionModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="conditionsModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Conditions</h2>
+      <div id="conditionsModalList"></div>
+      <div class="actions">
+        <button id="conditionsModalCancel" class="secondary">Cancel</button>
+        <button id="conditionsModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="knownAcModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Known AC</h2>
+      <p style="color:#888;font-size:12px;">Lowest roll known to hit. Leave blank to clear.</p>
+      <div class="field"><input type="number" id="knownAcModalInput" min="0" max="99" /></div>
+      <div class="actions">
+        <button id="knownAcModalCancel" class="secondary">Cancel</button>
+        <button id="knownAcModalClear" class="secondary">Clear</button>
+        <button id="knownAcModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="characterPickerModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Pick Your Character</h2>
+      <div id="characterPickerStatus" class="picker-status"></div>
+      <div id="characterPickerList"></div>
+      <div class="actions">
+        <button type="button" id="characterPickerCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Attack flow: confirm step then roll-result step share one shell, body swapped in JS.
+       Also used for spell casting (Phase 3) - same shell, action.kind branches the content. -->
+  <div id="attackModal" class="modal-overlay">
+    <div class="modal">
+      <div id="attackModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Forage (vtt-forage unit C). Player popup: picks, waiting/mark steps and the result. Closes freely. -->
+  <div id="foragePlayerModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal">
+      <div id="foragePlayerBody"></div>
+    </div>
+  </div>
+
+  <!-- Forage GM popup. Deliberately no backdrop or Escape close: closing would cancel a player's request.
+       The body is built by forage.js. -->
+  <div id="forageModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal">
+      <div id="forageQueue"></div>
+      <div id="forageNotice" class="forage-msg" hidden></div>
+      <div id="forageModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Combat Actions modal (Phase 8): single entry point replacing the mini-sheet's
+       old inline action rows. Tab bar picks intent (Attack/Heal) - both tabs list
+       the same underlying action set (weapons, spells, items); which tab is active
+       when a row is clicked IS the Attack/Heal choice, threaded into
+       armActionTargeting. Buff/Support and Utility are visual placeholders only,
+       no content yet (Phase 8 Section 4 - explicitly not this phase). -->
+  <div id="combatActionsModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Combat Actions</h2>
+      <div class="picker-tabs">
+        <button type="button" class="picker-tab active" data-combat-tab="attack">Attack</button>
+        <button type="button" class="picker-tab" data-combat-tab="heal">Heal</button>
+        <button type="button" class="picker-tab" disabled title="Coming soon">Buff/Support</button>
+        <button type="button" class="picker-tab" disabled title="Coming soon">Utility</button>
+      </div>
+      <div id="combatActionsBody" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" class="secondary" id="combatActionsCancelBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Spell picker (Phase 3): opened by clicking a slot-level/Cantrips row in the mini-sheet. -->
+  <div id="spellPickerModal" class="modal-overlay">
+    <div class="modal">
+      <h2 id="spellPickerTitle">Cast a Spell</h2>
+      <div id="spellPickerList"></div>
+      <div class="actions">
+        <button type="button" id="spellPickerCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="imagePickerModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Choose Token Image</h2>
+      <div class="picker-tabs">
+        <button type="button" id="pickerTabLibraryBtn" class="picker-tab active">Browse Library</button>
+        <button type="button" id="pickerTabUploadBtn" class="picker-tab">Upload Custom</button>
+      </div>
+
+      <div id="pickerLibraryPane">
+        <div class="field row">
+          <div>
+            <label>Source</label>
+            <select id="pickerSourceSelect">
+              <option value="">All sources</option>
+            </select>
+          </div>
+          <div>
+            <label>Category</label>
+            <select id="pickerCategorySelect">
+              <option value="">All categories</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Search</label>
+          <input type="text" id="pickerSearchInput" placeholder="e.g. drow, wolf, cleric…" />
+        </div>
+        <div id="pickerStatus" class="picker-status"></div>
+        <div id="pickerResults" class="picker-grid"></div>
+      </div>
+
+      <div id="pickerUploadPane" style="display:none;">
+        <div class="field"><label>Upload image or video</label><input type="file" id="pickerFileInput" accept="image/*,video/mp4,video/webm,.mp4,.webm,.m4v,.ogv" /></div>
+        <img id="pickerUploadThumb" class="thumb" />
+      </div>
+
+      <div class="actions">
+        <button type="button" id="pickerCancelBtn" class="secondary">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GM-only manual sound trigger, folders under assets/creature-sounds/ -
+       kept as a modal rather than an inline sidebar section since the folder
+       list will keep growing. -->
+  <div id="soundboardModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Soundboard</h2>
+      <div id="soundboardModalList" class="actions scrollable-list" style="flex-wrap:wrap;"></div>
+      <div class="actions">
+        <button type="button" id="soundboardModalCloseBtn" class="secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GM-only saved-creature picker (see saveTokenAsTemplate/openCreatureLibraryModal
+       in main.js) - a modal for the same reason as soundboardModal: this list
+       only grows. Picking a card fills the Add Token form; each card also
+       has its own Delete. -->
+  <div id="creatureLibraryModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Creature Library</h2>
+      <div id="creatureLibraryModalList" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" id="creatureLibraryModalCloseBtn" class="secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dice Roller (Phase 9): freeform d4/d6/d8/d10/d12/d20 roller, independent
+       of any specific check - results post to the Roll Log via dice:roll.
+       GM-only "Make this roll public" toggle, defaulting unchecked on every
+       open (see openDiceRollerModal in main.js) so a GM never accidentally
+       reveals a private roll by assuming the default was public. -->
+  <div id="diceRollerModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Roll Dice</h2>
+      <div class="field" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        <div><label>d4</label><input type="number" id="diceQty-d4" min="0" value="0" /></div>
+        <div><label>d6</label><input type="number" id="diceQty-d6" min="0" value="0" /></div>
+        <div><label>d8</label><input type="number" id="diceQty-d8" min="0" value="0" /></div>
+        <div><label>d10</label><input type="number" id="diceQty-d10" min="0" value="0" /></div>
+        <div><label>d12</label><input type="number" id="diceQty-d12" min="0" value="0" /></div>
+        <div><label>d20</label><input type="number" id="diceQty-d20" min="0" value="0" /></div>
+      </div>
+      <div class="field" id="diceRollerGmField" style="display:none;">
+        <label><input type="checkbox" id="diceRollerPublicToggle" /> Make this roll public (visible to players)</label>
+      </div>
+      <div id="diceRollerResult" class="combat-log-line" style="display:none;"></div>
+      <div class="actions">
+        <button type="button" id="diceRollerCancelBtn" class="secondary">Close</button>
+        <button type="button" id="diceRollerRollBtn">Roll</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Map Settings (Phase 10): the map upload/dimensions/grid-size/brightness/
+       music fields, formerly inline in the GM sidebar. Reveal/Hide is
+       deliberately NOT here - it's a plain button next to "Map Settings…" in
+       the sidebar itself (see gmSidebarHtml in main.js) - since it's used far
+       more often than these "set once per map" fields. Field values are
+       populated at open time by openMapSettingsModal() in main.js, same
+       pattern as visionModal. -->
+  <div id="mapSettingsModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Map Settings</h2>
+      <div class="field"><label>Upload map (image or video)</label><input type="file" id="mapFileInput" accept="image/*,video/mp4,video/webm,.mp4,.webm,.m4v,.ogv" /></div>
+      <img id="mapThumb" class="thumb" />
+      <div class="field"><label>Image/video URL</label><input type="text" id="mapImageUrlInput" placeholder="/uploads/... or paste a URL" /></div>
+      <div class="field row">
+        <div><label>Width (px)</label><input type="number" id="mapWidthInput" /></div>
+        <div><label>Height (px)</label><input type="number" id="mapHeightInput" /></div>
+      </div>
+      <div class="field row">
+        <div>
+          <label>Grid size (px/square)</label>
+          <div class="row">
+            <input type="number" id="mapGridSizeInput" />
+            <button type="button" id="gridSizeStandardBtn" class="secondary" title="Standard tabletop scale: 1 inch = 5ft, using the web's 96px-per-inch reference. Exact on-screen size can vary slightly by monitor/browser zoom.">1in=5ft</button>
+          </div>
+        </div>
+        <div><label>Ambient light</label>
+          <select id="mapBrightnessSelect">
+            <option value="bright">Bright</option>
+            <option value="dim">Dim</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Grid colour &amp; opacity (GM view, saved in this browser)</label>
+        <div class="row">
+          <input type="color" id="gridColourInput" value="#757575" style="width:50px;padding:2px;" />
+          <input type="range" id="gridOpacityInput" min="5" max="100" value="50" style="flex:1;" />
+          <button type="button" id="gridStyleResetBtn" class="secondary">Reset</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Ambient music</label>
+        <select id="mapMusicSelect"><option value="">No music</option></select>
+      </div>
+      <div class="field" id="mapMusicCustomField" style="display:none;">
+        <label>Upload or paste a track URL</label>
+        <input type="file" id="mapMusicFileInput" accept="audio/*" />
+        <input type="text" id="mapMusicUrlInput" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
+      </div>
+      <div class="field">
+        <label>Battle music (plays instead, while combat is active)</label>
+        <select id="mapBattleMusicSelect"><option value="">Same as ambient</option></select>
+      </div>
+      <div class="field" id="mapBattleMusicCustomField" style="display:none;">
+        <label>Upload or paste a track URL</label>
+        <input type="file" id="mapBattleMusicFileInput" accept="audio/*" />
+        <input type="text" id="mapBattleMusicUrlInput" placeholder="/uploads/... or paste a URL" style="margin-top:6px;" />
+      </div>
+      <div class="actions">
+        <button type="button" id="mapSettingsCancelBtn" class="secondary">Cancel</button>
+        <button type="button" id="setMapBtn">Set map</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Token (Phase 10, 2b): formerly inline in the GM sidebar, now a modal
+       serving both create (from the sidebar's "Add Token…" button or Token
+       Manager's "+ Add Token") and edit (clicking a row in Token Manager)
+       modes from the same form - see tokenFormState/openAddTokenModal in
+       main.js. Field visibility is type-conditional (syncFieldVisibilityForType
+       in main.js) - HP/AC/vision/speed/sound-folder fields hide for `type:
+       'prop'` (Phase 12), which has none of those. Light-emission fields
+       (tokenLightEmittingInput/tokenLightRadiusInput) are NOT type-conditional
+       - any token type can emit light (Phase 12 Section 2a). -->
+  <div id="addTokenModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2 id="addTokenModalTitle">Add Token</h2>
+      <div class="field row" id="addTokenCreatureLibraryField">
+        <div><button type="button" id="openCreatureLibraryBtn" class="secondary">Load from Creature Library…</button></div>
+        <div id="creatureLibraryLoadedLabel" style="align-self:center;font-size:12px;color:#888;"></div>
+      </div>
+      <div class="field row">
+        <div><label>Name</label><input type="text" id="tokenNameInput" placeholder="Goblin" /></div>
+        <div id="tokenQuantityField"><label>Quantity</label><input type="number" id="tokenQuantityInput" value="1" min="1" max="50" /></div>
+      </div>
+      <div class="field row">
+        <div><label>Type</label>
+          <select id="tokenTypeSelect">
+            <option value="pc">PC</option>
+            <option value="npc">NPC</option>
+            <option value="enemy">Enemy</option>
+            <option value="prop">Prop</option>
+          </select>
+        </div>
+        <div id="tokenOwnerField"><label>Owner (PCs, optionally Props)</label>
+          <select id="tokenOwnerSelect"><option value="">- none -</option></select>
+        </div>
+      </div>
+      <div class="field row">
+        <div id="tokenSoundFolderField"><label>Sound folder (attack cue)</label>
+          <select id="tokenSoundFolderSelect"></select>
+        </div>
+        <div id="tokenSpeedField"><label>Speed (ft)</label><input type="number" id="tokenSpeedInput" value="30" /></div>
+      </div>
+      <div class="field row" id="tokenVisionField">
+        <div><label>Normal vision (ft)</label><input type="number" id="tokenVisionNormalInput" value="30" /></div>
+        <div><label>Darkvision (ft)</label><input type="number" id="tokenVisionDarkInput" value="0" /></div>
+      </div>
+      <div class="field row" id="tokenStatsField">
+        <div><label>HP</label><input type="number" id="tokenHpInput" value="10" /></div>
+        <div><label>Max HP</label><input type="number" id="tokenMaxHpInput" value="10" /></div>
+        <div><label>AC</label><input type="number" id="tokenAcInput" value="10" /></div>
+      </div>
+      <div class="field row">
+        <div><button type="button" id="tokenBrowseLibraryBtn" class="secondary">Browse Token Library…</button></div>
+        <div><label>Or upload a custom image or video</label><input type="file" id="tokenFileInput" accept="image/*,video/mp4,video/webm,.mp4,.webm,.m4v,.ogv" /></div>
+      </div>
+      <div class="field row">
+        <div><label>Image URL</label><input type="text" id="tokenImageUrlInput" placeholder="/uploads/... or paste a URL" /></div>
+        <div style="flex: 0 0 120px;"><img id="tokenThumb" class="thumb" style="width: 120px;" /></div>
+      </div>
+      <div class="field row">
+        <div><label><input type="checkbox" id="tokenLightEmittingInput" /> Light-emitting</label></div>
+        <div><label>Light radius (ft)</label><input type="number" id="tokenLightRadiusInput" value="20" /></div>
+      </div>
+      <div class="field"><label><input type="checkbox" id="tokenHiddenInput" /> Hidden from players</label></div>
+      <div class="actions">
+        <button type="button" id="addTokenCancelBtn" class="secondary">Cancel</button>
+        <button type="button" id="tokenSaveToCatalogBtn" class="secondary" style="display:none;">Save to catalog…</button>
+        <button type="button" id="addTokenBtn">Add token</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Token Manager (Phase 10, Section 3): replaces the old per-token sidebar
+       cards (gmTokenListHtml) with one searchable/filterable list. Rows reuse
+       .token-card styling; clicking a row opens addTokenModal in edit mode. -->
+  <div id="tokenManagerModal" class="modal-overlay">
+    <div class="modal modal-wide">
+      <h2>Token Manager</h2>
+      <div class="field row">
+        <div><label>Search</label><input type="text" id="tokenManagerSearchInput" placeholder="Name…" /></div>
+        <div><label>Type</label>
+          <select id="tokenManagerTypeFilter">
+            <option value="">All types</option>
+            <option value="pc">PC</option>
+            <option value="npc">NPC</option>
+            <option value="enemy">Enemy</option>
+            <option value="prop">Prop</option>
+          </select>
+        </div>
+      </div>
+      <div id="tokenManagerList" class="scrollable-list"></div>
+      <div class="actions">
+        <button type="button" id="tokenManagerCloseBtn" class="secondary">Close</button>
+        <button type="button" id="tokenManagerRemoveSelectedBtn" class="danger">Remove selected</button>
+        <button type="button" id="tokenManagerAddBtn">+ Add Token</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/vtt-app/main.js"></script>
+</body>
+</html>
