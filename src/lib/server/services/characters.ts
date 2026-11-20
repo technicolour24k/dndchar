@@ -34,6 +34,9 @@ type CharacterRow = {
   system_key: string;
   metadata_json: Record<string, unknown>;
   updated_at: string;
+  campaign_id: string | null;
+  campaign_name: string | null;
+  party_active: boolean;
 };
 
 type CharacterSnapshot = {
@@ -146,10 +149,13 @@ const metadataFields = [
   'hair'
 ];
 
-function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof CharacterRow | 'ownerUserId' | 'systemKey' | 'metadata' | 'updatedAt'>): CharacterDetail {
+function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof CharacterRow | 'ownerUserId' | 'systemKey' | 'metadata' | 'updatedAt' | 'campaignId' | 'campaignName' | 'partyActive'>): CharacterDetail {
   return {
     id: row.id,
     ownerUserId: row.owner_user_id,
+    campaignId: row.campaign_id,
+    campaignName: row.campaign_name,
+    partyActive: row.party_active,
     name: row.name,
     ancestry: row.ancestry,
     background: row.background,
@@ -163,10 +169,12 @@ function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof 
 export async function listCharacters(userId: string): Promise<CharacterListItem[]> {
   const characters = await query<CharacterRow>(
     `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE owner_user_id = $1
-      ORDER BY updated_at DESC
+      SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
+             c.campaign_id, cp.name AS campaign_name, c.party_active
+      FROM characters c
+      LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+      WHERE c.owner_user_id = $1
+      ORDER BY c.updated_at DESC
     `,
     [userId]
   );
@@ -178,6 +186,9 @@ export async function listCharacters(userId: string): Promise<CharacterListItem[
     const hp = resources.find((resource) => resource.key === 'hp');
     list.push({
       id: row.id,
+      campaignId: row.campaign_id,
+      campaignName: row.campaign_name,
+      partyActive: row.party_active,
       name: row.name,
       ancestry: row.ancestry,
       background: row.background,
@@ -244,9 +255,11 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
 export async function getCharacter(userId: string, characterId: string): Promise<CharacterDetail | null> {
   const result = await query<CharacterRow>(
     `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE id = $1 AND owner_user_id = $2
+      SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
+             c.campaign_id, cp.name AS campaign_name, c.party_active
+      FROM characters c
+      LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+      WHERE c.id = $1 AND c.owner_user_id = $2
     `,
     [characterId, userId]
   );
@@ -267,9 +280,11 @@ export async function getCharacter(userId: string, characterId: string): Promise
 export async function getCharacterForRoll(characterId: string): Promise<CharacterDetail | null> {
   const result = await query<CharacterRow>(
     `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE id = $1
+      SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
+             c.campaign_id, cp.name AS campaign_name, c.party_active
+      FROM characters c
+      LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+      WHERE c.id = $1
     `,
     [characterId]
   );

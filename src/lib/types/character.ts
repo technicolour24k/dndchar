@@ -116,6 +116,9 @@ export type CharacterProficiencies = {
 export type CharacterDetail = {
   id: string;
   ownerUserId: string;
+  campaignId: string | null;
+  campaignName: string | null;
+  partyActive: boolean;
   name: string;
   ancestry: string;
   background: string;
@@ -141,6 +144,9 @@ export type CharacterDetail = {
 
 export type CharacterListItem = {
   id: string;
+  campaignId: string | null;
+  campaignName: string | null;
+  partyActive: boolean;
   name: string;
   ancestry: string;
   background: string;
