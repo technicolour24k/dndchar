@@ -6,7 +6,10 @@ import { shouldPlayerSeeMarker } from '../store.js';
 // shouldPlayerSeeMarker) - it just trusts shape from a fixed allowlist and
 // passes the shape-specific fields through opaquely, exactly like radiusFt
 // already did for circles.
-const ALLOWED_SHAPES = new Set(['circle', 'cone', 'cube', 'sphere']);
+const ALLOWED_SHAPES = new Set(['circle', 'cone', 'cube', 'sphere', 'glyph']);
+// A glyph is a fixed one-square (5 ft wide) icon, never user-sized: the radius
+// is forced to half of that, whatever the client sent.
+const GLYPH_RADIUS_FT = 2.5;
 
 function canEditMarker(meta, marker) {
   if (meta.role === 'gm') return true;
@@ -48,7 +51,7 @@ function handleMarkerEvent(meta, msg, context) {
         shape,
         x: input.x,
         y: input.y,
-        radiusFt: Number(input.radiusFt) || 0, // circle/sphere
+        radiusFt: shape === 'glyph' ? GLYPH_RADIUS_FT : Number(input.radiusFt) || 0, // circle/sphere (fixed for glyph)
         angleDeg: Number(input.angleDeg) || 0, // cone/cube facing
         lengthFt: Number(input.lengthFt) || 0, // cone length / cube depth
         widthFt: Number(input.widthFt) || 0, // cube width

@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import { sessions, broadcast } from '$vtt/store.js';
 import { createGameSession, endGameSession } from '$lib/server/services/gameSessions';
+import { isRoomGm } from '$lib/server/vttForage';
 
 // Start/End Session for Session Notes - mirrors ../combat/+server.ts exactly,
 // just against game_sessions instead of encounters. Independent of Start/Stop
@@ -8,13 +9,16 @@ import { createGameSession, endGameSession } from '$lib/server/services/gameSess
 export async function POST({ request, params, locals }) {
   const session = sessions.get(params.id!);
   if (!session) return json({ error: 'session_not_found' }, { status: 404 });
+  // Campaign rooms: only the seated GM may start or end a session (admin is not exempt). Quick
+  // rooms stay open to anyone who knows the code, a known POC gap.
+  if (session.campaignId && !isRoomGm(session, locals.user!.id)) return json({ error: 'not_gm' }, { status: 403 });
 
   const body = await request.json().catch(() => ({}));
   const action = body?.action;
 
   if (action === 'start') {
     const name = typeof body?.name === 'string' && body.name.trim() ? body.name.trim() : `Session - room ${params.id}`;
-    const gameSessionId = await createGameSession(locals.user!.id, name);
+    const gameSessionId = await createGameSession(locals.user!.id, name, session.campaignId ?? null);
     session.gameSessionId = gameSessionId;
     broadcast(params.id!, () => ({ type: 'game_session:state', active: true, gameSessionId, name }));
     return json({ gameSessionId });

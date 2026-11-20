@@ -10,7 +10,7 @@ export type RuleHook = {
 };
 
 export type ModifierOperation =
-  | 'bonus' | 'penalty' | 'set' | 'multiplier' | 'advantage' | 'disadvantage'
+  | 'bonus' | 'penalty' | 'set' | 'minimum' | 'multiplier' | 'advantage' | 'disadvantage'
   | 'extra_die' | 'resistance' | 'vulnerability' | 'immunity' | 'grant' | 'block'
   | 'condition_apply' | 'condition_remove' | 'formula_override';
 

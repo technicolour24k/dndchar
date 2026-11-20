@@ -11,13 +11,14 @@
   </div>
 
   <form method="POST" class="stack">
+    <input type="hidden" name="next" value={data.next} />
     {#if form?.error}
       <p class="form-error">{form.error}</p>
     {/if}
 
     {#if !registrationEnabled}
       <p class="form-error">Registration is currently disabled.</p>
-      <a class="button-link" href="/login">Back to Log In</a>
+      <a class="button-link" href={`/login${data.nextQuery}`}>Back to Log In</a>
     {:else}
       <label>
         Display Name
@@ -36,7 +37,7 @@
         <input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required />
       </label>
       <button type="submit">Create Account</button>
-      <a class="text-button" href="/login">Already have an account?</a>
+      <a class="text-button" href={`/login${data.nextQuery}`}>Already have an account?</a>
     {/if}
   </form>
 </section>

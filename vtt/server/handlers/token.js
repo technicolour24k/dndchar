@@ -2,6 +2,13 @@
 import { filterTokenForPlayer } from '../store.js';
 import { TARGET_WINDOW_MS } from './target.js';
 import { pickRandomCreatureSoundFile, creatureSoundUrl } from '../creatureSoundLibrary.js';
+import { postRollLog } from './dice.js';
+// Shared with the browser client (static/vtt-app/main.js) so the drag ghost, the path label and
+// this server deduction can never disagree. See that file's header.
+import { pathFt, chebyshevFt } from '../../../static/vtt-app/shared/gridDistance.js';
+
+// A path move is at most 50 points including the final one, so 49 intermediate waypoints.
+const MAX_MOVE_WAYPOINTS = 49;
 
 // Must match the fallback in src/routes/vtt/api/log/+server.ts - see that
 // file's comment for why this is a shared-secret header rather than a normal
@@ -24,26 +31,81 @@ function logCombatLine(context, session, message, details) {
   }).catch((err) => console.error('[VTT] combat log write failed', err));
 }
 
+// The client sends back the d20 pool the server rolled (attackPool from the roll endpoints). It is
+// only used to word the logs, so it is validated hard: anything odd and it is dropped, and the log
+// falls back to the plain to-hit text. Never trusted for anything mechanical.
+function validatePool(pool) {
+  if (!pool || typeof pool !== 'object') return null;
+  const { size, net, rolls, kept, manualAdvantage, manualDisadvantage } = pool;
+  if (!Number.isInteger(size) || size < 1 || size > 11) return null;
+  if (!Array.isArray(rolls) || rolls.length !== size) return null;
+  if (!rolls.every((roll) => Number.isInteger(roll) && roll >= 1 && roll <= 20)) return null;
+  if (!Number.isInteger(kept) || !rolls.includes(kept)) return null;
+  if (!Number.isInteger(net) || Math.abs(net) !== size - 1) return null;
+  if (!Number.isInteger(manualAdvantage) || manualAdvantage < 0 || manualAdvantage > 5) return null;
+  if (!Number.isInteger(manualDisadvantage) || manualDisadvantage < 0 || manualDisadvantage > 5) return null;
+  return { size, net, rolls: [...rolls], kept, manualAdvantage, manualDisadvantage };
+}
+
+// JS twin of poolSummary() in src/lib/rules/attackRoll.ts - keep the wording in step. Empty for a
+// plain single die with no manual points.
+function poolSummaryText(pool) {
+  const manual = [
+    pool.manualAdvantage ? `manual +${pool.manualAdvantage} adv` : '',
+    pool.manualDisadvantage ? `manual +${pool.manualDisadvantage} dis` : '',
+  ].filter(Boolean);
+  if (pool.size <= 1 && manual.length === 0) return '';
+  const base = pool.size <= 1 ? '1d20 flat' : `${pool.size}d20 ${pool.net > 0 ? 'adv' : 'dis'} x${Math.abs(pool.net)}, keeps ${pool.kept}`;
+  return manual.length ? `${base}; ${manual.join(', ')}` : base;
+}
+
+// The " (21: 3d20 adv x2, keeps 17)" part of an attack's combat-log line. Without a (valid) pool,
+// or for a plain single die, this is the old text: " (21)" or " (natural 1)". A natural 1 never
+// shows the total (e.g. "(25)" on a fumble would read as "AC is above 25"). AC is never used here.
+export function formatAttackRollText(outcome, toHit, pool) {
+  const valid = validatePool(pool);
+  const summary = valid ? poolSummaryText(valid) : '';
+  const total = typeof toHit === 'number' && Number.isFinite(toHit) ? toHit : null;
+  const lead = outcome === 'critical_miss' ? 'natural 1' : total !== null ? String(total) : '';
+  if (!summary) return lead ? ` (${lead})` : '';
+  return ` (${lead ? `${lead}: ` : ''}${summary})`;
+}
+
+// INTERIM: clamps the client-sent manual damage-dice delta to a whole number in -5..5 (anything
+// else is 0). Done once at the top of each handler so the stored log details always match the text.
+function clampManualDamage(value) {
+  return Number.isInteger(value) ? Math.max(-5, Math.min(5, value)) : 0;
+}
+
+// INTERIM: the manual damage-dice delta, appended after the damage in hit/crit and spell lines.
+// Only the server-returned (already clamped) value is meaningful; anything else is ignored.
+export function formatManualDamageText(delta) {
+  if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 5) return '';
+  return ` (manual ${delta > 0 ? '+' : ''}${delta} damage ${Math.abs(delta) === 1 ? 'die' : 'dice'})`;
+}
+
 // Flavor-text pools for the combat log, picked at random each time so it
 // doesn't read as a flat, repetitive damage ticker. {attacker}/{target} are
 // always token names; {damage}/{damageType} only apply to the critical-hit
 // pool (a miss deals no damage, so there's nothing to interpolate there).
+// {roll} is the attacker's to-hit total as " (17)" (or " (natural 1)"), or an
+// empty string if the total is missing - it sits right after the attack verb.
 // damageType already carries its own trailing space when present (see
 // damageTypeText below) so "{damageType}damage" reads correctly either way.
 const MISS_PHRASES = [
-  '{attacker} attacks {target}, but is parried!',
-  '{target} dodges an attack from {attacker}.',
-  "{attacker}'s attack glances off {target}'s armour.",
-  '{target} narrowly avoids a strike from {attacker}!',
-  '{attacker} swings at {target} and misses completely.',
-  "{target} deflects {attacker}'s attack at the last moment.",
+  '{attacker} attacks{roll} {target}, but is parried!',
+  '{target} dodges an attack{roll} from {attacker}.',
+  "{attacker}'s attack{roll} glances off {target}'s armour.",
+  '{target} narrowly avoids a strike{roll} from {attacker}!',
+  '{attacker} swings{roll} at {target} and misses completely.',
+  "{target} deflects {attacker}'s attack{roll} at the last moment.",
 ];
 
 const CRITICAL_HIT_PHRASES = [
-  "[Critical] {attacker}'s attack strikes true! Dealing {damage} {damageType}damage!",
-  "[Critical] {attacker} strikes just between the folds of {target}'s armour, dealing {damage} {damageType}damage!",
-  '[Critical] A devastating blow from {attacker} tears into {target} for {damage} {damageType}damage!',
-  '[Critical] {attacker} finds the perfect opening, striking {target} for a brutal {damage} {damageType}damage!',
+  "[Critical] {attacker}'s attack{roll} strikes true! Dealing {damage} {damageType}damage{manual}!",
+  "[Critical] {attacker} strikes{roll} just between the folds of {target}'s armour, dealing {damage} {damageType}damage{manual}!",
+  '[Critical] A devastating blow{roll} from {attacker} tears into {target} for {damage} {damageType}damage{manual}!',
+  '[Critical] {attacker} finds the perfect opening, striking{roll} {target} for a brutal {damage} {damageType}damage{manual}!',
 ];
 
 function pickLine(pool, vars) {
@@ -87,8 +149,10 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
-  // The lowest attack roll that has actually hit this token - server-set only
-  // (attack:resolve), never written directly by a client. Top-level so it
+  // The lowest attack roll that has actually hit this token. Set by
+  // attack:resolve, or manually via the dedicated token:knownAc:set event (any
+  // role, any visible token - deliberately not in PLAYER_EDITABLE_FIELDS, so
+  // the generic token:stat:update path still can't write it). Top-level so it
   // survives filterTokenForPlayer (unlike the real `ac`, which is stripped for
   // enemy/npc) - it's the deliberately-revealed upper bound players discover.
   'knownAc',
@@ -200,6 +264,46 @@ function broadcastCreatureSound(context, session, sessionId, sourceTokenId) {
   }));
 }
 
+// Validates a client-supplied list of points: an array of minLen..maxLen entries, each with
+// finite x and y. Returns a fresh array of plain { x, y } (nothing else copied), or null.
+function parsePoints(list, minLen, maxLen) {
+  if (!Array.isArray(list) || list.length < minLen || list.length > maxLen) return null;
+  const out = [];
+  for (const p of list) {
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) return null;
+    out.push({ x: p.x, y: p.y });
+  }
+  return out;
+}
+
+// Relays a move-preview payload ({ type, tokenId, points? } only - never the token object, so no
+// stat filtering is needed). Same two visibility gates as broadcastToken: GM-role recipients
+// always get it, everyone else gets nothing if the token is hidden or the map unrevealed.
+// `gmOnly` (a private GM plan) drops every non-GM recipient. The sender is skipped, it already
+// draws its own plan. The builder is also called with { role: 'watcher', playerId: null } (no
+// ws), so it must not touch recipient.ws. These types are deliberately NOT in store.js's
+// WATCHABLE_BROADCAST_TYPES, so watchers never receive them anyway.
+function broadcastMovePreview(broadcast, session, sessionId, token, payload, senderMeta, gmOnly) {
+  const mapHidden = session.map && !session.map.revealed;
+  broadcast(sessionId, (recipient) => {
+    if (recipient === senderMeta) return null;
+    if (recipient.role === 'gm') return payload;
+    if (gmOnly || token.hidden || mapHidden) return null;
+    return payload;
+  });
+}
+
+// Called when a socket closes: if it had a plan in progress, tell everyone else to drop it.
+export function clearMovePreviewForSocket(meta, session, broadcast) {
+  const tokenId = meta.movePreviewTokenId;
+  meta.movePreviewTokenId = null;
+  const token = tokenId ? session.tokens[tokenId] : null;
+  if (!token) return;
+  // A private plan was never sent to players, so a clear to them is a harmless no-op.
+  broadcastMovePreview(broadcast, session, meta.sessionId, token,
+    { type: 'token:move:preview:clear', tokenId }, meta, false);
+}
+
 function handleTokenEvent(meta, msg, context) {
   const session = context.sessions.get(meta.sessionId);
   if (!session) return;
@@ -234,16 +338,26 @@ function handleTokenEvent(meta, msg, context) {
     case 'token:move': {
       const token = session.tokens[msg.tokenId];
       if (!token || !canEditToken(meta, token)) return;
+      // Reject malformed coordinates outright (a NaN would poison speedRemainingFt).
+      if (!Number.isFinite(msg.x) || !Number.isFinite(msg.y)) return;
+      // Optional intermediate waypoints for a planned path move. Absent means a plain drag
+      // (a one-leg path). Anything malformed rejects the whole move.
+      let waypoints = [];
+      if (msg.waypoints !== undefined) {
+        const parsed = parsePoints(msg.waypoints, 0, MAX_MOVE_WAYPOINTS);
+        if (!parsed) return;
+        waypoints = parsed;
+      }
       const prevX = token.x;
       const prevY = token.y;
       token.x = msg.x;
       token.y = msg.y;
-      // Decrement speedRemainingFt to match the drag ghost label's distance
-      // (main.js's dragState rendering) - same Euclidean formula and
-      // rounding, so the two never disagree. Never blocks the move (product
-      // philosophy: automate/suggest, never hard-enforce) - just clamps the
-      // remaining budget at 0 and lets the overage show visually client-side.
-      // Rides on the existing token:move broadcast rather than a separate
+      // Decrement speedRemainingFt by the path's distance: Chebyshev (a diagonal square costs
+      // 5 ft), nearest foot per leg, legs summed - the same shared helper the client drag ghost
+      // and path label use, so they never disagree. Never blocks the move (product philosophy:
+      // automate/suggest, never hard-enforce) - just clamps the remaining budget at 0 and lets
+      // the overage show visually client-side. Waypoints are only used for the sum, they are not
+      // echoed in the broadcast. Rides on the existing token:move broadcast rather than a separate
       // token:stat:update, which would trigger a full sidebar rebuild on
       // every connected client on every single drag (see item 7).
       // Props omit speed fields entirely (see main.js's readTokenFormFields),
@@ -251,16 +365,72 @@ function handleTokenEvent(meta, msg, context) {
       // the decrement rather than deriving a bogus number in either case.
       const gridSizePx = session.map?.gridSizePx;
       if (typeof token.speedRemainingFt === 'number' && typeof gridSizePx === 'number' && gridSizePx > 0) {
-        const pxPerFoot = gridSizePx / 5;
-        const distanceFt = Math.round(Math.hypot(token.x - prevX, token.y - prevY) / pxPerFoot);
-        token.speedRemainingFt = Math.max(0, token.speedRemainingFt - distanceFt);
+        const pathDistanceFt = pathFt([{ x: prevX, y: prevY }, ...waypoints, { x: msg.x, y: msg.y }], gridSizePx);
+        // Never charge less than the straight start-to-end distance: per-leg rounding means a
+        // spam of sub-foot waypoints would otherwise round every leg down to 0 ft.
+        const straightFt = chebyshevFt(prevX, prevY, msg.x, msg.y, gridSizePx);
+        const distanceFt = pathDistanceFt === null || straightFt === null ? null : Math.max(pathDistanceFt, straightFt);
+        if (distanceFt !== null) token.speedRemainingFt = Math.max(0, token.speedRemainingFt - distanceFt);
       }
+      if (meta.movePreviewTokenId === token.id) meta.movePreviewTokenId = null;
       broadcastToken(context, session, meta.sessionId, 'token:move', token, {
         tokenId: token.id,
         x: token.x,
         y: token.y,
         speedRemainingFt: token.speedRemainingFt,
       });
+      break;
+    }
+
+    // Recenter on Map: a rescue for a token stuck somewhere unreachable. A dedicated event
+    // (not a flag on token:move) so a client can never make an arbitrary free move - the server
+    // picks the target (the map centre) itself and does NOT deduct speedRemainingFt. Same
+    // permission rule as token:move. Broadcasts as a normal token:move so every client's
+    // existing handler just works.
+    case 'token:recenter': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !canEditToken(meta, token)) return;
+      const map = session.map;
+      if (!map || !Number.isFinite(map.widthPx) || !Number.isFinite(map.heightPx)) return;
+      token.x = map.widthPx / 2;
+      token.y = map.heightPx / 2;
+      if (meta.movePreviewTokenId === token.id) meta.movePreviewTokenId = null;
+      broadcastToken(context, session, meta.sessionId, 'token:move', token, {
+        tokenId: token.id,
+        x: token.x,
+        y: token.y,
+        speedRemainingFt: token.speedRemainingFt,
+      });
+      break;
+    }
+
+    // Movement path preview (ephemeral, never stored in session). The sender plans a path
+    // client-side and we just relay it to everyone who could see the token. See
+    // broadcastMovePreview for the visibility rules. A GM may flag a preview `private`, which
+    // then reaches GM-role recipients only (enforced here, not just in the client).
+    case 'token:move:preview': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !canEditToken(meta, token) || !session.map) return;
+      const points = parsePoints(msg.points, 1, MAX_MOVE_WAYPOINTS + 1);
+      if (!points) return;
+      // One plan per socket: starting on a different token clears the old one first.
+      const previous = meta.movePreviewTokenId;
+      if (previous && previous !== token.id && session.tokens[previous]) {
+        broadcastMovePreview(context.broadcast, session, meta.sessionId, session.tokens[previous],
+          { type: 'token:move:preview:clear', tokenId: previous }, meta, false);
+      }
+      meta.movePreviewTokenId = token.id;
+      broadcastMovePreview(context.broadcast, session, meta.sessionId, token,
+        { type: 'token:move:preview', tokenId: token.id, points }, meta, msg.private === true && meta.role === 'gm');
+      break;
+    }
+
+    case 'token:move:preview:clear': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !canEditToken(meta, token)) return;
+      broadcastMovePreview(context.broadcast, session, meta.sessionId, token,
+        { type: 'token:move:preview:clear', tokenId: token.id }, meta, false);
+      if (meta.movePreviewTokenId === token.id) meta.movePreviewTokenId = null;
       break;
     }
 
@@ -388,6 +558,96 @@ function handleTokenEvent(meta, msg, context) {
       break;
     }
 
+    // Manual known AC: any player or the GM can note "this token's AC is at
+    // most X" for a visible token (the table's own bookkeeping, no ownership
+    // check). IMPORTANT: this case must never read token.ac / token.stats.ac.
+    // No clamping against it, no rejection, no reply that differs by it -
+    // any of those would turn this endpoint into an oracle for the hidden AC.
+    case 'token:knownAc:set': {
+      const token = session.tokens[msg.tokenId];
+      if (!token) return;
+      // A player can't act on a token they can't see (never knew it existed).
+      if (meta.role !== 'gm' && (token.hidden || (session.map && !session.map.revealed))) return;
+
+      let value = null;
+      if (msg.value !== null) {
+        const n = typeof msg.value === 'number' || typeof msg.value === 'string' ? Number(msg.value) : NaN;
+        value = Math.round(n);
+        if (msg.value === '' || (typeof msg.value === 'string' && msg.value.trim() === '') || !Number.isFinite(n) || value < 0 || value > 99) {
+          meta.ws.send(JSON.stringify({
+            type: 'token:stat:update:error',
+            tokenId: msg.tokenId,
+            stat: 'knownAc',
+            reason: 'invalid_value',
+          }));
+          return;
+        }
+      }
+      token.knownAc = value;
+      broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+        tokenId: token.id, stat: 'knownAc', value,
+      });
+      break;
+    }
+
+    // token:vision:sync - pushes the character sheet's resolved vision (darkvision etc.) onto a
+    // token WITHOUT clobbering manual VTT edits. The token remembers the last sheet values it took
+    // in `sheetVision`; a vision field only follows the sheet if its current value still equals
+    // that remembered value. If a human changed it (Darkvision checkbox, Advanced Vision modal,
+    // Token Manager), it's an override and stays put. The remembered value is always updated.
+    // visionTrueFt/visionDevilFt stay out of PLAYER_EDITABLE_FIELDS, so the normal edit controls
+    // can't hand-set truesight. Note this path TRUSTS the client's resolved values (the VTT
+    // server can't fetch the character to check them) - an owner could send made-up numbers
+    // from the console. Accepted gap for a trusted group, same as token:add storing a player's
+    // own PC token verbatim. Gated on canEditToken (owner or GM) plus a linked character.
+    case 'token:vision:sync': {
+      const token = session.tokens[msg.tokenId];
+      if (!token || !token.characterId) return;
+      if (!canEditToken(meta, token)) return;
+
+      const incoming = msg.vision;
+      const keys = ['normalFt', 'darkFt', 'trueFt', 'devilFt'];
+      const vision = {};
+      for (const key of keys) {
+        const raw = incoming && (typeof incoming[key] === 'number' || typeof incoming[key] === 'string') ? incoming[key] : NaN;
+        const n = Math.round(Number(raw));
+        if (raw === '' || !Number.isFinite(n) || n < 0 || n > 1000) {
+          meta.ws.send(JSON.stringify({
+            type: 'token:stat:update:error',
+            tokenId: msg.tokenId,
+            stat: 'sheetVision',
+            reason: 'invalid_value',
+          }));
+          return;
+        }
+        vision[key] = n;
+      }
+
+      const fieldFor = { normalFt: 'visionNormalFt', darkFt: 'visionDarkFt', trueFt: 'visionTrueFt', devilFt: 'visionDevilFt' };
+      const previous = token.sheetVision;
+      // A token made before sheetVision existed has no baseline to compare against, so its
+      // fields are never touched (it just starts remembering from now on).
+      if (previous && typeof previous === 'object') {
+        for (const key of keys) {
+          const field = fieldFor[key];
+          if (token[field] === previous[key] && token[field] !== vision[key]) {
+            token[field] = vision[key];
+            broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+              tokenId: token.id, stat: field, value: vision[key],
+            });
+          }
+        }
+      }
+
+      if (JSON.stringify(previous ?? null) !== JSON.stringify(vision)) {
+        token.sheetVision = vision;
+        broadcastToken(context, session, meta.sessionId, 'token:stat:update', token, {
+          tokenId: token.id, stat: 'sheetVision', value: vision,
+        });
+      }
+      break;
+    }
+
     // token:update (Phase 10) - the Token Manager's multi-field edit form,
     // GM-only. Deliberately gated on role alone, not canEditToken - that
     // helper also passes for a token's own owner, which would let a player
@@ -457,6 +717,7 @@ function handleTokenEvent(meta, msg, context) {
       if (meta.role !== 'gm' && !targetWindowOk) return;
 
       const toHit = Number(msg.toHit) || 0;
+      const manualDamageDice = clampManualDamage(msg.manualDamageDice); // INTERIM
       const damage = Math.max(0, Number(msg.damage) || 0);
       const outcome = msg.outcome || null; // 'critical_hit' | 'critical_miss' | null
       const ac = typeof target.ac === 'number' ? target.ac
@@ -547,22 +808,50 @@ function handleTokenEvent(meta, msg, context) {
       // the same reason - a hit landing is worth announcing regardless of how
       // much HP was actually left to remove.
       {
+        // To-hit total for the log. Never the target's real AC. A nat 1 shows
+        // "(natural 1)" rather than the total, since e.g. "(25)" on a fumble
+        // would read as "AC is above 25".
+        const toHitTotal = typeof msg.toHit === 'number' && Number.isFinite(msg.toHit) ? msg.toHit : null;
+        const pool = validatePool(msg.pool);
+        const rollText = formatAttackRollText(outcome, toHitTotal, pool);
+        const manualText = formatManualDamageText(manualDamageDice);
+        const logDetails = { pool, manualDamageDice };
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const targetName = target.name || 'something';
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
         const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         if (!hit) {
           logCombatLine(context, session,
-            pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName }),
-            { kind: 'attack', outcome: 'miss', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
+            pickLine(MISS_PHRASES, { attacker: attackerName, target: targetName, roll: rollText }),
+            { ...logDetails, kind: 'attack', outcome: 'miss', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
         } else if (outcome === 'critical_hit') {
           logCombatLine(context, session,
-            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText }),
-            { kind: 'attack', outcome: 'critical', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText, roll: rollText, manual: manualText }),
+            { ...logDetails, kind: 'attack', outcome: 'critical', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         } else {
           logCombatLine(context, session,
-            `${attackerName} hits ${targetName} for ${damage} ${damageTypeText}damage.`,
-            { kind: 'attack', outcome: 'hit', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            `${attackerName} hits${rollText} ${targetName} for ${damage} ${damageTypeText}damage${manualText}.`,
+            { ...logDetails, kind: 'attack', outcome: 'hit', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+        }
+      }
+
+      // One PUBLIC roll-log line per VTT attack, whether or not an encounter is running (the
+      // combat log above only exists during combat). Dice only: no to-hit bonus breakdown and no
+      // hit/miss. A natural 1 says so instead of showing the total, for the same reason as above.
+      {
+        const toHitForLog = typeof msg.toHit === 'number' && Number.isFinite(msg.toHit) ? msg.toHit : null;
+        if (toHitForLog !== null) {
+          const pool = validatePool(msg.pool);
+          const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
+          const title = msg.title || 'an attack';
+          const poolPart = pool ? poolSummaryText(pool) : '';
+          const rolled = outcome === 'critical_miss' ? 'a natural 1' : String(toHitForLog);
+          postRollLog(
+            context, meta.sessionId,
+            `${attackerName} rolled ${rolled} to hit ${target.name || 'something'} with ${title}${poolPart ? ` (${poolPart})` : ''}.`,
+            { label: `${title} to hit`, pool, breakdown: pool ? `d20 [${pool.rolls.join(', ')}], kept ${pool.kept}` : undefined },
+            'public'
+          );
         }
       }
       break;
@@ -587,6 +876,8 @@ function handleTokenEvent(meta, msg, context) {
         && meta.lastTargetTokenIds.includes(target.id)
         && Date.now() - (meta.lastTargetAt || 0) < TARGET_WINDOW_MS;
       if (meta.role !== 'gm' && !targetWindowOk) return;
+
+      const manualDamageDice = clampManualDamage(msg.manualDamageDice); // INTERIM
 
       // Heal (Phase 8) - always lands (no save/attack layer), adds instead of
       // subtracts, and caps at maxHp instead of flooring at 0. Mirrors the
@@ -620,8 +911,8 @@ function handleTokenEvent(meta, msg, context) {
 
         const healerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         logCombatLine(context, session,
-          `${healerName} uses ${msg.title || 'a heal'} — ${target.name || 'something'} recovers ${reportedAmount} HP.`,
-          { kind: 'heal', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: reportedAmount, title: msg.title || null });
+          `${healerName} uses ${msg.title || 'a heal'} — ${target.name || 'something'} recovers ${reportedAmount} HP${formatManualDamageText(manualDamageDice)}.`,
+          { kind: 'heal', manualDamageDice, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: reportedAmount, title: msg.title || null });
 
         broadcastCreatureSound(context, session, meta.sessionId, msg.sourceTokenId);
         break;
@@ -665,8 +956,8 @@ function handleTokenEvent(meta, msg, context) {
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
         const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         logCombatLine(context, session,
-          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage.`,
-          { kind: 'spell', sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage${formatManualDamageText(manualDamageDice)}.`,
+          { kind: 'spell', manualDamageDice, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
       }
       // Creature attack cue - casting the spell is the attack, so this fires
       // regardless of whether the save negated all damage (same rationale as

@@ -74,6 +74,10 @@ export type ModifierContext = {
   // 'critical_hit'), so a dependent roll's Modifiers can condition on "on:<outcome>". Open-ended:
   // any roll type can register its own outcome names without changing how conditions check them.
   outcomes?: string[];
+  // Distance in feet between attacker and target (VTT only). Lets a condition like
+  // "within:5" / "beyond:5" gate a modifier (e.g. Prone: adv in melee, dis from range). Left
+  // undefined when the distance isn't known, in which case both predicates are false.
+  distanceFt?: number;
 };
 
 export type ResolvedBonus = {
@@ -94,7 +98,9 @@ export type ModifierAuditEntry = ResolvedBonus & {
 export function modifierTargetMatches(target: string, candidates: string[]) {
   return candidates.some((candidate) => {
     if (target === candidate) return true;
-    if (target.endsWith('.all')) return candidate.startsWith(target.slice(0, -4));
+    // Slice off only "all" (not the dot) so 'attack_roll.all' matches 'attack_roll.weapon' but
+    // never a differently named family like 'attack_roll_against.x' that merely shares a prefix.
+    if (target.endsWith('.all')) return candidate.startsWith(target.slice(0, -3));
     return false;
   });
 }
@@ -177,6 +183,13 @@ export function modifierConditionMatches(expression:string,context:ModifierConte
     // roll produced (e.g. 'on:critical_hit'). Generic over any outcome name; new roll types
     // register new outcome strings without this predicate changing.
     if(part.startsWith('on:'))return (context.outcomes||[]).includes(part.slice(3));
+    // "within:<n>" / "beyond:<n>" - distance gates (feet). Unknown distance is false for both,
+    // so a distance-gated modifier never fires on a roll with no token context (e.g. the sheet).
+    if(part.startsWith('within:')||part.startsWith('beyond:')){
+      const limit=Number(part.slice(part.indexOf(':')+1));
+      if(!Number.isFinite(limit)||typeof context.distanceFt!=='number'||!Number.isFinite(context.distanceFt))return false;
+      return part.startsWith('within:')?context.distanceFt<=limit:context.distanceFt>limit;
+    }
     return false;
   });
 }
@@ -190,6 +203,28 @@ export function resolveD20Outcomes(natural: number, critThreshold = 20): string[
   if (natural === 1) outcomes.push('critical_miss');
   if (natural >= critThreshold) outcomes.push('critical_hit');
   return outcomes;
+}
+
+// 5e death saving throw. `natural` is the KEPT d20 (so a net-advantage pool uses the die that
+// counts) and `total` is the whole roll including bonuses (Bless, flat save bonuses). Per RAW the
+// total is compared against 10: 10 or higher is a success, below 10 a failure. A natural 1 on the
+// kept die is two failures and a natural 20 means the character regains 1 HP and both counters
+// reset, whatever the bonuses. Counters cap at 3; rolling at 3 is allowed, it just stays capped.
+// This only SUGGESTS the new counters - the sheet applies them like a manual icon click, so the
+// player can still correct them.
+export type DeathSaveResult = {
+  successes: number;
+  failures: number;
+  kind: 'success' | 'failure' | 'critical_failure' | 'revived';
+  regainHp: boolean;
+};
+
+export function resolveDeathSave(natural: number, total: number, successes: number, failures: number): DeathSaveResult {
+  const cap = (value: number) => Math.max(0, Math.min(3, value));
+  if (natural === 20) return { successes: 0, failures: 0, kind: 'revived', regainHp: true };
+  if (natural === 1) return { successes: cap(successes), failures: cap(failures + 2), kind: 'critical_failure', regainHp: false };
+  if (total >= 10) return { successes: cap(successes + 1), failures: cap(failures), kind: 'success', regainHp: false };
+  return { successes: cap(successes), failures: cap(failures + 1), kind: 'failure', regainHp: false };
 }
 
 // Extensibility hook for crit-range-altering Modifiers (e.g. a Champion Fighter's 19-20 crit
@@ -226,6 +261,29 @@ export function resolveExtraDiceRolls(
         return { label, expression: modifier.valueExpression, rolls, value: rolls.reduce((sum, roll) => sum + roll, 0) };
       })
   );
+}
+
+// HOMEBREW crit rule (deliberately NOT 5e's "double the dice"): on a critical hit, roll the damage
+// dice normally, then add the MAXIMUM of the weapon's/spell's own PRIMARY dice once on top. Nothing
+// is doubled, flat bonuses are untouched, and secondary dice (an extra 1d4 poison, sneak attack,
+// modifier-granted extra dice) are NOT maximised. So 2d8 + 1d4 + 4 on a crit is 2d8 + 1d4 + 4 + 16.
+// "Primary dice" uses the same rule as the interim manual damage-dice control: the die size of the
+// first dice term in the expression, with every term of that size merged (so a scaled cantrip's
+// "1d10 + 1d10" counts as 2d10). Pass the expression AFTER any manual adjustment, so a +1 manual
+// die is maximised too. Used by rollDamage whenever it is told the hit was critical.
+export function critMaxDiceBonus(expression: string): { bonus: number; auditLine: string | null } {
+  const diceTerms = expression
+    .split('+')
+    .map((term) => term.trim().match(/^(\d*)d(\d+)$/i))
+    .filter((match): match is RegExpMatchArray => match !== null);
+  if (diceTerms.length === 0) return { bonus: 0, auditLine: null };
+  const primarySides = Number(diceTerms[0][2]);
+  const primaryCount = diceTerms
+    .filter((match) => Number(match[2]) === primarySides)
+    .reduce((sum, match) => sum + Math.max(1, Number(match[1]) || 1), 0);
+  const bonus = primaryCount * primarySides;
+  if (bonus === 0) return { bonus: 0, auditLine: null };
+  return { bonus, auditLine: `Crit (homebrew max dice): +${bonus} (${primaryCount}d${primarySides} max)` };
 }
 
 // modifier-primacy.md §3.3 - advantage/disadvantage is a dice pool, not a binary state.
@@ -408,11 +466,38 @@ export type SpellDamageProfile = {
   resolution: 'attack' | 'save' | 'auto';
   damageType: string;
   diceExpression: string;
+  // Short note on how the dice were scaled, e.g. "cantrip, level 6" or "cast at level 4". Absent
+  // when nothing scaled. Display only.
+  scalingNote?: string;
   extraDice: ExtraDieResult[];
   flatBonuses: ResolvedBonus[];
   saveAbility?: AbilityKey;
   saveEffect?: 'half' | 'negate';
 };
+
+// Display helper: combines like dice terms so scaled expressions read naturally, e.g.
+// "1d10 + 1d10" -> "2d10" and "2d6 + 1d4 + 2d6 + 3" -> "4d6 + 1d4 + 3". Each die size appears at the
+// position of its first term; flat numbers and anything else are left where they are. Input with
+// no dice terms (empty, flat-only) comes back unchanged. Purely cosmetic: the same dice are
+// rolled either way. (static/vtt-app/main.js has a display-only twin, mergeDiceTermsJs.)
+export function mergeDiceTerms(expression: string): string {
+  const parts = expression.split('+').map((part) => part.trim()).filter(Boolean);
+  const parsed = parts.map((part) => part.match(/^(\d*)d(\d+)$/i));
+  if (!parsed.some((match) => match)) return expression;
+  const counts = new Map<number, number>();
+  parsed.forEach((match) => {
+    if (match) counts.set(Number(match[2]), (counts.get(Number(match[2])) ?? 0) + Math.max(1, Number(match[1]) || 1));
+  });
+  const emitted = new Set<number>();
+  return parts.map((part, index) => {
+    const match = parsed[index];
+    if (!match) return part;
+    const sides = Number(match[2]);
+    if (emitted.has(sides)) return '';
+    emitted.add(sides);
+    return `${counts.get(sides)}d${sides}`;
+  }).filter(Boolean).join(' + ');
+}
 
 function repeatDiceExpression(expression: string, times: number): string {
   if (times <= 1 || !expression.trim()) return expression;
@@ -433,13 +518,16 @@ function repeatDiceExpression(expression: string, times: number): string {
 export function resolveSpellDamage(spell: SpellDamageSource, ctx: SpellDamageContext): SpellDamageProfile {
   const scaling = spell.scaling || {};
   let diceExpression = spell.baseDice;
+  let scalingNote: string | undefined;
 
   if (scaling.kind === 'cantrip' && scaling.extraDice) {
     const tiersCrossed = (scaling.tiers || []).filter((tier) => ctx.casterLevel >= tier).length;
     diceExpression = [diceExpression, ...Array(tiersCrossed).fill(scaling.extraDice)].filter(Boolean).join(' + ');
+    if (tiersCrossed > 0) scalingNote = `cantrip, level ${ctx.casterLevel}`;
   } else if (scaling.kind === 'leveled' && scaling.extraDicePerSlotLevel) {
     const levelsAbove = Math.max(0, ctx.castAtSlotLevel - spell.spellLevel);
     diceExpression = [diceExpression, ...Array(levelsAbove).fill(scaling.extraDicePerSlotLevel)].filter(Boolean).join(' + ');
+    if (levelsAbove > 0) scalingNote = `cast at level ${ctx.castAtSlotLevel}`;
   }
 
   const candidates = ['damage_roll.spell.all', `damage_roll.spell.${spell.damageType}`, `damage_roll.spell.${slugifySpellName(spell.name)}`]
@@ -463,7 +551,9 @@ export function resolveSpellDamage(spell: SpellDamageSource, ctx: SpellDamageCon
   return {
     resolution: spell.resolutionType,
     damageType: spell.damageType,
-    diceExpression,
+    // Merged for display ("2d10", not "1d10 + 1d10"); rolls the same dice.
+    diceExpression: mergeDiceTerms(diceExpression),
+    scalingNote,
     extraDice,
     flatBonuses,
     saveAbility: spell.saveAbility,
@@ -545,25 +635,100 @@ export function passiveScore(
   return 10 + abilityModifier(abilityScore) + (proficient ? prof : 0) + bonuses.reduce((sum, bonus) => sum + bonus.value, 0);
 }
 
-// New for VTT Phase 2 - vision.*_ft aren't feats or race traits in this
-// codebase's data model, they're just Modifiers like everything else
-// (docs/architecture/modifier-primacy-architecture.md), resolved the same
-// way AC/speed are. Baselines are standard human vision (30ft normal, no
-// darkvision/truesight/devil's sight) with any granted Modifiers added on
-// top - deliberately additive ('bonus'), not 'set', since the tie-break rule
-// for 'set' operations is an explicitly open question in the architecture
-// doc and additive bonuses on a fixed baseline sidestep it entirely.
+export type SenseKey = 'normalFt' | 'darkFt' | 'trueFt' | 'devilFt';
+export type SenseResolution = { value: number; lines: string[] };
+
+const SENSE_TARGETS: Record<SenseKey, { target: string; baseline: number }> = {
+  normalFt: { target: 'vision.normal_ft', baseline: 30 },
+  darkFt: { target: 'vision.dark_ft', baseline: 0 },
+  trueFt: { target: 'vision.true_ft', baseline: 0 },
+  devilFt: { target: 'vision.devil_ft', baseline: 0 }
+};
+
+// Resolves one sense (darkvision, truesight, ...) with a source-attributed audit trail.
+// See docs/architecture/modifier-primacy.md section 3.1 for the stacking rules. Order:
+//   1. 'set'     - if any exists, the last one by priority is the base (mirrors speedPipeline),
+//                  replacing the baseline and every 'minimum'.
+//   2. 'minimum' - otherwise the base is the highest of the baseline and every 'minimum' grant.
+//                  Grants never sum, so a racial 60ft plus a 60ft feat is still 60ft.
+//   3. add       - every 'bonus' is added and every 'penalty' subtracted on top.
+//   4. floor     - never below 0.
+// Any other op on a sense target is listed as "Not applied" rather than silently dropped.
+export function resolveSense(
+  modifierSources: ActiveCharacterEffect[],
+  target: string,
+  baseline: number,
+  context: ModifierContext = {}
+): SenseResolution {
+  const lines: string[] = [];
+  const sets = resolvedNumericModifiers(modifierSources, [target], ['set'], context);
+  const minimums = resolvedNumericModifiers(modifierSources, [target], ['minimum'], context);
+  const activeSet = sets.length ? sets.at(-1) : undefined;
+
+  let base: number;
+  if (activeSet) {
+    base = activeSet.value;
+    lines.push(`Set by ${activeSet.label}: ${base} ft (replaces baseline and at-least grants)`);
+  } else {
+    lines.push(`Baseline: ${baseline} ft`);
+    // The first grant with the top value (by priority) is the one marked as used.
+    const top = minimums.reduce((best, entry) => (entry.value > best ? entry.value : best), Number.NEGATIVE_INFINITY);
+    let usedMarked = false;
+    for (const entry of minimums) {
+      const isUsed = !usedMarked && entry.value === top && entry.value > baseline;
+      if (isUsed) usedMarked = true;
+      lines.push(`${entry.label}: at least ${entry.value} ft ${isUsed ? '(highest)' : '(not the highest, not used)'}`);
+    }
+    base = Math.max(baseline, ...minimums.map((entry) => entry.value));
+  }
+
+  let total = base;
+  for (const bonus of resolvedAdditiveModifiers(modifierSources, [target], context)) {
+    total += bonus.value;
+    lines.push(`${bonus.label}: ${bonus.value >= 0 ? '+' : '-'}${Math.abs(bonus.value)} ft`);
+  }
+
+  // Ops senses don't understand (multiplier, advantage, ...) are shown, not silently ignored.
+  const handled = ['set', 'minimum', 'bonus', 'penalty'];
+  for (const effect of modifierSources) {
+    for (const modifier of effect.modifiers) {
+      if (handled.includes(modifier.modifierType)) continue;
+      if (!modifierTargetMatches(modifier.target, [target]) || !modifierConditionMatches(modifier.conditionExpression, context)) continue;
+      lines.push(`Not applied: ${modifier.label?.trim() || effect.name} (${modifier.modifierType} isn't supported for senses)`);
+    }
+  }
+
+  const value = Math.max(0, total);
+  lines.push(`Total: ${value} ft`);
+  return { value, lines };
+}
+
+export function visionBreakdown(
+  modifierSources: ActiveCharacterEffect[],
+  context: ModifierContext = {}
+): Record<SenseKey, SenseResolution> {
+  const entries = (Object.keys(SENSE_TARGETS) as SenseKey[]).map((key) => [
+    key,
+    resolveSense(modifierSources, SENSE_TARGETS[key].target, SENSE_TARGETS[key].baseline, context)
+  ]);
+  return Object.fromEntries(entries) as Record<SenseKey, SenseResolution>;
+}
+
+// vision.*_ft aren't feats or race traits in this codebase's data model, they're just Modifiers
+// like everything else (docs/architecture/modifier-primacy.md), resolved the same way AC/speed
+// are. Baselines are standard human vision (30ft normal, no darkvision/truesight/devil's sight).
+// Darkvision-style grants use the 'minimum' op ("At least - highest wins"), so overlapping
+// sources don't sum; 'bonus'/'penalty' still add on top. See resolveSense for the full order.
 export function visionRadii(
   modifierSources: ActiveCharacterEffect[],
   context: ModifierContext = {}
 ): { normalFt: number; darkFt: number; trueFt: number; devilFt: number } {
-  const bonusFor = (target: string) =>
-    resolvedAdditiveModifiers(modifierSources, [target], context).reduce((sum, bonus) => sum + bonus.value, 0);
+  const breakdown = visionBreakdown(modifierSources, context);
   return {
-    normalFt: 30 + bonusFor('vision.normal_ft'),
-    darkFt: bonusFor('vision.dark_ft'),
-    trueFt: bonusFor('vision.true_ft'),
-    devilFt: bonusFor('vision.devil_ft')
+    normalFt: breakdown.normalFt.value,
+    darkFt: breakdown.darkFt.value,
+    trueFt: breakdown.trueFt.value,
+    devilFt: breakdown.devilFt.value
   };
 }
 

@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { query } from '$lib/server/db';
+import { getCharacterAccess } from '$lib/server/services/access';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { getRoomGameSessionId } from '$lib/server/services/gameSessions';
 
@@ -15,8 +16,9 @@ import { getRoomGameSessionId } from '$lib/server/services/gameSessions';
 // that builds the entire computed sheet (~15 queries, every effect definition,
 // all content), and this endpoint is polled on a timer by every open sheet.
 export const GET: RequestHandler = async ({ locals, params }) => {
-  const owned = await query('SELECT 1 FROM characters WHERE id = $1 AND owner_user_id = $2', [params.id!, locals.user!.id]);
-  if (!owned.rowCount) return json({ error: 'not_found' }, { status: 404 });
+  // canView, same as the sheet itself (viewers see the Activity Log too).
+  const access = await getCharacterAccess({ query }, locals.user!.id, params.id!);
+  if (!access?.canView) return json({ error: 'not_found' }, { status: 404 });
 
   return json({
     encounterId: await getActiveEncounterForCharacter(params.id!),

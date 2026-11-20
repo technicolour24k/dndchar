@@ -6,6 +6,7 @@ export const operationRegistry: Array<{ key: ModifierOperation; label: string; v
   { key: 'bonus', label: 'Bonus', value: 'formula' },
   { key: 'penalty', label: 'Penalty', value: 'formula' },
   { key: 'set', label: 'Set value', value: 'formula' },
+  { key: 'minimum', label: 'At least - highest wins (senses only)', value: 'number' },
   { key: 'multiplier', label: 'Multiplier', value: 'number' },
   { key: 'advantage', label: 'Advantage', value: 'none' },
   { key: 'disadvantage', label: 'Disadvantage', value: 'none' },

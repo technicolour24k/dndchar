@@ -9,6 +9,7 @@ import {
   proficiencyBonus,
   resolveCritThreshold,
   resolveD20Outcomes,
+  resolveDeathSave,
   resolveDicePool,
   resolveExtraDiceRolls,
   resolveModifierNumericValue,
@@ -26,7 +27,10 @@ import {
   spellAttackBonus,
   spellSaveDc,
   standardSpellSlotMaximums,
-  totalLevel
+  totalLevel,
+  resolveSense,
+  visionBreakdown,
+  visionRadii
 } from './dnd5e';
 import type { ActiveCharacterEffect, EffectModifier } from '$lib/types/character';
 import { rollWithModifiers } from './attackRoll';
@@ -392,9 +396,9 @@ describe('D&D 5e helpers', () => {
     };
     const ctx = (casterLevel: number) => ({ castAtSlotLevel: 0, casterLevel, modifierSources: [] });
     expect(resolveSpellDamage(fireBolt, ctx(1)).diceExpression).toBe('1d10');
-    expect(resolveSpellDamage(fireBolt, ctx(5)).diceExpression).toBe('1d10 + 1d10');
-    expect(resolveSpellDamage(fireBolt, ctx(11)).diceExpression).toBe('1d10 + 1d10 + 1d10');
-    expect(resolveSpellDamage(fireBolt, ctx(17)).diceExpression).toBe('1d10 + 1d10 + 1d10 + 1d10');
+    expect(resolveSpellDamage(fireBolt, ctx(5)).diceExpression).toBe('2d10');
+    expect(resolveSpellDamage(fireBolt, ctx(11)).diceExpression).toBe('3d10');
+    expect(resolveSpellDamage(fireBolt, ctx(17)).diceExpression).toBe('4d10');
   });
 
   it('scales a leveled spell by slot levels cast above its minimum (upcasting), per vtt-phase-3-magic-spec.md', () => {
@@ -405,7 +409,7 @@ describe('D&D 5e helpers', () => {
     };
     const ctx = (castAtSlotLevel: number) => ({ castAtSlotLevel, casterLevel: 5, modifierSources: [] });
     expect(resolveSpellDamage(fireball, ctx(3)).diceExpression).toBe('8d6');
-    expect(resolveSpellDamage(fireball, ctx(5)).diceExpression).toBe('8d6 + 1d6 + 1d6');
+    expect(resolveSpellDamage(fireball, ctx(5)).diceExpression).toBe('10d6');
     expect(resolveSpellDamage(fireball, ctx(3)).saveAbility).toBe('dex');
     expect(resolveSpellDamage(fireball, ctx(3)).saveEffect).toBe('half');
   });
@@ -427,7 +431,7 @@ describe('D&D 5e helpers', () => {
       ]
     };
     const profile = resolveSpellDamage(sleep, { castAtSlotLevel: 1, casterLevel: 5, modifierSources: [doublingItem] });
-    expect(profile.diceExpression).toBe('5d8 + 5d8');
+    expect(profile.diceExpression).toBe('10d8');
     expect(profile.flatBonuses).toEqual([{ label: 'Somnolent Rod', value: 3 }]);
   });
 });
@@ -634,5 +638,95 @@ describe('rollWithModifiers flatModifiersIncluded', () => {
     const rollDie = () => 10;
     expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie).total).toBe(17);
     expect(rollWithModifiers([source], 5, ['initiative'], [], rollDie, { flatModifiersIncluded: true }).total).toBe(15);
+  });
+});
+
+describe('resolveDeathSave', () => {
+  it('counts a total of 10 as a success', () => {
+    expect(resolveDeathSave(10, 10, 0, 0)).toEqual({ successes: 1, failures: 0, kind: 'success', regainHp: false });
+  });
+  it('counts a total of 9 as a failure', () => {
+    expect(resolveDeathSave(9, 9, 1, 1)).toEqual({ successes: 1, failures: 2, kind: 'failure', regainHp: false });
+  });
+  it('compares the TOTAL, so bonuses count: natural 8 + 3 = 11 is a success', () => {
+    expect(resolveDeathSave(8, 11, 0, 0).kind).toBe('success');
+    expect(resolveDeathSave(8, 5, 0, 0).kind).toBe('failure');
+  });
+  it('counts a natural 1 as two failures even with bonuses', () => {
+    expect(resolveDeathSave(1, 12, 0, 0)).toEqual({ successes: 0, failures: 2, kind: 'critical_failure', regainHp: false });
+  });
+  it('resets both counters and regains 1 HP on a natural 20, whatever the total', () => {
+    expect(resolveDeathSave(20, 20, 2, 2)).toEqual({ successes: 0, failures: 0, kind: 'revived', regainHp: true });
+    expect(resolveDeathSave(20, 18, 1, 1).kind).toBe('revived');
+  });
+  it('caps at 3 rather than blocking the roll', () => {
+    expect(resolveDeathSave(15, 15, 3, 0).successes).toBe(3);
+    expect(resolveDeathSave(1, 1, 0, 2).failures).toBe(3);
+    expect(resolveDeathSave(5, 5, 0, 3).failures).toBe(3);
+  });
+});
+
+describe('senses (minimum op)', () => {
+  const grant = (name: string, modifierType: string, value: string, target = 'vision.dark_ft', priority = 0): ActiveCharacterEffect => ({
+    id: name, effectId: name, effectKey: name, name, sourceType: 'condition', sourceName: name, description: '',
+    durationType: '', requiresConcentration: false, isCondition: false, isSelectable: true, remainingRounds: null,
+    modifiers: [{ target, modifierType, label: '', valueExpression: value, defaultValueExpression: value,
+      valueOverrideExpression: '', conditionExpression: '', priority }]
+  });
+  const dark = (sources: ActiveCharacterEffect[]) => resolveSense(sources, 'vision.dark_ft', 0);
+
+  it('does not sum two equal minimum grants', () => {
+    expect(dark([grant('Elf', 'minimum', '60'), grant('Feat', 'minimum', '60')]).value).toBe(60);
+  });
+
+  it('takes the highest of several minimum grants', () => {
+    const result = dark([grant('Elf', 'minimum', '60'), grant('Goggles', 'minimum', '120')]);
+    expect(result.value).toBe(120);
+    expect(result.lines).toContain('Goggles: at least 120 ft (highest)');
+    expect(result.lines).toContain('Elf: at least 60 ft (not the highest, not used)');
+  });
+
+  it('marks only the first tied grant as highest', () => {
+    const lines = dark([grant('Elf', 'minimum', '60'), grant('Goggles', 'minimum', '60')]).lines;
+    expect(lines).toContain('Elf: at least 60 ft (highest)');
+    expect(lines).toContain('Goggles: at least 60 ft (not the highest, not used)');
+  });
+
+  it('adds a bonus on top of the minimum', () => {
+    const result = dark([grant('Elf', 'minimum', '60'), grant('Owl Ring', 'bonus', '30')]);
+    expect(result.value).toBe(90);
+    expect(result.lines).toContain('Owl Ring: +30 ft');
+    expect(result.lines.at(-1)).toBe('Total: 90 ft');
+  });
+
+  it('floors at zero', () => {
+    expect(dark([grant('Curse', 'penalty', '100')]).value).toBe(0);
+  });
+
+  it('lets a set beat a minimum, with bonuses still applied after', () => {
+    expect(dark([grant('Elf', 'minimum', '60'), grant('Blind', 'set', '0')]).value).toBe(0);
+    expect(dark([grant('Elf', 'minimum', '60'), grant('Blind', 'set', '0'), grant('Ring', 'bonus', '10')]).value).toBe(10);
+  });
+
+  it('keeps normal vision at the 30ft baseline when the minimum is lower', () => {
+    const sources = [grant('Odd', 'minimum', '20', 'vision.normal_ft')];
+    expect(visionBreakdown(sources).normalFt.value).toBe(30);
+  });
+
+  it('lists unsupported ops as not applied', () => {
+    const result = dark([grant('Haste-ish', 'multiplier', '2')]);
+    expect(result.value).toBe(0);
+    expect(result.lines.some((line) => line.startsWith('Not applied: Haste-ish'))).toBe(true);
+  });
+
+  it('visionRadii matches visionBreakdown', () => {
+    const sources = [grant('Elf', 'minimum', '60'), grant('Ring', 'bonus', '30'), grant('Sight', 'minimum', '30', 'vision.true_ft')];
+    const radii = visionRadii(sources);
+    const breakdown = visionBreakdown(sources);
+    expect(radii).toEqual({
+      normalFt: breakdown.normalFt.value, darkFt: breakdown.darkFt.value,
+      trueFt: breakdown.trueFt.value, devilFt: breakdown.devilFt.value
+    });
+    expect(radii).toEqual({ normalFt: 30, darkFt: 90, trueFt: 30, devilFt: 0 });
   });
 });

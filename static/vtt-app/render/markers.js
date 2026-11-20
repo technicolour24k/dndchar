@@ -1,13 +1,15 @@
 // Player/GM-placed AOE markers (spell templates etc). One shape per marker,
 // dispatched by marker.shape - each shape gets its own draw path, sharing the
 // fill/stroke/label conventions established by the original circle-only pass.
-export function drawMarkers(ctx, markers, gridSizePx) {
+// `getImage(url)` (optional) is main.js's cached image loader - only glyphs use it.
+export function drawMarkers(ctx, markers, gridSizePx, getImage) {
   const pxPerFoot = gridSizePx / 5;
 
   ctx.save();
   for (const marker of markers) {
     if (marker.shape === 'cone') drawCone(ctx, marker, pxPerFoot);
     else if (marker.shape === 'cube') drawCube(ctx, marker, pxPerFoot);
+    else if (marker.shape === 'glyph') drawGlyph(ctx, marker, pxPerFoot, getImage);
     else drawCircle(ctx, marker, pxPerFoot); // 'circle' and 'sphere' share identical math
   }
   ctx.restore();
@@ -23,6 +25,27 @@ function drawCircle(ctx, marker, pxPerFoot) {
   fillAndStroke(ctx, color);
   drawOrigin(ctx, marker.x, marker.y, color);
   drawLabel(ctx, marker, `${marker.radiusFt}ft`, marker.x, marker.y - radius - 8);
+}
+
+const GLYPH_IMAGE_URL = '/images/cinder-glyph.svg';
+
+// A glyph is a fixed 5 ft wide (one grid square) icon, so marker.radiusFt is
+// ignored. The ring in the marker colour is what identifies whose it is.
+function drawGlyph(ctx, marker, pxPerFoot, getImage) {
+  const radius = 2.5 * pxPerFoot;
+  const color = marker.color || '#ff5252';
+
+  ctx.beginPath();
+  ctx.arc(marker.x, marker.y, radius, 0, Math.PI * 2);
+  fillAndStroke(ctx, color);
+
+  // The first draw happens before the image has loaded and just shows the ring;
+  // getImage re-renders the canvas once the image arrives.
+  const img = getImage ? getImage(GLYPH_IMAGE_URL) : null;
+  if (img && img.complete && img.naturalWidth > 0) {
+    ctx.drawImage(img, marker.x - radius, marker.y - radius, radius * 2, radius * 2);
+  }
+  drawLabel(ctx, marker, 'glyph', marker.x, marker.y - radius - 8);
 }
 
 function drawCone(ctx, marker, pxPerFoot) {

@@ -33,7 +33,26 @@
     </div>
 
     <div class="error" id="loginError"></div>
+
+    <!-- Campaign tables (campaign.js): opened from /vtt with ?campaignId=, so none of the above
+         applies. Create/Join and the name field are hidden and this status line shows instead. -->
+    <div id="campaignJoining" style="display:none;">
+      <p id="campaignJoiningText" style="margin:0;"></p>
+      <p class="hint"><a href="/vtt" style="color:#8fb0ff;">Back to the table lobby</a></p>
+    </div>
   </div>
+
+  <!-- Campaign notices (campaign.js): errors, kicks and the seat takeover offer. A small card over
+       everything, with buttons the script fills in. -->
+  <div id="campaignNotice" class="modal-overlay">
+    <div class="modal">
+      <h2 id="campaignNoticeTitle"></h2>
+      <p id="campaignNoticeText" style="margin:0;font-size:13px;color:#ccc;line-height:1.4;"></p>
+      <div class="actions" id="campaignNoticeActions"></div>
+    </div>
+  </div>
+  <!-- A passing message that doesn't block play (e.g. "The DM has taken the GM seat."). -->
+  <div id="campaignBanner" hidden></div>
 
   <div id="app">
     <div id="sidebar"></div>
@@ -87,6 +106,14 @@
         <span id="actionTargetBannerText">Click a token to target</span>
         <button type="button" id="actionTargetCancelBtn" class="secondary">Cancel</button>
       </div>
+      <div id="movePlanNotice" class="marker-placement-banner"></div>
+      <div id="movePlanBanner" class="marker-placement-banner">
+        <span id="movePlanBannerText">Tap the map to add waypoints</span>
+        <label id="movePlanPrivateLabel" style="display:none" title="GM only: when on, players do not see this plan"><input type="checkbox" id="movePlanPrivateInput"> Private plan</label>
+        <button type="button" id="movePlanUndoBtn" class="secondary">Undo</button>
+        <button type="button" id="movePlanMoveBtn">Move</button>
+        <button type="button" id="movePlanCancelBtn" class="secondary">Cancel</button>
+      </div>
     </div>
   </div>
 
@@ -97,6 +124,10 @@
       <div class="field"><label>Darkvision (ft)</label><input type="number" id="visionModalDark" min="0" /></div>
       <div class="field"><label>Truesight (ft)</label><input type="number" id="visionModalTrue" min="0" /></div>
       <div class="field"><label>Devil's Sight (ft)</label><input type="number" id="visionModalDevil" min="0" /></div>
+      <div class="field">
+        <button type="button" id="visionModalUseSheet" class="secondary">Use sheet values</button>
+        <small id="visionModalHint" style="display:none">Differs from character sheet - won't auto-update.</small>
+      </div>
       <div class="actions">
         <button id="visionModalCancel" class="secondary">Cancel</button>
         <button id="visionModalSave">Save</button>
@@ -111,6 +142,19 @@
       <div class="actions">
         <button id="conditionsModalCancel" class="secondary">Cancel</button>
         <button id="conditionsModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="knownAcModal" class="modal-overlay">
+    <div class="modal">
+      <h2>Known AC</h2>
+      <p style="color:#888;font-size:12px;">Lowest roll known to hit. Leave blank to clear.</p>
+      <div class="field"><input type="number" id="knownAcModalInput" min="0" max="99" /></div>
+      <div class="actions">
+        <button id="knownAcModalCancel" class="secondary">Cancel</button>
+        <button id="knownAcModalClear" class="secondary">Clear</button>
+        <button id="knownAcModalSave">Save</button>
       </div>
     </div>
   </div>
@@ -131,6 +175,23 @@
   <div id="attackModal" class="modal-overlay">
     <div class="modal">
       <div id="attackModalBody"></div>
+    </div>
+  </div>
+
+  <!-- Forage (vtt-forage unit C). Player popup: picks, waiting/mark steps and the result. Closes freely. -->
+  <div id="foragePlayerModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal">
+      <div id="foragePlayerBody"></div>
+    </div>
+  </div>
+
+  <!-- Forage GM popup. Deliberately no backdrop or Escape close: closing would cancel a player's request.
+       The body is built by forage.js. -->
+  <div id="forageModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal">
+      <div id="forageQueue"></div>
+      <div id="forageNotice" class="forage-msg" hidden></div>
+      <div id="forageModalBody"></div>
     </div>
   </div>
 

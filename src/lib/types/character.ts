@@ -86,6 +86,9 @@ export type ActiveCharacterEffect = {
   isCondition: boolean;
   isSelectable: boolean;
   remainingRounds: number | null;
+  // content_key of the Container this source came from (e.g. 'condition:condition_poisoned'),
+  // used to avoid counting the same condition twice (sheet + token). Absent on legacy sources.
+  containerKey?: string;
   modifiers: EffectModifier[];
 };
 
@@ -113,6 +116,9 @@ export type CharacterProficiencies = {
 export type CharacterDetail = {
   id: string;
   ownerUserId: string;
+  campaignId: string | null;
+  campaignName: string | null;
+  partyActive: boolean;
   name: string;
   ancestry: string;
   background: string;
@@ -134,10 +140,15 @@ export type CharacterDetail = {
   spellSlots: import('$lib/types/content').SpellSlot[];
   combatClock: { roundNumber: number; turnNumber: number };
   updatedAt: string;
+  /** Bumped by every whole-sheet write; the sheet posts it back with Save (stale-save guard). */
+  sheetVersion: number;
 };
 
 export type CharacterListItem = {
   id: string;
+  campaignId: string | null;
+  campaignName: string | null;
+  partyActive: boolean;
   name: string;
   ancestry: string;
   background: string;

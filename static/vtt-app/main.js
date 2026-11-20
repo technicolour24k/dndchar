@@ -3,7 +3,12 @@ import { drawTokens, TYPE_COLOR, CONDITION_COLOR } from './render/tokens.js';
 import { computeVisionRadii, isPointRevealed, computeLightRevealCircles } from './render/vision.js';
 import { updateMapLayers, hideMapLayers, isVideoUrl } from './render/mapLayers.js';
 import { drawMovementRange } from './render/movement.js';
+import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/movePath.js';
+// Shared with the Node server (vtt/server/handlers/token.js), so the label and the deduction agree.
+import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
+import { createForage } from './forage.js';
+import { createCampaignClient } from './campaign.js';
 import { drawTargetRings } from './render/targeting.js';
 import { getTokensInShape } from './render/shapeGeometry.js';
 
@@ -28,6 +33,9 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
+  // Last sheet vision values the token took (see token:vision:sync). Client-side list only, so
+  // the generic token:stat:update path on the server can't write it.
+  'sheetVision',
 ]);
 
 // Shared cap for the three live log arrays (combat log, roll log, session
@@ -49,8 +57,9 @@ const joinCodeInput = document.getElementById('joinCodeInput');
 // user). Falls back to manual name entry + a per-browser random id when the
 // page is opened standalone, so the tool still works outside the main app.
 const accountParams = new URLSearchParams(location.search);
-const accountPlayerId = accountParams.get('playerId');
-const accountPlayerName = accountParams.get('playerName');
+// `let` because a campaign table's join ticket (campaign.js) is the authority on who we are.
+let accountPlayerId = accountParams.get('playerId');
+let accountPlayerName = accountParams.get('playerName');
 
 let ws = null;
 let role = null; // 'gm' | 'player'
@@ -58,7 +67,13 @@ let playerId = null;
 let playerName = null;
 let sessionId = null;
 let session = null; // local mirror of the (already role-filtered) session state
-let dragState = null; // { tokenId, originX, originY, x, y } - visual ghost only, see canvas handlers
+let dragState = null; // { tokenId, originX, originY, x, y, startClientX, startClientY, moved, fromPlan } - visual ghost only, see canvas handlers
+// Movement path planning (see the "Movement path planning" section below): the viewer's own plan,
+// and other people's plans received over the socket (tokenId -> points, origin is the token itself).
+// Time of the last touch, so the mouse events synthesised from a tap can be told from a real mouse.
+let lastTouchAt = 0;
+let movePlan = null; // { tokenId, points: [{x,y}], hover: {x,y} | null, broadcast: bool } or null
+const remoteMovePreviews = new Map();
 let currentRenderedTokens = []; // whichever token list render() last actually drew, for hit-testing
 let zoomLevel = 1; // CSS-only scale of the canvas; the backing pixel buffer stays at native map size
 let currentTargetTokenIds = []; // tokens highlighted by the most recent target:select/target:clear seen
@@ -113,6 +128,39 @@ function escapeHtml(str) {
 let topModalZIndex = 100;
 function bringModalToFront(modalEl) {
   modalEl.style.zIndex = ++topModalZIndex;
+}
+
+// Backdrop close fires on PRESS, not click. A click event fires on the common
+// ancestor when you press inside a modal and release over the backdrop (e.g.
+// dragging to select text in an input), which used to close the modal by
+// accident. Pressing on the backdrop itself is unambiguous.
+// preventDefault() on pointerdown suppresses a touch tap's follow-up
+// mousedown/mouseup, and swallowNextClick() eats the compatibility click, so
+// neither lands on whatever is under the finger once the overlay has gone
+// (canvas pan, armed marker placement, sidebar buttons).
+// NOTE: the same swallowNextClick/backdrop-press logic is duplicated in
+// src/lib/ui/backdropPress.ts (this file is unbundled and can't import it).
+// Keep the two in step.
+function swallowNextClick() {
+  const swallow = (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    done();
+  };
+  const timer = setTimeout(() => done(), 500);
+  function done() {
+    clearTimeout(timer);
+    window.removeEventListener('click', swallow, true);
+  }
+  window.addEventListener('click', swallow, true);
+}
+function closeOnBackdropPress(overlayEl, closeFn) {
+  overlayEl.addEventListener('pointerdown', (e) => {
+    if (e.target !== overlayEl || e.button !== 0) return;
+    e.preventDefault();
+    swallowNextClick();
+    closeFn();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -536,19 +584,76 @@ function getPersistentPlayerName() {
 
 function connect(joinPayload) {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${protocol}://${location.host}/vtt-ws`);
+  const socket = new WebSocket(`${protocol}://${location.host}/vtt-ws`);
+  ws = socket;
 
-  ws.addEventListener('open', () => ws.send(JSON.stringify(joinPayload)));
-  ws.addEventListener('message', (ev) => handleMessage(JSON.parse(ev.data)));
-  ws.addEventListener('close', () => {
+  ws.addEventListener('open', () => socket.send(JSON.stringify(joinPayload)));
+  ws.addEventListener('message', (ev) => {
+    // A replaced socket (e.g. we took the seat on a newer one) must not drive the UI any more.
+    if (ws === socket) handleMessage(JSON.parse(ev.data));
+  });
+  ws.addEventListener('close', (ev) => {
+    // Drop pending character-sync debounces: the reconnect's state:full runs a
+    // full syncOwnedCharacterTokens() catch-up anyway.
+    for (const timer of characterSyncDebounceTimers.values()) clearTimeout(timer);
+    characterSyncDebounceTimers.clear();
+    // The server clears our plan for everyone else on close; drop ours and everyone else's here.
+    clearAllMovePreviews();
+    // Campaign tables: a join ticket is single use, so a reconnect needs a fresh one - campaign.js
+    // fetches it (and decides whether to retry at all after a kick or a takeover).
+    if (campaignClient.active) {
+      // Ignore the close of a socket we already replaced (a stale one can close late).
+      if (ws === socket) campaignClient.onClose(ev.code);
+      return;
+    }
     // Only auto-retry after a successful join - a bad room code shouldn't loop.
     if (session) setTimeout(() => connect(joinPayload), 1500);
   });
 }
 
+// Movement path previews: drop one token's preview (and abort our own plan for it, since the
+// token moved, changed or vanished under us), or everything (geometry/visibility may have changed).
+function dropMovePreview(tokenId) {
+  remoteMovePreviews.delete(tokenId);
+  if (movePlan && movePlan.tokenId === tokenId) {
+    abortMovePlan();
+    showMovePlanNotice('Plan cancelled - the token was moved');
+  }
+}
+
+// Brief message after our plan is aborted by someone else's change (there is no toast system).
+let movePlanNoticeTimer = null;
+function showMovePlanNotice(text) {
+  const notice = document.getElementById('movePlanNotice');
+  if (!notice) return;
+  notice.textContent = text;
+  notice.classList.add('visible');
+  clearTimeout(movePlanNoticeTimer);
+  movePlanNoticeTimer = setTimeout(() => notice.classList.remove('visible'), 2500);
+}
+
+function clearAllMovePreviews() {
+  remoteMovePreviews.clear();
+  abortMovePlan();
+}
+
 function handleMessage(msg) {
   switch (msg.type) {
+    // Campaign tables: the server's seat/kick messages. campaign.js decides what to show and
+    // whether to reconnect; the socket's close follows straight after.
+    case 'kicked':
+      campaignClient.onKicked(msg.reason);
+      break;
+
+    case 'gm:replaced':
+      campaignClient.onGmReplaced();
+      break;
+
     case 'join:error':
+      if (campaignClient.active) {
+        campaignClient.onJoinError(msg);
+        break;
+      }
       if (msg.reason === 'session_not_found') loginError.textContent = 'Room not found.';
       else if (msg.reason === 'gm_already_claimed') loginError.textContent = 'This room already has a GM connected.';
       else loginError.textContent = msg.reason;
@@ -557,9 +662,11 @@ function handleMessage(msg) {
       break;
 
     case 'state:full':
+      clearAllMovePreviews();
       session = msg.session;
       session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
+      if (campaignClient.active) campaignClient.onJoined();
       // render() first - it computes currentRenderedTokens (vision-filtered
       // for a player), which renderSidebar()'s "other tokens in view" list
       // now reads from; the reverse order would show a stale/empty list
@@ -567,6 +674,9 @@ function handleMessage(msg) {
       render();
       renderSidebar();
       updateAmbientMusic();
+      // Forage: the GM's pending requests (or the player's own view and result) arrive in
+      // session.forage / session.forageResults. Targeted updates only, no extra sidebar rebuild.
+      forage.onStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
       // 'character:changed' below instead. See that case and
@@ -603,6 +713,7 @@ function handleMessage(msg) {
       break;
 
     case 'map:set':
+      clearAllMovePreviews();
       session.map = msg.map;
       render();
       renderSidebar();
@@ -615,6 +726,7 @@ function handleMessage(msg) {
     // state:full's combat-log/roll-log/session-notes backlog refetches,
     // which would be wasted round-trips on every single toggle click.
     case 'map:revealed':
+      clearAllMovePreviews();
       session = msg.session;
       session.markers = session.markers || {};
       render();
@@ -629,6 +741,7 @@ function handleMessage(msg) {
       break;
 
     case 'token:remove':
+      dropMovePreview(msg.tokenId);
       delete session.tokens[msg.tokenId];
       render();
       renderSidebar();
@@ -638,6 +751,8 @@ function handleMessage(msg) {
     // the broadcast token wholesale into the local mirror, same idea as
     // token:add but for an existing id.
     case 'token:update':
+      // Only a position change ends a preview - an unrelated Token Manager save must not.
+      if (session.tokens[msg.token.id]?.x !== msg.token.x || session.tokens[msg.token.id]?.y !== msg.token.y) dropMovePreview(msg.token.id);
       session.tokens[msg.token.id] = msg.token;
       render();
       renderSidebar();
@@ -646,12 +761,17 @@ function handleMessage(msg) {
     // token:remove:bulk (Phase 10, Token Manager's bulk-remove) - one message
     // instead of N token:remove events.
     case 'token:remove:bulk':
-      msg.tokenIds.forEach((id) => delete session.tokens[id]);
+      msg.tokenIds.forEach((id) => {
+        dropMovePreview(id);
+        delete session.tokens[id];
+      });
       render();
       renderSidebar();
       break;
 
     case 'token:move': {
+      // The move landed (ours or someone else's): any preview of it is finished.
+      dropMovePreview(msg.tokenId);
       const t = session.tokens[msg.tokenId];
       if (t) {
         t.x = msg.x;
@@ -695,7 +815,22 @@ function handleMessage(msg) {
       break;
     }
 
+    // Movement path preview relays (see the "Movement path planning" section). Render only - never
+    // renderSidebar()/scheduleSidebarRender(), so a plan being laid out cannot rebuild anyone's
+    // sidebar (batch 1's no-rebuild-storm guarantee).
+    case 'token:move:preview':
+      remoteMovePreviews.set(msg.tokenId, msg.points);
+      render();
+      break;
+
+    case 'token:move:preview:clear':
+      remoteMovePreviews.delete(msg.tokenId);
+      render();
+      break;
+
     case 'token:stat:update': {
+      // x/y are player-writable stat updates that move the token, so they end any preview too.
+      if (msg.stat === 'x' || msg.stat === 'y') dropMovePreview(msg.tokenId);
       const t = session.tokens[msg.tokenId];
       // value is omitted by the server for filtered fields (e.g. an enemy's
       // hp, per the server-side comment in handlers/token.js) - nothing to
@@ -705,11 +840,13 @@ function handleMessage(msg) {
         else { t.stats = t.stats || {}; t.stats[msg.stat] = msg.value; }
       }
       render();
-      renderSidebar();
+      // Coalesced: one sheet save can send up to 3 of these back-to-back.
+      scheduleSidebarRender();
       break;
     }
 
     case 'token:hidden:toggle': {
+      dropMovePreview(msg.tokenId);
       const t = session.tokens[msg.tokenId];
       if (t) t.hidden = msg.hidden;
       render();
@@ -818,6 +955,16 @@ function handleMessage(msg) {
     // characterId so a burst of saves/equips doesn't fire a sync per event.
     case 'character:changed':
       if (role === 'player') scheduleCharacterSync(msg.characterId);
+      break;
+
+    // Forage (vtt-forage unit C). Per-recipient: the GM gets the whole request, the finder only their
+    // own view. Handled with targeted DOM updates, never renderSidebar().
+    case 'forage:update':
+      forage.onUpdate(msg);
+      break;
+
+    case 'forage:closed':
+      forage.onClosed(msg);
       break;
 
     default:
@@ -983,7 +1130,7 @@ function render() {
     updateMapLayers({ map, role, radii: null, zoomLevel });
     drawGrid(ctx, map, gridStyle);
     if (showMovementRanges) drawMovementRange(ctx, allTokens, map.gridSizePx);
-    drawMarkers(ctx, visibleMarkers, map.gridSizePx);
+    drawMarkers(ctx, visibleMarkers, map.gridSizePx, getImage);
     drawTokens(ctx, allTokens, map.gridSizePx, getImage, null);
     drawTargetRings(ctx, currentTargetTokenIds, allTokens, map.gridSizePx);
     currentRenderedTokens = allTokens;
@@ -1002,7 +1149,7 @@ function render() {
     // far an enemy or another player's token can still move is tactical
     // information a player shouldn't see, same trust boundary as HP.
     drawMovementRange(ctx, ownedTokens, map.gridSizePx);
-    drawMarkers(ctx, visibleMarkers, map.gridSizePx);
+    drawMarkers(ctx, visibleMarkers, map.gridSizePx, getImage);
     drawTokens(ctx, visibleTokens, map.gridSizePx, getImage, playerId);
     drawTargetRings(ctx, currentTargetTokenIds, visibleTokens, map.gridSizePx);
     currentRenderedTokens = visibleTokens;
@@ -1013,45 +1160,71 @@ function render() {
   }
 
   if (shapeDrag) {
-    drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx);
+    drawMarkers(ctx, [markerFromShapeDrag(shapeDrag)], map.gridSizePx, getImage);
+  }
+
+  // Other people's planned paths (drawn first so the viewer's own plan and drag ghost sit on top).
+  // Looked up in currentRenderedTokens, so a player never sees a path for a token outside their
+  // vision, while the GM sees everything. The token the viewer is planning themselves is skipped.
+  for (const [tokenId, points] of remoteMovePreviews) {
+    if (movePlan && movePlan.tokenId === tokenId) continue;
+    const token = currentRenderedTokens.find((t) => t.id === tokenId);
+    if (!token) continue;
+    const fullPoints = [{ x: token.x, y: token.y }, ...points];
+    const totalFt = pathFt(fullPoints, map.gridSizePx) ?? 0;
+    const remainingFt = token.speedRemainingFt ?? token.speedFt ?? null;
+    drawMovePath(ctx, {
+      points: fullPoints,
+      totalFt,
+      remainingFt,
+      // Budgets are tactical info: only the GM and the token's owner see "of N ft".
+      showBudget: role === 'gm' || token.ownerId === playerId,
+      overBudget: remainingFt !== null && totalFt > remainingFt,
+      gridSizePx: map.gridSizePx,
+      style: 'remote',
+    });
+  }
+
+  if (movePlan) {
+    const token = session.tokens[movePlan.tokenId];
+    if (token) {
+      const origin = { x: token.x, y: token.y };
+      const committed = [origin, ...movePlan.points];
+      // The hover leg (desktop only) is drawn locally and never broadcast.
+      const drawn = movePlan.hover ? [...committed, movePlan.hover] : committed;
+      const remainingFt = token.speedRemainingFt ?? token.speedFt ?? null;
+      const totalFt = pathFt(drawn, map.gridSizePx) ?? 0;
+      drawMovePath(ctx, {
+        points: drawn,
+        totalFt,
+        remainingFt,
+        showBudget: true,
+        overBudget: remainingFt !== null && totalFt > remainingFt,
+        gridSizePx: map.gridSizePx,
+        style: 'local',
+      });
+      // The banner uses the committed total only (no hover leg) so it does not jitter.
+      updateMovePlanBanner(token, pathFt(committed, map.gridSizePx) ?? 0, remainingFt);
+    }
   }
 
   if (dragState) {
     const radius = map.gridSizePx * 0.4;
-    const pxPerFoot = map.gridSizePx / 5;
-    const distanceFt = Math.round(Math.hypot(dragState.x - dragState.originX, dragState.y - dragState.originY) / pxPerFoot);
+    const distanceFt = chebyshevFt(dragState.originX, dragState.originY, dragState.x, dragState.y, map.gridSizePx) ?? 0;
     const token = session.tokens[dragState.tokenId];
     const remainingFt = token ? token.speedRemainingFt ?? token.speedFt ?? null : null;
     const overBudget = remainingFt !== null && distanceFt > remainingFt;
 
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(dragState.x, dragState.y, radius, 0, Math.PI * 2);
-    ctx.strokeStyle = overBudget ? 'rgba(229,57,53,0.9)' : 'rgba(255,255,255,0.85)';
-    ctx.setLineDash([4, 4]);
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
     // A line back to the token's actual starting point makes "distance
     // between these two points" legible even after dragging far from it.
-    ctx.beginPath();
-    ctx.moveTo(dragState.originX, dragState.originY);
-    ctx.lineTo(dragState.x, dragState.y);
-    ctx.strokeStyle = overBudget ? 'rgba(229,57,53,0.6)' : 'rgba(255,255,255,0.5)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    ctx.restore();
-
-    const label = remainingFt !== null ? `${distanceFt} ft (of ${remainingFt} ft)` : `${distanceFt} ft`;
-    ctx.save();
-    ctx.font = 'bold 13px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = overBudget ? '#ff8a80' : '#fff';
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 3;
-    ctx.strokeText(label, dragState.x, dragState.y - radius - 10);
-    ctx.fillText(label, dragState.x, dragState.y - radius - 10);
-    ctx.restore();
+    drawDistanceLine(ctx, { x: dragState.originX, y: dragState.originY }, { x: dragState.x, y: dragState.y }, overBudget);
+    drawDistanceGhost(ctx, {
+      x: dragState.x,
+      y: dragState.y,
+      radius,
+      label: remainingFt !== null ? `${distanceFt} ft (of ${remainingFt} ft)` : `${distanceFt} ft`,
+      overBudget,
+    });
   }
 
   ensureTokenVideoLoop();
@@ -1133,6 +1306,7 @@ const markerPlacementBanner = document.getElementById('markerPlacementBanner');
 let pendingMarkerPlacement = null; // { radiusFt, color, label } or null while armed
 
 function armMarkerPlacement(config) {
+  cancelMovePlan(); // only one click-the-map mode armed at a time
   disarmActionTargeting(); // only one click-the-map mode armed at a time
   pendingMarkerPlacement = config;
   markerPlacementBanner.classList.add('visible');
@@ -1171,6 +1345,7 @@ let pendingActionTarget = null; // { sourceTokenId, action, intent } while an ac
 // from - it's the [Attack]/[Heal] choice, not a property of the action itself (the same
 // weapon/spell/item can go down either tab).
 function armActionTargeting(sourceTokenId, action, intent = 'attack') {
+  cancelMovePlan(); // only one click-the-map mode armed at a time
   disarmMarkerPlacement();
   combatActionsModal.classList.remove('visible');
   spellPickerModal.classList.remove('visible');
@@ -1195,6 +1370,213 @@ function disarmActionTargeting() {
 document.getElementById('actionTargetCancelBtn').addEventListener('click', disarmActionTargeting);
 
 // ---------------------------------------------------------------------------
+// Movement path planning - lay out a path as clicked waypoints, see the running
+// distance against remaining movement, then Move (the server deducts the summed
+// path distance) or Cancel. Everyone who can see the token watches the path live
+// (token:move:preview, relayed by the server - never stored). Free-form like
+// drag-to-move: no walls, terrain or pathfinding, it is a measuring/intent tool.
+// Same arm/disarm-banner pattern as marker placement and action targeting.
+// ---------------------------------------------------------------------------
+
+const movePlanBanner = document.getElementById('movePlanBanner');
+const movePlanBannerText = document.getElementById('movePlanBannerText');
+const movePlanUndoBtn = document.getElementById('movePlanUndoBtn');
+const movePlanMoveBtn = document.getElementById('movePlanMoveBtn');
+const movePlanPrivateLabel = document.getElementById('movePlanPrivateLabel');
+const movePlanPrivateInput = document.getElementById('movePlanPrivateInput');
+
+// A press that releases within this many screen pixels of where it started is a tap, not a drag.
+const TAP_SLOP_PX = 8;
+// GM-only "Private plan" toggle: remembered for this browser session, defaults to off.
+const MOVE_PLAN_PRIVATE_KEY = 'vttMovePlanPrivate';
+
+function isMovePlanPrivate() {
+  if (role !== 'gm') return false; // players never get the toggle, their plans are always visible
+  try {
+    return sessionStorage.getItem(MOVE_PLAN_PRIVATE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function armMovePlan(tokenId) {
+  const token = session?.tokens[tokenId];
+  if (!token || !session.map) return;
+  // Starting a plan on a different token drops the old one (and tells the others).
+  if (movePlan && movePlan.tokenId !== tokenId) cancelMovePlan();
+  disarmMarkerPlacement();
+  disarmActionTargeting();
+  movePlan = { tokenId, points: [], hover: null, broadcast: false };
+  movePlanPrivateLabel.style.display = role === 'gm' ? '' : 'none';
+  movePlanPrivateInput.checked = isMovePlanPrivate();
+  movePlanBanner.classList.add('visible');
+  canvas.style.cursor = 'crosshair';
+  render();
+}
+
+// Snaps to the centre of the grid square under the point, then keeps it on the map. Waypoints
+// snap, the token's own origin does not (so only the first leg can be a non-multiple of 5 ft).
+function snapWaypoint(x, y) {
+  const snapped = snapToSquareCentre(x, y, session.map.gridSizePx);
+  return clampToMapBounds(snapped.x, snapped.y);
+}
+
+function sameSquare(a, b) {
+  const g = session.map.gridSizePx;
+  return Math.floor(a.x / g) === Math.floor(b.x / g) && Math.floor(a.y / g) === Math.floor(b.y / g);
+}
+
+function addMoveWaypoint(x, y) {
+  if (!movePlan || !session?.map) return;
+  const token = session.tokens[movePlan.tokenId];
+  if (!token) return;
+  const point = snapWaypoint(x, y);
+  // Ignore a click in the same square as the previous point (the token itself, for the first
+  // waypoint) so there are no zero-length legs.
+  const previous = movePlan.points.length ? movePlan.points[movePlan.points.length - 1] : token;
+  if (sameSquare(point, previous)) return;
+  movePlan.points.push(point);
+  movePlan.hover = null; // a stale hover leg (e.g. from a touch tap) must not linger
+  render();
+  sendMovePreview();
+}
+
+function undoMoveWaypoint() {
+  if (!movePlan || !movePlan.points.length) return;
+  movePlan.points.pop();
+  movePlan.hover = null;
+  if (movePlan.points.length) {
+    sendMovePreview();
+  } else if (movePlan.broadcast) {
+    send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
+    movePlan.broadcast = false;
+  }
+  render();
+}
+
+// Sends the whole waypoint list (idempotent, so a dropped frame self-heals on the next one).
+// A GM's "private" flag makes the server relay it to GM-role sockets only.
+function sendMovePreview() {
+  const msg = { type: 'token:move:preview', tokenId: movePlan.tokenId, points: movePlan.points };
+  if (isMovePlanPrivate()) msg.private = true;
+  send(msg);
+  movePlan.broadcast = true;
+}
+
+function commitMovePlan() {
+  if (!movePlan || !movePlan.points.length) return;
+  const final = movePlan.points[movePlan.points.length - 1];
+  send({
+    type: 'token:move',
+    tokenId: movePlan.tokenId,
+    x: final.x,
+    y: final.y,
+    waypoints: movePlan.points.slice(0, -1),
+  });
+  // No clear message needed: every client drops the preview on the token:move broadcast.
+  endMovePlan();
+}
+
+function cancelMovePlan() {
+  if (!movePlan) return;
+  if (movePlan.broadcast) send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
+  endMovePlan();
+}
+
+// The token moved, vanished or the socket closed - everyone else already knows, so no message.
+function abortMovePlan() {
+  if (movePlan) endMovePlan();
+}
+
+function endMovePlan() {
+  movePlan = null;
+  movePlanBanner.classList.remove('visible');
+  canvas.style.cursor = '';
+  render();
+}
+
+// Called from render() so the banner stays correct when Remaining changes mid-plan (+5/-5, GM
+// reset). Cheap textContent updates only - never touches the sidebar.
+function updateMovePlanBanner(token, totalFt, remainingFt) {
+  const name = token.name || 'token';
+  const hasPoints = movePlan.points.length > 0;
+  if (!hasPoints) {
+    movePlanBannerText.textContent = `Planning ${name}'s move - tap the map to add waypoints`;
+    movePlanBannerText.classList.remove('over-budget');
+  } else {
+    movePlanBannerText.textContent = remainingFt !== null
+      ? `${name}: ${totalFt} ft of ${remainingFt} ft`
+      : `${name}: ${totalFt} ft`;
+    movePlanBannerText.classList.toggle('over-budget', remainingFt !== null && totalFt > remainingFt);
+  }
+  movePlanUndoBtn.disabled = !hasPoints;
+  movePlanMoveBtn.disabled = !hasPoints;
+}
+
+movePlanUndoBtn.addEventListener('click', undoMoveWaypoint);
+movePlanMoveBtn.addEventListener('click', commitMovePlan);
+document.getElementById('movePlanCancelBtn').addEventListener('click', cancelMovePlan);
+
+// Toggling mid-plan: wipe whatever the other side currently shows, then re-send in the new mode.
+movePlanPrivateInput.addEventListener('change', () => {
+  try {
+    sessionStorage.setItem(MOVE_PLAN_PRIVATE_KEY, movePlanPrivateInput.checked ? '1' : '0');
+  } catch {
+    // sessionStorage unavailable - the toggle just won't be remembered.
+  }
+  if (!movePlan) return;
+  if (movePlan.broadcast) {
+    send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
+    movePlan.broadcast = false;
+  }
+  if (movePlan.points.length) sendMovePreview();
+});
+
+canvas.addEventListener('contextmenu', (e) => {
+  if (movePlan) e.preventDefault();
+});
+
+// Keyboard shortcuts, only while planning and never while typing in a control (so Backspace in
+// a text box does not undo a waypoint).
+window.addEventListener('keydown', (e) => {
+  if (!movePlan || isEditableControl(document.activeElement)) return;
+  // A focused button keeps its own Enter/Space behaviour, and a visible modal owns the keyboard.
+  if (document.activeElement && document.activeElement.tagName === 'BUTTON') return;
+  if (document.querySelector('.modal-overlay.visible')) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    cancelMovePlan();
+  } else if (e.key === 'Enter') {
+    if (movePlan.points.length) {
+      e.preventDefault();
+      commitMovePlan();
+    }
+  } else if (e.key === 'Backspace') {
+    e.preventDefault(); // stop the browser treating it as "back"
+    undoMoveWaypoint();
+  }
+});
+
+// Desktop hover leg: drawn locally only, never broadcast. Cleared when the pointer leaves.
+canvas.addEventListener('mousemove', (e) => {
+  if (!movePlan || dragState || panState || !session?.map) return;
+  // A tap makes the browser synthesise a mousemove: ignore it so touch leaves no phantom leg.
+  if (Date.now() - lastTouchAt < 800) return;
+  const raw = canvasCoords(e);
+  const point = snapWaypoint(raw.x, raw.y);
+  const token = session.tokens[movePlan.tokenId];
+  const previous = movePlan.points.length ? movePlan.points[movePlan.points.length - 1] : token;
+  movePlan.hover = previous && sameSquare(point, previous) ? null : point;
+  render();
+});
+canvas.addEventListener('mouseleave', () => {
+  if (movePlan && movePlan.hover) {
+    movePlan.hover = null;
+    render();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Attack/spell confirm + roll-result modal (Phase 2.5, extended in Phase 3 for
 // spells). Clicking a target no longer resolves instantly - it shows an
 // explicit Attack/Cast button (confirm step), then rolls via the shared
@@ -1209,7 +1591,7 @@ document.getElementById('actionTargetCancelBtn').addEventListener('click', disar
 // ---------------------------------------------------------------------------
 const attackModal = document.getElementById('attackModal');
 const attackModalBody = document.getElementById('attackModalBody');
-let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName }
+let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName, options, stage }
 
 function closeAttackModal() {
   attackModal.classList.remove('visible');
@@ -1230,12 +1612,216 @@ function closeAttackModal() {
   pendingAttack = null;
 }
 
+// ---------------------------------------------------------------------------
+// Advantage / disadvantage panel + manual damage dice, on the confirm card.
+//
+// The SERVER does all the real work (it recomputes every source and rolls the dice pool). This
+// side only shows a preview of the sources, lets the user untick sources and set the manual
+// situational counters, and sends those CHOICES back with the roll. The live "Net" readout here is
+// display-only; the server's result is the authority.
+//
+// INTERIM: the "Damage dice" control is a manual per-roll stopgap until proper modifiers handle
+// extra damage dice. It is not part of the modifier model (see the vtt-combat-mechanics plan).
+// ---------------------------------------------------------------------------
+function newAttackOptions(action, intent) {
+  const isSpell = action.kind === 'spell';
+  const skipsPreview = intent === 'heal' || action.kind === 'item';
+  // Whether the advantage panel is shown: never for heals/items; manual spells only when they
+  // are attack-resolution; character spells start unknown ('maybe') until the preview decides.
+  let showAdvantage = true;
+  if (skipsPreview) showAdvantage = false;
+  else if (isSpell && action.manual && action.resolution !== 'attack') showAdvantage = false;
+  return {
+    showAdvantage,
+    // 'loading' | 'ready' | 'failed' | 'skipped'
+    status: skipsPreview ? 'skipped' : 'loading',
+    sources: [],          // non-situational sources from the preview
+    disabled: new Set(),  // ids the user unticked
+    adv: 0,               // situational advantage counter, 0-5
+    dis: 0,               // situational disadvantage counter, 0-5
+    damageDelta: 0,       // INTERIM: manual damage-dice delta, -5..+5
+    primaryDamageDice: '',
+  };
+}
+
+function advSourceLabel(source) {
+  const suffix = { attacker: '', target: ' (target)', attacker_condition: " (attacker's condition)", target_condition: " (target's condition)", situational: ' (manual)' }[source.origin] || '';
+  return `${source.kind === 'advantage' ? '+1 Advantage' : '+1 Disadvantage'}: ${source.label}${suffix}`;
+}
+
+// Display-only twin of mergeDiceTerms (src/lib/rules/dnd5e.ts): combines like dice terms, so
+// "1d10 + 1d10" reads as "2d10". Keep in step with the TypeScript version.
+function mergeDiceTermsJs(expression) {
+  const parts = String(expression || '').split('+').map((p) => p.trim()).filter(Boolean);
+  const parsed = parts.map((p) => p.match(/^(\d*)d(\d+)$/i));
+  if (!parsed.some((m) => m)) return String(expression || '');
+  const counts = new Map();
+  parsed.forEach((m) => { if (m) counts.set(Number(m[2]), (counts.get(Number(m[2])) || 0) + Math.max(1, Number(m[1]) || 1)); });
+  const emitted = new Set();
+  return parts.map((p, i) => {
+    const m = parsed[i];
+    if (!m) return p;
+    const sides = Number(m[2]);
+    if (emitted.has(sides)) return '';
+    emitted.add(sides);
+    return `${counts.get(sides)}d${sides}`;
+  }).filter(Boolean).join(' + ');
+}
+
+// Display-only twin of the server's adjustPrimaryDamageDice (src/lib/rules/attackRoll.ts): shows
+// "2d6 -> 3d6". The server's result is what actually applies.
+function previewPrimaryDice(expression, delta) {
+  const parts = String(expression || '').split('+').map((p) => p.trim()).filter(Boolean);
+  const parsed = parts.map((p) => p.match(/^(\d*)d(\d+)$/i));
+  const first = parsed.findIndex((m) => m);
+  if (first === -1 || !delta) return '';
+  const sides = Number(parsed[first][2]);
+  let total = 0;
+  parsed.forEach((m) => { if (m && Number(m[2]) === sides) total += Math.max(1, Number(m[1]) || 1); });
+  const count = Math.max(1, total + delta);
+  const rebuilt = parts.map((p, i) => {
+    const m = parsed[i];
+    if (!m || Number(m[2]) !== sides) return p;
+    return i === first ? `${count}d${sides}` : '';
+  }).filter(Boolean).join(' + ');
+  return `${mergeDiceTermsJs(parts.join(' + '))} \u2192 ${mergeDiceTermsJs(rebuilt)}`;
+}
+
+function advReadoutText(options) {
+  const ticked = options.sources.filter((src) => !options.disabled.has(src.id));
+  const adv = ticked.filter((src) => src.kind === 'advantage').length + options.adv;
+  const dis = ticked.filter((src) => src.kind === 'disadvantage').length + options.dis;
+  if (adv === 0 && dis === 0) return 'Flat roll';
+  const net = adv - dis;
+  const counts = `(${adv} adv, ${dis} dis)`;
+  if (net === 0) return `Net 0 ${counts}: flat roll`;
+  return `Net ${net > 0 ? '+' : ''}${net} ${counts}: roll ${1 + Math.abs(net)}d20, keep ${net > 0 ? 'highest' : 'lowest'}`;
+}
+
+function counterRowHtml(label, kind, value) {
+  return `
+    <div class="adv-row">
+      <span class="adv-row-label">${label}</span>
+      <button type="button" class="secondary adv-step" data-adv-kind="${kind}" data-adv-step="-1" aria-label="Fewer ${label.toLowerCase()}">-</button>
+      <span class="adv-value" data-adv-value="${kind}">${value}</span>
+      <button type="button" class="secondary adv-step" data-adv-kind="${kind}" data-adv-step="1" aria-label="More ${label.toLowerCase()}">+</button>
+    </div>`;
+}
+
+function advancedOptionsHtml(options) {
+  const advPanel = options.showAdvantage ? `
+    <div class="adv-panel" id="advPanel">
+      <h4>Advantage</h4>
+      <div id="advStatus" class="attack-subtext"></div>
+      <div id="advSources"></div>
+      ${counterRowHtml('Advantage', 'adv', options.adv)}
+      ${counterRowHtml('Disadvantage', 'dis', options.dis)}
+      <div class="attack-subtext">Each point counts as one source. Advantage and disadvantage cancel one for one.</div>
+      <div class="adv-readout" id="advReadout"></div>
+    </div>` : '';
+  const dmgPanel = `
+    <div class="adv-panel" id="dmgPanel">
+      <h4>Damage dice <span class="adv-manual">manual</span></h4>
+      <div class="adv-row">
+        <span class="adv-row-label">Dice</span>
+        <button type="button" class="secondary adv-step" data-adv-kind="dmg" data-adv-step="-1" aria-label="Fewer damage dice">-</button>
+        <span class="adv-value" data-adv-value="dmg">0</span>
+        <button type="button" class="secondary adv-step" data-adv-kind="dmg" data-adv-step="1" aria-label="More damage dice">+</button>
+      </div>
+      <div class="attack-subtext" id="dmgPreview"></div>
+    </div>`;
+  return advPanel + dmgPanel;
+}
+
+// Repaints the parts of the panel that depend on state (not the whole card, so focus is kept).
+function refreshAdvantagePanel() {
+  const options = pendingAttack?.options;
+  if (!options || pendingAttack.stage !== 'confirm') return;
+  const statusEl = document.getElementById('advStatus');
+  if (statusEl) {
+    statusEl.textContent = options.status === 'loading' ? 'Checking advantage\u2026'
+      : options.status === 'failed' ? "Couldn't check modifiers, the roll will still apply them" : '';
+  }
+  const sourcesEl = document.getElementById('advSources');
+  // Only rebuild the tick boxes when the source list itself changed (the preview arriving). Tick
+  // and counter changes just update the readout, so a focused checkbox keeps its focus.
+  const sourcesKey = options.sources.map((src) => src.id).join('|');
+  if (sourcesEl && sourcesEl.dataset.renderedKey !== sourcesKey) {
+    sourcesEl.dataset.renderedKey = sourcesKey;
+    sourcesEl.innerHTML = options.sources.map((src) => `
+      <label class="adv-source"><input type="checkbox" class="advSourceCheckbox" data-source-id="${escapeHtml(src.id)}" ${options.disabled.has(src.id) ? '' : 'checked'} /> ${escapeHtml(advSourceLabel(src))}</label>`).join('');
+  }
+  const readout = document.getElementById('advReadout');
+  if (readout) readout.textContent = advReadoutText(options);
+  for (const kind of ['adv', 'dis']) {
+    const el = document.querySelector(`[data-adv-value="${kind}"]`);
+    if (el) el.textContent = String(options[kind]);
+  }
+  const dmgValue = document.querySelector('[data-adv-value="dmg"]');
+  if (dmgValue) dmgValue.textContent = options.damageDelta > 0 ? `+${options.damageDelta}` : String(options.damageDelta);
+  const dmgPreview = document.getElementById('dmgPreview');
+  if (dmgPreview) dmgPreview.textContent = previewPrimaryDice(options.primaryDamageDice, options.damageDelta);
+  const advPanel = document.getElementById('advPanel');
+  if (advPanel && !options.showAdvantage) advPanel.remove();
+}
+
+// One delegated listener for the whole panel (the modal body is rebuilt as the flow moves on).
+attackModalBody.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-adv-kind]');
+  const options = pendingAttack?.options;
+  if (!button || !options || pendingAttack.stage !== 'confirm') return;
+  const step = Number(button.dataset.advStep);
+  const kind = button.dataset.advKind;
+  if (kind === 'dmg') options.damageDelta = Math.max(-5, Math.min(5, options.damageDelta + step));
+  else options[kind] = Math.max(0, Math.min(5, options[kind] + step));
+  refreshAdvantagePanel();
+});
+attackModalBody.addEventListener('change', (event) => {
+  const box = event.target.closest('.advSourceCheckbox');
+  const options = pendingAttack?.options;
+  if (!box || !options || pendingAttack.stage !== 'confirm') return;
+  if (box.checked) options.disabled.delete(box.dataset.sourceId);
+  else options.disabled.add(box.dataset.sourceId);
+  refreshAdvantagePanel();
+});
+
+// The choices sent with every roll/preview request. The server recomputes every source itself;
+// this is only what the user chose.
+function attackRollExtras(sourceTokenId, targetId, options, preview) {
+  return {
+    ...(preview ? { preview: true } : {}),
+    vtt: { sessionId, sourceTokenId, targetTokenId: targetId },
+    advantage: { disabled: [...options.disabled], situationalAdvantage: options.adv, situationalDisadvantage: options.dis },
+    manualDamageDice: options.damageDelta, // INTERIM
+  };
+}
+
+// Asks the server (same endpoint as the roll, preview mode: nothing is rolled or spent) which
+// sources apply. Never blocks the confirm button; a failure just leaves the counters.
+async function loadAttackPreview(pending) {
+  const { sourceTokenId, action, targetId, options } = pending;
+  try {
+    const preview = await rollPendingAction(action, session.tokens[sourceTokenId], attackRollExtras(sourceTokenId, targetId, options, true));
+    if (pendingAttack !== pending) return; // stale: the card was closed or replaced
+    options.status = 'ready';
+    options.primaryDamageDice = preview.primaryDamageDice || '';
+    if (preview.usesAttackRoll === false) options.showAdvantage = false;
+    options.sources = (preview.sources || []).filter((src) => src.origin !== 'situational');
+  } catch (err) {
+    if (pendingAttack !== pending) return;
+    console.warn('[VTT] advantage preview failed', err);
+    options.status = 'failed';
+  }
+  refreshAdvantagePanel();
+}
+
 // Step 2 -> 3: a target was clicked; show the confirm card with an explicit Attack/Cast button.
 // The chosen target gets ringed for everyone (target:select) as immediate visible feedback.
 function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   const isSpell = action.kind === 'spell';
   const isHeal = intent === 'heal';
-  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name };
+  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name, options: newAttackOptions(action, intent), stage: 'confirm' };
+  const pending = pendingAttack;
   send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
   currentTargetTokenIds = [target.id];
   render();
@@ -1244,6 +1830,7 @@ function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   attackModalBody.innerHTML = `
     <h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2>
     <div class="attack-target-name">${isHeal ? 'Healing' : isSpell ? 'Casting' : 'Attacking'} <strong>${escapeHtml(target.name)}</strong> with <span class="attack-weapon-name">${escapeHtml(action.name)}</span></div>
+    ${advancedOptionsHtml(pending.options)}
     <div class="actions">
       <button type="button" class="secondary" id="attackCancelBtn">Cancel</button>
       <button type="button" id="attackConfirmBtn">${verb}</button>
@@ -1251,7 +1838,11 @@ function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   `;
   attackModal.classList.add('visible');
   document.getElementById('attackCancelBtn').addEventListener('click', closeAttackModal);
-  document.getElementById('attackConfirmBtn').addEventListener('click', resolveAttack);
+  const confirmBtn = document.getElementById('attackConfirmBtn');
+  confirmBtn.addEventListener('click', resolveAttack);
+  confirmBtn.focus(); // Enter confirms, same as the sheet's roll-options panel
+  refreshAdvantagePanel();
+  if (pending.options.status === 'loading') loadAttackPreview(pending);
 }
 
 function attackModalError(message) {
@@ -1268,10 +1859,11 @@ let awaitingSpellResult = null;
 // Rolls the armed action via whichever server endpoint applies: a character's
 // equipped weapon, a GM's manual stat-block attack, or (Phase 3) a character's
 // prepared spell.
-async function rollManualAction(action) {
+async function rollManualAction(action, extraBody = {}) {
   const res = await fetch('/vtt/api/roll-manual', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      ...extraBody,
       name: action.name, toHitBonus: action.toHitBonus,
       damageRolls: action.damageRolls, damageBonus: action.damageBonus,
       damageType: action.damageType,
@@ -1285,14 +1877,16 @@ async function rollManualAction(action) {
   return body;
 }
 
-async function rollPendingAction(action, source) {
+// extraBody carries the advantage choices (and `preview: true` for a preview) into whichever
+// endpoint applies; the item_not_found fallback covers previews too.
+async function rollPendingAction(action, source, extraBody = {}) {
   // Manual stat-block spell: no character/slots behind it, just the numbers on the action.
-  if (action.kind === 'spell' && action.manual) return rollManualAction(action);
+  if (action.kind === 'spell' && action.manual) return rollManualAction(action, extraBody);
 
   if (action.kind === 'spell') {
     const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-spell', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ instanceId: action.instanceId, slotLevel: action.slotLevel }),
+      body: JSON.stringify({ ...extraBody, instanceId: action.instanceId, slotLevel: action.slotLevel }),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
@@ -1302,18 +1896,18 @@ async function rollPendingAction(action, source) {
   if (action.kind === 'item') {
     const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-item', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inventoryId: action.inventoryId }),
+      body: JSON.stringify({ ...extraBody, inventoryId: action.inventoryId }),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
     return body;
   }
 
-  if (!source?.characterId) return rollManualAction(action); // enemy/npc stat-block attack
+  if (!source?.characterId) return rollManualAction(action, extraBody); // enemy/npc stat-block attack
 
   const res = await fetch('/vtt/api/characters/' + source.characterId + '/roll-attack', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ itemName: action.name }),
+    body: JSON.stringify({ ...extraBody, itemName: action.name }),
   });
   const body = await res.json().catch(() => ({}));
   if (res.ok) return body;
@@ -1326,7 +1920,7 @@ async function rollPendingAction(action, source) {
   // stored on the action itself (same as an enemy/npc attack) - loses the
   // sheet's rich advantage/disadvantage-aware roll, but a homebrew extra
   // attack was never going to have that anyway.
-  if (body.error === 'item_not_found') return rollManualAction(action);
+  if (body.error === 'item_not_found') return rollManualAction(action, extraBody);
 
   // Any other reason (not_found, missing_item) is a real failure - surface
   // the server's actual reason rather than just a bare status code.
@@ -1358,7 +1952,8 @@ function deductLocalSpellSlot(tokenId, level) {
 // total; spell:resolve for save/auto spells, see renderSpellResolutionControls).
 async function resolveAttack() {
   if (!pendingAttack) return;
-  const { sourceTokenId, action, intent, targetId, targetName } = pendingAttack;
+  const { sourceTokenId, action, intent, targetId, targetName, options } = pendingAttack;
+  pendingAttack.stage = 'rolling'; // the panel's listeners ignore clicks from here on
   const source = session.tokens[sourceTokenId];
   const isSpell = action.kind === 'spell';
   const isHeal = intent === 'heal';
@@ -1366,7 +1961,7 @@ async function resolveAttack() {
   attackModalBody.innerHTML = `<h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isHeal ? 'Healing with' : isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
   let result;
   try {
-    result = await rollPendingAction(action, source);
+    result = await rollPendingAction(action, source, attackRollExtras(sourceTokenId, targetId, options, false));
   } catch (err) {
     console.error('[VTT] roll failed', err);
     attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
@@ -1410,6 +2005,9 @@ async function resolveAttack() {
       damageType: inferDamageType(action, result),
       damageLabel: result.damageType || null,
       title: result.title || action.name || null,
+      // The server-returned pool and damage delta (not the raw client choices), for the logs.
+      pool: result.attackPool || null,
+      manualDamageDice: result.manualDamageDice || 0, // INTERIM
     });
     return;
   }
@@ -1500,6 +2098,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent =
     damageType: mapSrdDamageTypeToEffect(result.damageType) || 'magic',
     damageLabel: result.damageType || null,
     title: result.title || null,
+    manualDamageDice: result.manualDamageDice || 0, // INTERIM: server-returned applied delta
   });
 }
 
@@ -1562,9 +2161,11 @@ function drawArmedTargetHighlights(ctx, tokens, gridSizePx, sourceTokenId, inten
 // token you don't control) pans the map instead - same click-and-drag
 // gesture, disambiguated by what's under the cursor.
 let panState = null; // { startClientX, startClientY, startScrollLeft, startScrollTop }
+let planTap = null; // { clientX, clientY } - a press in path mode that becomes a waypoint if it does not travel
 
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); // avoid native text-selection/drag-ghost while panning
+  blurSidebarFocus();
 
   if (pendingActionTarget) {
     const { x, y } = canvasCoords(e);
@@ -1606,14 +2207,40 @@ canvas.addEventListener('mousedown', (e) => {
 
   const { x, y } = canvasCoords(e);
   const token = hitTestToken(x, y);
-  const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
+  // Left button only: a right or middle press must not start a token drag (or arm planning), and
+  // on macOS/Linux a right-click opens the context menu on mousedown, which would leave it stuck.
+  const canDragToken = e.button === 0 && token && (role === 'gm' || token.ownerId === playerId);
+
+  // Path planning: a click adds a waypoint (on mouseup, so a drag pans instead), right-click
+  // undoes one. Pressing the planned token itself starts a normal drag as an escape hatch (a real
+  // drag cancels the plan on mouseup). Any other token is just a point on the map.
+  if (movePlan) {
+    if (e.button === 2) {
+      undoMoveWaypoint();
+      return;
+    }
+    if (e.button !== 0) return; // middle and other buttons do nothing while planning
+    if (canDragToken && token.id === movePlan.tokenId) {
+      dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y, startClientX: e.clientX, startClientY: e.clientY, moved: false, fromPlan: true };
+    } else {
+      planTap = { clientX: e.clientX, clientY: e.clientY };
+      panState = {
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startScrollLeft: mapWrap.scrollLeft,
+        startScrollTop: mapWrap.scrollTop,
+      };
+    }
+    canvas.classList.add('dragging');
+    return;
+  }
 
   if (canDragToken) {
     // originX/originY are the token's actual pre-drag position - that's the
     // true distance the token will travel, not the (possibly off-center)
     // point clicked within its radius. x/y track the live cursor for the
     // ghost circle.
-    dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y };
+    dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y, startClientX: e.clientX, startClientY: e.clientY, moved: false, fromPlan: false };
   } else {
     panState = {
       startClientX: e.clientX,
@@ -1638,6 +2265,7 @@ window.addEventListener('mousemove', (e) => {
     const { x, y } = clampToMapBounds(raw.x, raw.y);
     dragState.x = x;
     dragState.y = y;
+    if (Math.hypot(e.clientX - dragState.startClientX, e.clientY - dragState.startClientY) > TAP_SLOP_PX) dragState.moved = true;
     render();
   } else if (panState) {
     mapWrap.scrollLeft = panState.startScrollLeft - (e.clientX - panState.startClientX);
@@ -1678,6 +2306,10 @@ function placeMarker(marker) {
   const fullMarker = { id, ownerId: role === 'player' ? playerId : null, ...marker };
   send({ type: 'marker:add', marker: fullMarker });
 
+  // A glyph is a placed rune/trap, not an instant area effect, so it never
+  // auto-targets the tokens standing on it.
+  if (fullMarker.shape === 'glyph') return;
+
   const pxPerFoot = (session?.map?.gridSizePx || 50) / 5;
   const caughtTokens = getTokensInShape(fullMarker, Object.values(session.tokens), pxPerFoot);
   if (caughtTokens.length) {
@@ -1694,14 +2326,30 @@ window.addEventListener('mouseup', (e) => {
     return;
   }
   if (dragState) {
-    const raw = canvasCoords(e);
-    const { x, y } = clampToMapBounds(raw.x, raw.y);
-    const { tokenId } = dragState;
-    send({ type: 'token:move', tokenId, x, y });
-    // dragState itself is cleared once the server echoes the move back (see
-    // handleMessage's token:move case) - the token doesn't actually move on
-    // screen until then, per the "server is the only writer" rule.
+    const { tokenId, moved, fromPlan } = dragState;
+    if (!moved) {
+      // A tap, not a drag. It used to send a pointless micro-nudge token:move; now it arms path
+      // planning for the token instead (or does nothing if it was the planned token itself).
+      dragState = null;
+      if (!fromPlan) armMovePlan(tokenId);
+      render();
+    } else {
+      if (fromPlan) cancelMovePlan(); // dragging the planned token abandons the plan
+      const raw = canvasCoords(e);
+      const { x, y } = clampToMapBounds(raw.x, raw.y);
+      send({ type: 'token:move', tokenId, x, y });
+      // dragState itself is cleared once the server echoes the move back (see
+      // handleMessage's token:move case) - the token doesn't actually move on
+      // screen until then, per the "server is the only writer" rule.
+    }
+  } else if (planTap && movePlan) {
+    // A press that stayed put is a waypoint; one that travelled was a pan.
+    if (Math.hypot(e.clientX - planTap.clientX, e.clientY - planTap.clientY) <= TAP_SLOP_PX) {
+      const { x, y } = canvasCoords(e);
+      addMoveWaypoint(x, y);
+    }
   }
+  planTap = null;
   panState = null;
   canvas.classList.remove('dragging');
 });
@@ -1730,6 +2378,8 @@ function findTouchById(touchList, id) {
 let activeTouch = null; // { id, kind: 'token' | 'shape' } - which touch owns whichever of dragState/shapeDrag is currently live
 
 canvas.addEventListener('touchstart', (e) => {
+  lastTouchAt = Date.now();
+  blurSidebarFocus();
   if (pendingActionTarget) return; // tap-to-target has no drag step, synthesized click already handles it
   if (e.touches.length !== 1) return; // multi-touch - not a drag gesture
 
@@ -1750,10 +2400,14 @@ canvas.addEventListener('touchstart', (e) => {
 
   const token = hitTestToken(x, y);
   const canDragToken = token && (role === 'gm' || token.ownerId === playerId);
+  // Path planning: only the planned token itself starts a drag (escape hatch). Anything else is
+  // left alone, so native scroll pans and a plain tap reaches the mouse handlers as synthesised
+  // mousedown/mouseup, which add the waypoint.
+  if (movePlan && !(canDragToken && token.id === movePlan.tokenId)) return;
   if (!canDragToken) return; // miss - let native pan handle it, unchanged
 
   e.preventDefault(); // now that we know it's a token drag, opt this gesture out of native scroll
-  dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y };
+  dragState = { tokenId: token.id, originX: token.x, originY: token.y, x, y, startClientX: touch.clientX, startClientY: touch.clientY, moved: false, fromPlan: !!movePlan };
   activeTouch = { id: touch.identifier, kind: 'token' };
   canvas.classList.add('dragging');
 }, { passive: false });
@@ -1780,6 +2434,7 @@ window.addEventListener('touchmove', (e) => {
     const { x, y } = clampToMapBounds(raw.x, raw.y);
     dragState.x = x;
     dragState.y = y;
+    if (Math.hypot(touch.clientX - dragState.startClientX, touch.clientY - dragState.startClientY) > TAP_SLOP_PX) dragState.moved = true;
   } else {
     shapeDrag.currentX = raw.x;
     shapeDrag.currentY = raw.y;
@@ -1793,12 +2448,20 @@ function endTouchDrag(e, commit) {
   if (!touch) return;
 
   if (commit && activeTouch.kind === 'token') {
-    const raw = canvasCoords(touch);
-    const { x, y } = clampToMapBounds(raw.x, raw.y);
-    const { tokenId } = dragState;
-    send({ type: 'token:move', tokenId, x, y });
-    // dragState itself clears once the server echoes the move back (see
-    // handleMessage's token:move case), same as the mouse path above.
+    const { tokenId, moved, fromPlan } = dragState;
+    if (!moved) {
+      // A tap: arm path planning rather than sending a micro-nudge (same rule as the mouse path).
+      dragState = null;
+      if (!fromPlan) armMovePlan(tokenId);
+      render();
+    } else {
+      if (fromPlan) cancelMovePlan();
+      const raw = canvasCoords(touch);
+      const { x, y } = clampToMapBounds(raw.x, raw.y);
+      send({ type: 'token:move', tokenId, x, y });
+      // dragState itself clears once the server echoes the move back (see
+      // handleMessage's token:move case), same as the mouse path above.
+    }
   } else if (commit && activeTouch.kind === 'shape') {
     const { x, y } = canvasCoords(touch);
     shapeDrag.currentX = x;
@@ -1815,7 +2478,10 @@ function endTouchDrag(e, commit) {
   canvas.classList.remove('dragging');
 }
 
-window.addEventListener('touchend', (e) => endTouchDrag(e, true));
+window.addEventListener('touchend', (e) => {
+  lastTouchAt = Date.now();
+  endTouchDrag(e, true);
+});
 window.addEventListener('touchcancel', (e) => endTouchDrag(e, false));
 
 // ---------------------------------------------------------------------------
@@ -2049,9 +2715,7 @@ pickerFileInput.addEventListener('change', async () => {
 });
 
 document.getElementById('pickerCancelBtn').addEventListener('click', closeImagePicker);
-imagePickerModal.addEventListener('click', (e) => {
-  if (e.target === imagePickerModal) closeImagePicker();
-});
+closeOnBackdropPress(imagePickerModal, closeImagePicker);
 
 // ---------------------------------------------------------------------------
 // Character picker (Phase 2, Section 1a) - a player selects one of their own
@@ -2069,22 +2733,30 @@ const characterPickerList = document.getElementById('characterPickerList');
 async function openCharacterPicker() {
   characterPickerModal.classList.add('visible');
   characterPickerList.innerHTML = '';
-  characterPickerStatus.textContent = 'Loading your characters…';
+  characterPickerStatus.textContent = campaignClient.active ? 'Loading the party…' : 'Loading your characters…';
   try {
-    const res = await fetch('/vtt/api/characters');
+    // In a campaign room the server decides the list: the GM gets the whole active party, a player
+    // gets their own characters in this campaign. In a Quick room it is the caller's own list.
+    const res = await fetch('/vtt/api/characters?roomId=' + encodeURIComponent(sessionId || ''));
     if (!res.ok) throw new Error('failed');
     const characters = await res.json();
     if (!characters.length) {
-      characterPickerStatus.textContent = 'No characters found - create one in the main app first.';
+      characterPickerStatus.textContent = campaignClient.active
+        ? (role === 'gm'
+          ? 'No party characters to add yet. Players add theirs from the campaign page.'
+          : 'None of your characters are in this campaign yet. Add one from its campaign page.')
+        : 'No characters found - create one in the main app first.';
       return;
     }
     characterPickerStatus.textContent = '';
     characterPickerList.innerHTML = characters
       .map((c) => {
         const classSummary = (c.classes || []).map((cls) => `${cls.className} ${cls.level}`).join(' / ') || 'No class';
+        // The GM sees whose character it is; the name stays clean for the token (data attribute below).
+        const ownerTag = c.ownerName && c.ownerUserId !== accountPlayerId ? ` (${c.ownerName})` : '';
         return `
-          <div class="character-picker-item" data-character-id="${escapeHtml(c.id)}">
-            <div class="name">${escapeHtml(c.name)}</div>
+          <div class="character-picker-item" data-character-id="${escapeHtml(c.id)}" data-owner-id="${escapeHtml(c.ownerUserId || '')}" data-character-name="${escapeHtml(c.name)}">
+            <div class="name">${escapeHtml(c.name)}${escapeHtml(ownerTag)}</div>
             <div class="summary">${escapeHtml(classSummary)} - HP ${c.hpCurrent}/${c.hpMax}</div>
           </div>
         `;
@@ -2100,15 +2772,17 @@ function closeCharacterPicker() {
 }
 
 document.getElementById('characterPickerCancelBtn').addEventListener('click', closeCharacterPicker);
-characterPickerModal.addEventListener('click', (e) => {
-  if (e.target === characterPickerModal) closeCharacterPicker();
-});
+closeOnBackdropPress(characterPickerModal, closeCharacterPicker);
 
 characterPickerList.addEventListener('click', async (e) => {
   const item = e.target.closest('.character-picker-item');
   if (!item) return;
   const characterId = item.dataset.characterId;
-  const characterName = item.querySelector('.name').textContent;
+  const characterName = item.dataset.characterName;
+  // The GM puts a player's character on the map as that player's token, so they can move it.
+  // Your own characters keep the old behaviour (ownerId = playerId, which is null for a GM).
+  const pickedOwnerId = item.dataset.ownerId;
+  const tokenOwnerId = pickedOwnerId && pickedOwnerId !== accountPlayerId ? pickedOwnerId : playerId;
   closeCharacterPicker();
 
   const res = await fetch('/vtt/api/characters/' + characterId);
@@ -2122,7 +2796,7 @@ characterPickerList.addEventListener('click', async (e) => {
       id: `token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       name: characterName,
       type: 'pc',
-      ownerId: playerId,
+      ownerId: tokenOwnerId,
       x: Math.round(map.widthPx / 2),
       y: Math.round(map.heightPx / 2),
       imageUrl: null,
@@ -2130,6 +2804,8 @@ characterPickerList.addEventListener('click', async (e) => {
       visionDarkFt: snapshot.vision.darkFt,
       visionTrueFt: snapshot.vision.trueFt,
       visionDevilFt: snapshot.vision.devilFt,
+      // Remembered so later sheet changes can follow compare-and-follow (token:vision:sync).
+      sheetVision: { ...snapshot.vision },
       speedFt: snapshot.speedFt,
       speedRemainingFt: snapshot.speedFt,
       hidden: false,
@@ -2148,17 +2824,15 @@ characterPickerList.addEventListener('click', async (e) => {
 // Character resync - re-pulls a token's source character and pushes any
 // changed reference fields through the existing token:stat:update event, so
 // leveling up / re-equipping mid-session doesn't require removing and
-// re-adding the token. Only syncs fields with NO editable control anywhere in
-// the VTT session (ac, saves, actions, preparedSpells) - not just hp/
-// spellSlots as originally scoped. The first version also synced speedFt/
-// vision*/maxHp, which are each editable by the GM or player during a session
-// (the Speed field, the Darkvision checkbox, the Advanced Vision modal, Max
-// HP) - a sync landing after a GM manually granted a player temporary
-// darkvision (a spell, a potion) would silently revert it back to the
-// sheet's baseline, which is exactly the "reverts to unchecked and 0" bug
-// this was found from. The dividing line is simple: if a human can edit it
-// in the VTT, a sync must never touch it - only genuinely read-only-in-VTT
-// reference data is safe to auto-sync.
+// re-adding the token. The dividing line: if a human can edit it in the VTT, a
+// sync must never overwrite that edit. Fields with NO editable control (saves,
+// actions, preparedSpells) are simply pushed. Vision (darkvision etc.) IS
+// editable (the Darkvision checkbox, the Advanced Vision modal, the Token
+// Manager), so it uses compare-and-follow instead: the token remembers the
+// last sheet values it took in `sheetVision`, and the server (token:vision:sync)
+// only moves a vision field if its current value still equals that remembered
+// value. A hand-edited field is an override and stays put. hp, maxHp, ac and
+// speedFt are never synced - they stay session-authoritative once set.
 //
 // db-traffic-reduction Phase 6: this used to run on a 30s poll for every
 // owned token regardless of whether anything had actually changed. Now it
@@ -2211,13 +2885,10 @@ async function syncOwnedCharacterTokens(onlyCharacterId) {
 }
 
 function applyCharacterSyncFields(token, snapshot) {
-  // hp, maxHp, ac, speedFt, and all four vision fields are deliberately excluded -
-  // each now has an editable control somewhere in the VTT (HP/Max HP/Speed
-  // inputs, the mini-sheet AC input, the Darkvision checkbox, the Advanced
-  // Vision modal) and must stay session-authoritative once set, the same way
-  // hp/spellSlots already are. (ac joined this list when the mini-sheet AC field
-  // became editable - polling it would revert a manual in-session AC change on
-  // the next tick, the same clobber the vision fields hit earlier.)
+  // hp, maxHp, ac and speedFt are deliberately excluded - each has an editable
+  // control in the VTT (HP/Max HP/Speed inputs, the mini-sheet AC input) and
+  // must stay session-authoritative once set, the same way hp/spellSlots
+  // already are. Polling them would revert a manual in-session change.
   const updates = {
     saves: snapshot.saves,
     actions: snapshot.actions,
@@ -2227,6 +2898,21 @@ function applyCharacterSyncFields(token, snapshot) {
     if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
       send({ type: 'token:stat:update', tokenId: token.id, stat, value });
     }
+  }
+  // Vision: let the server decide per field whether it still follows the sheet
+  // (compare-and-follow, see the comment above). Only sent when the sheet's
+  // resolved vision differs from what the token last remembered.
+  // Round/clamp the same way the server does (0-1000 ft), otherwise a fractional
+  // or huge sheet value would never compare equal and re-send on every push.
+  const clampFt = (v) => Math.min(1000, Math.max(0, Math.round(Number(v) || 0)));
+  const vision = snapshot.vision && {
+    normalFt: clampFt(snapshot.vision.normalFt),
+    darkFt: clampFt(snapshot.vision.darkFt),
+    trueFt: clampFt(snapshot.vision.trueFt),
+    devilFt: clampFt(snapshot.vision.devilFt),
+  };
+  if (vision && JSON.stringify(token.sheetVision ?? null) !== JSON.stringify(vision)) {
+    send({ type: 'token:vision:sync', tokenId: token.id, vision });
   }
 }
 
@@ -2240,7 +2926,35 @@ const visionModalNormal = document.getElementById('visionModalNormal');
 const visionModalDark = document.getElementById('visionModalDark');
 const visionModalTrue = document.getElementById('visionModalTrue');
 const visionModalDevil = document.getElementById('visionModalDevil');
+const visionModalUseSheet = document.getElementById('visionModalUseSheet');
+const visionModalHint = document.getElementById('visionModalHint');
 let visionModalTokenId = null;
+
+// Shows the "won't auto-update" hint when any input differs from the sheet value the token
+// last remembered (only for sheet-linked tokens that have one).
+function updateVisionModalHint() {
+  const token = session.tokens[visionModalTokenId];
+  const sheet = token && token.sheetVision;
+  const differs = sheet && (
+    Number(visionModalNormal.value) !== sheet.normalFt ||
+    Number(visionModalDark.value) !== sheet.darkFt ||
+    Number(visionModalTrue.value) !== sheet.trueFt ||
+    Number(visionModalDevil.value) !== sheet.devilFt
+  );
+  visionModalHint.style.display = differs ? '' : 'none';
+}
+[visionModalNormal, visionModalDark, visionModalTrue, visionModalDevil].forEach((input) => input.addEventListener('input', updateVisionModalHint));
+
+// Fills the four inputs from the remembered sheet values. Doesn't save - Save does that.
+visionModalUseSheet.addEventListener('click', () => {
+  const sheet = session.tokens[visionModalTokenId]?.sheetVision;
+  if (!sheet) return;
+  visionModalNormal.value = sheet.normalFt;
+  visionModalDark.value = sheet.darkFt;
+  visionModalTrue.value = sheet.trueFt;
+  visionModalDevil.value = sheet.devilFt;
+  updateVisionModalHint();
+});
 
 function openVisionModal(tokenId) {
   const token = session.tokens[tokenId];
@@ -2250,6 +2964,8 @@ function openVisionModal(tokenId) {
   visionModalDark.value = token.visionDarkFt || 0;
   visionModalTrue.value = token.visionTrueFt || 0;
   visionModalDevil.value = token.visionDevilFt || 0;
+  visionModalUseSheet.disabled = !token.sheetVision;
+  updateVisionModalHint();
   bringModalToFront(visionModal);
   visionModal.classList.add('visible');
 }
@@ -2269,9 +2985,7 @@ document.getElementById('visionModalSave').addEventListener('click', () => {
   send({ type: 'token:stat:update', tokenId, stat: 'visionDevilFt', value: Number(visionModalDevil.value) || 0 });
   closeVisionModal();
 });
-visionModal.addEventListener('click', (e) => {
-  if (e.target === visionModal) closeVisionModal(); // click on the overlay (outside the box) closes it
-});
+closeOnBackdropPress(visionModal, closeVisionModal);
 
 // ---------------------------------------------------------------------------
 // Conditions modal - standard 5e status conditions (Poisoned, Prone, etc.),
@@ -2324,9 +3038,56 @@ document.getElementById('conditionsModalSave').addEventListener('click', () => {
   send({ type: 'token:stat:update', tokenId, stat: 'conditions', value });
   closeConditionsModal();
 });
-conditionsModal.addEventListener('click', (e) => {
-  if (e.target === conditionsModal) closeConditionsModal();
+closeOnBackdropPress(conditionsModal, closeConditionsModal);
+
+// ---------------------------------------------------------------------------
+// Known AC modal - manual "this token's AC is at most X" note, for players
+// (via Other tokens in view) and the GM (via Token Manager). Sends the
+// dedicated token:knownAc:set event; the server never compares it against the
+// real AC. Wired once at top level like the Conditions modal.
+// ---------------------------------------------------------------------------
+
+const knownAcModal = document.getElementById('knownAcModal');
+const knownAcModalInput = document.getElementById('knownAcModalInput');
+let knownAcModalTokenId = null;
+
+function openKnownAcModal(tokenId) {
+  const token = session.tokens[tokenId];
+  if (!token) return;
+  knownAcModalTokenId = tokenId;
+  knownAcModalInput.value = typeof token.knownAc === 'number' ? token.knownAc : '';
+  bringModalToFront(knownAcModal);
+  knownAcModal.classList.add('visible');
+  knownAcModalInput.focus();
+}
+
+function closeKnownAcModal() {
+  knownAcModal.classList.remove('visible');
+  knownAcModalTokenId = null;
+}
+
+// value: a number, or null to clear.
+function saveKnownAc(value) {
+  if (!knownAcModalTokenId) return;
+  send({ type: 'token:knownAc:set', tokenId: knownAcModalTokenId, value });
+  closeKnownAcModal();
+}
+
+function saveKnownAcFromInput() {
+  const raw = knownAcModalInput.value.trim();
+  saveKnownAc(raw === '' ? null : Number(raw));
+}
+
+document.getElementById('knownAcModalCancel').addEventListener('click', closeKnownAcModal);
+document.getElementById('knownAcModalClear').addEventListener('click', () => saveKnownAc(null));
+document.getElementById('knownAcModalSave').addEventListener('click', saveKnownAcFromInput);
+knownAcModalInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveKnownAcFromInput();
+  }
 });
+closeOnBackdropPress(knownAcModal, closeKnownAcModal);
 
 // ---------------------------------------------------------------------------
 // Soundboard modal - GM-only manual trigger, one button per
@@ -2354,9 +3115,7 @@ soundboardModalList.addEventListener('click', (e) => {
   send({ type: 'soundboard:play', folder: e.target.dataset.folder });
 });
 document.getElementById('soundboardModalCloseBtn').addEventListener('click', closeSoundboardModal);
-soundboardModal.addEventListener('click', (e) => {
-  if (e.target === soundboardModal) closeSoundboardModal();
-});
+closeOnBackdropPress(soundboardModal, closeSoundboardModal);
 
 // ---------------------------------------------------------------------------
 // Dice Roller modal (Phase 9) - freeform d4/d6/d8/d10/d12/d20 roller,
@@ -2384,9 +3143,7 @@ function closeDiceRollerModal() {
 }
 
 document.getElementById('diceRollerCancelBtn').addEventListener('click', closeDiceRollerModal);
-diceRollerModal.addEventListener('click', (e) => {
-  if (e.target === diceRollerModal) closeDiceRollerModal();
-});
+closeOnBackdropPress(diceRollerModal, closeDiceRollerModal);
 
 document.getElementById('diceRollerRollBtn').addEventListener('click', () => {
   const dice = [];
@@ -2459,9 +3216,7 @@ creatureLibraryModalList.addEventListener('click', async (e) => {
   if (template && onSelect) onSelect(template);
 });
 document.getElementById('creatureLibraryModalCloseBtn').addEventListener('click', closeCreatureLibraryModal);
-creatureLibraryModal.addEventListener('click', (e) => {
-  if (e.target === creatureLibraryModal) closeCreatureLibraryModal();
-});
+closeOnBackdropPress(creatureLibraryModal, closeCreatureLibraryModal);
 
 // ---------------------------------------------------------------------------
 // Movement quick-adjust - shared between the GM's card for any token and a
@@ -2483,24 +3238,120 @@ function resetTokenSpeedRemaining(tokenId) {
 }
 
 // Rescue for a token dragged somewhere unreachable (see clampToMapBounds's
-// comment) - a plain token:move to the map's center, same as any other
-// drag-drop, so a token stuck from before that fix shipped (or however else
+// comment) - so a token stuck from before that fix shipped (or however else
 // it might end up off-canvas) can be recovered with a click instead of
-// needing a database edit.
+// needing a database edit. A dedicated token:recenter event: the server picks
+// the map centre itself and does not charge movement for it (a plain
+// token:move would deduct speedRemainingFt like any other move).
 function recenterToken(tokenId) {
-  const token = session.tokens[tokenId];
-  const map = session?.map;
-  if (!token || !map) return;
-  send({ type: 'token:move', tokenId, x: map.widthPx / 2, y: map.heightPx / 2 });
+  if (!session?.tokens[tokenId] || !session.map) return;
+  send({ type: 'token:recenter', tokenId });
 }
 
 // ---------------------------------------------------------------------------
 // Sidebar
 // ---------------------------------------------------------------------------
 
+// True for controls where the user can be mid-edit (typing, picking a colour).
+// Buttons and checkboxes keep focus after a click, so deferring on them would
+// stall renders for no benefit.
+function isEditableControl(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag !== 'INPUT') return false;
+  return !['checkbox', 'radio', 'button', 'submit'].includes(el.type);
+}
+
+// Set when a rebuild was skipped because an editable sidebar control had focus;
+// the focusout handler below runs the catch-up render.
+let sidebarRenderDeferred = false;
+
+// True while a mouse/touch/pen press that started inside the sidebar is still
+// down. Rebuilding mid-press would detach the pressed button before mouseup,
+// so its click would never fire (e.g. type a note, then press Post).
+let sidebarPointerDown = false;
+
+// Runs the deferred rebuild once it is safe: no editable sidebar control has
+// focus and no press inside the sidebar is in progress.
+function catchUpSidebarRender() {
+  if (!sidebarRenderDeferred || sidebarPointerDown) return;
+  const active = document.activeElement;
+  if (sidebarEl.contains(active) && isEditableControl(active)) return;
+  sidebarRenderDeferred = false;
+  renderSidebar();
+}
+
+sidebarEl.addEventListener('pointerdown', () => { sidebarPointerDown = true; }, true);
+// Wait a tick after release so the click handler has run before the DOM is replaced.
+window.addEventListener('pointerup', () => {
+  if (!sidebarPointerDown) return;
+  sidebarPointerDown = false;
+  setTimeout(catchUpSidebarRender, 0);
+});
+window.addEventListener('pointercancel', () => {
+  if (!sidebarPointerDown) return;
+  sidebarPointerDown = false;
+  setTimeout(catchUpSidebarRender, 0);
+});
+
+// Wait a tick so document.activeElement is the NEW focus target. If focus just
+// moved to another editable sidebar field, stay deferred.
+sidebarEl.addEventListener('focusout', () => setTimeout(catchUpSidebarRender, 0));
+
+// A <select> keeps focus after a change, which would hold the deferral open
+// well past the edit - blur it so the sidebar catches up.
+sidebarEl.addEventListener('change', (e) => {
+  if (e.target.tagName === 'SELECT') e.target.blur();
+});
+
+// Clicking/tapping the map should release any sidebar field the user was in,
+// otherwise the sidebar stays deferred (the canvas calls preventDefault, which
+// stops the browser blurring it for us).
+function blurSidebarFocus() {
+  const active = document.activeElement;
+  if (active && sidebarEl.contains(active) && typeof active.blur === 'function') active.blur();
+}
+
+// Coalesces bursts of renders (e.g. the up-to-3 token:stat:update broadcasts
+// one sheet save causes) into a single rebuild per animation frame.
+let sidebarRenderQueued = false;
+function scheduleSidebarRender() {
+  if (sidebarRenderQueued) return;
+  sidebarRenderQueued = true;
+  requestAnimationFrame(() => {
+    sidebarRenderQueued = false;
+    renderSidebar();
+  });
+}
+
 function renderSidebar() {
   if (!session) return;
+
+  // Don't yank the DOM out from under someone who is typing. The log updaters
+  // (appendCombatLogLine etc.) write into their own containers, so logs stay
+  // live; the rest of the sidebar catches up on blur.
+  if (sidebarEl.contains(document.activeElement) && isEditableControl(document.activeElement)) {
+    sidebarRenderDeferred = true;
+    refreshCombatActionsModal();
+    refreshTokenManagerModal();
+    return;
+  }
+
+  // Local-draft controls (session note box, marker form) don't mirror session
+  // state, so carry their values across the rebuild.
+  const drafts = {};
+  sidebarEl.querySelectorAll('[data-draft][id]').forEach((el) => { drafts[el.id] = el.value; });
+
   sidebarEl.innerHTML = role === 'gm' ? gmSidebarHtml() : playerSidebarHtml();
+
+  // Restore BEFORE wiring: wireMarkerForm() reads the shape select at wire time
+  // to show/hide the radius vs cone/cube fields.
+  for (const [id, value] of Object.entries(drafts)) {
+    const el = sidebarEl.querySelector('#' + id);
+    if (el) el.value = value;
+  }
+
   role === 'gm' ? wireGmSidebar() : wirePlayerSidebar();
   refreshCombatActionsModal();
   refreshTokenManagerModal();
@@ -2516,9 +3367,12 @@ function playerListHtml() {
 }
 
 function roomInfoHtml(roleLabel) {
-  return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+  // A campaign table shows the campaign's name above its (long, fixed) room code.
+  const campaignLine = campaignClient.campaignName ? `<strong>${escapeHtml(campaignClient.campaignName)}</strong><br/>Room: ` : '';
+  return `<div id="roomInfo">${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${combatControlHtml()}
+    ${forage.forageControlHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
     ${sessionNotesControlHtml()}
@@ -2593,7 +3447,7 @@ function sessionNotesHtml() {
     <h2>Session Notes</h2>
     <div id="sessionNotes" class="combat-log">${lines}</div>
     <div class="field row">
-      <input type="text" id="sessionNoteInput" placeholder="Type a note and press Enter..." autocomplete="off" />
+      <input type="text" id="sessionNoteInput" data-draft placeholder="Type a note and press Enter..." autocomplete="off" />
       <button type="button" id="postSessionNoteBtn" class="secondary">Post</button>
     </div>
   `;
@@ -2716,6 +3570,7 @@ function wireSessionNotesControls() {
     if (event.key === 'Enter') {
       event.preventDefault();
       postSessionNoteFromVtt();
+      event.target.blur(); // release focus so the deferred sidebar rebuild can run
     }
   });
 }
@@ -2834,23 +3689,24 @@ function markerFormHtml() {
     <h2>Markers</h2>
     <div class="field">
       <label>Shape</label>
-      <select id="markerShapeSelect">
+      <select id="markerShapeSelect" data-draft>
         <option value="circle">Circle (token-anchored point)</option>
         <option value="sphere">Sphere/Burst (placed point)</option>
         <option value="cone">Cone</option>
         <option value="cube">Cube/Line</option>
+        <option value="glyph">Glyph (placed point)</option>
       </select>
     </div>
     <div class="field row" id="markerRadiusField">
-      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" value="20" /></div>
-      <div><label>Color</label><input type="color" id="markerColorInput" value="#ff5252" /></div>
+      <div><label>Radius (ft)</label><input type="number" id="markerRadiusInput" data-draft value="20" /></div>
+      <div><label>Color</label><input type="color" id="markerColorInput" data-draft value="#ff5252" /></div>
     </div>
     <div class="field row" id="markerShapeFields" style="display:none;">
-      <div><label>Width (ft)</label><input type="number" id="markerWidthInput" value="10" /></div>
-      <div><label>Cone angle (deg)</label><input type="number" id="markerConeAngleInput" value="60" /></div>
+      <div><label>Width (ft)</label><input type="number" id="markerWidthInput" data-draft value="10" /></div>
+      <div><label>Cone angle (deg)</label><input type="number" id="markerConeAngleInput" data-draft value="60" /></div>
     </div>
     <p id="markerShapeHint" style="color:#666;font-size:12px;display:none;">Click the map to place the origin, then drag to aim and set length - release to confirm.</p>
-    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" placeholder="Fireball" /></div>
+    <div class="field"><label>Label (optional)</label><input type="text" id="markerLabelInput" data-draft placeholder="Fireball" /></div>
     <button id="placeMarkerBtn">Place on Map</button>
   `;
 }
@@ -2869,6 +3725,9 @@ function wireMarkerForm() {
     radiusField.style.display = isDirectional ? 'none' : '';
     shapeFields.style.display = isDirectional ? '' : 'none';
     shapeHint.style.display = isDirectional ? '' : 'none';
+    // A glyph is a fixed 5 ft icon, so hide just the Radius input (the Colour
+    // input shares its row and still applies).
+    document.getElementById('markerRadiusInput').parentElement.style.display = shapeSelect.value === 'glyph' ? 'none' : '';
   }
   shapeSelect.addEventListener('change', syncShapeFields);
   syncShapeFields();
@@ -2958,6 +3817,7 @@ function tokenManagerRowsHtml(tokens) {
             <div><label>Max HP</label><input type="number" class="maxHpInput" value="${maxHp}" /></div>
             <div><label>AC</label><input type="number" class="acInput" value="${t.ac ?? ''}" /></div>
           </div>
+          <div class="field" style="font-size:12px;color:#aaa;">${typeof t.knownAc === 'number' ? `Known AC ≤ ${t.knownAc}` : 'Known AC: none'} <button type="button" class="secondary knownAcBtn">Known AC…</button></div>
           ${gmAttacksHtml(t)}
           <div class="field"><label>Condition</label>
             <select class="conditionSelect">
@@ -2979,6 +3839,7 @@ function tokenManagerRowsHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
@@ -3003,6 +3864,7 @@ function tokenManagerRowsHtml(tokens) {
 function markerSizeLabel(marker) {
   if (marker.shape === 'cone') return `${marker.lengthFt}ft cone`;
   if (marker.shape === 'cube') return `${marker.lengthFt}x${marker.widthFt}ft`;
+  if (marker.shape === 'glyph') return 'glyph'; // fixed 5 ft, no size to report
   return `${marker.radiusFt} ft`;
 }
 
@@ -3171,9 +4033,7 @@ function closeMapSettingsModal() {
 }
 
 document.getElementById('mapSettingsCancelBtn').addEventListener('click', closeMapSettingsModal);
-mapSettingsModal.addEventListener('click', (e) => {
-  if (e.target === mapSettingsModal) closeMapSettingsModal();
-});
+closeOnBackdropPress(mapSettingsModal, closeMapSettingsModal);
 
 mapFileInput.addEventListener('change', async () => {
   const file = mapFileInput.files[0];
@@ -3430,9 +4290,7 @@ function closeAddTokenModal() {
 }
 
 document.getElementById('addTokenCancelBtn').addEventListener('click', closeAddTokenModal);
-addTokenModal.addEventListener('click', (e) => {
-  if (e.target === addTokenModal) closeAddTokenModal();
-});
+closeOnBackdropPress(addTokenModal, closeAddTokenModal);
 
 tokenTypeSelect.addEventListener('change', syncFieldVisibilityForType);
 
@@ -3675,9 +4533,7 @@ tokenManagerList.addEventListener('focusout', () => {
 
 document.getElementById('tokenManagerCloseBtn').addEventListener('click', closeTokenManagerModal);
 document.getElementById('tokenManagerAddBtn').addEventListener('click', () => openAddTokenModal('create'));
-tokenManagerModal.addEventListener('click', (e) => {
-  if (e.target === tokenManagerModal) closeTokenManagerModal();
-});
+closeOnBackdropPress(tokenManagerModal, closeTokenManagerModal);
 
 tokenManagerSearchInput.addEventListener('input', renderTokenManagerList);
 tokenManagerTypeFilter.addEventListener('change', renderTokenManagerList);
@@ -3718,7 +4574,9 @@ tokenManagerList.addEventListener('change', (e) => {
   } else if (e.target.classList.contains('soundFolderSelect')) {
     send({ type: 'token:stat:update', tokenId, stat: 'soundFolder', value: e.target.value || null });
   } else if (e.target.classList.contains('darkvisionToggle')) {
-    send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? 60 : 0 });
+    // On = the sheet's resolved darkvision if it has one, otherwise the usual 60ft.
+    const sheetDark = session.tokens[tokenId]?.sheetVision?.darkFt;
+    send({ type: 'token:stat:update', tokenId, stat: 'visionDarkFt', value: e.target.checked ? (sheetDark > 0 ? sheetDark : 60) : 0 });
   } else if (e.target.classList.contains('speedInput')) {
     const value = Number(e.target.value) || 0;
     send({ type: 'token:stat:update', tokenId, stat: 'speedFt', value });
@@ -3736,6 +4594,10 @@ tokenManagerList.addEventListener('click', (e) => {
 
   if (e.target.classList.contains('editTokenBtn')) {
     openAddTokenModal('edit', tokenId);
+    return;
+  }
+  if (e.target.classList.contains('knownAcBtn')) {
+    openKnownAcModal(tokenId);
     return;
   }
   // --- Manual stat-block attacks (checked before the row, since the delete
@@ -3792,6 +4654,10 @@ tokenManagerList.addEventListener('click', (e) => {
     saveTokenAsTemplate(token);
   } else if (e.target.classList.contains('recenterTokenBtn')) {
     recenterToken(tokenId);
+  } else if (e.target.classList.contains('planMoveBtn')) {
+    // The modal would cover the map, so close it first.
+    closeTokenManagerModal();
+    armMovePlan(tokenId);
   } else if (e.target.classList.contains('speedMinusBtn')) {
     adjustTokenSpeedRemaining(tokenId, -5);
   } else if (e.target.classList.contains('speedPlusBtn')) {
@@ -3892,12 +4758,14 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
             ${isProp ? '' : '<button class="secondary conditionsBtn">Conditions…</button>'}
+            ${forage.forageButtonHtml(t)}
             <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if your token ever gets dragged somewhere unreachable">Recenter on Map</button>
           </div>
           ${miniSheetHtml(t)}
@@ -3957,10 +4825,18 @@ function otherTokenListHtml(tokens) {
         : t.condition
           ? `Condition: ${escapeHtml(t.condition)}`
           : 'No status known';
+      // Known AC controls only when no true AC reached us (same rule as
+      // render/tokens.js's drawAcIndicator) - allies' real AC is just shown.
+      const trueAc = typeof t.ac === 'number' ? t.ac
+        : (t.stats && typeof t.stats.ac === 'number' ? t.stats.ac : null);
+      const knownAcHtml = trueAc === null && t.type !== 'prop'
+        ? `<div style="font-size:12px;color:#aaa;">${typeof t.knownAc === 'number' ? `<span style="color:#ffa726;">Known AC ≤ ${t.knownAc}</span> ` : ''}<button type="button" class="secondary knownAcBtn">Known AC…</button></div>`
+        : '';
       return `
-        <div class="token-card">
+        <div class="token-card" data-token-id="${escapeHtml(t.id)}">
           <div class="title"><span>${escapeHtml(t.name)} <span class="tag">${t.type}</span></span></div>
           <div style="font-size:12px;color:#aaa;">${detail}</div>
+          ${knownAcHtml}
           ${t.conditions && t.conditions.length ? `<div class="field">${conditionTagsHtml(t.conditions)}</div>` : ''}
         </div>
       `;
@@ -4195,6 +5071,14 @@ function wirePlayerSidebar() {
   wireSessionNotesControls();
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
 
+  // Delegated, so it keeps working when updateOtherTokensInViewList swaps the
+  // list's innerHTML on token:move.
+  document.getElementById('otherTokenList')?.addEventListener('click', (e) => {
+    if (!e.target.classList.contains('knownAcBtn')) return;
+    const card = e.target.closest('.token-card');
+    if (card?.dataset.tokenId) openKnownAcModal(card.dataset.tokenId);
+  });
+
   const ownList = document.getElementById('ownTokenList');
   if (!ownList) return;
   ownList.addEventListener('change', (e) => {
@@ -4227,6 +5111,8 @@ function wirePlayerSidebar() {
       openConditionsModal(tokenId);
     } else if (e.target.classList.contains('recenterTokenBtn')) {
       recenterToken(tokenId);
+    } else if (e.target.classList.contains('planMoveBtn')) {
+      armMovePlan(tokenId);
     } else if (e.target.classList.contains('speedMinusBtn')) {
       adjustTokenSpeedRemaining(tokenId, -5);
     } else if (e.target.classList.contains('speedPlusBtn')) {
@@ -4249,3 +5135,43 @@ function wirePlayerSidebar() {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// Forage (vtt-forage plan, unit C): the player popup, the GM popup and the finder's result card all
+// live in forage.js. Created last so every helper it borrows above exists. It never calls
+// renderSidebar(): it updates its own modals and two small sidebar spots directly.
+// ---------------------------------------------------------------------------
+// Campaign tables (campaign-system unit F): ticket fetch, seat takeover, kicks and reconnects. Quick
+// rooms never touch it (campaignClient.active stays false). Created before forage so it is ready
+// for the first join.
+const campaignClient = createCampaignClient({
+  connect,
+  closeSocket: () => { if (ws) ws.close(); },
+  // The ticket is the authority on who we are and which role we hold at this table.
+  setIdentity: ({ roomCode, role: newRole, userId, displayName }) => {
+    sessionId = roomCode;
+    role = newRole;
+    playerName = displayName;
+    // A GM keeps playerId = null, exactly as the Quick room create flow does.
+    playerId = newRole === 'player' ? userId : null;
+    accountPlayerId = userId;
+    accountPlayerName = displayName;
+  },
+});
+campaignClient.start();
+
+const forage = createForage({
+  getSession: () => session,
+  getRole: () => role,
+  getSessionId: () => sessionId,
+  getPlayerId: () => playerId,
+  // Forage endpoints are account-scoped, so a player who joined without the app's VTT link can't use it.
+  isAccountLinked: () => !!accountPlayerId,
+  sidebarEl,
+  escapeHtml,
+  advSourceLabel,
+  advReadoutText,
+  counterRowHtml,
+  bringModalToFront,
+  closeOnBackdropPress,
+});

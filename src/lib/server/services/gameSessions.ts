@@ -1,19 +1,39 @@
-import { query } from '$lib/server/db';
+import { query, withTransaction } from '$lib/server/db';
 import { sessions, broadcast, publish } from '$vtt/store.js';
 
 export type GameSession = { id: string; name: string; isActive: boolean; ownerUserId: string; createdAt: string };
 export type SessionNote = { id: string; gameSessionId: string; userId: string; displayName: string; message: string; createdAt: string };
 
-export async function createGameSession(userId: string, name: string): Promise<string> {
-  const result = await query<{ id: string }>(
-    'INSERT INTO game_sessions (owner_user_id, name) VALUES ($1,$2) RETURNING id',
-    [userId, name.trim() || 'New Session']
-  );
-  return result.rows[0].id;
+// With a campaignId the session belongs to that campaign's table. A campaign has one long-lived
+// room, so any session still marked active (left behind by a server restart) is closed first, in
+// the same transaction: a campaign never has two active sessions.
+export async function createGameSession(userId: string, name: string, campaignId: string | null = null): Promise<string> {
+  return withTransaction(async (client) => {
+    if (campaignId) {
+      // Lock the campaign row first so two quick Start clicks queue up instead of both inserting an
+      // active session (the second then deactivates the first).
+      await client.query('SELECT id FROM campaigns WHERE id = $1 FOR UPDATE', [campaignId]);
+      await client.query('UPDATE game_sessions SET is_active = false, updated_at = now() WHERE campaign_id = $1 AND is_active', [campaignId]);
+    }
+    const result = await client.query<{ id: string }>(
+      'INSERT INTO game_sessions (owner_user_id, name, campaign_id) VALUES ($1,$2,$3) RETURNING id',
+      [userId, name.trim() || 'New Session', campaignId]
+    );
+    return result.rows[0].id;
+  });
 }
 
+// The owner, a real DM (primary or co-DM) of the session's campaign, or a site admin may end it.
 export async function endGameSession(userId: string, gameSessionId: string): Promise<void> {
-  await query('UPDATE game_sessions SET is_active=false, updated_at=now() WHERE id=$1 AND owner_user_id=$2', [gameSessionId, userId]);
+  await query(
+    `UPDATE game_sessions s SET is_active = false, updated_at = now()
+     WHERE s.id = $1 AND (
+       s.owner_user_id = $2
+       OR EXISTS (SELECT 1 FROM users u WHERE u.id = $2 AND u.role = 'admin')
+       OR EXISTS (SELECT 1 FROM campaign_members m WHERE m.campaign_id = s.campaign_id AND m.user_id = $2 AND m.role IN ('dm', 'co_dm'))
+     )`,
+    [gameSessionId, userId]
+  );
 }
 
 // Any signed-in user may join, not just the owner - matches this app's existing
@@ -77,6 +97,7 @@ export async function listGameSessionsForUser(userId: string): Promise<GameSessi
      FROM game_sessions s
      LEFT JOIN game_session_notes n ON n.game_session_id = s.id AND n.user_id = $1
      WHERE s.owner_user_id = $1 OR n.user_id = $1
+        OR s.campaign_id IN (SELECT campaign_id FROM campaign_members WHERE user_id = $1)
      ORDER BY s.created_at DESC`,
     [userId]
   );

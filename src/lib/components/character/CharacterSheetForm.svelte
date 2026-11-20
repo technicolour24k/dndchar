@@ -2,11 +2,21 @@
   import { deserialize, enhance } from '$app/forms';
   import { invalidate } from '$app/navigation';
   import { mergeLogEntries, subscribeTopic } from '$lib/stores/liveUpdates';
-  import { untrack } from 'svelte';
+  import { backdropPress } from '$lib/ui/backdropPress';
+  import { tick, untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
-  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel } from '$lib/rules/dnd5e';
-  import { battleDamageBonuses as sharedBattleDamageBonuses, rollAttack, rollDamage, rollWithModifiers } from '$lib/rules/attackRoll';
+  import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
+  import ForageModal from '$lib/components/character/ForageModal.svelte';
+  import { readOnlyLock } from '$lib/ui/readOnlyLock';
+  import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
+  import type { ForageMine } from '$lib/types/forage';
+  import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
+  import {
+    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, defaultRollChoices, poolSummary,
+    rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
+  } from '$lib/rules/attackRoll';
+  import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { CharacterContentInstance, ContentType } from '$lib/types/content';
@@ -19,6 +29,10 @@
     activeEncounterId = null,
     activeVttSessionId = null,
     activeGameSessionId = null,
+    currentUserId = null,
+    access = null,
+    readOnly = false,
+    ownerName = null,
     onVersionHistory
   }: {
     character: CharacterDetail;
@@ -28,6 +42,13 @@
     activeEncounterId?: string | null;
     activeVttSessionId?: string | null;
     activeGameSessionId?: string | null;
+    currentUserId?: string | null;
+    // Why this user may edit the sheet (owner, campaign DM or the admin override); drives the badge.
+    access?: { isOwner: boolean; isCampaignDm: boolean; viaAdmin: boolean } | null;
+    // True for a campaign member who can view but not edit: every control in the tab bodies and in the editing modals
+    // is locked (readOnlyLock; the "?" breakdowns, read-out openers and Close stay usable) and Save / the unsaved-changes prompt / forage / Activity Log room controls are hidden.
+    readOnly?: boolean;
+    ownerName?: string | null;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -121,7 +142,36 @@
     { key: 'junk', label: 'Junk' },
     { key: 'misc', label: 'Misc' }
   ]);
+  // Stale-save guard: the sheet version this form last knew about, posted as a hidden field with
+  // Save. It follows the server's value on every reload, EXCEPT while there are unsaved local edits
+  // (then someone else's save must still be caught, so it stays at what the edits were made against).
+  // A successful save sets it straight from the save response, so the user's own earlier save never
+  // makes their next one look stale, including saves made through the in-place saveSheetNow path.
+  let sheetToken = $state(untrack(() => character.sheetVersion));
+  $effect(() => {
+    // Tracks ONLY the server's version: reading hasUnsavedChanges untracked stops this re-running (and
+    // briefly resetting the token to a not-yet-reloaded value) the moment a save clears that flag.
+    const serverVersion = character.sheetVersion;
+    if (!untrack(() => hasUnsavedChanges)) sheetToken = serverVersion;
+  });
+  // Set when the server refused a Save as stale; the banner offers a reload.
+  let staleSheet = $state(false);
+  function reloadSheet() {
+    hasUnsavedChanges = false; // so the beforeunload prompt does not ask about edits we are discarding
+    window.location.reload();
+  }
   const inventoryRows = $derived(character.inventory);
+  // What the inventory looked like when this sheet was loaded (and after each reload). Posted with
+  // Save so the server can tell which rows and fields the user actually changed, and leave the rest
+  // alone (a forage haul, VTT item use or equip action may have changed them since). The form
+  // inputs render from the same rows, so "input differs from baseline" means "the user edited it".
+  const inventoryBaselineJson = $derived(JSON.stringify(inventoryRows.filter((item) => item.id).map((item) => ({
+    id: item.id, name: item.name, category: item.category, location: item.location, quantity: item.quantity,
+    equipped: item.equipped, isEquipment: item.isEquipment, acBonus: item.acBonus, toHitBonus: item.toHitBonus,
+    damageBonus: item.damageBonus, attackAbility: item.attackAbility, proficient: item.proficient,
+    sourceContentId: item.sourceContentId ?? null, attuned: item.attuned ?? false, damageRolls: item.damageRolls,
+    effects: item.effects, notes: item.notes
+  }))));
   const equippedInventoryRows = $derived(equippedItems(inventoryRows));
   const backpackInventoryRows = $derived(
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
@@ -149,6 +199,78 @@
   let deathSaveFailures = $state(0);
   let savingThrowsOpen = $state(false);
   let skillChecksOpen = $state(false);
+
+  // Forage (vtt-forage unit E). The sheet owns the latest `mine` (the finder's private forage state)
+  // so the button badge stays right while the popup is closed. It is fetched: once on load when there
+  // is no room to watch (a room's first resync does it otherwise), when a detail-free `forage:ping`
+  // arrives on the room topic, on a reconnect resync, and whenever the popup opens. Nothing polls.
+  let forageOpen = $state(false);
+  // Forage is for the character's owner only. The user wants player stand-ins (someone acting for an
+  // absent player's character) later: widen THIS one flag (e.g. `|| standInFor(character)`) and the
+  // server's loadOwnedCharacter check, and the button, the on-load fetch and the pings all follow.
+  const forageOwner = $derived(!readOnly && !!currentUserId && currentUserId === character.ownerUserId);
+  let forageMine = $state<ForageMine | null>(null);
+  const forageBadge = $derived(forageBadgeText(forageMine, character.id));
+  // Find tables belong to campaigns: with no campaign, the wrong room, or a campaign with no tables the
+  // button looks off with a plain reason (never anything about tables); a click still opens the popup,
+  // which re-checks with the server and shows the reason or the form. A forage already in flight
+  // or a result waiting keeps it live so it can be finished.
+  const forageOff = $derived(forageUnavailableReason(forageMine, character.id));
+  // A find landed while the sheet had unsaved edits, so the new rows wait for Save (see haulLanded).
+  let haulWaitingForSave = $state(false);
+  // DM-approved hauls already dealt with (by request id), so one result never reloads the sheet twice.
+  const handledHauls = new Set<string>();
+  // When this sheet mounted, on the server's clock (learned from the first successful `mine`). A DM
+  // result closed BEFORE this counts as pre-existing: it is already in the rows the sheet loaded, so it
+  // must not reload. One closed after it is new, even if the first fetch failed or came late.
+  const mountedAtClient = Date.now();
+  let serverOffsetMs: number | null = null;
+  // Only the latest response may update state (a slow older one must not overwrite a newer one).
+  // The parent keys this component on the character id, so none of this leaks between characters.
+  let forageSeq = 0;
+
+  async function refreshForage() {
+    if (!forageOwner) return;
+    const characterId = character.id;
+    const seq = ++forageSeq;
+    try {
+      const response = await fetch(`/vtt/api/forage/mine?characterId=${encodeURIComponent(characterId)}`);
+      if (!response.ok) return;
+      const mine = (await response.json()) as ForageMine;
+      if (seq !== forageSeq || characterId !== character.id) return;
+      forageMine = mine;
+      if (serverOffsetMs === null && typeof mine.serverNow === 'number') serverOffsetMs = mine.serverNow - Date.now();
+      const decision = haulDecision({
+        mine, characterId, mountedAt: mountedAtClient + (serverOffsetMs ?? 0), handled: handledHauls, hasUnsavedChanges
+      });
+      if (decision.key) handledHauls.add(decision.key);
+      if (decision.action === 'reload') haulLanded();
+      else if (decision.action === 'defer') haulWaitingForSave = true;
+    } catch {
+      // Offline or the server hiccuped: the badge just stays as it was.
+    }
+  }
+
+  // New items from a forage (self-serve pass, or a DM approval) are already in the database. With no
+  // unsaved edits the sheet reloads so the new or stacked rows show. With unsaved edits it must NOT
+  // reload (that could re-render rows mid-edit, see the notes by runInventoryAction), so it says the
+  // find will appear on Save. The changes-only Save leaves rows the user didn't touch alone, so that
+  // Save keeps the find and the post-save load then shows it.
+  function haulLanded() {
+    if (hasUnsavedChanges) {
+      haulWaitingForSave = true;
+    } else {
+      void invalidate('app:character-sheet');
+    }
+  }
+
+  // With no room, nothing else will fetch it for the badge. (In a room the subscription's first resync
+  // does, so this doesn't double up.) Keyed on the id only, so a reload doesn't refetch.
+  const forageCharacterId = $derived(character.id);
+  $effect(() => {
+    if (!forageCharacterId || activeVttSessionId || !forageOwner) return;
+    untrack(() => void refreshForage());
+  });
   let playerModificationsOpen = $state(false);
   let activityLogOpen = $state(false);
   let sessionNotesModalId = $state<string | null>(null);
@@ -223,26 +345,8 @@
     { key: 'all', label: 'All' }
   ] as const;
   const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
-  const skillChecks: Array<{ key: string; name: string; ability: AbilityKey }> = [
-    { key: 'acrobatics', name: 'Acrobatics', ability: 'dex' },
-    { key: 'animal_handling', name: 'Animal Handling', ability: 'wis' },
-    { key: 'arcana', name: 'Arcana', ability: 'int' },
-    { key: 'athletics', name: 'Athletics', ability: 'str' },
-    { key: 'deception', name: 'Deception', ability: 'cha' },
-    { key: 'history', name: 'History', ability: 'int' },
-    { key: 'insight', name: 'Insight', ability: 'wis' },
-    { key: 'intimidation', name: 'Intimidation', ability: 'cha' },
-    { key: 'investigation', name: 'Investigation', ability: 'int' },
-    { key: 'medicine', name: 'Medicine', ability: 'wis' },
-    { key: 'nature', name: 'Nature', ability: 'int' },
-    { key: 'perception', name: 'Perception', ability: 'wis' },
-    { key: 'performance', name: 'Performance', ability: 'cha' },
-    { key: 'persuasion', name: 'Persuasion', ability: 'cha' },
-    { key: 'religion', name: 'Religion', ability: 'int' },
-    { key: 'sleight_of_hand', name: 'Sleight of Hand', ability: 'dex' },
-    { key: 'stealth', name: 'Stealth', ability: 'dex' },
-    { key: 'survival', name: 'Survival', ability: 'wis' }
-  ];
+  // The 18-skill list and the check maths live in $lib/rules/skills (shared with the server).
+  const skillChecks = SKILL_CHECKS;
 
   function meta(field: string, fallback = '') {
     return String(metadata[field] ?? fallback);
@@ -295,7 +399,7 @@
     Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>
   );
   const skillCheckModifierBonuses = $derived(
-    Object.fromEntries(skillChecks.map((skill) => [skill.key, resolvedAdditiveModifiers(character.modifierSources, [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], { classes: classRows })])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
+    Object.fromEntries(skillChecks.map((skill) => [skill.key, skillModifierBonuses(character.modifierSources, classRows, skill)])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
   );
 
   // The single reusable resolver (src/lib/rules/characterStats.ts) for all 9 overridable
@@ -427,6 +531,17 @@
     };
   });
 
+  // Senses (vision, darkvision, ...) resolved from modifiers, read-only on the sheet. Each sense
+  // carries its own source-attributed breakdown lines (highest "at least" grant wins, bonuses add).
+  const senses = $derived(visionBreakdown(character.modifierSources, { classes: classRows }));
+  const senseRows = $derived([
+    { label: 'Vision', sense: senses.normalFt, always: true },
+    { label: 'Darkvision', sense: senses.darkFt, always: false },
+    { label: 'Truesight', sense: senses.trueFt, always: false },
+    { label: "Devil's Sight", sense: senses.devilFt, always: false }
+  ].filter((row) => row.always || row.sense.value > 0));
+  const senseHelpLines = $derived(senseRows.flatMap((row) => [`${row.label}:`, ...row.sense.lines.map((line) => `  ${line}`)]));
+
   function openFormulaHelp(title: string, lines: string[]) {
     formulaHelp = { title, lines };
   }
@@ -514,7 +629,7 @@
 
   // Browser's own "leave site?" prompt - the only safety net now autosave is gone.
   function warnIfUnsaved(event: BeforeUnloadEvent) {
-    if (!hasUnsavedChanges) return;
+    if (readOnly || !hasUnsavedChanges) return;
     event.preventDefault();
     event.returnValue = '';
   }
@@ -594,6 +709,55 @@
       deathSaveFailures = deathSaveFailures === value ? value - 1 : value;
     }
     markUnsaved();
+  }
+
+  // Rolls a death save through the shared panel/dice-pool path, then applies the suggested result
+  // exactly like a manual icon click would (local state + markUnsaved), so the player can still
+  // click the icons to correct it. Rolling is never blocked (not at 3 successes/failures, not above
+  // 0 HP) - it only adds a gentle note.
+  function rollDeathSave(choices: RollChoices = defaultRollChoices()) {
+    // Modifier 0: a death save has no ability modifier (5e RAW); only saving_throw.all style
+    // modifiers (Bless, flat save bonuses) apply. The success/failure is the TOTAL against 10;
+    // a natural 1 and a natural 20 are judged on the KEPT die (see resolveDeathSave).
+    const result = rollText(0, deathSaveCandidates, [], false, choices);
+    const outcome = resolveDeathSave(result.natural, result.total, deathSaveSuccesses, deathSaveFailures);
+    deathSaveSuccesses = outcome.successes;
+    deathSaveFailures = outcome.failures;
+    markUnsaved();
+
+    const notes = [
+      outcome.kind === 'revived' ? 'Natural 20: regain 1 HP, both counters reset.'
+        : outcome.kind === 'critical_failure' ? 'Natural 1: two failures.'
+        : outcome.kind === 'success' ? 'Success.' : 'Failure.'
+    ];
+    if (outcome.regainHp) notes.push(regainOneHp());
+    if (currentHpOnScreen() > 0) notes.push('Note: current HP is above 0, so a death save is not normally needed.');
+    simpleRollResult = { title: 'Death Saving Throw', lines: [{ label: 'Death Save', ...result }], passiveNote: notes.join(' ') };
+    void logRoll('Death Save', result);
+  }
+
+  // Natural 20 on a death save: adds 1 to the Current HP box the same way typing in it would (the
+  // box is an uncontrolled form field, so set it and fire its input event - that flags unsaved
+  // changes through the form's own oninput). Falls back to a text note if the box isn't on screen.
+  // The Current HP box's live value (what the player sees, including unsaved edits), falling back to
+  // the server value when the box isn't on screen.
+  function currentHpOnScreen(): number {
+    const input = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpCurrent"]');
+    return input ? Number(input.value) || 0 : hp.currentValue;
+  }
+
+  function regainOneHp(): string {
+    const input = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpCurrent"]');
+    if (!input) return 'Regain 1 HP (set it by hand).';
+    const before = Number(input.value) || 0;
+    // Cap against the Max HP box (unsaved edits included), falling back to the server max, and
+    // never lower HP (e.g. if the box is already above max).
+    const maxInput = sheetFormEl?.querySelector<HTMLInputElement>('input[name="hpMax"]');
+    const max = Math.max(maxInput ? Number(maxInput.value) || 0 : hp.maxValue, 1);
+    const after = Math.max(before, Math.min(max, before + 1));
+    input.value = String(after);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return `HP ${before} -> ${after}.`;
   }
 
   // Both effects below resync local edit state from the server only when the server value actually
@@ -679,8 +843,13 @@
   }
 
   function skillCheckTotal(skill: { key: string; ability: AbilityKey }) {
-    const bonuses = skillCheckModifierBonuses[skill.key] ?? [];
-    return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0) + bonuses.reduce((sum, b) => sum + b.value, 0);
+    return skillCheckBonus({
+      abilityScores,
+      proficient: isSkillProficient(skill.key),
+      proficiencyBonus: prof,
+      modifierSources: character.modifierSources,
+      classes: classRows
+    }, skill).total;
   }
 
   function skillCheckFormula(skill: { key: string; ability: AbilityKey; name: string }): string[] {
@@ -693,6 +862,60 @@
     ];
   }
 
+  // The shared pre-roll options panel (RollOptionsModal.svelte), shown before every d20 roll on the
+  // sheet. It only collects choices (unticked advantage sources, the manual adv/dis counters, and
+  // the INTERIM manual damage-dice delta); `run` then does the real roll with them. Every caller
+  // builds its candidates here (askRoll/askAttackRoll), and the roll function uses the very same
+  // candidate lists, so the panel's preview can't drift from what actually rolls.
+  type RollOptionsSpec = {
+    title: string;
+    advantage: { effects: typeof character.modifierSources; candidates: string[]; context: ModifierContext; batch?: boolean } | null;
+    damageDice: { baseExpression: string } | null;
+    run: (choices: RollChoices) => void;
+  };
+  let rollOptions = $state<RollOptionsSpec | null>(null);
+
+  // Focus restore: remember the button that opened the panel, and give it focus back once the panel
+  // AND the result modal that follows it have both closed (so keyboard users land where they were).
+  let rollTrigger: HTMLElement | null = null;
+  function rememberRollTrigger() {
+    const active = document.activeElement;
+    rollTrigger = active instanceof HTMLElement && active !== document.body ? active : null;
+  }
+  $effect(() => {
+    if (rollOptions || simpleRollResult || rollResult || !rollTrigger) return;
+    const trigger = rollTrigger;
+    rollTrigger = null;
+    void tick().then(() => { if (trigger.isConnected) trigger.focus(); });
+  });
+
+  function submitRollOptions(choices: RollChoices) {
+    const spec = rollOptions;
+    rollOptions = null;
+    spec?.run(choices);
+  }
+
+  // A plain d20 roll (save, skill, ability check, initiative, death save).
+  function askRoll(title: string, candidates: string[], run: (choices: RollChoices) => void, ability?: AbilityKey) {
+    rememberRollTrigger();
+    rollOptions = { title, advantage: { effects: character.modifierSources, candidates, context: { classes: classRows, ability } }, damageDice: null, run };
+  }
+
+  // "Roll all ...": counters only, applied to every line in the batch (the sources differ per line,
+  // so there are no per-source tick boxes). Batches are not logged, as before.
+  function askBatchRoll(title: string, run: (choices: RollChoices) => void) {
+    rememberRollTrigger();
+    rollOptions = { title, advantage: { effects: [], candidates: [], context: {}, batch: true }, damageDice: null, run };
+  }
+
+  // Candidate lists, shared by the panel and the roll functions.
+  const saveCandidates = (key: AbilityKey) => [`saving_throw.${key}`];
+  const abilityCheckCandidates = (key: AbilityKey) => [`ability_check.${key}`];
+  const initiativeCandidates = ['initiative'];
+  // There is no death-save target in the rules model yet, so a death save counts as a saving throw:
+  // saving_throw.all advantage/disadvantage (and Bless-style bonuses) apply, nothing else does.
+  const deathSaveCandidates = ['saving_throw.death'];
+
   // Thin wrapper over the shared, pure rollWithModifiers (src/lib/rules/attackRoll.ts) - the
   // component just supplies its own reactive modifierSources and RNG. The VTT's server endpoint
   // calls the exact same function, so saves/skills/attacks can't drift between the two surfaces.
@@ -700,32 +923,50 @@
   // folded in (saves, skills, initiative - all of which go through resolvedAdditiveModifiers()/
   // resolveCharacterStats() before calling this), otherwise rollWithModifiers would add them a
   // second time (see attackRoll.ts's flatModifiersIncluded comment).
-  function rollText(modifier: number, candidates: string[] = [], modifierBreakdown: Array<{ label: string; value: number }> = [], flatModifiersIncluded = false) {
-    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie, { flatModifiersIncluded });
+  //
+  // `choices` are the user's picks from the roll-options panel (unticked sources and the manual
+  // situational counters). The sheet has no target or token, so only the attacker's own sources and
+  // the situational counters can apply here.
+  function rollText(
+    modifier: number,
+    candidates: string[] = [],
+    modifierBreakdown: Array<{ label: string; value: number }> = [],
+    flatModifiersIncluded = false,
+    choices: RollChoices = defaultRollChoices(),
+    // The roll's ability (a save's ability, a skill's ability, 'dex' for initiative), so
+    // "ability:dex" gated modifiers apply. Undefined for rolls with no ability (death saves).
+    ability?: AbilityKey
+  ) {
+    return rollWithModifiers(character.modifierSources, modifier, candidates, modifierBreakdown, rollDie, {
+      flatModifiersIncluded,
+      context: { classes: classRows, ability },
+      extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+      disabledSourceIds: choices.disabledSourceIds
+    });
   }
 
-  function rollAllSavingThrows() {
+  function rollAllSavingThrows(choices: RollChoices = defaultRollChoices()) {
     simpleRollResult = {
       title: 'Saving Throws',
-      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), [`saving_throw.${key}`], [], true) }))
+      lines: abilityOrder.map((key) => ({ label: `${key.toUpperCase()} Save`, ...rollText(savingThrowTotal(key), saveCandidates(key), [], true, choices, key) }))
     };
   }
 
-  function rollAllSkillChecks() {
+  function rollAllSkillChecks(choices: RollChoices = defaultRollChoices()) {
     simpleRollResult = {
       title: 'Skill Checks',
-      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], [], true) }))
+      lines: skillChecks.map((skill) => ({ label: skill.name, ...rollText(skillCheckTotal(skill), skillCandidates(skill), [], true, choices, skill.ability) }))
     };
   }
 
-  function rollSingleSavingThrow(key: AbilityKey) {
+  function rollSingleSavingThrow(key: AbilityKey, choices: RollChoices = defaultRollChoices()) {
     const label = `${key.toUpperCase()} Save`;
-    const result = rollText(savingThrowTotal(key), [`saving_throw.${key}`], [], true);
+    const result = rollText(savingThrowTotal(key), saveCandidates(key), [], true, choices, key);
     simpleRollResult = { title: `${key.toUpperCase()} Saving Throw`, lines: [{ label, ...result }] };
     void logRoll(label, result);
   }
 
-  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }) {
+  function rollSingleSkillCheck(skill: { key: string; ability: AbilityKey; name: string }, choices: RollChoices = defaultRollChoices()) {
     const passiveScores: Record<string, number> = {
       perception: stats.passivePerception.value,
       insight: stats.passiveInsight.value,
@@ -734,7 +975,7 @@
     const passiveNote = skill.key in passiveScores
       ? `Your passive ${skill.name} is ${passiveScores[skill.key]}.`
       : undefined;
-    const result = rollText(skillCheckTotal(skill), [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], [], true);
+    const result = rollText(skillCheckTotal(skill), skillCandidates(skill), [], true, choices, skill.ability);
     simpleRollResult = {
       title: skill.name,
       lines: [{ label: skill.name, ...result }],
@@ -743,17 +984,17 @@
     void logRoll(skill.name, result);
   }
 
-  function rollAbilityCheck(key: AbilityKey) {
+  function rollAbilityCheck(key: AbilityKey, choices: RollChoices = defaultRollChoices()) {
     const label = `${key.toUpperCase()} Check`;
     // Deliberately flatModifiersIncluded: false (the default) - rollAbilityCheck passes the raw
     // ability mod only, with no bonus/penalty modifiers folded in first.
-    const result = rollText(abilityModifier(abilityScores[key]), [`ability_check.${key}`]);
+    const result = rollText(abilityModifier(abilityScores[key]), abilityCheckCandidates(key), [], false, choices, key);
     simpleRollResult = { title: `${key.toUpperCase()} Ability Check`, lines: [{ label, ...result }] };
     void logRoll(label, result);
   }
 
-  function rollInitiative() {
-    const result = rollText(stats.initiative.value, ['initiative'], [], true);
+  function rollInitiative(choices: RollChoices = defaultRollChoices()) {
+    const result = rollText(stats.initiative.value, initiativeCandidates, [], true, choices, 'dex');
     simpleRollResult = { title: 'Initiative', lines: [{ label: 'Initiative', ...result }] };
     void logRoll('Initiative', result);
   }
@@ -895,6 +1136,7 @@
     const unsubscribe = subscribeTopic(`room:${sessionId}`, {
       onResync: () => {
         refreshActivityStatus();
+        void refreshForage();
         fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
         if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
       },
@@ -905,6 +1147,10 @@
           combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
         } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
           refreshActivityStatus();
+        } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
+          // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
+          // nothing read in here can become a dependency of this effect (Review 3).
+          untrack(() => void refreshForage());
         }
       }
     });
@@ -952,13 +1198,27 @@
   // Fire-and-forget - a dropped log write shouldn't ever block or fail the roll
   // itself. Skipped entirely when the character hasn't joined a VTT room, same
   // "nothing to log against" gate the server action itself also applies.
-  async function logRoll(label: string, result: { text: string; natural: number; total: number }) {
+  async function logRoll(
+    label: string,
+    result: { text: string; natural: number; total: number; pool?: AttackPool },
+    extras: { manualDamageDice?: number } = {}
+  ) {
     if (!activeVttSessionId) return;
     const body = new FormData();
     body.set('label', label);
     body.set('total', String(result.total));
     body.set('breakdown', result.text);
     body.set('natural', String(result.natural));
+    // The d20 pool (for the "(3d20 adv x2, keeps 17)" suffix). The server validates these.
+    if (result.pool) {
+      body.set('poolSize', String(result.pool.size));
+      body.set('poolNet', String(result.pool.net));
+      body.set('poolKept', String(result.pool.kept));
+      body.set('poolManualAdv', String(result.pool.manualAdvantage));
+      body.set('poolManualDis', String(result.pool.manualDisadvantage));
+    }
+    // INTERIM: manual damage-dice delta (weapon attacks).
+    if (extras.manualDamageDice) body.set('manualDamageDice', String(extras.manualDamageDice));
     await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
   }
 
@@ -1064,13 +1324,22 @@
       headers: { 'x-sveltekit-action': 'true' }
     });
     let ok = false;
+    let stale = false;
     try {
-      ok = response.ok && deserialize(await response.text()).type === 'success';
+      const parsed = deserialize(await response.text());
+      ok = parsed.type === 'success';
+      if (parsed.type === 'success') {
+        const next = (parsed.data as { sheetVersion?: number } | undefined)?.sheetVersion;
+        if (typeof next === 'number') sheetToken = next;
+      } else if (parsed.type === 'failure') {
+        stale = Boolean((parsed.data as { staleSheet?: boolean } | undefined)?.staleSheet);
+      }
     } catch {
       // Non-JSON error page (e.g. a 500) - treat as a failed save.
     }
-    if (ok) hasUnsavedChanges = false;
-    saveStatus = ok ? 'Saved' : 'Save failed';
+    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; }
+    staleSheet = stale;
+    saveStatus = ok ? 'Saved' : stale ? 'Not saved' : 'Save failed';
     return ok;
   }
 
@@ -1193,14 +1462,37 @@
     return sharedBattleDamageBonuses(character.modifierSources, item, classRows, outcomes);
   }
 
-  function rollBattleAction(item: InventoryItem) {
-    rollResult = rollAttack(item, {
+  // Opens the shared panel for a weapon attack: advantage sources plus the INTERIM damage-dice control.
+  function askAttackRoll(item: InventoryItem) {
+    rememberRollTrigger();
+    rollOptions = {
+      title: item.name || 'Attack',
+      advantage: {
+        effects: character.modifierSources,
+        candidates: attackCandidatesFor(item),
+        context: { classes: classRows, ability: item.attackAbility, attackType: 'melee_weapon' }
+      },
+      damageDice: { baseExpression: item.damageRolls },
+      run: (choices) => rollBattleAction(item, choices)
+    };
+  }
+
+  function rollBattleAction(item: InventoryItem, choices: RollChoices = defaultRollChoices()) {
+    const attackResult = rollAttack(item, {
       modifierSources: character.modifierSources,
       abilityScores,
       proficiencyBonus: prof,
       classes: classRows,
-      rollDie
+      rollDie,
+      extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+      disabledSourceIds: choices.disabledSourceIds,
+      manualDamageDice: choices.manualDamageDice // INTERIM
     });
+    rollResult = attackResult;
+    // Sheet attacks now log like the other sheet rolls (once, here, after the panel).
+    void logRoll(`${item.name || 'Attack'} attack`,
+      { text: attackResult.attack, natural: attackResult.attackNatural, total: attackResult.attackTotal, pool: attackResult.attackPool },
+      { manualDamageDice: attackResult.manualDamageDice });
   }
 
   // Per vtt-phase-3-magic-spec.md: the character sheet just displays what a spell resolves
@@ -1208,27 +1500,105 @@
   // job). Runs resolveSpellDamage() client-side (unlike the VTT's vanilla client, this
   // component can import $lib directly) - same function, same Modifier-aware damage the
   // VTT's roll-spell endpoint produces.
-  function rollSpellDamage(spell: { name: string; spellLevel: number | null; spellDamage?: NonNullable<CharacterContentInstance['spellDamage']> }) {
+  type SheetSpell = { name: string; spellLevel: number | null; spellDamage?: NonNullable<CharacterContentInstance['spellDamage']> };
+
+  // A spell's resolved damage at the character's level (cantrips scale with character level; levelled
+  // spells are shown at their own base level). `outcomes` lets a crit-gated modifier apply once the
+  // to-hit is known. Null when the spell has no damage dice.
+  function spellProfile(spell: SheetSpell, outcomes: string[] = []) {
     const damage = spell.spellDamage;
-    if (!damage || !damage.baseDice) return;
-    const profile = resolveSpellDamage(
+    if (!damage || !damage.baseDice) return null;
+    return resolveSpellDamage(
       { name: spell.name, spellLevel: spell.spellLevel ?? 0, resolutionType: damage.resolutionType, damageType: damage.damageType,
         baseDice: damage.baseDice, saveAbility: damage.saveAbility, saveEffect: damage.saveEffect, scaling: damage.scaling },
-      { castAtSlotLevel: spell.spellLevel ?? 0, casterLevel: level, modifierSources: character.modifierSources }
+      { castAtSlotLevel: spell.spellLevel ?? 0, casterLevel: level, modifierSources: character.modifierSources, outcomes }
     );
-    const rolled = rollDamage(profile.diceExpression, 0, 0, '', profile.flatBonuses, profile.extraDice, rollDie);
-    const resolutionText = profile.resolution === 'save'
-      ? `Save (${(profile.saveAbility || '').toUpperCase()}, ${profile.saveEffect === 'negate' ? 'negate' : 'half'} on success)`
-      : profile.resolution === 'attack' ? 'Spell Attack' : 'Automatic';
-    rollResult = { title: spell.name, attack: '', damage: rolled.lines, effects: `${resolutionText}${profile.damageType ? ` · ${profile.damageType}` : ''}` };
   }
 
+  // The spell's damage dice and the INTERIM damage-dice delta, rolled. Shared by the damage-only
+  // spells and the attack spells (which add a to-hit roll first).
+  function rollSpellDice(spell: SheetSpell, profile: NonNullable<ReturnType<typeof spellProfile>>, choices: RollChoices, critical = false) {
+    const adjusted = adjustPrimaryDamageDice(profile.diceExpression, choices.manualDamageDice);
+    const rolled = rollDamage(adjusted.expression, 0, 0, '', profile.flatBonuses, profile.extraDice, rollDie, critical);
+    const scalingLine = profile.scalingNote ? [`Dice: ${profile.diceExpression} (${profile.scalingNote})`] : [];
+    return { adjusted, lines: [...(adjusted.auditLine ? [adjusted.auditLine] : []), ...scalingLine, ...rolled.lines] };
+  }
+
+  // Per vtt-phase-3-magic-spec.md: the sheet rolls a spell for reference - no target/application
+  // concept here (that's the VTT's job). Same resolveSpellDamage() the VTT's roll-spell endpoint uses.
+  // Attack spells get the full roll-options panel and roll to-hit first (like weapon attacks);
+  // save and automatic spells stay damage-only, with just the INTERIM damage-dice control.
+  function rollSpellDamage(spell: SheetSpell) {
+    const profile = spellProfile(spell);
+    if (!profile) return;
+    // Computed once, before the panel opens, so its preview and the roll agree.
+    rememberRollTrigger();
+    const spellContext = { classes: classRows, ability: spellcastingAbility, attackType: 'spell' } as const;
+
+    if (profile.resolution === 'attack') {
+      rollOptions = {
+        title: spell.name,
+        advantage: { effects: character.modifierSources, candidates: spellAttackCandidates, context: spellContext },
+        damageDice: { baseExpression: profile.diceExpression },
+        run: (choices) => {
+          // Same to-hit path as the VTT's roll-spell: stats.spellAttackBonus already folds in
+          // spell attack modifiers and any manual override, so the flat sum is skipped.
+          const bonus = stats.spellAttackBonus.value;
+          const attackRoll = rollWithModifiers(character.modifierSources, bonus, spellAttackCandidates,
+            [{ label: 'Spell Attack', value: bonus }], rollDie, {
+              flatModifiersIncluded: true,
+              context: spellContext,
+              extraAdvantageSources: situationalAdvantageSources(choices.situationalAdvantage, choices.situationalDisadvantage),
+              disabledSourceIds: choices.disabledSourceIds
+            });
+          const outcomes = resolveD20Outcomes(attackRoll.natural, resolveCritThreshold(character.modifierSources, { attackType: 'spell' }));
+          // Re-resolve with the outcomes so crit-gated damage modifiers apply, as a weapon crit does.
+          const hitProfile = spellProfile(spell, outcomes) ?? profile;
+          const dice = rollSpellDice(spell, hitProfile, choices, outcomes.includes('critical_hit'));
+          rollResult = {
+            title: spell.name,
+            attack: `${attackRoll.text} (beats AC ${attackRoll.total} or below)${outcomes.length ? ` - ${outcomes.join(', ')}` : ''}`,
+            damage: dice.lines,
+            effects: `Spell Attack${hitProfile.damageType ? ` · ${hitProfile.damageType}` : ''}`
+          };
+          void logRoll(`${spell.name} attack`,
+            { text: attackRoll.text, natural: attackRoll.natural, total: attackRoll.total, pool: attackRoll.pool },
+            { manualDamageDice: dice.adjusted.applied });
+        }
+      };
+      return;
+    }
+
+    // Save / automatic: no d20 here, so only the INTERIM damage-dice control.
+    rollOptions = {
+      title: spell.name,
+      advantage: null,
+      damageDice: { baseExpression: profile.diceExpression },
+      run: (choices) => {
+        const dice = rollSpellDice(spell, profile, choices);
+        const resolutionText = profile.resolution === 'save'
+          ? `Save (${(profile.saveAbility || '').toUpperCase()}, ${profile.saveEffect === 'negate' ? 'negate' : 'half'} on success)`
+          : 'Automatic';
+        rollResult = {
+          title: spell.name,
+          attack: '',
+          damage: dice.lines,
+          effects: `${resolutionText}${profile.damageType ? ` · ${profile.damageType}` : ''}`
+        };
+      }
+    };
+  }
+
+  // Spell list row summary: the SCALED dice at the character's level (levelled spells at their base
+  // level), merged ("2d10"), not the raw base dice. Save details only show for save spells - a
+  // stored save ability on an attack spell is ignored here.
   function spellDamageSummary(spell: CharacterContentInstance): string {
     const damage = spell.spellDamage;
-    if (!damage || !damage.baseDice) return '';
+    const profile = spellProfile(spell);
+    if (!damage || !profile) return '';
     const resolutionLabel = damage.resolutionType === 'save' ? `Save (${damage.saveAbility.toUpperCase()})`
       : damage.resolutionType === 'attack' ? 'Attack' : 'Auto';
-    return `${resolutionLabel} · ${damage.baseDice}${damage.damageType ? ` ${damage.damageType}` : ''}`;
+    return `${resolutionLabel} · ${profile.diceExpression}${damage.damageType ? ` ${damage.damageType}` : ''}`;
   }
 
   function findInventoryRow(event: MouseEvent) {
@@ -1346,6 +1716,8 @@
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
   function closeOpenModal() {
+    if (forageOpen) { forageOpen = false; return; }
+    if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
     if (simpleRollResult) { simpleRollResult = null; return; }
     if (inventoryMessage) { inventoryMessage = null; return; }
@@ -1384,20 +1756,57 @@
       // after a form action), but this keeps that rerun scoped to this route's own
       // depends('app:character-sheet') rather than also re-running unrelated layout loads.
       await update({ reset: false, invalidateAll: false });
-      if (result.type === 'success') hasUnsavedChanges = false;
-      saveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
+      if (result.type === 'success') {
+        hasUnsavedChanges = false; haulWaitingForSave = false; staleSheet = false;
+        const next = (result.data as { sheetVersion?: number } | undefined)?.sheetVersion;
+        if (typeof next === 'number') sheetToken = next;
+      }
+      staleSheet = result.type === 'failure' && Boolean((result.data as { staleSheet?: boolean } | undefined)?.staleSheet);
+      saveStatus = result.type === 'success' ? 'Saved' : staleSheet ? 'Not saved' : 'Save failed';
       await invalidate('app:character-sheet');
     };
   }}
   oninput={markUnsavedIfSheetField}
   onchange={markUnsavedIfSheetField}
 >
+  <input name="inventoryBaseline" type="hidden" value={inventoryBaselineJson} />
+  <input name="sheetVersion" type="hidden" value={sheetToken} />
+  {#if staleSheet}
+    <div class="panel stale-sheet-banner" role="alert">
+      <span>Someone else saved this sheet. Reload to see their changes.</span>
+      <button type="button" class="compact-button" onclick={reloadSheet}>Reload</button>
+    </div>
+  {/if}
   <section class="panel sheet-header compact">
     <div>
       <p class="eyebrow">D&D 5E 2014</p>
       <h1>{character.name}</h1>
       <p class="muted">
         {race || character.ancestry || 'Unknown origin'} - {classes.className} {classes.level}
+      </p>
+      {#if access && !access.isOwner}
+        <!-- Someone other than the owner: either editing (DM / admin) or just viewing. Say which, and whose sheet it is. -->
+        <p class="editing-as-line">
+          {#if readOnly}
+            <span class="muted">Viewing {ownerName ?? "someone else"}'s character. Only the owner and the DMs can change it.</span>
+          {:else}
+            {#if access.isCampaignDm}
+              <span class="badge">Editing as DM</span>
+            {:else if access.viaAdmin}
+              <span class="badge badge-admin">Editing as site admin</span>
+            {/if}
+            {#if ownerName}<span class="muted">{ownerName}'s character</span>{/if}
+          {/if}
+        </p>
+      {/if}
+      <p class="campaign-badge-line">
+        {#if character.campaignId}
+          <a class="text-button" href={`/campaigns/${character.campaignId}`}>Campaign: {character.campaignName}</a>
+          <span class="badge" class:badge-muted={!character.partyActive}>{character.partyActive ? 'Active in party' : 'Not in party'}</span>
+        {:else}
+          <span class="muted">No campaign</span>
+          <a class="text-button" href="/campaigns">Add to campaign</a>
+        {/if}
       </p>
     </div>
     <nav class="sheet-tabs in-header" aria-label="Character sheet sections">
@@ -1409,21 +1818,26 @@
     <div class="actions sheet-header-actions">
       <div class="combat-clock">
         <span class="save-state combat-clock-status">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
-        <button type="button" class="compact-button combat-clock-full" disabled={contentBusy} onclick={() => runContentAction('newBattle')}>New Battle</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('advanceRound')}>Next Round</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button>
-        <button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button>
+        <button type="button" class="compact-button combat-clock-full" disabled={contentBusy || readOnly} onclick={() => runContentAction('newBattle')}>New Battle</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceRound')}>Next Round</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('rest', { restType: 'short_rest' })}>Short Rest</button>
+        <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('rest', { restType: 'long_rest' })}>Long Rest</button>
       </div>
       <div class="save-cluster">
         <div class="save-command-row">
-          <div class="save-button-col">
-            <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
-            <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
-            {#if result?.saved}
-              <span class="save-state good">Saved</span>
-            {/if}
-          </div>
+          {#if !readOnly}
+            <div class="save-button-col">
+              <button type="submit" class="compact-button" disabled={contentBusy}>Save</button>
+              <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
+              {#if haulWaitingForSave && hasUnsavedChanges}
+                <span class="forage-pending-note">Your find will appear when you save.</span>
+              {/if}
+              {#if result?.saved}
+                <span class="save-state good">Saved</span>
+              {/if}
+            </div>
+          {/if}
           <div class="history-links">
             {#if onVersionHistory}
               <button type="button" class="text-button" onclick={onVersionHistory}>Character History</button>
@@ -1436,6 +1850,7 @@
   </section>
 
   {#if activeTab === 'battle'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="battle-layout">
       <div class="battle-top-row">
         <section class="panel stack compact-panel">
@@ -1527,7 +1942,7 @@
               </span>
               <span class="summary-input-roll">
                 <input type="text" inputmode="numeric" value={statFmt.initiative(stats.initiative.value)} onchange={(event) => commitStatInput('initiative', event)} />
-                <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={rollInitiative}>
+                <button type="button" class="dice-icon-button small" aria-label="Roll initiative" title="Roll initiative" onclick={() => askRoll('Initiative', initiativeCandidates, rollInitiative, 'dex')}>
                   <img src={d20Icon} alt="" />
                 </button>
               </span>
@@ -1548,12 +1963,15 @@
               </span>
               <input type="text" inputmode="numeric" value={statFmt.passiveInsight(stats.passiveInsight.value)} onchange={(event) => commitStatInput('passiveInsight', event)} />
             </label>
-            <div class="death-save-grid" aria-label="Death saves">
+            <div class="death-save-grid" role="group" aria-label="Death saves">
               <input name="deathSaveSuccesses" type="hidden" value={deathSaveSuccesses} />
               <input name="deathSaveFailures" type="hidden" value={deathSaveFailures} />
-              <div class="death-save-row success">
-                <span>Successes</span>
-                <div class="death-save-icons">
+              <span class="death-save-label" aria-hidden="true"><span>Death</span><span>Saves</span></span>
+              <button type="button" class="dice-icon-button death-save-roll" aria-label="Roll death save" title="Roll death save" onclick={() => askRoll('Death Saving Throw', deathSaveCandidates, rollDeathSave)}>
+                <img src={d20Icon} alt="" />
+              </button>
+              <div class="death-save-rows">
+                <div class="death-save-icons" role="group" aria-label="Death save successes">
                   {#each [1, 2, 3] as value}
                     <button
                       type="button"
@@ -1565,10 +1983,7 @@
                     ></button>
                   {/each}
                 </div>
-              </div>
-              <div class="death-save-row failure">
-                <span>Failures</span>
-                <div class="death-save-icons">
+                <div class="death-save-icons" role="group" aria-label="Death save failures">
                   {#each [1, 2, 3] as value}
                     <button
                       type="button"
@@ -1591,6 +2006,15 @@
               <input type="text" inputmode="numeric" value={statFmt.passiveInvestigation(stats.passiveInvestigation.value)} onchange={(event) => commitStatInput('passiveInvestigation', event)} />
             </label>
           </div>
+          <div class="senses-line" aria-label="Senses">
+            <span class="field-label-with-help">
+              Senses
+              <button type="button" class="formula-help-button" title={helpTitle(senseHelpLines)} aria-label="Senses breakdown" onclick={() => openFormulaHelp('Senses', senseHelpLines)}>?</button>
+            </span>
+            {#each senseRows as row}
+              <span class="sense-chip">{row.label} {row.sense.value} ft</span>
+            {/each}
+          </div>
         </section>
 
         <section class="panel stack compact-panel">
@@ -1605,7 +2029,7 @@
                   </span>
                   <span class="modifier-line">
                     Mod: {abilityModifier(abilityScores[key])}
-                    <button type="button" class="dice-icon-button small" aria-label={`Roll ${key.toUpperCase()} ability check`} title={`Roll ${key.toUpperCase()} ability check`} onclick={() => rollAbilityCheck(key)}>
+                    <button type="button" class="dice-icon-button small" aria-label={`Roll ${key.toUpperCase()} ability check`} title={`Roll ${key.toUpperCase()} ability check`} onclick={() => askRoll(`${key.toUpperCase()} Ability Check`, abilityCheckCandidates(key), (choices) => rollAbilityCheck(key, choices), key)}>
                       <img src={d20Icon} alt="" />
                     </button>
                   </span>
@@ -1613,8 +2037,15 @@
               {/each}
             </div>
             <div class="ability-popup-links">
-              <button type="button" class="text-button" onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
-              <button type="button" class="text-button" onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
+              <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
+              <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
+              <!-- Enabled unless the server says forage is unavailable; it decides DM vs self-serve when pressed. -->
+              {#if forageOwner}
+                <button type="button" class="text-button" class:forage-off={!!forageOff} title={forageOff ? forageUnavailableText(forageOff) : undefined} onclick={() => (forageOpen = true)}>
+                  <span>Forage</span>{#if forageBadge}<span class="forage-status-badge">{forageBadge}</span>{/if}
+                  {#if forageOff}<span class="forage-unavailable-note">{forageUnavailableText(forageOff)}</span>{/if}
+                </button>
+              {/if}
             </div>
           </div>
         </section>
@@ -1622,7 +2053,7 @@
         <section class="panel stack compact-panel modifications-panel">
           <div class="panel-head compact-head">
             <h2>Player Modifications</h2>
-            <button type="button" class="compact-button" onclick={() => (playerModificationsOpen = true)}>Manage</button>
+            <button type="button" class="compact-button" data-viewer-ok onclick={() => (playerModificationsOpen = true)}>Manage</button>
           </div>
           <div class="mod-summary">
             <label>Exhaustion
@@ -1681,7 +2112,7 @@
                 <span>{signed(item.toHitBonus)}</span>
                 <span>{damageSummary(item)}</span>
                 <span>{item.notes || '-'}</span>
-                <button type="button" class="compact-button dice-button" onclick={() => rollBattleAction(item)}>
+                <button type="button" class="compact-button dice-button" onclick={() => askAttackRoll(item)}>
                   <img src={d20Icon} alt="" />
                   Roll
                 </button>
@@ -1711,7 +2142,7 @@
             <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
-                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>Roll Damage</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
+                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
               {/each}
             </div>
           </div>
@@ -1726,9 +2157,11 @@
         </section>
       </div>
     </section>
+  </div>
   {/if}
 
   {#if activeTab === 'traits'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="traits-layout">
     <section class="panel stack">
       <div class="panel-head">
@@ -1766,9 +2199,11 @@
       </div>
     </section>
     </section>
+  </div>
   {/if}
 
   {#if activeTab === 'inventory'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="panel catalogue-add-panel">
       <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
       <div class="catalogue-add-row"><CatalogueSearch type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
@@ -1935,9 +2370,11 @@
         {/each}
       </section>
     </section>
+  </div>
   {/if}
 
   {#if activeTab === 'character'}
+  <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="sheet-columns character-layout">
       <section class="panel stack">
         <h2>Identity</h2>
@@ -1990,6 +2427,7 @@
         <label>Additional Notes <textarea name="additionalNotesNote">{notes.additional_notes ?? ''}</textarea></label>
       </section>
     </section>
+  </div>
   {/if}
 
   <div class="hidden-save-fields" aria-hidden="true">
@@ -2114,16 +2552,16 @@
   </div>
 
   {#if savingThrowsOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (savingThrowsOpen = false)}>
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (savingThrowsOpen = false))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="saving-throws-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="saving-throws-title">Saving Throws</h2>
           <div class="actions">
-            <button type="button" class="compact-button dice-button" onclick={rollAllSavingThrows}>
+            <button type="button" class="compact-button dice-button" onclick={() => askBatchRoll('Roll all saving throws', rollAllSavingThrows)}>
               <img src={d20Icon} alt="" />
               Roll All Saves
             </button>
-            <button type="button" class="text-button" onclick={() => (savingThrowsOpen = false)}>Close</button>
+            <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = false)}>Close</button>
           </div>
         </div>
         <div class="check-list">
@@ -2138,30 +2576,32 @@
                 <b>{signed(savingThrowTotal(key))}</b>
               </label>
               <button type="button" class="formula-help-button" title={helpTitle(savingThrowFormula(key))} aria-label={`${key.toUpperCase()} saving throw breakdown`} onclick={() => openFormulaHelp(`${key.toUpperCase()} Saving Throw`, savingThrowFormula(key))}>?</button>
-              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => rollSingleSavingThrow(key)}>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${key.toUpperCase()} saving throw`} title={`Roll ${key.toUpperCase()} saving throw`} onclick={() => askRoll(`${key.toUpperCase()} Saving Throw`, saveCandidates(key), (choices) => rollSingleSavingThrow(key, choices), key)}>
                 <img src={d20Icon} alt="" />
               </button>
             </div>
           {/each}
         </div>
-        <div class="modal-actions">
-          <button type="submit">Save Proficiencies</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Proficiencies</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if skillChecksOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (skillChecksOpen = false)}>
-      <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (skillChecksOpen = false))}>
+      <div class="panel compact-modal wide-check-modal" role="dialog" aria-modal="true" aria-labelledby="skill-checks-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="skill-checks-title">Skill Checks</h2>
           <div class="actions">
-            <button type="button" class="compact-button dice-button" onclick={rollAllSkillChecks}>
+            <button type="button" class="compact-button dice-button" onclick={() => askBatchRoll('Roll all skill checks', rollAllSkillChecks)}>
               <img src={d20Icon} alt="" />
               Roll All Skills
             </button>
-            <button type="button" class="text-button" onclick={() => (skillChecksOpen = false)}>Close</button>
+            <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = false)}>Close</button>
           </div>
         </div>
         <div class="check-list skill-list">
@@ -2176,28 +2616,30 @@
                 <b>{signed(skillCheckTotal(skill))}</b>
               </label>
               <button type="button" class="formula-help-button" title={helpTitle(skillCheckFormula(skill))} aria-label={`${skill.name} breakdown`} onclick={() => openFormulaHelp(skill.name, skillCheckFormula(skill))}>?</button>
-              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => rollSingleSkillCheck(skill)}>
+              <button type="button" class="compact-button dice-icon-button" aria-label={`Roll ${skill.name}`} title={`Roll ${skill.name}`} onclick={() => askRoll(skill.name, skillCandidates(skill), (choices) => rollSingleSkillCheck(skill, choices), skill.ability)}>
                 <img src={d20Icon} alt="" />
               </button>
             </div>
           {/each}
         </div>
-        <div class="modal-actions">
-          <button type="submit">Save Proficiencies</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Proficiencies</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if playerModificationsOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (playerModificationsOpen = false)}>
-      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (playerModificationsOpen = false))}>
+      <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="player-modifications-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <div>
             <h2 id="player-modifications-title">Player Modifications</h2>
             <p class="muted">Conditions, spells, combat states, and environment effects applied to this character.</p>
           </div>
-          <button type="button" class="text-button" onclick={() => (playerModificationsOpen = false)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (playerModificationsOpen = false)}>Close</button>
         </div>
 
         <label class="exhaustion-control">Exhaustion Level
@@ -2214,6 +2656,7 @@
           <div class="modifier-toolbar">
             <label class="modifier-search">Search
               <input
+                data-viewer-ok
                 value={modifierSearch}
                 placeholder="Search conditions, spells, features, states..."
                 oninput={(event) => (modifierSearch = event.currentTarget.value)}
@@ -2224,6 +2667,7 @@
               {#each modifierFilters as filter}
                 <button
                   type="button"
+                  data-viewer-ok
                   class:active={modifierFilter === filter.key}
                   onclick={() => (modifierFilter = filter.key)}
                 >
@@ -2285,9 +2729,11 @@
           </section>
         </div>
 
-        <div class="modal-actions">
-          <button type="submit">Save Modifications</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Modifications</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
@@ -2295,11 +2741,11 @@
   {#if formulaHelp}
     {@const statKey = formulaHelp.statKey}
     {@const stat = statKey ? stats[statKey] : null}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (formulaHelp = null)}>
-      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (formulaHelp = null))}>
+      <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="formula-help-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="formula-help-title">{formulaHelp.title}</h2>
-          <button type="button" class="text-button" onclick={() => (formulaHelp = null)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (formulaHelp = null)}>Close</button>
         </div>
         <div class="formula-breakdown">
           {#each (statKey ? statFormulaLines[statKey] : formulaHelp.lines) ?? [] as line}
@@ -2336,8 +2782,29 @@
     </div>
   {/if}
 
+  {#if forageOpen && forageOwner}
+    <ForageModal
+      characterId={character.id}
+      mine={forageMine}
+      haulWaiting={haulWaitingForSave && hasUnsavedChanges}
+      onRefresh={refreshForage}
+      onHaul={() => haulLanded()}
+      onClose={() => (forageOpen = false)}
+    />
+  {/if}
+
+  {#if rollOptions && !readOnly}
+    <RollOptionsModal
+      title={rollOptions.title}
+      advantage={rollOptions.advantage}
+      damageDice={rollOptions.damageDice}
+      onroll={submitRollOptions}
+      oncancel={() => (rollOptions = null)}
+    />
+  {/if}
+
   {#if rollResult}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (rollResult = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (rollResult = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="roll-result-title">{rollResult.title}</h2>
@@ -2368,7 +2835,7 @@
   {/if}
 
   {#if activityLogOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (activityLogOpen = false)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (activityLogOpen = false))}>
       <div class="panel modifier-modal" role="dialog" aria-modal="true" aria-labelledby="activity-log-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <div>
@@ -2378,20 +2845,23 @@
           <button type="button" class="text-button" onclick={() => (activityLogOpen = false)}>Close</button>
         </div>
 
-        {#if activeVttSessionId}
-          <div class="combat-encounter-id">
-            <span>Room <code>{activeVttSessionId}</code></span>
-            <button type="button" class="text-button" disabled={leaveRoomBusy} onclick={leaveRoom}>Leave Room</button>
-          </div>
+        <!-- Joining or leaving a room is account state meant for the character's own player, so a viewer doesn't get it here. -->
+        {#if !readOnly}
+          {#if activeVttSessionId}
+            <div class="combat-encounter-id">
+              <span>Room <code>{activeVttSessionId}</code></span>
+              <button type="button" class="text-button" disabled={leaveRoomBusy} onclick={leaveRoom}>Leave Room</button>
+            </div>
+          {/if}
+          <label class="join-combat-label">
+            {activeVttSessionId ? 'Switch Room' : 'Join Room'}
+            <span class="summary-input-roll">
+              <input type="text" class="room-code-input" placeholder="Room code" bind:value={joinRoomIdInput} disabled={joinRoomBusy} />
+              <button type="button" class="compact-use-button" disabled={joinRoomBusy || !joinRoomIdInput.trim()} onclick={joinRoom}>Join</button>
+            </span>
+          </label>
+          {#if joinRoomError}<p class="combat-log-empty" style="color:#e57373;">{joinRoomError}</p>{/if}
         {/if}
-        <label class="join-combat-label">
-          {activeVttSessionId ? 'Switch Room' : 'Join Room'}
-          <span class="summary-input-roll">
-            <input type="text" class="room-code-input" placeholder="Room code" bind:value={joinRoomIdInput} disabled={joinRoomBusy} />
-            <button type="button" class="compact-use-button" disabled={joinRoomBusy || !joinRoomIdInput.trim()} onclick={joinRoom}>Join</button>
-          </span>
-        </label>
-        {#if joinRoomError}<p class="combat-log-empty" style="color:#e57373;">{joinRoomError}</p>{/if}
 
         <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
           <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
@@ -2449,7 +2919,7 @@
                 </div>
               </div>
             {:else}
-              <p class="muted">Join a room above to log rolls.</p>
+              <p class="muted">{readOnly ? 'You are not in a room.' : 'Join a room above to log rolls.'}</p>
             {/if}
           </section>
         {:else}
@@ -2498,7 +2968,7 @@
   {/if}
 
   {#if simpleRollResult}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleRollResult = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleRollResult = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="simple-roll-result-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="simple-roll-result-title">{simpleRollResult.title}</h2>
@@ -2520,7 +2990,7 @@
   {/if}
 
   {#if inventoryMessage}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (inventoryMessage = null)}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (inventoryMessage = null))}>
       <div class="panel compact-modal" role="dialog" aria-modal="true" aria-labelledby="inventory-action-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="inventory-action-title">Inventory Action</h2>
@@ -2532,11 +3002,11 @@
   {/if}
 
   {#if simpleItemOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (simpleItemOpen = false)}>
-      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (simpleItemOpen = false))}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="simple-item-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="simple-item-title">Add Item</h2>
-          <button type="button" class="text-button" onclick={() => (simpleItemOpen = false)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (simpleItemOpen = false)}>Close</button>
         </div>
         <div class="new-item-grid">
           <label>Item <input bind:value={simpleItemName} placeholder="Gold watch, emerald ring, six cabbages" /></label>
@@ -2556,19 +3026,21 @@
           </label>
           <label>Notes <input bind:value={simpleItemNotes} /></label>
         </div>
-        <div class="modal-actions">
-          <button type="button" disabled={!simpleItemName.trim() || contentBusy} onclick={addSimpleItem}>Add Item</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="button" disabled={!simpleItemName.trim() || contentBusy} onclick={addSimpleItem}>Add Item</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if newItemOpen}
-    <div class="modal-backdrop" role="presentation" onpointerdown={() => (newItemOpen = false)}>
-      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" onpointerdown={(event) => event.stopPropagation()}>
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (newItemOpen = false))}>
+      <div class="panel item-modal" role="dialog" aria-modal="true" aria-labelledby="new-item-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head">
           <h2 id="new-item-title">Add Item</h2>
-          <button type="button" class="text-button" onclick={() => (newItemOpen = false)}>Close</button>
+          <button type="button" class="text-button" data-viewer-ok onclick={() => (newItemOpen = false)}>Close</button>
         </div>
         <div class="new-item-grid">
           <input name="inventoryId" type="hidden" value="" />
@@ -2622,9 +3094,11 @@
           <label>Notes <input name="inventoryNotes" /></label>
         </div>
         <input name="inventoryEquipped" type="hidden" value={newItemLocation === 'equipped' ? 'true' : 'false'} />
-        <div class="modal-actions">
-          <button type="submit">Save Item</button>
-        </div>
+        {#if !readOnly}
+          <div class="modal-actions">
+            <button type="submit">Save Item</button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}

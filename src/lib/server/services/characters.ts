@@ -7,6 +7,7 @@ import { resolveCharacterModifierSources } from '$lib/server/services/rule-engin
 import { applyCharacterEffect } from '$lib/server/services/effects';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { logCombatEvent } from '$lib/server/services/combatLog';
+import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
 import type {
   AbilityKey,
@@ -34,6 +35,10 @@ type CharacterRow = {
   system_key: string;
   metadata_json: Record<string, unknown>;
   updated_at: string;
+  campaign_id: string | null;
+  campaign_name: string | null;
+  party_active: boolean;
+  sheet_version: number;
 };
 
 type CharacterSnapshot = {
@@ -146,10 +151,14 @@ const metadataFields = [
   'hair'
 ];
 
-function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof CharacterRow | 'ownerUserId' | 'systemKey' | 'metadata' | 'updatedAt'>): CharacterDetail {
+function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof CharacterRow | 'ownerUserId' | 'systemKey' | 'metadata' | 'updatedAt' | 'campaignId' | 'campaignName' | 'partyActive' | 'sheetVersion'>): CharacterDetail {
   return {
     id: row.id,
     ownerUserId: row.owner_user_id,
+    campaignId: row.campaign_id,
+    campaignName: row.campaign_name,
+    partyActive: row.party_active,
+    sheetVersion: row.sheet_version,
     name: row.name,
     ancestry: row.ancestry,
     background: row.background,
@@ -163,10 +172,12 @@ function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof 
 export async function listCharacters(userId: string): Promise<CharacterListItem[]> {
   const characters = await query<CharacterRow>(
     `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE owner_user_id = $1
-      ORDER BY updated_at DESC
+      SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
+             c.campaign_id, cp.name AS campaign_name, c.party_active, c.sheet_version
+      FROM characters c
+      LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+      WHERE c.owner_user_id = $1
+      ORDER BY c.updated_at DESC
     `,
     [userId]
   );
@@ -178,6 +189,9 @@ export async function listCharacters(userId: string): Promise<CharacterListItem[
     const hp = resources.find((resource) => resource.key === 'hp');
     list.push({
       id: row.id,
+      campaignId: row.campaign_id,
+      campaignName: row.campaign_name,
+      partyActive: row.party_active,
       name: row.name,
       ancestry: row.ancestry,
       background: row.background,
@@ -241,18 +255,33 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   });
 }
 
+// Loads the full sheet for anyone who may VIEW it: the owner, any member of the character's
+// (live) campaign, or a site admin. Callers that show editing controls must also check
+// access.canEdit (the sheet page turns it into a read-only sheet). Everything that loads a sheet
+// (the VTT pull-through and the encounter page included) goes through here, so they all follow;
+// every write path still has its own edit/act check.
 export async function getCharacter(userId: string, characterId: string): Promise<CharacterDetail | null> {
+  return (await getCharacterWithAccess(userId, characterId))?.character ?? null;
+}
+
+// Same as getCharacter, but also hands back the access flags it already worked out, so the sheet's
+// load() does not run the access query a second time.
+export async function getCharacterWithAccess(userId: string, characterId: string): Promise<{ character: CharacterDetail; access: CharacterAccess } | null> {
+  const access = await getCharacterAccess({ query }, userId, characterId);
+  if (!access?.canView) return null;
   const result = await query<CharacterRow>(
     `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE id = $1 AND owner_user_id = $2
+      SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
+             c.campaign_id, cp.name AS campaign_name, c.party_active, c.sheet_version
+      FROM characters c
+      LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+      WHERE c.id = $1
     `,
-    [characterId, userId]
+    [characterId]
   );
   const row = result.rows[0];
   if (!row) return null;
-  return loadCharacterDetail(row);
+  return { character: await loadCharacterDetail(row), access };
 }
 
 // Same computed character detail as getCharacter, but without the owner
@@ -267,9 +296,11 @@ export async function getCharacter(userId: string, characterId: string): Promise
 export async function getCharacterForRoll(characterId: string): Promise<CharacterDetail | null> {
   const result = await query<CharacterRow>(
     `
-      SELECT id, owner_user_id, name, ancestry, background, system_key, metadata_json, updated_at
-      FROM characters
-      WHERE id = $1
+      SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
+             c.campaign_id, cp.name AS campaign_name, c.party_active, c.sheet_version
+      FROM characters c
+      LEFT JOIN campaigns cp ON cp.id = c.campaign_id
+      WHERE c.id = $1
     `,
     [characterId]
   );
@@ -313,15 +344,36 @@ export async function listItemCategories(): Promise<ItemCategory[]> {
   }
 }
 
-export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<void> {
+// Thrown by updateCharacter when the sheet being saved is older than what is in the database (the
+// owner, a DM or an admin saved in between). The route turns it into a 409 and the sheet asks the
+// user to reload. Nothing has been written when it is thrown.
+export class StaleSheetError extends Error {
+  constructor() {
+    super('Someone else saved this sheet. Reload to see their changes.');
+    this.name = 'StaleSheetError';
+  }
+}
+
+// Whole-sheet save. Owner, campaign DM/co-DM and site admin may call it (assertCanEditCharacter).
+// Returns the sheet's new version number so the sheet can carry it into its next save.
+//
+// Stale-save guard: the sheet posts the `sheetVersion` it loaded. characters.sheet_version is bumped
+// only by whole-sheet writes (this and a version restore), so button actions, forage finds and VTT
+// HP changes never make an open sheet refuse its next Save. A missing field (a tab opened before
+// this shipped) skips the check.
+export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<number> {
   const resources = parseResources(form);
   const newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
   let previousHp: number | null = null;
   let characterName = '';
 
+  let newVersion = 0;
   await withTransaction(async (client) => {
-    const owned = await client.query('SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2', [characterId, userId]);
-    if (!owned.rowCount) throw new Error('Character not found.');
+    await assertCanEditCharacter(client, userId, characterId);
+    // FOR UPDATE: two simultaneous saves queue here, so the second sees the first's new version.
+    const current = await client.query<{ sheet_version: number }>('SELECT sheet_version FROM characters WHERE id = $1 FOR UPDATE', [characterId]);
+    const loadedRaw = String(form.get('sheetVersion') ?? '').trim();
+    if (loadedRaw !== '' && Number(loadedRaw) !== current.rows[0]?.sheet_version) throw new StaleSheetError();
 
     // Read the pre-update HP before replaceResources overwrites it, so a
     // change can be reported as a delta ("takes 12 damage") rather than just
@@ -336,15 +388,17 @@ export async function updateCharacter(userId: string, characterId: string, form:
     const overrides = parseStatOverridesField(form);
     const metadataPatch = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
 
-    await client.query(
+    const updated = await client.query<{ sheet_version: number }>(
       `
         UPDATE characters
         SET name = $1,
             ancestry = $2,
             background = $3,
             metadata_json = metadata_json || $4::jsonb,
-            updated_at = now()
+            updated_at = now(),
+            sheet_version = sheet_version + 1
         WHERE id = $5
+        RETURNING sheet_version
       `,
       [
         characterName,
@@ -354,11 +408,16 @@ export async function updateCharacter(userId: string, characterId: string, form:
         characterId
       ]
     );
+    newVersion = updated.rows[0].sheet_version;
 
     await replaceClasses(client, characterId, parseClasses(form));
     await replaceAbilities(client, characterId, parseAbilities(form));
     await replaceResources(client, characterId, resources);
-    await replaceInventory(client, characterId, parseInventory(form));
+    // Changes only when the sheet sent its loaded baseline (see saveInventoryChanges); otherwise the
+    // old full replace.
+    const inventoryBaseline = parseInventoryBaseline(form);
+    if (inventoryBaseline) await saveInventoryChanges(client, characterId, parseInventory(form), inventoryBaseline);
+    else await replaceInventory(client, characterId, parseInventory(form));
     await replaceAttacks(client, characterId, parseAttacks(form));
     await replaceNotes(client, characterId, parseNotes(form));
     await replaceProficiencies(client, characterId, parseProficiencies(form));
@@ -380,9 +439,14 @@ export async function updateCharacter(userId: string, characterId: string, form:
       await logCombatEvent(encounterId, message, { type: 'sheet_hp_change', delta });
     }
   }
+  return newVersion;
 }
 
+// Anyone who can view the sheet can see its version list; only editors may restore (that has its
+// own edit check in restoreCharacterVersion).
 export async function listVersions(userId: string, characterId: string): Promise<CharacterVersion[]> {
+  const access = await getCharacterAccess({ query }, userId, characterId);
+  if (!access?.canView) return [];
   const result = await query<{
     id: string;
     character_id: string;
@@ -390,14 +454,13 @@ export async function listVersions(userId: string, characterId: string): Promise
     change_summary: string;
   }>(
     `
-      SELECT character_versions.id, character_versions.character_id, character_versions.created_at, character_versions.change_summary
+      SELECT id, character_id, created_at, change_summary
       FROM character_versions
-      JOIN characters ON characters.id = character_versions.character_id
-      WHERE character_versions.character_id = $1 AND characters.owner_user_id = $2
-      ORDER BY character_versions.created_at DESC
+      WHERE character_id = $1
+      ORDER BY created_at DESC
       LIMIT 20
     `,
-    [characterId, userId]
+    [characterId]
   );
 
   return result.rows.map((row) => ({
@@ -408,22 +471,23 @@ export async function listVersions(userId: string, characterId: string): Promise
   }));
 }
 
+// Owner, campaign DM/co-DM or site admin (assertCanEditCharacter). The snapshot is looked up by
+// character id only; the edit check above is what gates it. A restore is a whole-sheet write, so
+// applySnapshot bumps sheet_version too.
 export async function restoreCharacterVersion(userId: string, characterId: string, versionId: string): Promise<void> {
   return await withTransaction(async (client) => {
+    await assertCanEditCharacter(client, userId, characterId);
     const version = await client.query<{
       character_id: string;
       created_at: string;
       snapshot_json: CharacterSnapshot;
     }>(
       `
-        SELECT character_versions.character_id, character_versions.created_at, character_versions.snapshot_json
+        SELECT character_id, created_at, snapshot_json
         FROM character_versions
-        JOIN characters ON characters.id = character_versions.character_id
-        WHERE character_versions.id = $1
-          AND character_versions.character_id = $2
-          AND characters.owner_user_id = $3
+        WHERE id = $1 AND character_id = $2
       `,
-      [versionId, characterId, userId]
+      [versionId, characterId]
     );
     const row = version.rows[0];
     if (!row) throw new Error('Version not found.');
@@ -521,7 +585,8 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
           background = $3,
           system_key = $4,
           metadata_json = $5::jsonb,
-          updated_at = now()
+          updated_at = now(),
+          sheet_version = sheet_version + 1
       WHERE id = $6
     `,
     [
@@ -1031,51 +1096,145 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
   }
 }
 
+// Upserts one posted inventory row (insert, or update when the id already belongs to this
+// character). Shared by the full replace below and by the changes-only Save.
+async function upsertInventoryRow(client: pg.PoolClient, characterId: string, row: InventoryItem, sortOrder: number): Promise<void> {
+  await client.query(
+    `
+      INSERT INTO character_inventory_items
+        (id, character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order, source_content_id, attuned)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, location=EXCLUDED.location,
+        quantity=EXCLUDED.quantity, equipped=EXCLUDED.equipped, is_equipment=EXCLUDED.is_equipment,
+        ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
+        attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
+        effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
+        source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
+      WHERE character_inventory_items.character_id = EXCLUDED.character_id
+    `,
+    [
+      row.id || null,
+      characterId,
+      row.name,
+      row.category || 'gear',
+      row.location || (row.equipped ? 'equipped' : 'backpack'),
+      Math.max(0, Number(row.quantity) || 1),
+      row.location === 'equipped' || row.equipped,
+      row.isEquipment,
+      Number(row.acBonus) || 0,
+      Number(row.toHitBonus) || 0,
+      Number(row.damageBonus) || 0,
+      abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str',
+      row.proficient ?? true,
+      row.damageRolls || '',
+      row.effects || '',
+      Number(row.abilityBonuses.str) || 0,
+      Number(row.abilityBonuses.dex) || 0,
+      Number(row.abilityBonuses.con) || 0,
+      Number(row.abilityBonuses.int) || 0,
+      Number(row.abilityBonuses.wis) || 0,
+      Number(row.abilityBonuses.cha) || 0,
+      row.notes || '',
+      sortOrder,
+      row.sourceContentId || null,
+      row.attuned || false
+    ]
+  );
+}
+
+// Full replace: deletes every row whose id wasn't passed. Only for callers that really mean "make
+// the inventory exactly this" (restoring a version, or a save from a client that sent no baseline).
+// The sheet's normal Save uses saveInventoryChanges instead.
 async function replaceInventory(client: pg.PoolClient, characterId: string, inventory: InventoryItem[]): Promise<void> {
   const retainedIds = inventory.filter((row) => row.name.trim() && Number(row.quantity) > 0).map((row) => row.id).filter(Boolean);
   await client.query('DELETE FROM character_inventory_items WHERE character_id = $1 AND NOT (id = ANY($2::uuid[]))', [characterId, retainedIds]);
   for (const [index, row] of inventory.entries()) {
     if (!row.name.trim() || Number(row.quantity) <= 0) continue;
+    await upsertInventoryRow(client, characterId, row, index);
+  }
+}
+
+// The columns a sheet Save can change on an existing row, each with the value it would write.
+// Both the posted row and the baseline row go through the same getters, so the comparison is on
+// what would actually be stored (trimmed names, defaulted categories, and so on).
+const INVENTORY_SAVE_FIELDS: Array<[column: string, read: (row: InventoryItem) => string | number | boolean | null]> = [
+  ['name', (row) => String(row.name ?? '').trim()],
+  ['category', (row) => row.category || 'gear'],
+  ['location', (row) => row.location || (row.equipped ? 'equipped' : 'backpack')],
+  ['quantity', (row) => Math.max(0, Number(row.quantity) || 0)],
+  ['equipped', (row) => row.location === 'equipped' || !!row.equipped],
+  ['is_equipment', (row) => !!row.isEquipment],
+  ['ac_bonus', (row) => Number(row.acBonus) || 0],
+  ['to_hit_bonus', (row) => Number(row.toHitBonus) || 0],
+  ['damage_bonus', (row) => Number(row.damageBonus) || 0],
+  ['attack_ability', (row) => (abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str')],
+  ['proficient', (row) => row.proficient ?? true],
+  ['damage_rolls', (row) => row.damageRolls || ''],
+  ['effects', (row) => row.effects || ''],
+  ['notes', (row) => row.notes || ''],
+  ['source_content_id', (row) => row.sourceContentId || null],
+  ['attuned', (row) => !!row.attuned]
+];
+
+/**
+ * The inventory the sheet had loaded when the user pressed Save (hidden field inventoryBaseline).
+ * Null when it is missing or malformed, so the caller can fall back to a full replace.
+ */
+function parseInventoryBaseline(form: FormData): InventoryItem[] | null {
+  const raw = form.get('inventoryBaseline');
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+      .filter((row) => row && typeof row.id === 'string')
+      .map((row) => ({ ...row, abilityBonuses: row.abilityBonuses ?? {} }) as InventoryItem);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Q6: the sheet Save writes only what the user changed since the sheet loaded.
+ *
+ * Other things change inventory outside the sheet (a forage haul stacking onto a row, VTT item use,
+ * equip and remove actions), so blindly writing every posted row would overwrite them with the
+ * sheet's stale copy. Instead, comparing the posted rows with the baseline the sheet loaded:
+ *   - a row the user did not touch is left alone, whatever the DB now holds;
+ *   - a row the user edited gets only the fields they changed (so their edit wins, and a field they
+ *     left alone keeps any newer DB value);
+ *   - a row with no baseline match is new and is inserted;
+ *   - a baseline row that is no longer posted (removed, or quantity set to 0) is deleted;
+ *   - rows the sheet never knew about are never touched.
+ */
+export async function saveInventoryChanges(
+  client: pg.PoolClient, characterId: string, posted: InventoryItem[], baseline: InventoryItem[]
+): Promise<void> {
+  const baselineById = new Map(baseline.map((row) => [row.id as string, row]));
+  const postedIds = new Set(posted.map((row) => row.id).filter(Boolean));
+
+  const removedIds = [...baselineById.keys()].filter((id) => !postedIds.has(id));
+  if (removedIds.length) {
+    await client.query('DELETE FROM character_inventory_items WHERE character_id = $1 AND id = ANY($2::uuid[])', [characterId, removedIds]);
+  }
+
+  const maxSort = await client.query<{ next: number }>(
+    'SELECT COALESCE(MAX(sort_order) + 1, 0)::int AS next FROM character_inventory_items WHERE character_id = $1', [characterId]
+  );
+  let nextSort = maxSort.rows[0].next;
+
+  for (const row of posted) {
+    const before = row.id ? baselineById.get(row.id) : undefined;
+    if (!before) {
+      await upsertInventoryRow(client, characterId, row, nextSort++);
+      continue;
+    }
+    const changed = INVENTORY_SAVE_FIELDS.filter(([, read]) => read(row) !== read(before));
+    if (!changed.length) continue;
+    const assignments = changed.map(([column], index) => `${column} = $${index + 3}`).join(', ');
     await client.query(
-      `
-        INSERT INTO character_inventory_items
-          (id, character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order, source_content_id, attuned)
-        VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
-        ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, location=EXCLUDED.location,
-          quantity=EXCLUDED.quantity, equipped=EXCLUDED.equipped, is_equipment=EXCLUDED.is_equipment,
-          ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
-          attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
-          effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
-          source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
-        WHERE character_inventory_items.character_id = EXCLUDED.character_id
-      `,
-      [
-        row.id || null,
-        characterId,
-        row.name,
-        row.category || 'gear',
-        row.location || (row.equipped ? 'equipped' : 'backpack'),
-        Math.max(0, Number(row.quantity) || 1),
-        row.location === 'equipped' || row.equipped,
-        row.isEquipment,
-        Number(row.acBonus) || 0,
-        Number(row.toHitBonus) || 0,
-        Number(row.damageBonus) || 0,
-        abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str',
-        row.proficient ?? true,
-        row.damageRolls || '',
-        row.effects || '',
-        Number(row.abilityBonuses.str) || 0,
-        Number(row.abilityBonuses.dex) || 0,
-        Number(row.abilityBonuses.con) || 0,
-        Number(row.abilityBonuses.int) || 0,
-        Number(row.abilityBonuses.wis) || 0,
-        Number(row.abilityBonuses.cha) || 0,
-        row.notes || '',
-        index,
-        row.sourceContentId || null,
-        row.attuned || false
-      ]
+      `UPDATE character_inventory_items SET ${assignments} WHERE id = $1 AND character_id = $2`,
+      [row.id, characterId, ...changed.map(([, read]) => read(row))]
     );
   }
 }
@@ -1339,11 +1498,7 @@ export async function spendHitDice(
   hpGained: number
 ): Promise<void> {
   await withTransaction(async (client) => {
-    const owned = await client.query(
-      'SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2',
-      [characterId, userId]
-    );
-    if (!owned.rowCount) throw new Error('Character not found.');
+    await assertCanEditCharacter(client, userId, characterId);
 
     // Decrement hit dice pool for this class. `defaultMax` only seeds max_value on first
     // INSERT (a pool that doesn't exist yet) - the ON CONFLICT branch deliberately does NOT

@@ -139,6 +139,7 @@ Default behaviours by operation type:
 | Resistance / Vulnerability | Net serially, per damage-type bucket (3.2) - simple binary cancellation today; a candidate for the same dice-pool-style mechanic as advantage/disadvantage in the future, not yet built that way (3.3). |
 | Flat numeric add/subtract | Sum normally. Multiple +1 AC sources add up. |
 | Set (override to an exact value) | Most-restrictive or most-recently-applied wins. The exact tie-break rule is an open question - 8. |
+| At least (`minimum`) | Highest value wins, no summing. A `set` on the same target beats it. Flat add/subtract then apply on top. Currently honoured by senses only. |
 | Grant of a resource (e.g. luck dice, extra action, Vowfire charges) | Sums by count, since each instance is a discrete, countable grant - 2 + 3 luck dice from two sources is meaningfully different from "you have advantage twice." |
 
 A "doesn't stack with itself" flag is available on a Modifier definition for genuine exceptions outside these defaults (a homebrew aura that should not combine with a second copy of itself from a different source) - it is the exception path, not the primary mechanism.

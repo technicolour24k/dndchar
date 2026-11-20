@@ -1,6 +1,8 @@
 // Translucent highlight showing how far a token can still move this turn.
-// Drawn as a plain radius circle, same "no walls" simplification as vision -
-// it's a planning aid, not a pathfinding/terrain-aware range.
+// Movement is measured Chebyshev-style (a diagonal square costs the same 5 ft
+// as an orthogonal one - see shared/gridDistance.js), so the reachable area is
+// an axis-aligned square, not a circle. Same "no walls" simplification as
+// vision - it's a planning aid, not a pathfinding/terrain-aware range.
 export function drawMovementRange(ctx, tokens, gridSizePx) {
   const pxPerFoot = gridSizePx / 5;
 
@@ -13,9 +15,9 @@ export function drawMovementRange(ctx, tokens, gridSizePx) {
   for (const token of tokens) {
     const remainingFt = token.speedRemainingFt || 0;
     if (remainingFt <= 0) continue;
-    const radius = remainingFt * pxPerFoot;
+    const half = remainingFt * pxPerFoot;
     ctx.beginPath();
-    ctx.arc(token.x, token.y, radius, 0, Math.PI * 2);
+    ctx.rect(token.x - half, token.y - half, half * 2, half * 2);
     ctx.fill();
     ctx.stroke();
   }

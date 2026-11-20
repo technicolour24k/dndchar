@@ -187,6 +187,9 @@ body {
 }
 .marker-placement-banner.visible { display: flex; }
 .marker-placement-banner button { padding: 4px 10px; border: none; border-radius: 4px; background: #3a3d44; color: #fff; cursor: pointer; font-size: 12px; }
+.marker-placement-banner button:disabled { opacity: .5; cursor: default; }
+#movePlanBannerText.over-budget { color: #ff8a80; }
+#movePlanPrivateLabel { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; white-space: nowrap; }
 
 .modal-overlay {
   display: none;
@@ -366,6 +369,17 @@ body {
   color: #888;
   font-family: inherit;
 }
+/* Advantage panel + interim manual damage dice on the attack confirm card. */
+.adv-panel { background: #14161b; border: 1px solid #2c2f36; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.adv-panel h4 { margin: 0 0 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #888; }
+.adv-manual { margin-left: 6px; padding: 0 5px; border: 1px solid #555; border-radius: 8px; font-size: 9px; color: #aaa; }
+.adv-source { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #ddd; padding: 2px 0; }
+.adv-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12px; color: #ccc; }
+.adv-row-label { min-width: 90px; }
+.adv-step { width: 32px; height: 28px; padding: 0; border: none; border-radius: 4px; cursor: pointer; background: #3a3d44; color: #fff; font-size: 16px; }
+.adv-value { min-width: 24px; text-align: center; font-weight: 600; }
+.adv-readout { margin-top: 6px; font-size: 12px; font-weight: 600; color: #cfd8ff; }
+
 .attack-outcome { font-weight: 700; font-size: 15px; margin: 10px 0 4px; }
 .attack-outcome.hit { color: #66bb6a; }
 .attack-outcome.miss { color: #e57373; }
@@ -393,3 +407,58 @@ body {
 .gm-attack-add .atkDmg { width: 60px; }
 .gm-attack-add select { padding: 3px 5px; border-radius: 4px; border: 1px solid #2c2f36; background: #14161b; color: #eee; font-size: 11px; }
 .gm-attack-add .addAttackBtn { font-size: 11px; padding: 3px 8px; }
+
+/* Forage popups (vtt-forage unit C). Reuses .modal, .adv-panel and .adv-row. 44px tap targets. */
+.forage-modal { max-height: 92vh; overflow-y: auto; }
+.forage-modal .forage-select,
+.forage-modal .forage-qty { width: 100%; min-height: 44px; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 14px; box-sizing: border-box; }
+.forage-modal .actions { flex-wrap: wrap; }
+.forage-modal .actions button,
+.forage-modal .forage-row button,
+.forage-modal .forage-lines button,
+.forage-queue button,
+.forage-sidebar-line button,
+.forageBtn { min-height: 44px; min-width: 44px; }
+.forageBtn.forage-off { opacity: .55; }
+.forage-modal .adv-step { width: 44px; height: 44px; }
+.forage-modal .adv-source { min-height: 44px; }
+.forage-modal .adv-source input { width: 22px; height: 22px; }
+.forage-row { display: flex; gap: 8px; margin-bottom: 10px; align-items: flex-end; }
+.forage-row > * { flex: 1 1 0; min-width: 0; }
+.forage-row > button { flex: 0 0 auto; }
+.forage-table-line { font-size: 13px; color: #cfd8ff; margin: 2px 0 6px; }
+.forage-warn { color: #ffb300; }
+.forage-msg { color: #e57373; font-size: 13px; margin: 8px 0; }
+.forage-check { background: #14161b; border: 1px solid #2c2f36; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.forage-check-total { font-size: 15px; }
+.forage-badge { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; color: #111; }
+.forage-badge.good { background: #ffb300; }
+.forage-badge.bad { background: #e57373; }
+.forage-lines { list-style: none; margin: 8px 0; padding: 0; }
+.forage-lines li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 14px; }
+.forage-lines .forage-line-name { flex: 1 1 auto; min-width: 0; }
+.forage-lines .forage-qty { width: 80px; flex: 0 0 80px; }
+.forage-lines .forage-qty.invalid { border-color: #e57373; }
+/* "Recent finds" (collapsible, player popup form step) */
+.forage-recent { margin: 10px 0; border: 1px solid #2c2f36; border-radius: 6px; padding: 0 10px; }
+.forage-recent summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-size: 14px; }
+.forage-recent-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.forage-recent-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; font-size: 13px; border-top: 1px solid #2c2f36; }
+.forage-recent-list li > div { flex: 1 1 auto; min-width: 0; }
+.forage-recent-list button { min-height: 44px; min-width: 64px; flex: 0 0 auto; }
+.forage-queue { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.forage-queue button { padding: 6px 10px; border: none; border-radius: 4px; color: #fff; background: #3a3d44; cursor: pointer; font-size: 13px; }
+.forage-queue button.active { background: #4a7fff; }
+.forage-sidebar-line { margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; background: #2a2d36; border: 1px solid #4a7fff; border-radius: 6px; padding: 6px 8px; }
+@media (max-width: 600px) {
+  .forage-modal { width: 94vw; padding: 14px; }
+  .forage-row { flex-wrap: wrap; }
+}
+
+/* Campaign tables (campaign.js): the notice card sits above every other modal, the banner is a
+   passing message at the top of the screen. */
+#campaignNotice { z-index: 500; }
+#campaignNotice .modal { width: 340px; max-width: 92vw; }
+#campaignNotice .actions { flex-wrap: wrap; }
+#campaignBanner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; padding: 8px 14px; border-radius: 6px; background: #2a2d36; border: 1px solid #4a7fff; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+#campaignBanner[hidden] { display: none; }

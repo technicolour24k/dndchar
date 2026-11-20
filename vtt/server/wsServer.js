@@ -1,8 +1,8 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
-import { sessions, socketsBySession, broadcast, setWatches, removeWatcher } from './store.js';
+import { sessions, socketsBySession, broadcast, setWatches, removeWatcher, releaseSocket, registerReleaseHook } from './store.js';
 import handleJoin from './handlers/join.js';
-import handleTokenEvent from './handlers/token.js';
+import handleTokenEvent, { clearMovePreviewForSocket } from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
 import handleMarkerEvent from './handlers/marker.js';
 import handleTargetEvent from './handlers/target.js';
@@ -50,6 +50,10 @@ export function attachVttWebSocketServer(httpServer) {
   if (wss) return wss;
   wss = new WebSocketServer({ noServer: true });
 
+  // A movement-path preview this socket was planning is dropped whenever it leaves its room
+  // (close, heartbeat terminate, kick, or a hop to another room).
+  registerReleaseHook('movePreview', (meta, session) => clearMovePreviewForSocket(meta, session, broadcast));
+
   const context = {
     sessions,
     socketsBySession,
@@ -89,7 +93,7 @@ export function attachVttWebSocketServer(httpServer) {
   wss.on('close', () => clearInterval(heartbeatInterval));
 
   wss.on('connection', (ws) => {
-    const meta = { ws, sessionId: null, role: null, playerId: null, playerName: null, watchTopics: new Set() };
+    const meta = { ws, sessionId: null, role: null, playerId: null, playerName: null, watchTopics: new Set(), movePreviewTokenId: null };
     ws.vttMeta = meta;
     ws.isAlive = true;
     ws.on('pong', () => {
@@ -125,8 +129,13 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:remove':
         case 'token:remove:bulk':
         case 'token:move':
+        case 'token:recenter':
+        case 'token:move:preview':
+        case 'token:move:preview:clear':
         case 'token:move:resetAll':
         case 'token:stat:update':
+        case 'token:knownAc:set':
+        case 'token:vision:sync':
         case 'token:update':
         case 'token:hidden:toggle':
         case 'attack:resolve':
@@ -162,21 +171,7 @@ export function attachVttWebSocketServer(httpServer) {
       // watch-only socket (sheet/Session Notes modal) has meta.sessionId ===
       // null and must still be cleaned out of watchersByTopic.
       removeWatcher(meta);
-      if (!meta.sessionId) return;
-      const sockets = socketsBySession.get(meta.sessionId);
-      if (sockets) sockets.delete(meta);
-
-      const session = sessions.get(meta.sessionId);
-      if (!session) return;
-
-      if (meta.role === 'player' && meta.playerId && session.players[meta.playerId]) {
-        // Don't delete the player outright - they should reappear correctly
-        // on reconnect via the same state:full path join.js already uses.
-        session.players[meta.playerId].connected = false;
-        broadcast(meta.sessionId, () => ({ type: 'player:left', playerId: meta.playerId }));
-      } else if (meta.role === 'gm' && session.gmSocketId === (meta.playerId || 'gm')) {
-        session.gmSocketId = null;
-      }
+      releaseSocket(meta);
     });
   });
 

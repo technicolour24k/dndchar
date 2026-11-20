@@ -1,10 +1,14 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { createCharacter, listCharacters } from '$lib/server/services/characters';
+import { listCampaignCharactersForUser } from '$lib/server/services/campaigns';
 
 export async function load({ locals }) {
-  return {
-    characters: await listCharacters(locals.user!.id)
-  };
+  const [characters, campaignCharacters] = await Promise.all([
+    listCharacters(locals.user!.id),
+    // Other people's characters in the user's campaigns (read-only for plain members).
+    listCampaignCharactersForUser(locals.user!.id)
+  ]);
+  return { characters, campaignCharacters };
 }
 
 export const actions = {
