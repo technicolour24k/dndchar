@@ -15,6 +15,7 @@ import {
   critMaxDiceBonus,
   mergeDiceTerms,
   modifierConditionMatches,
+  withStatusFlags,
   modifierTargetMatches,
   resolveCritThreshold,
   resolveD20Outcomes,
@@ -96,11 +97,12 @@ export function collectAdvantageSources(
   origin: AdvantageOrigin
 ): AdvantageSource[] {
   const sources: AdvantageSource[] = [];
+  const flagged = withStatusFlags(context, effects);
   for (const effect of effects) {
     effect.modifiers.forEach((modifier, index) => {
       if (modifier.modifierType !== 'advantage' && modifier.modifierType !== 'disadvantage') return;
       if (!modifierTargetMatches(modifier.target, candidates)) return;
-      if (!modifierConditionMatches(modifier.conditionExpression, context)) return;
+      if (!modifierConditionMatches(modifier.conditionExpression, flagged)) return;
       sources.push({
         id: `${origin}|${effect.id}|${modifier.target}|${modifier.modifierType}|${index}`,
         label: modifier.label?.trim() || effect.name,
@@ -272,7 +274,7 @@ export function rollWithModifiers(
   rollDie: (sides: number) => number = defaultRollDie,
   options: RollWithModifiersOptions = {}
 ): { text: string; natural: number; total: number; pool: AttackPool; advantageSources: AdvantageSource[] } {
-  const context = options.context ?? {};
+  const context = withStatusFlags(options.context ?? {}, modifierSources);
   const relevant = modifierSources.flatMap((effect) => effect.modifiers.map((entry) => ({ effect: effect.name, entry })))
     .filter(({ entry }) => modifierTargetMatches(entry.target, candidates) && modifierConditionMatches(entry.conditionExpression, context));
 

@@ -158,10 +158,11 @@ export function resolvedNumericModifiers(
   modifierTypes: string[],
   context: ModifierContext = {}
 ): ResolvedBonus[] {
+  const flagged = withStatusFlags(context, effects);
   return effects.flatMap((effect) =>
     effect.modifiers
       .filter((modifier) => modifierTypes.includes(modifier.modifierType) && modifierTargetMatches(modifier.target, candidates)
-        && modifierConditionMatches(modifier.conditionExpression,context))
+        && modifierConditionMatches(modifier.conditionExpression,flagged))
       .map((modifier) => ({
         label: modifier.label?.trim() || effect.name,
         value: resolveModifierNumericValue(modifier.valueExpression, context, effect.modifiers, modifier),
@@ -169,6 +170,25 @@ export function resolvedNumericModifiers(
       }))
       .filter((bonus) => bonus.value !== 0 || modifierTypes.includes('set'))
   ).sort((left,right)=>left.priority-right.priority).map(({label,value})=>({label,value}));
+}
+
+// Status flags for "flag:<name>" conditions: every active effect on the character (Raging, Hidden,
+// Cover, ...) raises a flag named after it, lower-cased, with spaces as underscores too
+// ("Half Cover" -> "half cover" and "half_cover"), plus its effect key. So a weapon damage bonus
+// with condition "flag:raging" only applies while the Raging effect is active.
+export function statusFlagsOf(effects:Array<{name?:string;effectKey?:string}>):string[]{
+  const flags=new Set<string>();
+  for(const effect of effects){
+    for(const raw of [effect.name,effect.effectKey]){
+      const value=(raw||'').trim().toLowerCase();if(!value)continue;
+      flags.add(value);flags.add(value.replace(/\s+/g,'_'));
+    }
+  }
+  return [...flags];
+}
+// The context with the effects' status flags added to any flags it already carries.
+export function withStatusFlags(context:ModifierContext,effects:Array<{name?:string;effectKey?:string}>):ModifierContext{
+  return {...context,flags:[...new Set([...(context.flags||[]),...statusFlagsOf(effects)])]};
 }
 
 export function modifierConditionMatches(expression:string,context:ModifierContext={}):boolean{
@@ -248,10 +268,11 @@ export function resolveExtraDiceRolls(
   context: ModifierContext = {},
   rollDie: (sides: number) => number = (sides) => Math.floor(Math.random() * sides) + 1
 ): ExtraDieResult[] {
+  const flagged = withStatusFlags(context, effects);
   return effects.flatMap((effect) =>
     effect.modifiers
       .filter((modifier) => modifier.modifierType === 'extra_die' && modifierTargetMatches(modifier.target, candidates)
-        && modifierConditionMatches(modifier.conditionExpression, context))
+        && modifierConditionMatches(modifier.conditionExpression, flagged))
       .map((modifier): ExtraDieResult => {
         const label = modifier.label?.trim() || effect.name;
         const match = modifier.valueExpression.match(/^(\d*)d(\d+)$/i);
@@ -317,8 +338,9 @@ export function rollD20Pool(
 
 function countAdvantageSources(effects: ActiveCharacterEffect[], candidates: string[], context: ModifierContext = {}) {
   let advantageCount = 0, disadvantageCount = 0;
+  const flagged = withStatusFlags(context, effects);
   for (const effect of effects) for (const modifier of effect.modifiers) {
-    if (!modifierTargetMatches(modifier.target, candidates) || !modifierConditionMatches(modifier.conditionExpression, context)) continue;
+    if (!modifierTargetMatches(modifier.target, candidates) || !modifierConditionMatches(modifier.conditionExpression, flagged)) continue;
     if (modifier.modifierType === 'advantage') advantageCount += 1;
     if (modifier.modifierType === 'disadvantage') disadvantageCount += 1;
   }
