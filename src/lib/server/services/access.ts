@@ -1,4 +1,5 @@
 import type { CampaignRole } from '$lib/types/campaign';
+import { CampaignError } from '$lib/server/campaignError';
 
 // Who may see, edit or act for a character, and who may manage a campaign's members.
 //
@@ -178,7 +179,7 @@ export async function getCharacterAccess(db: Queryable, userId: string, characte
 // All three throw the same message, so a failed check never reveals whether the character exists.
 async function assertCharacter(db: Queryable, userId: string, characterId: string, flag: 'canView' | 'canEdit' | 'canAct'): Promise<CharacterAccess> {
   const access = await getCharacterAccess(db, userId, characterId);
-  if (!access || !access[flag]) throw new Error('Character not found.');
+  if (!access || !access[flag]) throw new CampaignError('Character not found.');
   return access;
 }
 export const assertCanViewCharacter = (db: Queryable, userId: string, characterId: string) => assertCharacter(db, userId, characterId, 'canView');

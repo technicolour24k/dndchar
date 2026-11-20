@@ -4,6 +4,8 @@ import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacter, listItemCategories, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { attempt } from '$lib/server/campaignAction';
+import { addCharacterToCampaign, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
 import { getRoomGameSessionId, logSessionNote } from '$lib/server/services/gameSessions';
@@ -22,8 +24,10 @@ export async function load({ params, locals, depends }) {
   if (!character) throw error(404, 'Character not found.');
 
   // Independent reads, so they can run concurrently rather than one round-trip each.
-  const [itemCategories, activeVttSessionId, activeEncounterId, activeGameSessionId] = await Promise.all([
+  const [itemCategories, myCampaigns, activeVttSessionId, activeEncounterId, activeGameSessionId] = await Promise.all([
     listItemCategories(),
+    // For the sheet's "Add to campaign" select (the campaigns this user is a member of).
+    listMyCampaignOptions(locals.user!.id),
     // All three below - activeVttSessionId (the one thing a player joins),
     // activeEncounterId, activeGameSessionId - are user-scoped, not
     // character-scoped: a player joins a room once, and every character sheet
@@ -42,6 +46,7 @@ export async function load({ params, locals, depends }) {
   return {
     character,
     itemCategories,
+    myCampaigns,
     activeVttSessionId,
     activeEncounterId,
     activeGameSessionId
@@ -49,6 +54,22 @@ export async function load({ params, locals, depends }) {
 }
 
 export const actions = {
+  // Campaign membership of this character (B5). The campaign service does the permission checks.
+  // Results use their own keys so the sheet's own "saved" / error banners are not triggered.
+  setCampaign: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => addCharacterToCampaign(locals.user!.id, params.id, String(form.get('campaignId') || '')));
+    return result.ok ? { campaignDone: true } : fail(400, { campaignError: result.failure.data.error });
+  },
+  leaveCampaign: async ({ params, locals }) => {
+    const result = await attempt(() => removeCharacterFromCampaign(locals.user!.id, params.id));
+    return result.ok ? { campaignDone: true } : fail(400, { campaignError: result.failure.data.error });
+  },
+  setPartyActive: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => setCharacterPartyActive(locals.user!.id, params.id, form.get('active') === '1'));
+    return result.ok ? { campaignDone: true } : fail(400, { campaignError: result.failure.data.error });
+  },
   save: async ({ request, params, locals }) => {
     const form = await request.formData();
     await updateCharacter(locals.user!.id, params.id, form, 'Manual save');

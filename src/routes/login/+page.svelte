@@ -10,6 +10,7 @@
   </div>
 
   <form method="POST" class="stack">
+    <input type="hidden" name="next" value={data.next} />
     {#if form?.error}
       <p class="form-error">{form.error}</p>
     {/if}
@@ -23,7 +24,7 @@
     </label>
     <button type="submit">Log in</button>
     {#if data.registrationEnabled}
-      <a class="text-button" href="/register">Create an account</a>
+      <a class="text-button" href={`/register${data.nextQuery}`}>Create an account</a>
     {/if}
   </form>
 </section>

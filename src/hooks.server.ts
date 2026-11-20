@@ -1,6 +1,7 @@
 import { redirect, type Handle } from '@sveltejs/kit';
 import { getUserForToken, readSessionCookie } from '$lib/server/auth/session';
 import { requireAdmin } from '$lib/server/auth/authorization';
+import { safeNext } from '$lib/server/auth/safeNext';
 import type { SessionUser } from '$lib/types/auth';
 import { queryStatsStorage, startPeriodicSummary, statsEnabled, type QueryStats } from '$lib/server/db/queryStats';
 
@@ -52,11 +53,18 @@ async function handleRequest({ event, resolve }: Parameters<Handle>[0]) {
     event.url.pathname === '/vtt/api/log' ||
     event.url.pathname === '/vtt/api/roll-log';
   if (!event.locals.user && !publicRoutes.has(event.url.pathname) && !bypassesUserAuth) {
-    throw redirect(303, '/login');
+    // Remember where they were going (GET only, a POST can't be replayed) so login can send them
+    // back, e.g. to an invite link. safeNext re-validates it on the way out of login.
+    // Only for page navigations: a stray logged-out favicon or polling GET must not become the
+    // post-login destination. Browsers send sec-fetch-dest; fall back to Accept if it is missing.
+    const dest = event.request.headers.get('sec-fetch-dest');
+    const isDocument = dest ? dest === 'document' : (event.request.headers.get('accept') ?? '').includes('text/html');
+    const back = event.request.method === 'GET' && isDocument ? event.url.pathname + event.url.search : '';
+    throw redirect(303, back && back !== '/' ? `/login?next=${encodeURIComponent(back)}` : '/login');
   }
 
   if (event.locals.user && event.url.pathname === '/login') {
-    throw redirect(303, '/dashboard');
+    throw redirect(303, safeNext(event.url.searchParams.get('next')));
   }
 
   if (event.url.pathname.startsWith('/admin')) requireAdmin(event.locals.user);

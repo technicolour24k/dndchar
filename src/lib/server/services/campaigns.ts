@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { CampaignError } from '$lib/server/campaignError';
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { canLeave, canRemoveMember, canSetRole, decideCampaignAccess, getCampaignAccess, isUuid, type LoadedCampaignAccess } from '$lib/server/services/access';
@@ -64,12 +65,12 @@ type Locked = { campaign: { id: string; roomCode: string; isArchived: boolean };
 
 // Loads the campaign and its members (locking the member rows) plus whether the actor is admin.
 async function lockCampaign(client: pg.PoolClient, userId: string, campaignId: string): Promise<Locked> {
-  if (!isUuid(campaignId) || !isUuid(userId)) throw new Error('Campaign not found.');
+  if (!isUuid(campaignId) || !isUuid(userId)) throw new CampaignError('Campaign not found.');
   const campaign = await client.query<{ id: string; room_code: string; is_archived: boolean }>(
     'SELECT id, room_code, is_archived FROM campaigns WHERE id = $1',
     [campaignId]
   );
-  if (!campaign.rows[0]) throw new Error('Campaign not found.');
+  if (!campaign.rows[0]) throw new CampaignError('Campaign not found.');
   const members = await client.query<{ user_id: string; role: CampaignRole }>(
     'SELECT user_id, role FROM campaign_members WHERE campaign_id = $1 FOR UPDATE',
     [campaignId]
@@ -86,7 +87,7 @@ const roleOf = (locked: Locked, userId: string): CampaignRole | null => locked.m
 
 // Only admin may touch an archived campaign.
 function assertNotArchived(locked: Locked) {
-  if (locked.campaign.isArchived && !locked.isAdmin) throw new Error('This campaign is archived.');
+  if (locked.campaign.isArchived && !locked.isAdmin) throw new CampaignError('This campaign is archived.');
 }
 
 // A user leaving (or being removed): their characters leave the campaign and, if their sheet was
@@ -102,9 +103,9 @@ async function releaseMember(client: pg.PoolClient, campaignId: string, roomCode
 
 function checkDetails(name: string, description: string) {
   const trimmed = String(name ?? '').trim();
-  if (!trimmed) throw new Error('Give the campaign a name.');
-  if (trimmed.length > 80) throw new Error('The name can be at most 80 characters.');
-  if (String(description ?? '').length > 2000) throw new Error('The description can be at most 2000 characters.');
+  if (!trimmed) throw new CampaignError('Give the campaign a name.');
+  if (trimmed.length > 80) throw new CampaignError('The name can be at most 80 characters.');
+  if (String(description ?? '').length > 2000) throw new CampaignError('The description can be at most 2000 characters.');
   return { name: trimmed, description: String(description ?? '') };
 }
 
@@ -280,6 +281,17 @@ export async function getCampaignPage(userId: string, campaignId: string): Promi
   };
 }
 
+// The user's own live campaigns (not archived), for the sheet's campaign picker. Unpaged: it is a
+// select box of the campaigns one person actually plays in.
+export async function listMyCampaignOptions(userId: string): Promise<{ id: string; name: string }[]> {
+  const result = await query<{ id: string; name: string }>(
+    `SELECT cp.id, cp.name FROM campaigns cp JOIN campaign_members m ON m.campaign_id = cp.id
+     WHERE m.user_id = $1 AND cp.is_archived = false ORDER BY lower(cp.name), cp.id`,
+    [userId]
+  );
+  return result.rows;
+}
+
 // Public to any signed-in user holding the code (the invite page shows it before joining).
 export async function findCampaignByInviteCode(code: string): Promise<{ id: string; name: string; dmName: string | null } | null> {
   const normalised = normaliseCode(code);
@@ -303,7 +315,7 @@ export async function joinCampaignByInviteCode(userId: string, code: string): Pr
     const found = normalised
       ? await client.query<{ id: string }>('SELECT id FROM campaigns WHERE invite_code = $1 AND is_archived = false FOR SHARE', [normalised])
       : { rows: [] as { id: string }[] };
-    if (!found.rows[0]) throw new Error("That invite code wasn't found.");
+    if (!found.rows[0]) throw new CampaignError("That invite code wasn't found.");
     await client.query(
       `INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1, $2, 'player') ON CONFLICT (campaign_id, user_id) DO NOTHING`,
       [found.rows[0].id, userId]
@@ -318,7 +330,7 @@ export async function regenerateInviteCode(userId: string, campaignId: string): 
     withTransaction(async (client) => {
       const locked = await lockCampaign(client, userId, campaignId);
       const access = decideCampaignAccess({ isAdmin: locked.isAdmin, memberRole: roleOf(locked, userId), archived: locked.campaign.isArchived });
-      if (!access.canManage) throw new Error("You can't manage this campaign.");
+      if (!access.canManage) throw new CampaignError("You can't manage this campaign.");
       const code = generateCode(INVITE_LENGTH);
       await client.query('UPDATE campaigns SET invite_code = $2, updated_at = now() WHERE id = $1', [campaignId, code]);
       return code;
@@ -332,7 +344,7 @@ export async function updateCampaignDetails(userId: string, campaignId: string, 
   await withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
     const access = decideCampaignAccess({ isAdmin: locked.isAdmin, memberRole: roleOf(locked, userId), archived: locked.campaign.isArchived });
-    if (!access.canManage) throw new Error("You can't manage this campaign.");
+    if (!access.canManage) throw new CampaignError("You can't manage this campaign.");
     await client.query('UPDATE campaigns SET name = $2, description = $3, updated_at = now() WHERE id = $1', [campaignId, details.name, details.description]);
   });
 }
@@ -349,10 +361,10 @@ export async function setMemberRole(userId: string, campaignId: string, targetUs
       const locked = await lockCampaign(client, userId, campaignId);
       assertNotArchived(locked);
       const targetRole = roleOf(locked, targetUserId);
-      if (!targetRole) throw new Error('That person is not in this campaign.');
+      if (!targetRole) throw new CampaignError('That person is not in this campaign.');
       const roles = locked.members.map((m) => m.role);
       const verdict = canSetRole({ userId, role: roleOf(locked, userId), isAdmin: locked.isAdmin }, { userId: targetUserId, role: targetRole }, role, roles);
-      if (!verdict.ok) throw new Error(verdict.reason);
+      if (!verdict.ok) throw new CampaignError(verdict.reason);
 
       const set = (id: string, to: CampaignRole) =>
         client.query('UPDATE campaign_members SET role = $3 WHERE campaign_id = $1 AND user_id = $2', [campaignId, id, to]);
@@ -367,8 +379,8 @@ export async function setMemberRole(userId: string, campaignId: string, targetUs
       await client.query('UPDATE campaigns SET updated_at = now() WHERE id = $1', [campaignId]);
     });
   } catch (error) {
-    if (uniqueViolation(error, ['campaign_members_one_co_dm_idx'])) throw new Error('This campaign already has a co-DM.');
-    if (uniqueViolation(error, ['campaign_members_one_dm_idx'])) throw new Error('This campaign already has a DM.');
+    if (uniqueViolation(error, ['campaign_members_one_co_dm_idx'])) throw new CampaignError('This campaign already has a co-DM.');
+    if (uniqueViolation(error, ['campaign_members_one_dm_idx'])) throw new CampaignError('This campaign already has a DM.');
     throw error;
   }
 }
@@ -380,13 +392,13 @@ export async function removeMember(userId: string, campaignId: string, targetUse
     const locked = await lockCampaign(client, userId, campaignId);
     assertNotArchived(locked);
     const targetRole = roleOf(locked, targetUserId);
-    if (!targetRole) throw new Error('That person is not in this campaign.');
+    if (!targetRole) throw new CampaignError('That person is not in this campaign.');
     const verdict = canRemoveMember(
       { userId, role: roleOf(locked, userId), isAdmin: locked.isAdmin },
       { userId: targetUserId, role: targetRole },
       locked.members.map((m) => m.role)
     );
-    if (!verdict.ok) throw new Error(verdict.reason);
+    if (!verdict.ok) throw new CampaignError(verdict.reason);
     // Delete first so the 'dm' slot is free for the co-DM to take.
     await releaseMember(client, campaignId, locked.campaign.roomCode, targetUserId);
     if (verdict.promoteCoDm) {
@@ -402,9 +414,9 @@ export async function leaveCampaign(userId: string, campaignId: string): Promise
   return withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
     const myRole = roleOf(locked, userId);
-    if (!myRole) throw new Error("You're not in this campaign.");
+    if (!myRole) throw new CampaignError("You're not in this campaign.");
     const verdict = canLeave({ userId, role: myRole }, locked.members.map((m) => m.role), locked.campaign.isArchived);
-    if (!verdict.ok) throw new Error(verdict.reason);
+    if (!verdict.ok) throw new CampaignError(verdict.reason);
     await releaseMember(client, campaignId, locked.campaign.roomCode, userId);
     if (verdict.promoteCoDm) {
       await client.query(`UPDATE campaign_members SET role = 'dm' WHERE campaign_id = $1 AND role = 'co_dm'`, [campaignId]);
@@ -425,12 +437,12 @@ export async function leaveCampaign(userId: string, campaignId: string): Promise
 // another campaign moves (the UI confirms first). One campaign per character is the single column.
 export async function addCharacterToCampaign(userId: string, characterId: string, campaignId: string): Promise<void> {
   await withTransaction(async (client) => {
-    if (!isUuid(characterId)) throw new Error('Character not found.');
+    if (!isUuid(characterId)) throw new CampaignError('Character not found.');
     const locked = await lockCampaign(client, userId, campaignId);
     const character = await client.query<{ owner_user_id: string }>('SELECT owner_user_id FROM characters WHERE id = $1 FOR UPDATE', [characterId]);
-    if (!character.rows[0] || character.rows[0].owner_user_id !== userId) throw new Error('Character not found.');
-    if (!roleOf(locked, userId)) throw new Error('Join the campaign before adding a character.');
-    if (locked.campaign.isArchived) throw new Error('This campaign is archived.');
+    if (!character.rows[0] || character.rows[0].owner_user_id !== userId) throw new CampaignError('Character not found.');
+    if (!roleOf(locked, userId)) throw new CampaignError('Join the campaign before adding a character.');
+    if (locked.campaign.isArchived) throw new CampaignError('This campaign is archived.');
     await client.query('UPDATE characters SET campaign_id = $2, party_active = true WHERE id = $1', [characterId, campaignId]);
   });
 }
@@ -439,39 +451,41 @@ export async function addCharacterToCampaign(userId: string, characterId: string
 // may, otherwise a DM of its campaign or admin. Follows the lock order above: peek at the
 // character without a lock to find its campaign, lock that campaign, then lock the character and
 // check it hasn't moved in between.
-async function loadCharacterForCampaignChange(client: pg.PoolClient, userId: string, characterId: string) {
-  if (!isUuid(characterId)) throw new Error('Character not found.');
+async function loadCharacterForCampaignChange(client: pg.PoolClient, userId: string, characterId: string, expectedCampaignId?: string) {
+  if (!isUuid(characterId)) throw new CampaignError('Character not found.');
   const peek = await client.query<{ campaign_id: string | null }>('SELECT campaign_id FROM characters WHERE id = $1', [characterId]);
-  if (!peek.rows[0]) throw new Error('Character not found.');
+  if (!peek.rows[0]) throw new CampaignError('Character not found.');
   const campaignId = peek.rows[0].campaign_id;
-  if (!campaignId) throw new Error('That character is not in a campaign.');
+  if (!campaignId) throw new CampaignError('That character is not in a campaign.');
+  // The campaign page passes its own id, so a stale or forged form can't act on another campaign's character.
+  if (expectedCampaignId && campaignId !== expectedCampaignId) throw new CampaignError('That character is not in this campaign.');
   const locked = await lockCampaign(client, userId, campaignId);
   const row = await client.query<{ owner_user_id: string; campaign_id: string | null }>(
     'SELECT owner_user_id, campaign_id FROM characters WHERE id = $1 FOR UPDATE',
     [characterId]
   );
   const character = row.rows[0];
-  if (!character) throw new Error('Character not found.');
-  if (character.campaign_id !== campaignId) throw new Error("That character's campaign just changed, try again.");
+  if (!character) throw new CampaignError('Character not found.');
+  if (character.campaign_id !== campaignId) throw new CampaignError("That character's campaign just changed, try again.");
   const isOwner = character.owner_user_id === userId;
   const access = decideCampaignAccess({ isAdmin: locked.isAdmin, memberRole: roleOf(locked, userId), archived: locked.campaign.isArchived });
-  if (!isOwner && !access.canManage) throw new Error('Character not found.');
+  if (!isOwner && !access.canManage) throw new CampaignError('Character not found.');
   return campaignId;
 }
 
 // Owner, or a DM of its campaign, or admin.
-export async function removeCharacterFromCampaign(userId: string, characterId: string): Promise<void> {
+export async function removeCharacterFromCampaign(userId: string, characterId: string, expectedCampaignId?: string): Promise<void> {
   await withTransaction(async (client) => {
-    await loadCharacterForCampaignChange(client, userId, characterId);
+    await loadCharacterForCampaignChange(client, userId, characterId, expectedCampaignId);
     await client.query('UPDATE characters SET campaign_id = NULL, party_active = true WHERE id = $1', [characterId]);
   });
 }
 
 // Owner, or a DM of its campaign, or admin. Inactive characters stay in the campaign; the flag
 // only affects grouping and which characters the VTT GM picker offers.
-export async function setCharacterPartyActive(userId: string, characterId: string, active: boolean): Promise<void> {
+export async function setCharacterPartyActive(userId: string, characterId: string, active: boolean, expectedCampaignId?: string): Promise<void> {
   await withTransaction(async (client) => {
-    await loadCharacterForCampaignChange(client, userId, characterId);
+    await loadCharacterForCampaignChange(client, userId, characterId, expectedCampaignId);
     await client.query('UPDATE characters SET party_active = $2 WHERE id = $1', [characterId, Boolean(active)]);
   });
 }
@@ -485,8 +499,8 @@ export async function setCharacterPartyActive(userId: string, characterId: strin
 export async function archiveCampaign(userId: string, campaignId: string): Promise<{ roomCode: string }> {
   return withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
-    if (locked.campaign.isArchived) throw new Error('This campaign is already archived.');
-    if (!locked.isAdmin && roleOf(locked, userId) !== 'dm') throw new Error('Only the DM can archive this campaign.');
+    if (locked.campaign.isArchived) throw new CampaignError('This campaign is already archived.');
+    if (!locked.isAdmin && roleOf(locked, userId) !== 'dm') throw new CampaignError('Only the DM can archive this campaign.');
     await client.query('UPDATE campaigns SET is_archived = true, updated_at = now() WHERE id = $1', [campaignId]);
     await client.query('UPDATE characters SET campaign_id = NULL, party_active = true WHERE campaign_id = $1', [campaignId]);
     await client.query(

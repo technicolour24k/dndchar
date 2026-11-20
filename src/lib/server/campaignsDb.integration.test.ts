@@ -213,6 +213,13 @@ describe.skipIf(!enabled)('campaigns against the local dev DB', () => {
     await campaigns.joinCampaignByInviteCode(u('outsider'), (await codes(A)).invite);
     await expect(campaigns.removeCharacterFromCampaign(u('outsider'), charIds.p1)).rejects.toThrow();
     await campaigns.removeMember(u('p2'), A, u('outsider'));
+    // Tied to a campaign: a character that is not in the expected campaign is refused, as a CampaignError.
+    const wrong = '00000000-0000-4000-8000-0000000000aa';
+    const refusal = await campaigns.setCharacterPartyActive(u('p2'), charIds.p1, true, wrong).catch((e) => e);
+    expect(refusal.name).toBe('CampaignError');
+    expect(refusal.message).toBe('That character is not in this campaign.');
+    await expect(campaigns.removeCharacterFromCampaign(u('p2'), charIds.p1, wrong)).rejects.toThrow('not in this campaign');
+    await campaigns.setCharacterPartyActive(u('p2'), charIds.p1, true, A);
   });
 
   it('getCampaignPage: invite code only for DMs and admin; non-members get null', async () => {

@@ -1730,6 +1730,15 @@
       <p class="muted">
         {race || character.ancestry || 'Unknown origin'} - {classes.className} {classes.level}
       </p>
+      <p class="campaign-badge-line">
+        {#if character.campaignId}
+          <a class="text-button" href={`/campaigns/${character.campaignId}`}>Campaign: {character.campaignName}</a>
+          <span class="badge" class:badge-muted={!character.partyActive}>{character.partyActive ? 'Active in party' : 'Not in party'}</span>
+        {:else}
+          <span class="muted">No campaign</span>
+          <a class="text-button" href="/campaigns">Add to campaign</a>
+        {/if}
+      </p>
     </div>
     <nav class="sheet-tabs in-header" aria-label="Character sheet sections">
       <button type="button" class:active={activeTab === 'battle'} onclick={() => (activeTab = 'battle')}>Battle</button>

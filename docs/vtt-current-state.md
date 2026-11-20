@@ -1076,3 +1076,14 @@ Plan: `~/.claude/plans/dndchar/campaign-system/campaign-system.md` (Rev 1 and Re
 - **`services/campaigns.ts`.** Create, paginated and searchable list (12 per page), campaign page, invite codes, roles, remove and leave (co-DM auto-promotes), characters, archive, room-code lookup.
 - **Not wired up.** No existing call site uses the new access helpers yet (Units C and D). `getCharacter`, `listCharacters` and `getCharacterForRoll` only gained campaign fields.
 - **Tests.** `access.test.ts` (pure) and the gated `campaignsDb.integration.test.ts` (`CAMPAIGN_DB_TEST=1`, local DB only).
+
+### 2026-11-20 - Campaigns B: campaign UI
+
+Plan: `~/.claude/plans/dndchar/campaign-system/campaign-system.md`. No migration. Access rules are unchanged (Units C and D do that), so a DM still can't open a player's sheet yet.
+
+- **Login return path.** The auth hook adds `?next=` for anonymous GETs; login and register carry it in a hidden field and redirect through `safeNext` (same-origin paths only, never back into login/register).
+- **`/campaigns`.** Searchable (GET form), 12 per page, pager keeps the search; create and join-by-code panels; admins see every campaign with an "Include archived" box.
+- **`/campaigns/join/[code]`.** Confirm page, a GET never joins. Dead codes show "This invite isn't valid any more."
+- **`/campaigns/[id]`.** Collapsible panels: details, invite (code, link, copy, new code), members (role controls from `campaignControls.ts`, which reuses the `access.ts` rules; the service re-checks), party with "active in party", add your character, table link, archive. Leave, and the admin banner.
+- **Sheet and roster.** Campaign line and party badge in the sheet header, a Campaign panel below the sheet (add, move, remove, active toggle; outside the big form because forms can't nest), campaign badge on roster cards.
+- **Tests.** `safeNext.test.ts`, `listParams.test.ts`, `campaignControls.test.ts`, `campaignRoutes.test.ts` (route actions called directly with the service mocked).

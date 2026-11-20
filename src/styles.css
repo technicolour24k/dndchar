@@ -602,44 +602,65 @@ label.compact-check {
   grid-template-columns: minmax(0, 1fr);
 }
 
+/* Character cards (roster and dashboard). auto-fill, not auto-fit, so one card doesn't stretch
+   across the whole page. The whole card is a link to the sheet. */
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 14px;
 }
 
 .character-card {
   display: grid;
-  grid-template-columns: 58px minmax(0, 1fr);
-  gap: 14px;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 10px 12px;
   align-items: center;
+  padding: 14px;
+  color: var(--text);
+  min-width: 0;
 }
 
-.character-card dl {
+.character-card:hover {
+  outline: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+}
+
+.panel .character-card {
+  background: var(--panel-dark);
+}
+
+.character-card .token {
+  width: 44px;
+  height: 44px;
+  font-size: 14px;
+}
+
+.character-card-body {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.character-card-body p {
+  font-size: 13px;
+}
+
+.character-card-foot {
   grid-column: 1 / -1;
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 10px;
-  margin: 0;
-}
-
-.character-card dt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 30%, transparent);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 13px;
 }
 
-.character-card dd {
-  margin: 0;
-  font-weight: 900;
+.character-card-foot strong {
+  color: var(--text);
 }
 
-.character-card .button-link {
-  grid-column: 1 / -1;
-}
-
-.token {
-  width: 58px;
-  height: 58px;
+.character-card-foot .badge {
+  margin-left: auto;
 }
 
 .sheet-form {
@@ -2397,4 +2418,406 @@ button.death-save-icon.failure.active {
   .forage-entry-chance { align-self: center; }
   .forage-entry input, .forage-entry button, .forage-add input, .forage-add button { min-height: 44px; }
   .forage-entry button { grid-column: 1 / -1; }
+}
+
+/* Campaigns (Unit B). Everything wraps at 360px. */
+.campaign-forms {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.campaign-forms {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  align-items: start;
+}
+
+.campaign-panel > summary {
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.campaign-panel[open] > summary {
+  margin-bottom: 12px;
+}
+
+.campaign-panel h3 {
+  margin: 12px 0 6px;
+}
+
+/* Campaign list: Create / Join and the cards on the left, search in a sidebar on the right.
+   On a phone the search moves above the cards. */
+.campaigns-layout {
+  display: grid;
+  gap: 14px;
+  align-items: start;
+}
+
+.campaigns-main,
+.campaigns-side {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  min-width: 0;
+}
+
+.campaigns-main .campaign-forms {
+  margin-bottom: 0;
+}
+
+.campaigns-side {
+  order: -1;
+}
+
+@media (min-width: 900px) {
+  .campaigns-layout {
+    grid-template-columns: minmax(0, 1fr) 320px;
+  }
+
+  .campaigns-side {
+    order: 0;
+    position: sticky;
+    top: 14px;
+  }
+}
+
+.campaign-card-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+
+.campaign-card-grid .campaign-card {
+  gap: 8px;
+  min-height: 120px;
+  padding: 18px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.campaign-card-grid .campaign-card h3 {
+  font-size: 18px;
+}
+
+.campaign-card-grid .campaign-card:hover {
+  outline: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+}
+
+/* A checkbox with its label on one line. (Not .check-row: that is the sheet's skill/save row.) */
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 8px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* The global input rule makes every input full width; a checkbox here stays its natural size. */
+.toggle-row input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  margin: 0;
+  padding: 0;
+}
+
+.campaign-card {
+  display: grid;
+  gap: 6px;
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--panel-dark);
+  min-width: 0;
+}
+
+.campaign-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.campaign-card h3 {
+  overflow-wrap: anywhere;
+}
+
+.campaign-badges {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 9px;
+  background: #050505;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.badge-muted {
+  color: var(--muted);
+}
+
+.pager {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.button-link.disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.member-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.member-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px 14px;
+  flex-wrap: wrap;
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--panel-dark);
+}
+
+.member-name {
+  display: flex;
+  align-items: center;
+  gap: 4px 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.member-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Campaign page: party on the left, smaller boxes stacked on the right; one column on a phone. */
+.campaign-head {
+  align-items: flex-start;
+}
+
+.campaign-head h1 {
+  overflow-wrap: anywhere;
+}
+
+.campaign-head-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.badge-admin {
+  background: #18351f;
+  color: var(--ok);
+}
+
+.campaign-description {
+  max-width: 70ch;
+  margin-top: 8px;
+  color: var(--muted);
+  white-space: pre-line;
+}
+
+.campaign-layout {
+  display: grid;
+  gap: 14px;
+  align-items: start;
+}
+
+@media (min-width: 900px) {
+  .campaign-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  }
+}
+
+.campaign-main,
+.campaign-side {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  min-width: 0;
+}
+
+.campaign-box {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  min-width: 0;
+}
+
+.campaign-box h2 {
+  font-size: 16px;
+}
+
+.campaign-box h2 .muted {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.campaign-box .member-list {
+  margin: 0;
+}
+
+.campaign-box-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.campaign-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.campaign-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.invite-code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+
+.invite-link {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+a.button-link.compact-link {
+  min-height: 34px;
+  border-radius: 7px;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+
+button.text-button.danger-text,
+button.text-button.danger-text:hover {
+  color: var(--danger);
+}
+
+.stack-button {
+  justify-self: start;
+}
+
+.campaign-sub > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.campaign-sub[open] > summary {
+  margin-bottom: 10px;
+}
+
+.party-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+}
+
+.party-card {
+  display: grid;
+  gap: 2px;
+  align-content: start;
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel-dark);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.party-card.benched {
+  opacity: .7;
+}
+
+.party-card-name {
+  color: var(--text);
+  font-weight: 800;
+}
+
+.party-card-stats {
+  font-size: 13px;
+}
+
+.party-card-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 30%, transparent);
+}
+
+.party-card-actions .toggle-row {
+  color: var(--text);
+}
+
+.party-subhead {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.party-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.party-add select {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 360px;
+}
+
+.campaign-join {
+  max-width: 520px;
+  margin: 8vh auto;
+}
+
+/* Sheet campaign panel (B5) */
+.campaign-badge-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 480px) {
+  .campaign-join {
+    margin: 4vh auto;
+  }
 }
