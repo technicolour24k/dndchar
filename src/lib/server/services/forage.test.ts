@@ -6,7 +6,7 @@ import { query } from '$lib/server/db';
 import { invalidateReferenceData } from '$lib/server/cache/referenceData';
 import { withTransaction } from '$lib/server/db';
 import {
-  addFindTableEntry, canEditFindTable, createFindTable, loadForageCatalogue, removeFindTableEntry,
+  addFindTableEntry, canEditFindTable, createFindTable, loadForageCatalogue, markSelfFind, removeFindTableEntry,
   tablesForActor, toggleFindTableArchived, updateFindTable, updateFindTableEntries
 } from './forage';
 import type { FindTable } from '$lib/types/forage';
@@ -169,5 +169,47 @@ describe('loadForageCatalogue', () => {
     // cached: a second call makes no more queries
     await loadForageCatalogue();
     expect(queryMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('markSelfFind when the table has gone (Rev 4: players have no table picker)', () => {
+  const FIND = '55555555-5555-4555-8555-555555555555';
+  const findRow = {
+    id: FIND, character_id: 'c1', room_code: null, game_session_id: null, find_table_id: T1, nat20: false,
+    check_json: { skillKey: 'nature', skillLabel: 'Nature', total: 15, natural: 12, nat20: false, nat1: false, text: '', poolSummary: '' }
+  };
+
+  // A fake transaction client answering the queries markSelfFind makes, in order.
+  function fakeClient(tableRows: Array<{ type_die: number }>, entryRows: unknown[] = []) {
+    const client = {
+      query: vi.fn(async (sql: string, _params?: unknown[]) => {
+        if (/FROM finds WHERE id/.test(sql)) return { rows: [findRow], rowCount: 1 };
+        if (/FROM find_tables WHERE id/.test(sql)) return { rows: tableRows, rowCount: tableRows.length };
+        if (/find_table_entries|find_table_id = \$1/.test(sql) && /SELECT/.test(sql)) return { rows: entryRows, rowCount: entryRows.length };
+        return { rows: [], rowCount: 1 };
+      })
+    };
+    vi.mocked(withTransaction).mockImplementation(async (fn: any) => fn(client));
+    return client;
+  }
+
+  async function mark() {
+    return markSelfFind({ findId: FIND, userId: 'u1', passed: true });
+  }
+
+  it('closes as a failed find with a note when the table was archived', async () => {
+    const client = fakeClient([]);
+    const result = await mark();
+    expect(result).toMatchObject({ ok: true, result: { status: 'failed', lines: [] } });
+    const update = client.query.mock.calls.find(([sql]) => /UPDATE finds SET status = 'failed'/.test(sql as string));
+    expect(update?.[1]).toEqual([FIND, expect.stringContaining('archived')]);
+  });
+
+  it('closes as a failed find with a note when nothing on the table is pickable', async () => {
+    const client = fakeClient([{ type_die: 6 }], []);
+    const result = await mark();
+    expect(result).toMatchObject({ ok: true, result: { status: 'failed', lines: [] } });
+    expect(client.query.mock.calls.some(([sql]) => /UPDATE finds SET status = 'failed'/.test(sql as string))).toBe(true);
+    expect(client.query.mock.calls.some(([sql]) => /INSERT INTO character_inventory_items/.test(sql as string))).toBe(false);
   });
 });

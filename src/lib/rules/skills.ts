@@ -27,6 +27,13 @@ export const SKILL_CHECKS: SkillCheck[] = [
   { key: 'survival', name: 'Survival', ability: 'wis' }
 ];
 
+/**
+ * The only skills a player can pick for a SELF-SERVE forage (no DM present). In DM mode the DM calls
+ * any skill, so the full list is for the DM only. Mirrored in static/vtt-app/shared/forageView.js
+ * (unbundled browser JS can't import this file); vttForageView.test.ts asserts the two match.
+ */
+export const FORAGE_SELF_SKILLS = ['nature', 'survival', 'arcana', 'perception', 'investigation', 'religion'];
+
 export function findSkill(key: string): SkillCheck | undefined {
   return SKILL_CHECKS.find((skill) => skill.key === key);
 }

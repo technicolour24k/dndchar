@@ -4,20 +4,26 @@ import { sessions, dmPresent, forageViewForPlayer } from '$vtt/store.js';
 import { query } from '$lib/server/db';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { forageItemCount } from '$lib/rules/forage';
-import { getSuggestedCheck, getUnmarkedSelfFind, markSelfFind, startSelfFind } from '$lib/server/services/forage';
+import { getUnmarkedSelfFind, markSelfFind, startSelfFind } from '$lib/server/services/forage';
 import {
   broadcastForageUpdate, closeRequest, canWithdraw, findPendingForUser, forageMap, forageNudge, forageResultsMap,
   newRequest, resolveForageRoom, rollLogMessage
 } from '$lib/server/vttForage';
 import {
-  ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, rollForageCheck
+  ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, previewGenericAdvantage, rollForageCheck
 } from '$lib/server/vttForageRoll';
-import { isUuid, loadOwnedCharacter, parseChoice, shortText } from '$lib/server/vttForageApi';
+import { FORAGE_SELF_SKILLS } from '$lib/rules/skills';
+import { isUuid, loadOwnedCharacter, parseAdvantage, parseSelfChoice, playerUnmarked, shortText } from '$lib/server/vttForageApi';
 
 // Player-facing forage actions (vtt-forage plan, unit B). All writes are HTTP, the socket only
 // notifies. Every character action first checks the character is the caller's own. The mode is
 // decided here, at submit time: DM mode when the room is live and has a connected account GM,
 // otherwise self-serve (the player marks their own check and the haul goes straight in).
+//
+// Who picks what (Rev 4): in DM mode the player sends ONLY their adv/dis counters, and the DM picks
+// the skill, area, category and table. Anything else in the body is ignored. In self-serve mode the
+// player picks from a short skill list plus an area and category (never a table: the server resolves
+// it), and gets a neutral 'nothing_here' for a combination with nothing to find.
 //
 // Statuses: 400 bad input, 403 not allowed in that room, 404 not your character, 409 a conflict the
 // client can act on ('resume' carries the existing in-flight forage so the popup can reopen it).
@@ -55,11 +61,13 @@ async function previewAction(userId: string, body: any) {
     tokenId: shortText(body?.tokenId, 200) || null, activeRoomId: owned.activeRoomId
   });
   if (room.error) return err(room.error, 403);
-  const preview = await previewForageAdvantage({
-    characterId: body.characterId, skillKey: shortText(body?.skillKey, 40), token: room.token,
-    sessionId: room.session?.id ?? null, body
-  });
-  return json(preview);
+  const common = { characterId: body.characterId, token: room.token, sessionId: room.session?.id ?? null, body };
+  // DM mode: the DM hasn't called a skill yet, so the player only sees sources that apply to any
+  // check. Self-serve: the skill must be on the short list (the player can't probe other skills).
+  if (room.session && dmPresent(room.session)) return json(await previewGenericAdvantage(common));
+  const skillKey = shortText(body?.skillKey, 40);
+  if (!FORAGE_SELF_SKILLS.includes(skillKey)) return err('skill_not_allowed', 400);
+  return json(await previewForageAdvantage({ ...common, skillKey }));
 }
 
 async function startAction(userId: string, displayName: string, body: any) {
@@ -67,14 +75,10 @@ async function startAction(userId: string, displayName: string, body: any) {
   if (!owned) return err('not_found', 404);
   const characterId: string = body.characterId;
 
-  const picked = await parseChoice(body);
-  if ('error' in picked) return err(picked.error, picked.error === 'table_empty' ? 409 : 400);
-
   // Everything async that has to happen before the in-memory check-and-set below, so that two
   // quick starts can't both pass the "nothing in flight" check (no await between it and the set).
   const unmarked = await getUnmarkedSelfFind(userId);
-  if (unmarked) return err('resume', 409, { unmarkedSelf: unmarked });
-  const suggestedCheck = await getSuggestedCheck(picked.choice.tableId);
+  if (unmarked) return err('resume', 409, { unmarkedSelf: playerUnmarked(unmarked) });
 
   const room = resolveForageRoom({
     userId, roomId: shortText(body?.roomId, 64) || null, characterId,
@@ -83,16 +87,22 @@ async function startAction(userId: string, displayName: string, body: any) {
   if (room.error) return err(room.error, 403);
   const session = room.session;
 
+  // Self-serve picks are validated up front (this awaits). In DM mode they are never read.
+  const selfPicked = session && dmPresent(session) ? null : await parseSelfChoice(body);
+  if (selfPicked && 'error' in selfPicked) return err(selfPicked.error, 400);
+
   // One forage in flight per user, across rooms and modes.
   const pending = findPendingForUser(userId);
   if (pending) return err('resume', 409, { pending: forageViewForPlayer(pending.request), roomId: pending.session.id });
 
   if (session && dmPresent(session)) {
-    // DM mode: nothing is rolled yet. The request waits for the GM, pre-filled with the picks.
+    // DM mode: nothing is rolled yet. The request waits for the GM, who picks the skill, area,
+    // category and table. Whatever the player sent for those is ignored: only their adv/dis
+    // counters travel (the DM's popup pre-fills its counters from them).
     const created = newRequest({
       playerId: userId, playerName: displayName, characterId, characterName: owned.name,
       tokenId: room.token?.id ?? null, source: shortText(body?.roomId, 64) ? 'vtt' : 'sheet',
-      choice: picked.choice, suggestedCheck
+      choice: { skillKey: '', areaType: '', category: '', tableId: '', advantage: parseAdvantage(body) }
     });
     forageMap(session)[userId] = created;
     // A new request replaces the finder's old closed result.
@@ -101,7 +111,10 @@ async function startAction(userId: string, displayName: string, body: any) {
     return json({ mode: 'dm', roomId: session.id, request: forageViewForPlayer(created) });
   }
 
-  // Self-serve: the server rolls the check now and logs it as an unmarked find.
+  // Self-serve: the server rolls the check now and logs it as an unmarked find. (If a DM left while
+  // we awaited above there are no validated picks, so the client is told to choose and retry.)
+  if (!selfPicked || 'error' in selfPicked) return err('skill_not_allowed', 400);
+  const picked = selfPicked;
   const check = await rollForageCheck({
     characterId, skillKey: picked.choice.skillKey, token: room.token, sessionId: session?.id ?? null, body
   });
@@ -109,17 +122,19 @@ async function startAction(userId: string, displayName: string, body: any) {
     characterId, finderUserId: userId, tableId: picked.choice.tableId, check,
     roomCode: session?.id ?? null, gameSessionId: session?.gameSessionId ?? null
   });
-  if ('conflict' in started) return err('resume', 409, { unmarkedSelf: started.existing });
-  return json({ mode: 'self', findId: started.findId, tableId: picked.choice.tableId, check });
+  if ('conflict' in started) return err('resume', 409, { unmarkedSelf: playerUnmarked(started.existing) });
+  return json({ mode: 'self', findId: started.findId, check });
 }
 
 async function selfMarkAction(userId: string, body: any) {
   if (!isUuid(body?.findId)) return err('stale', 409);
   const marked = await markSelfFind({
-    findId: body.findId, userId, passed: body.passed === true,
-    tableId: isUuid(body?.tableId) ? body.tableId : undefined
+    // The table was fixed at start (resolved from area + category). A tableId from the player is ignored.
+    findId: body.findId, userId, passed: body.passed === true
   });
-  if (!marked.ok) return err(marked.error, marked.error === 'bad_table' ? 400 : 409);
+  // Only 'stale' is left: a table that went empty or archived closes the find as failed (a normal
+  // result), so a player is never shown table errors or stuck on an unmarked check.
+  if (!marked.ok) return err(marked.error, 409);
 
   const result = marked.result;
   const itemCount = forageItemCount(result.lines.map((line) => ({ itemId: line.itemId, qty: line.qty })));

@@ -410,12 +410,13 @@ export type MarkedSelfFind = {
  * Self-serve: the player marks the check pass or fail. A nat 1 forces a fail. A pass rolls the haul
  * (two runs on a nat 20), validates it like a DM's approval, and inserts it, all in one transaction
  * with the find row locked, so a double tap can only ever mark once ('stale' the second time).
- * 'table_empty' leaves the check unmarked. tableId overrides the stored table (the player's
- * manual pick when there was no table for their area and category).
+ * The table is the one fixed at start (the player never picks or changes it). If it has since been
+ * archived or has nothing pickable, a pass can't pay out, so the find closes as 'failed' with empty
+ * results and a note, rather than leaving the player stuck on an unmarked check.
  */
 export async function markSelfFind(input: {
-  findId: string; userId: string; passed: boolean; tableId?: string; rollDie?: RollDie;
-}): Promise<{ ok: true; result: MarkedSelfFind } | { ok: false; error: 'stale' | 'table_empty' | 'bad_table' }> {
+  findId: string; userId: string; passed: boolean; rollDie?: RollDie;
+}): Promise<{ ok: true; result: MarkedSelfFind } | { ok: false; error: 'stale' }> {
   return withTransaction(async (client) => {
     const found = await client.query<any>(
       `SELECT * FROM finds WHERE id = $1 AND finder_user_id = $2 AND status = 'checked' FOR UPDATE`, [input.findId, input.userId]
@@ -433,12 +434,18 @@ export async function markSelfFind(input: {
       return { ok: true as const, result: { status: 'failed' as const, ...base, lines: [] } };
     }
 
-    const tableId = input.tableId || find.find_table_id;
-    if (!UUID_PATTERN.test(tableId)) return { ok: false as const, error: 'bad_table' as const };
+    const tableId: string = find.find_table_id;
+    const closeNothingToFind = async () => {
+      await client.query(
+        `UPDATE finds SET status = 'failed', resolved_at = now(), revert_note = $2 WHERE id = $1`,
+        [find.id, 'Table empty or archived at mark time, nothing was added.']
+      );
+      return { ok: true as const, result: { status: 'failed' as const, ...base, lines: [] } };
+    };
     const table = await client.query<{ type_die: number }>('SELECT type_die FROM find_tables WHERE id = $1 AND is_archived = false', [tableId]);
-    if (!table.rowCount) return { ok: false as const, error: 'bad_table' as const };
+    if (!table.rowCount) return closeNothingToFind();
     const entries = (await client.query<EntryRow>(`${ENTRY_SELECT} WHERE e.find_table_id = $1`, [tableId])).rows.map(mapEntry);
-    if (pickableEntries(entries).length === 0) return { ok: false as const, error: 'table_empty' as const };
+    if (pickableEntries(entries).length === 0) return closeNothingToFind();
 
     const rolled = rollFind(entries, table.rows[0].type_die, !!find.nat20, input.rollDie ?? defaultRollDie);
     // The server's own haul goes through the same validator as a DM's approval.

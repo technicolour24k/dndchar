@@ -166,6 +166,8 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect((await call(playerRoute.POST, user(), { body: startBody({ characterId: crypto.randomUUID() }) })).status).toBe(404);
       expect((await call(playerRoute.POST, { ...user(), id: otherUserId }, { body: startBody() })).status).toBe(404);
       expect((await call(playerRoute.POST, user(), { body: startBody({ skillKey: 'fishing' }) })).status).toBe(400);
+      // Rev 4: a real skill that is not on the self-serve short list is refused too.
+      expect((await call(playerRoute.POST, user(), { body: startBody({ skillKey: 'stealth' }) })).body.error).toBe('skill_not_allowed');
     });
   });
 
@@ -200,12 +202,12 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect(Object.keys(start.body.request).sort()).toEqual(['check', 'id', 'source', 'stage']);
       const session: any = sessions.get(ROOM);
       const requestId = start.body.request.id;
-      expect(session.forage[userId].choice.skillKey).toBe('nature');
+      // Rev 4: in DM mode the player's picks are ignored, the DM chooses.
+      expect(session.forage[userId].choice.skillKey).toBe('');
 
-      // The GM's update carries the player's pre-filled choice.
+      // The GM's update carries no pre-filled choice, only the player's counters.
       const gmUpdate = frames(gm).find((f: any) => f.type === 'forage:update');
-      expect(gmUpdate.request.choice.tableId).toBe(meadowId);
-      expect(gmUpdate.request.suggestedCheck).toBe('Nature DC 12');
+      expect(gmUpdate.request.choice.tableId).toBe('');
 
       // A second start while pending resumes.
       const second = await call(playerRoute.POST, user(), { body: startBody({ roomId: ROOM }) });
@@ -342,12 +344,15 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
   describe('tables endpoint (Q9)', () => {
     it('suggestedCheck is absent for a player and present for the room GM', async () => {
       const player = await call(tablesRoute.GET, user(), { search: `?roomId=${ROOM}` });
-      expect(player.body.tables.some((t: any) => 'suggestedCheck' in t)).toBe(false);
-      expect(player.body.skills).toHaveLength(18);
+      // Rev 4: a player gets the short skill list and area + category pairs, no table names or counts.
+      expect(player.body.skills).toHaveLength(6);
+      expect(player.body.tables).toBeUndefined();
+      expect(player.body.options.some((o: any) => o.areaType === 'meadow' && o.category === 'plant')).toBe(true);
+      expect(JSON.stringify(player.body)).not.toContain('Nature DC');
       const gmView = await call(tablesRoute.GET, gmUser(), { search: `?roomId=${ROOM}` });
       expect(gmView.body.tables.find((t: any) => t.id === meadowId).suggestedCheck).toBe('Nature DC 12');
       const gmNoRoom = await call(tablesRoute.GET, gmUser());
-      expect(gmNoRoom.body.tables.some((t: any) => 'suggestedCheck' in t)).toBe(false);
+      expect(gmNoRoom.body.tables).toBeUndefined();
     });
   });
 

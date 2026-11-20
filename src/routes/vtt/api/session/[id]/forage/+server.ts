@@ -37,11 +37,23 @@ export const POST: RequestHandler = async ({ locals, params, request: httpReques
 
   const action = body?.action;
   if (action === 'cancel') return cancelAction(session, request);
+  // preview rolls nothing and mutates nothing (it only reads sources), so it never takes the busy lock.
+  // Otherwise the popup's own advantage preview, still in flight, bounces a quick "Roll check" with 409 busy.
+  // A slow preview can't clobber a newer state either: it returns sources only, and the client drops
+  // any response that is not for the current skill and request.
+  if (action === 'preview') {
+    try {
+      return await previewAction(session, request, body);
+    } catch (error) {
+      if (error instanceof ForageRollError) return err(error.code, error.code === 'bad_skill' ? 400 : 404);
+      console.error('[forage] GM preview failed', error);
+      return err('server_error', 500);
+    }
+  }
   if (request.busy) return err('busy', 409);
 
   request.busy = true;
   try {
-    if (action === 'preview') return await previewAction(session, request, body);
     if (action === 'check') return await checkAction(session, request, body);
     if (action === 'mark') return await markAction(session, request, body);
     if (action === 'reroll') return await rerollAction(session, request, body);

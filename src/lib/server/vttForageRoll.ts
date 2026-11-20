@@ -80,6 +80,26 @@ export async function previewForageAdvantage(input: RollInput): Promise<{ source
   return { sources: preview.sources, pool: preview.pool, skillLabel: skill.name, bonus: bonus.total };
 }
 
+/**
+ * The player's popup in DM mode, before the DM has called any skill. Only sources that apply to every
+ * ability check (targets like ability_check.all) can be known, so that's all it shows. There is no
+ * ability context here either, so conditional sources may differ from the DM's real roll. The real roll
+ * (the DM's chosen skill) still applies every source server-side. Reveals no skill, table or bonus.
+ */
+export async function previewGenericAdvantage(input: Omit<RollInput, 'skillKey' | 'rollDie'>): Promise<{ sources: AdvantageSource[]; pool: unknown }> {
+  const character = await getCharacterForRoll(input.characterId);
+  if (!character) throw new ForageRollError('character_not_found');
+  const options = parseAttackOptions(input.body);
+  const candidates = ['ability_check.any'];
+  const context = { classes: character.classes };
+  const gathered = await gatherVttAdvantageSources({
+    vtt: input.token && input.sessionId ? { sessionId: input.sessionId, sourceTokenId: input.token.id, targetTokenId: null } : null,
+    attackerSources: character.modifierSources, attackerCandidates: candidates, targetCandidates: [], context, choices: options
+  });
+  const preview = previewAdvantage(character.modifierSources, candidates, context, gathered.extraSources, options.disabledSourceIds);
+  return { sources: preview.sources, pool: preview.pool };
+}
+
 /** Rolls the skill check. nat20/nat1 come from the KEPT die (after any advantage pool). */
 export async function rollForageCheck(input: RollInput): Promise<ForageCheck> {
   const { skill, character, options, candidates, context, gathered, bonus, breakdown } = await prepare(input);

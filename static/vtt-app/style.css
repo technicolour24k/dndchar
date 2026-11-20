@@ -407,3 +407,42 @@ body {
 .gm-attack-add .atkDmg { width: 60px; }
 .gm-attack-add select { padding: 3px 5px; border-radius: 4px; border: 1px solid #2c2f36; background: #14161b; color: #eee; font-size: 11px; }
 .gm-attack-add .addAttackBtn { font-size: 11px; padding: 3px 8px; }
+
+/* Forage popups (vtt-forage unit C). Reuses .modal, .adv-panel and .adv-row. 44px tap targets. */
+.forage-modal { max-height: 92vh; overflow-y: auto; }
+.forage-modal .forage-select,
+.forage-modal .forage-qty { width: 100%; min-height: 44px; padding: 6px 8px; border-radius: 4px; border: 1px solid #3a3d44; background: #14161b; color: #eee; font-size: 14px; box-sizing: border-box; }
+.forage-modal .actions { flex-wrap: wrap; }
+.forage-modal .actions button,
+.forage-modal .forage-row button,
+.forage-modal .forage-lines button,
+.forage-queue button,
+.forage-sidebar-line button,
+.forageBtn { min-height: 44px; min-width: 44px; }
+.forage-modal .adv-step { width: 44px; height: 44px; }
+.forage-modal .adv-source { min-height: 44px; }
+.forage-modal .adv-source input { width: 22px; height: 22px; }
+.forage-row { display: flex; gap: 8px; margin-bottom: 10px; align-items: flex-end; }
+.forage-row > * { flex: 1 1 0; min-width: 0; }
+.forage-row > button { flex: 0 0 auto; }
+.forage-table-line { font-size: 13px; color: #cfd8ff; margin: 2px 0 6px; }
+.forage-warn { color: #ffb300; }
+.forage-msg { color: #e57373; font-size: 13px; margin: 8px 0; }
+.forage-check { background: #14161b; border: 1px solid #2c2f36; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.forage-check-total { font-size: 15px; }
+.forage-badge { padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; color: #111; }
+.forage-badge.good { background: #ffb300; }
+.forage-badge.bad { background: #e57373; }
+.forage-lines { list-style: none; margin: 8px 0; padding: 0; }
+.forage-lines li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 14px; }
+.forage-lines .forage-line-name { flex: 1 1 auto; min-width: 0; }
+.forage-lines .forage-qty { width: 80px; flex: 0 0 80px; }
+.forage-lines .forage-qty.invalid { border-color: #e57373; }
+.forage-queue { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.forage-queue button { padding: 6px 10px; border: none; border-radius: 4px; color: #fff; background: #3a3d44; cursor: pointer; font-size: 13px; }
+.forage-queue button.active { background: #4a7fff; }
+.forage-sidebar-line { margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; background: #2a2d36; border: 1px solid #4a7fff; border-radius: 6px; padding: 6px 8px; }
+@media (max-width: 600px) {
+  .forage-modal { width: 94vw; padding: 14px; }
+  .forage-row { flex-wrap: wrap; }
+}

@@ -3,7 +3,7 @@ import type { RequestHandler } from './$types';
 import { sessions, dmPresent, forageViewForPlayer } from '$vtt/store.js';
 import { getUnmarkedSelfFind } from '$lib/server/services/forage';
 import { findPendingForUser, resolveForageRoom } from '$lib/server/vttForage';
-import { loadOwnedCharacter, shortText } from '$lib/server/vttForageApi';
+import { loadOwnedCharacter, playerUnmarked, shortText } from '$lib/server/vttForageApi';
 
 // The finder's private forage state, owner-checked. This is the "fetch" half of the sheet's
 // nudge-plus-fetch delivery (the room only ever pushes a detail-free forage:ping), and what a popup
@@ -43,6 +43,6 @@ export const GET: RequestHandler = async ({ locals, url }) => {
     pending: pending ? forageViewForPlayer(pending.request) : null,
     pendingRoomId: pending?.session.id ?? null,
     lastDm,
-    unmarkedSelf: await getUnmarkedSelfFind(userId)
+    unmarkedSelf: playerUnmarked(await getUnmarkedSelfFind(userId))
   });
 };

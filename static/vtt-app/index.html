@@ -159,6 +159,23 @@
     </div>
   </div>
 
+  <!-- Forage (vtt-forage unit C). Player popup: picks, waiting/mark steps and the result. Closes freely. -->
+  <div id="foragePlayerModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal">
+      <div id="foragePlayerBody"></div>
+    </div>
+  </div>
+
+  <!-- Forage GM popup. Deliberately no backdrop or Escape close: closing would cancel a player's request.
+       The body is built by forage.js. -->
+  <div id="forageModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal">
+      <div id="forageQueue"></div>
+      <div id="forageNotice" class="forage-msg" hidden></div>
+      <div id="forageModalBody"></div>
+    </div>
+  </div>
+
   <!-- Combat Actions modal (Phase 8): single entry point replacing the mini-sheet's
        old inline action rows. Tab bar picks intent (Attack/Heal) - both tabs list
        the same underlying action set (weapons, spells, items); which tab is active

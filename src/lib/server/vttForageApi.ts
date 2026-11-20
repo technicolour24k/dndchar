@@ -1,8 +1,8 @@
 import { query } from '$lib/server/db';
-import { normaliseTag } from '$lib/rules/forage';
-import { findSkill } from '$lib/rules/skills';
+import { normaliseTag, resolveTable } from '$lib/rules/forage';
+import { FORAGE_SELF_SKILLS, findSkill } from '$lib/rules/skills';
 import { parseAttackOptions } from '$lib/server/vttAttackAdvantage';
-import { getActiveTable } from '$lib/server/services/forage';
+import { getActiveTable, loadForageCatalogue } from '$lib/server/services/forage';
 import type { ForageChoice } from '$lib/server/vttForage';
 
 // Small helpers shared by the forage HTTP endpoints.
@@ -59,6 +59,39 @@ export async function parseChoice(body: any): Promise<{ choice: ForageChoice; ta
       }
     }
   };
+}
+
+/** An unmarked self check as a player may see it: the check itself, never which table it is on. */
+export function playerUnmarked<T extends { tableId?: unknown } | null>(find: T): Omit<NonNullable<T>, 'tableId'> | null {
+  if (!find) return null;
+  const { tableId: _hidden, ...rest } = find as NonNullable<T> & { tableId?: unknown };
+  return rest;
+}
+
+/** Just the adv/dis counters and unticked sources from a body (the only thing a DM-mode player sends). */
+export function parseAdvantage(body: any): ForageChoice['advantage'] {
+  const options = parseAttackOptions(body);
+  return {
+    disabled: options.disabledSourceIds,
+    situationalAdvantage: options.situationalAdvantage,
+    situationalDisadvantage: options.situationalDisadvantage
+  };
+}
+
+/**
+ * A SELF-SERVE player's picks. The skill must be on the short list, and the table is resolved HERE
+ * from area + category: the player never names a table (a tableId in the body is ignored), and an
+ * area + category with no pickable table gets the same neutral 'nothing_here' as an empty one, so a
+ * player can't probe which tables exist.
+ */
+export async function parseSelfChoice(body: any): Promise<{ choice: ForageChoice } | { error: 'skill_not_allowed' | 'nothing_here' }> {
+  const skillKey = shortText(body?.skillKey, 40);
+  if (!FORAGE_SELF_SKILLS.includes(skillKey)) return { error: 'skill_not_allowed' };
+  const areaType = normaliseTag(shortText(body?.areaType, 80));
+  const category = normaliseTag(shortText(body?.category, 80));
+  const table = resolveTable(await loadForageCatalogue(), areaType, category);
+  if (!table || table.pickableCount === 0) return { error: 'nothing_here' };
+  return { choice: { skillKey, areaType, category, tableId: table.id, advantage: parseAdvantage(body) } };
 }
 
 /** The `advantage` part of a stored choice, shaped as a request body for parseAttackOptions. */

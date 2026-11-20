@@ -7,6 +7,7 @@ import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/move
 // Shared with the Node server (vtt/server/handlers/token.js), so the label and the deduction agree.
 import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
+import { createForage } from './forage.js';
 import { drawTargetRings } from './render/targeting.js';
 import { getTokensInShape } from './render/shapeGeometry.js';
 
@@ -645,6 +646,9 @@ function handleMessage(msg) {
       render();
       renderSidebar();
       updateAmbientMusic();
+      // Forage: the GM's pending requests (or the player's own view and result) arrive in
+      // session.forage / session.forageResults. Targeted updates only, no extra sidebar rebuild.
+      forage.onStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
       // 'character:changed' below instead. See that case and
@@ -923,6 +927,16 @@ function handleMessage(msg) {
     // characterId so a burst of saves/equips doesn't fire a sync per event.
     case 'character:changed':
       if (role === 'player') scheduleCharacterSync(msg.characterId);
+      break;
+
+    // Forage (vtt-forage unit C). Per-recipient: the GM gets the whole request, the finder only their
+    // own view. Handled with targeted DOM updates, never renderSidebar().
+    case 'forage:update':
+      forage.onUpdate(msg);
+      break;
+
+    case 'forage:closed':
+      forage.onClosed(msg);
       break;
 
     default:
@@ -3316,6 +3330,7 @@ function roomInfoHtml(roleLabel) {
   return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${combatControlHtml()}
+    ${forage.forageControlHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
     ${sessionNotesControlHtml()}
@@ -4708,6 +4723,7 @@ function ownTokenListHtml(tokens) {
           <div class="actions">
             <button class="secondary changeImageBtn">Change Image…</button>
             ${isProp ? '' : '<button class="secondary conditionsBtn">Conditions…</button>'}
+            ${forage.forageButtonHtml(t)}
             <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if your token ever gets dragged somewhere unreachable">Recenter on Map</button>
           </div>
           ${miniSheetHtml(t)}
@@ -5077,3 +5093,24 @@ function wirePlayerSidebar() {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// Forage (vtt-forage plan, unit C): the player popup, the GM popup and the finder's result card all
+// live in forage.js. Created last so every helper it borrows above exists. It never calls
+// renderSidebar(): it updates its own modals and two small sidebar spots directly.
+// ---------------------------------------------------------------------------
+const forage = createForage({
+  getSession: () => session,
+  getRole: () => role,
+  getSessionId: () => sessionId,
+  getPlayerId: () => playerId,
+  // Forage endpoints are account-scoped, so a player who joined without the app's VTT link can't use it.
+  isAccountLinked: () => !!accountPlayerId,
+  sidebarEl,
+  escapeHtml,
+  advSourceLabel,
+  advReadoutText,
+  counterRowHtml,
+  bringModalToFront,
+  closeOnBackdropPress,
+});
