@@ -12,6 +12,7 @@
     adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, defaultRollChoices, poolSummary,
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
+  import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
   import type { CharacterContentInstance, ContentType } from '$lib/types/content';
@@ -127,6 +128,17 @@
     { key: 'misc', label: 'Misc' }
   ]);
   const inventoryRows = $derived(character.inventory);
+  // What the inventory looked like when this sheet was loaded (and after each reload). Posted with
+  // Save so the server can tell which rows and fields the user actually changed, and leave the rest
+  // alone (a forage haul, VTT item use or equip action may have changed them since). The form
+  // inputs render from the same rows, so "input differs from baseline" means "the user edited it".
+  const inventoryBaselineJson = $derived(JSON.stringify(inventoryRows.filter((item) => item.id).map((item) => ({
+    id: item.id, name: item.name, category: item.category, location: item.location, quantity: item.quantity,
+    equipped: item.equipped, isEquipment: item.isEquipment, acBonus: item.acBonus, toHitBonus: item.toHitBonus,
+    damageBonus: item.damageBonus, attackAbility: item.attackAbility, proficient: item.proficient,
+    sourceContentId: item.sourceContentId ?? null, attuned: item.attuned ?? false, damageRolls: item.damageRolls,
+    effects: item.effects, notes: item.notes
+  }))));
   const equippedInventoryRows = $derived(equippedItems(inventoryRows));
   const backpackInventoryRows = $derived(
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
@@ -228,26 +240,8 @@
     { key: 'all', label: 'All' }
   ] as const;
   const abilityOrder: AbilityKey[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
-  const skillChecks: Array<{ key: string; name: string; ability: AbilityKey }> = [
-    { key: 'acrobatics', name: 'Acrobatics', ability: 'dex' },
-    { key: 'animal_handling', name: 'Animal Handling', ability: 'wis' },
-    { key: 'arcana', name: 'Arcana', ability: 'int' },
-    { key: 'athletics', name: 'Athletics', ability: 'str' },
-    { key: 'deception', name: 'Deception', ability: 'cha' },
-    { key: 'history', name: 'History', ability: 'int' },
-    { key: 'insight', name: 'Insight', ability: 'wis' },
-    { key: 'intimidation', name: 'Intimidation', ability: 'cha' },
-    { key: 'investigation', name: 'Investigation', ability: 'int' },
-    { key: 'medicine', name: 'Medicine', ability: 'wis' },
-    { key: 'nature', name: 'Nature', ability: 'int' },
-    { key: 'perception', name: 'Perception', ability: 'wis' },
-    { key: 'performance', name: 'Performance', ability: 'cha' },
-    { key: 'persuasion', name: 'Persuasion', ability: 'cha' },
-    { key: 'religion', name: 'Religion', ability: 'int' },
-    { key: 'sleight_of_hand', name: 'Sleight of Hand', ability: 'dex' },
-    { key: 'stealth', name: 'Stealth', ability: 'dex' },
-    { key: 'survival', name: 'Survival', ability: 'wis' }
-  ];
+  // The 18-skill list and the check maths live in $lib/rules/skills (shared with the server).
+  const skillChecks = SKILL_CHECKS;
 
   function meta(field: string, fallback = '') {
     return String(metadata[field] ?? fallback);
@@ -300,7 +294,7 @@
     Object.fromEntries(abilityOrder.map((key) => [key, resolvedAdditiveModifiers(character.modifierSources, [`saving_throw.${key}`], { classes: classRows })])) as Record<AbilityKey, import('$lib/rules/dnd5e').ResolvedBonus[]>
   );
   const skillCheckModifierBonuses = $derived(
-    Object.fromEntries(skillChecks.map((skill) => [skill.key, resolvedAdditiveModifiers(character.modifierSources, [`ability_check.${skill.ability}`, `ability_check.${skill.key}`], { classes: classRows })])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
+    Object.fromEntries(skillChecks.map((skill) => [skill.key, skillModifierBonuses(character.modifierSources, classRows, skill)])) as Record<string, import('$lib/rules/dnd5e').ResolvedBonus[]>
   );
 
   // The single reusable resolver (src/lib/rules/characterStats.ts) for all 9 overridable
@@ -744,8 +738,13 @@
   }
 
   function skillCheckTotal(skill: { key: string; ability: AbilityKey }) {
-    const bonuses = skillCheckModifierBonuses[skill.key] ?? [];
-    return abilityModifier(abilityScores[skill.ability]) + (isSkillProficient(skill.key) ? prof : 0) + bonuses.reduce((sum, b) => sum + b.value, 0);
+    return skillCheckBonus({
+      abilityScores,
+      proficient: isSkillProficient(skill.key),
+      proficiencyBonus: prof,
+      modifierSources: character.modifierSources,
+      classes: classRows
+    }, skill).total;
   }
 
   function skillCheckFormula(skill: { key: string; ability: AbilityKey; name: string }): string[] {
@@ -806,7 +805,6 @@
 
   // Candidate lists, shared by the panel and the roll functions.
   const saveCandidates = (key: AbilityKey) => [`saving_throw.${key}`];
-  const skillCandidates = (skill: { key: string; ability: AbilityKey }) => [`ability_check.${skill.ability}`, `ability_check.${skill.key}`];
   const abilityCheckCandidates = (key: AbilityKey) => [`ability_check.${key}`];
   const initiativeCandidates = ['initiative'];
   // There is no death-save target in the rules model yet, so a death save counts as a saving throw:
@@ -1646,6 +1644,7 @@
   oninput={markUnsavedIfSheetField}
   onchange={markUnsavedIfSheetField}
 >
+  <input name="inventoryBaseline" type="hidden" value={inventoryBaselineJson} />
   <section class="panel sheet-header compact">
     <div>
       <p class="eyebrow">D&D 5E 2014</p>

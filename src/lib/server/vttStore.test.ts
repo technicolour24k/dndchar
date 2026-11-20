@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Relative import, not the $vtt alias - store.js lives outside src/ entirely
 // (see vtt/README.md) and this test only needs the plain module, not
 // SvelteKit's alias resolution.
-import { broadcast, publish, removeWatcher, sessions, setWatches, socketsBySession, watchersByTopic } from '../../../vtt/server/store.js';
+import { broadcast, createSession, dmPresent, filterSessionForRole, forageViewForPlayer, hasLiveGm, publish, removeWatcher, sessions, setWatches, socketsBySession, watchersByTopic } from '../../../vtt/server/store.js';
 
 // A minimal stand-in for a real `ws` WebSocket - just enough for store.js's
 // own OPEN/readyState/send checks (see store.js's broadcast/publish).
@@ -124,6 +124,97 @@ describe('vtt store watch/publish (db-traffic-reduction Phase 5)', () => {
       broadcast(sessionId, () => ({ type: 'combat:log', message: 'hit' }));
 
       expect(watcher.ws.send).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('forage fields on the room (vtt-forage unit B)', () => {
+  const request = {
+    id: 'req-1', playerId: 'u1', stage: 'preview', source: 'vtt',
+    choice: { skillKey: 'nature', tableId: 't1' }, check: { total: 17 },
+    preview: { lines: [{ name: 'Moonleaf', qty: 3 }], tableEntries: [{ name: 'Secret' }] }
+  };
+  const result = { requestId: 'old', outcome: 'approved' };
+
+  function roomWithForage(map: unknown = null) {
+    const session: any = createSession('ROOM1');
+    session.map = map;
+    session.forage = { u1: request, u2: { ...request, id: 'req-2', playerId: 'u2' } };
+    session.forageResults = { u1: result, u2: { requestId: 'other' } };
+    return session;
+  }
+
+  it('createSession starts with empty forage and forageResults', () => {
+    const session: any = createSession('ROOM1');
+    expect(session.forage).toEqual({});
+    expect(session.forageResults).toEqual({});
+  });
+
+  it('the GM sees everything', () => {
+    const session = roomWithForage();
+    const view: any = filterSessionForRole(session, 'gm', null);
+    expect(view.forage.u1.preview).toBeDefined();
+    expect(Object.keys(view.forage)).toEqual(['u1', 'u2']);
+  });
+
+  it('the finder sees only their own player view and result', () => {
+    const view: any = filterSessionForRole(roomWithForage(), 'player', 'u1');
+    expect(view.forage).toEqual({ u1: forageViewForPlayer(request) });
+    expect(view.forage.u1).not.toHaveProperty('preview');
+    expect(view.forage.u1).not.toHaveProperty('choice');
+    expect(view.forageResults).toEqual({ u1: result });
+  });
+
+  it('another player sees empty objects for both', () => {
+    const view: any = filterSessionForRole(roomWithForage(), 'player', 'u3');
+    expect(view.forage).toEqual({});
+    expect(view.forageResults).toEqual({});
+  });
+
+  it('the hidden-map branch strips them too', () => {
+    const view: any = filterSessionForRole(roomWithForage({ revealed: false }), 'player', 'u3');
+    expect(view.forage).toEqual({});
+    expect(view.forageResults).toEqual({});
+    const own: any = filterSessionForRole(roomWithForage({ revealed: false }), 'player', 'u1');
+    expect(own.forage.u1).not.toHaveProperty('preview');
+  });
+
+  it('copes with a room made before the deploy (no forage fields)', () => {
+    const session: any = createSession('ROOM1');
+    delete session.forage;
+    delete session.forageResults;
+    const view: any = filterSessionForRole(session, 'player', 'u1');
+    expect(view.forage).toEqual({});
+  });
+
+  describe('dmPresent', () => {
+    function roomWithGm(gmSocketId: string | null, gmLive: boolean) {
+      const session: any = createSession('ROOM2');
+      session.gmSocketId = gmSocketId;
+      sessions.set('ROOM2', session);
+      const gm = { ...fakeMeta({ role: 'gm', playerId: null }), sessionId: 'ROOM2' };
+      gm.ws.readyState = gmLive ? 1 : 3;
+      socketsBySession.set('ROOM2', new Set([gm]));
+      return session;
+    }
+
+    it('is false with no GM socket', () => {
+      const session: any = createSession('ROOM2');
+      session.gmSocketId = 'user-1';
+      expect(hasLiveGm('ROOM2')).toBe(false);
+      expect(dmPresent(session)).toBe(false);
+    });
+
+    it('is false when the GM socket has closed', () => {
+      expect(dmPresent(roomWithGm('user-1', false))).toBe(false);
+    });
+
+    it('is false for the placeholder GM', () => {
+      expect(dmPresent(roomWithGm('gm', true))).toBe(false);
+    });
+
+    it('is true for a live account GM', () => {
+      expect(dmPresent(roomWithGm('user-1', true))).toBe(true);
     });
   });
 });

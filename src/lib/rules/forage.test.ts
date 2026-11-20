@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { isPickable, normaliseTag, parseEntryInput, parseTableInput, pickableEntries, resolveTable } from './forage';
-import type { ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
+import { forageItemCount, isPickable, normaliseTag, parseEntryInput, parseTableInput, pickableEntries, resolveTable, rollFind, validateFindLines, weightedPickDistinct } from './forage';
+import type { FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
 
 function table(overrides: Partial<ForageCatalogueTable> = {}): ForageCatalogueTable {
   return {
@@ -77,5 +77,97 @@ describe('resolveTable', () => {
   });
   it('never returns an archived table', () => {
     expect(resolveTable(catalogue, 'cave', 'ore')).toBeNull();
+  });
+});
+
+// --- The roll ---
+
+function scripted(values: number[]) {
+  const calls: number[] = [];
+  const rollDie = (sides: number) => {
+    calls.push(sides);
+    return values[calls.length - 1] ?? 1;
+  };
+  return { rollDie, calls };
+}
+
+function entry(itemId: string, weight: number, qtyDie = 1, itemArchived = false): FindTableEntry {
+  return { itemId, itemName: `Item ${itemId}`, itemCategory: 'consumable', weight, qtyDie, itemArchived, sortOrder: 0 };
+}
+
+describe('weightedPickDistinct', () => {
+  it('never picks weight 0 or archived entries', () => {
+    const entries = [entry('a', 0), entry('b', 3, 1, true), entry('c', 2)];
+    const picked = weightedPickDistinct(entries, 3, (sides) => sides);
+    expect(picked.map((e) => e.itemId)).toEqual(['c']);
+  });
+
+  it('passes the shrinking total weight to rollDie and walks the cumulative weights', () => {
+    const entries = [entry('a', 5), entry('b', 3), entry('c', 2)];
+    const { rollDie, calls } = scripted([6, 1]); // 6 lands in b (5 < 6 <= 8); then 1 lands in a
+    const picked = weightedPickDistinct(entries, 2, rollDie);
+    expect(picked.map((e) => e.itemId)).toEqual(['b', 'a']);
+    expect(calls).toEqual([10, 7]);
+  });
+});
+
+describe('rollFind', () => {
+  it('caps the type roll at the pickable count', () => {
+    const entries = [entry('a', 1), entry('b', 1), entry('c', 1), entry('d', 0)];
+    // type roll 6 -> capped to 3; picks roll 1 each; qty die 1 -> 1 each
+    const { lines, runs } = rollFind(entries, 6, false, (sides) => (sides === 6 ? 6 : 1));
+    expect(runs).toBe(1);
+    expect(lines.map((l) => l.itemId).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('rolls a qty die per pick, and a d1 is always 1', () => {
+    const entries = [entry('a', 1, 4), entry('b', 1, 1)];
+    // type roll 2, pick rolls 1 then 1, qty a = 3, qty b = 1 (d1)
+    const { lines } = rollFind(entries, 2, false, scripted([2, 1, 1, 3, 1]).rollDie);
+    expect(lines).toEqual([{ itemId: 'a', qty: 3 }, { itemId: 'b', qty: 1 }]);
+  });
+
+  it('runs twice on a nat 20 and merges quantities by item', () => {
+    const entries = [entry('a', 1, 6)];
+    // run 1: type 1, pick 1, qty 4. run 2: type 1, pick 1, qty 5
+    const { lines, runs } = rollFind(entries, 1, true, scripted([1, 1, 4, 1, 1, 5]).rollDie);
+    expect(runs).toBe(2);
+    expect(lines).toEqual([{ itemId: 'a', qty: 9 }]);
+  });
+
+  it('gives no lines when nothing is pickable, without rolling', () => {
+    const { rollDie, calls } = scripted([]);
+    expect(rollFind([entry('a', 0), entry('b', 2, 1, true)], 6, true, rollDie).lines).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('validateFindLines', () => {
+  const entries = [entry('a', 3), entry('z', 0), entry('x', 2, 1, true)];
+
+  it('accepts valid lines, including a weight-0 entry', () => {
+    const result = validateFindLines([{ itemId: 'a', qty: 2 }, { itemId: 'z', qty: 999 }], entries);
+    expect(result).toEqual({ ok: true, lines: [{ itemId: 'a', qty: 2 }, { itemId: 'z', qty: 999 }] });
+  });
+
+  it.each([
+    ['another table\'s item', [{ itemId: 'nope', qty: 1 }]],
+    ['an archived item', [{ itemId: 'x', qty: 1 }]],
+    ['qty 0', [{ itemId: 'a', qty: 0 }]],
+    ['qty 1000', [{ itemId: 'a', qty: 1000 }]],
+    ['qty 1.5', [{ itemId: 'a', qty: 1.5 }]],
+    ['a string qty', [{ itemId: 'a', qty: '2' }]],
+    ['a duplicate', [{ itemId: 'a', qty: 1 }, { itemId: 'a', qty: 1 }]],
+    ['an empty list', []],
+    ['not an array', 'lines'],
+    ['more than 50 lines', Array.from({ length: 51 }, () => ({ itemId: 'a', qty: 1 }))]
+  ])('rejects %s', (_label, lines) => {
+    expect(validateFindLines(lines, entries).ok).toBe(false);
+  });
+});
+
+describe('forageItemCount', () => {
+  it('sums quantities, not distinct items', () => {
+    expect(forageItemCount([{ itemId: 'a', qty: 3 }, { itemId: 'b', qty: 2 }])).toBe(5);
   });
 });

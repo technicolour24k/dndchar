@@ -1,16 +1,5 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
-import { filterSessionForRole } from '../store.js';
-
-// A live GM socket for this session, if one is currently connected - used to
-// tell "GM disconnected, gmSocketId is just stale" apart from "GM is still
-// here, reject the second claim."
-function findLiveGmSocket(sockets) {
-  if (!sockets) return null;
-  for (const entry of sockets) {
-    if (entry.role === 'gm' && entry.ws.readyState === entry.ws.OPEN) return entry;
-  }
-  return null;
-}
+import { filterSessionForRole, findLiveGmSocket } from '../store.js';
 
 // Handles `join` for both a brand-new join and a reconnect after a dropped
 // connection - same code path, full state resend, per spec Section 2.
@@ -40,6 +29,9 @@ function handleJoin(meta, msg, context) {
       return;
     }
     session.gmSocketId = playerId || 'gm';
+    // Remembered on the socket so the close handler can tell whether THIS socket is the GM
+    // gmSocketId points at (meta.playerId is always null for a GM).
+    meta.gmUserId = session.gmSocketId;
   }
 
   if (meta.role === 'player') {

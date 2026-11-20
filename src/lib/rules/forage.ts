@@ -1,6 +1,6 @@
-import type { FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
+import type { FindLine, FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
 
-// Pure helpers for find tables. No DB, no randomness here yet (the roll lands in unit B).
+// Pure helpers for find tables, plus the roll itself (below). No DB; randomness is injected.
 
 /** Suggestions for the area/category inputs. Free text still wins, so homebrew stays easy. */
 export const DEFAULT_FORAGE_CATEGORIES = ['plant', 'ore', 'gem', 'scroll', 'misc'];
@@ -71,4 +71,97 @@ export function resolveTable(
   const area = normaliseTag(areaType);
   const cat = normaliseTag(category);
   return catalogue.tables.find((table) => !table.isArchived && table.areaType === area && table.category === cat) ?? null;
+}
+
+// --- The roll (unit B) ---------------------------------------------------------------------
+// All randomness goes through an injected rollDie(sides), returning 1..sides (the attackRoll.ts
+// convention), so tests can script the dice.
+
+export type RollDie = (sides: number) => number;
+
+/** Biggest quantity on one result line, matching addInventoryItem's 999 cap. */
+export const MAX_FIND_QTY = 999;
+const MAX_FIND_LINES = 50;
+
+/**
+ * Picks `count` DISTINCT entries by weight. Only pickable entries are considered. Each pick rolls
+ * one die over the remaining total weight and walks the cumulative weights, then removes the pick,
+ * so the total shrinks. Stops early if nothing pickable is left.
+ */
+export function weightedPickDistinct<T extends Pick<FindTableEntry, 'weight' | 'itemArchived'>>(
+  entries: T[], count: number, rollDie: RollDie
+): T[] {
+  const pool = pickableEntries(entries);
+  const picked: T[] = [];
+  while (picked.length < count && pool.length > 0) {
+    const total = pool.reduce((sum, entry) => sum + entry.weight, 0);
+    let roll = rollDie(total);
+    let index = 0;
+    for (; index < pool.length - 1; index++) {
+      if (roll <= pool[index].weight) break;
+      roll -= pool[index].weight;
+    }
+    picked.push(pool[index]);
+    pool.splice(index, 1);
+  }
+  return picked;
+}
+
+/** One run: roll the type die (capped at the pickable count), pick that many, then a qty die each. */
+export function rollFindRun(entries: FindTableEntry[], typeDie: number, rollDie: RollDie): FindLine[] {
+  const pickable = pickableEntries(entries).length;
+  if (pickable === 0) return [];
+  const count = Math.min(rollDie(typeDie), pickable);
+  return weightedPickDistinct(entries, count, rollDie).map((entry) => ({
+    itemId: entry.itemId,
+    qty: rollDie(entry.qtyDie)
+  }));
+}
+
+/** A full find: one run, or two on a nat 20. Lines are merged by item so repeats stack. */
+export function rollFind(
+  entries: FindTableEntry[], typeDie: number, nat20: boolean, rollDie: RollDie
+): { lines: FindLine[]; runs: number } {
+  const runs = nat20 ? 2 : 1;
+  const merged = new Map<string, number>();
+  for (let run = 0; run < runs; run++) {
+    for (const line of rollFindRun(entries, typeDie, rollDie)) {
+      merged.set(line.itemId, (merged.get(line.itemId) ?? 0) + line.qty);
+    }
+  }
+  return { lines: [...merged].map(([itemId, qty]) => ({ itemId, qty })), runs };
+}
+
+export type ValidatedLines = { ok: true; lines: FindLine[] } | { ok: false; error: string };
+
+/**
+ * Checks lines a client sent for approval (and the server's own self-serve haul, same rules).
+ * 1..50 lines, each an item on THIS table with a live item (any weight, so the DM can add a
+ * weight-0 entry by hand), whole-number qty 1..cap, no duplicates.
+ */
+export function validateFindLines(rawLines: unknown, entries: FindTableEntry[], cap = MAX_FIND_QTY): ValidatedLines {
+  if (!Array.isArray(rawLines) || rawLines.length === 0) return { ok: false, error: 'There is nothing to approve.' };
+  if (rawLines.length > MAX_FIND_LINES) return { ok: false, error: `At most ${MAX_FIND_LINES} lines.` };
+  const byItem = new Map(entries.map((entry) => [entry.itemId, entry]));
+  const seen = new Set<string>();
+  const lines: FindLine[] = [];
+  for (const raw of rawLines) {
+    const itemId = typeof raw?.itemId === 'string' ? raw.itemId : '';
+    const entry = byItem.get(itemId);
+    if (!entry) return { ok: false, error: 'That item is not on this table.' };
+    if (entry.itemArchived) return { ok: false, error: `${entry.itemName} is archived.` };
+    if (seen.has(itemId)) return { ok: false, error: `${entry.itemName} appears twice.` };
+    const qty = raw.qty;
+    if (typeof qty !== 'number' || !Number.isInteger(qty) || qty < 1 || qty > cap) {
+      return { ok: false, error: `Quantity for ${entry.itemName} must be a whole number from 1 to ${cap}.` };
+    }
+    seen.add(itemId);
+    lines.push({ itemId, qty });
+  }
+  return { ok: true, lines };
+}
+
+/** "Found 3 items" counts total quantity, not distinct items (Q4). */
+export function forageItemCount(lines: FindLine[]): number {
+  return lines.reduce((sum, line) => sum + line.qty, 0);
 }

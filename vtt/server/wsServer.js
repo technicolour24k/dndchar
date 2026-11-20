@@ -1,6 +1,6 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
-import { sessions, socketsBySession, broadcast, setWatches, removeWatcher } from './store.js';
+import { sessions, socketsBySession, broadcast, setWatches, removeWatcher, findLiveGmSocket } from './store.js';
 import handleJoin from './handlers/join.js';
 import handleTokenEvent, { clearMovePreviewForSocket } from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
@@ -183,7 +183,10 @@ export function attachVttWebSocketServer(httpServer) {
         // on reconnect via the same state:full path join.js already uses.
         session.players[meta.playerId].connected = false;
         broadcast(meta.sessionId, () => ({ type: 'player:left', playerId: meta.playerId }));
-      } else if (meta.role === 'gm' && session.gmSocketId === (meta.playerId || 'gm')) {
+      } else if (meta.role === 'gm' && meta.gmUserId && session.gmSocketId === meta.gmUserId && !findLiveGmSocket(sockets)) {
+        // Clears for account GMs too (their gmSocketId is their user id, remembered on the socket
+        // as meta.gmUserId; meta.playerId is null for every GM). Skipped when another live GM
+        // socket exists, so a late close from an old socket can't unseat a reconnected GM.
         session.gmSocketId = null;
       }
     });

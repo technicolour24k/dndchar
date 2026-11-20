@@ -358,7 +358,11 @@ export async function updateCharacter(userId: string, characterId: string, form:
     await replaceClasses(client, characterId, parseClasses(form));
     await replaceAbilities(client, characterId, parseAbilities(form));
     await replaceResources(client, characterId, resources);
-    await replaceInventory(client, characterId, parseInventory(form));
+    // Changes only when the sheet sent its loaded baseline (see saveInventoryChanges); otherwise the
+    // old full replace.
+    const inventoryBaseline = parseInventoryBaseline(form);
+    if (inventoryBaseline) await saveInventoryChanges(client, characterId, parseInventory(form), inventoryBaseline);
+    else await replaceInventory(client, characterId, parseInventory(form));
     await replaceAttacks(client, characterId, parseAttacks(form));
     await replaceNotes(client, characterId, parseNotes(form));
     await replaceProficiencies(client, characterId, parseProficiencies(form));
@@ -1031,51 +1035,145 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
   }
 }
 
+// Upserts one posted inventory row (insert, or update when the id already belongs to this
+// character). Shared by the full replace below and by the changes-only Save.
+async function upsertInventoryRow(client: pg.PoolClient, characterId: string, row: InventoryItem, sortOrder: number): Promise<void> {
+  await client.query(
+    `
+      INSERT INTO character_inventory_items
+        (id, character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order, source_content_id, attuned)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, location=EXCLUDED.location,
+        quantity=EXCLUDED.quantity, equipped=EXCLUDED.equipped, is_equipment=EXCLUDED.is_equipment,
+        ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
+        attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
+        effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
+        source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
+      WHERE character_inventory_items.character_id = EXCLUDED.character_id
+    `,
+    [
+      row.id || null,
+      characterId,
+      row.name,
+      row.category || 'gear',
+      row.location || (row.equipped ? 'equipped' : 'backpack'),
+      Math.max(0, Number(row.quantity) || 1),
+      row.location === 'equipped' || row.equipped,
+      row.isEquipment,
+      Number(row.acBonus) || 0,
+      Number(row.toHitBonus) || 0,
+      Number(row.damageBonus) || 0,
+      abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str',
+      row.proficient ?? true,
+      row.damageRolls || '',
+      row.effects || '',
+      Number(row.abilityBonuses.str) || 0,
+      Number(row.abilityBonuses.dex) || 0,
+      Number(row.abilityBonuses.con) || 0,
+      Number(row.abilityBonuses.int) || 0,
+      Number(row.abilityBonuses.wis) || 0,
+      Number(row.abilityBonuses.cha) || 0,
+      row.notes || '',
+      sortOrder,
+      row.sourceContentId || null,
+      row.attuned || false
+    ]
+  );
+}
+
+// Full replace: deletes every row whose id wasn't passed. Only for callers that really mean "make
+// the inventory exactly this" (restoring a version, or a save from a client that sent no baseline).
+// The sheet's normal Save uses saveInventoryChanges instead.
 async function replaceInventory(client: pg.PoolClient, characterId: string, inventory: InventoryItem[]): Promise<void> {
   const retainedIds = inventory.filter((row) => row.name.trim() && Number(row.quantity) > 0).map((row) => row.id).filter(Boolean);
   await client.query('DELETE FROM character_inventory_items WHERE character_id = $1 AND NOT (id = ANY($2::uuid[]))', [characterId, retainedIds]);
   for (const [index, row] of inventory.entries()) {
     if (!row.name.trim() || Number(row.quantity) <= 0) continue;
+    await upsertInventoryRow(client, characterId, row, index);
+  }
+}
+
+// The columns a sheet Save can change on an existing row, each with the value it would write.
+// Both the posted row and the baseline row go through the same getters, so the comparison is on
+// what would actually be stored (trimmed names, defaulted categories, and so on).
+const INVENTORY_SAVE_FIELDS: Array<[column: string, read: (row: InventoryItem) => string | number | boolean | null]> = [
+  ['name', (row) => String(row.name ?? '').trim()],
+  ['category', (row) => row.category || 'gear'],
+  ['location', (row) => row.location || (row.equipped ? 'equipped' : 'backpack')],
+  ['quantity', (row) => Math.max(0, Number(row.quantity) || 0)],
+  ['equipped', (row) => row.location === 'equipped' || !!row.equipped],
+  ['is_equipment', (row) => !!row.isEquipment],
+  ['ac_bonus', (row) => Number(row.acBonus) || 0],
+  ['to_hit_bonus', (row) => Number(row.toHitBonus) || 0],
+  ['damage_bonus', (row) => Number(row.damageBonus) || 0],
+  ['attack_ability', (row) => (abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str')],
+  ['proficient', (row) => row.proficient ?? true],
+  ['damage_rolls', (row) => row.damageRolls || ''],
+  ['effects', (row) => row.effects || ''],
+  ['notes', (row) => row.notes || ''],
+  ['source_content_id', (row) => row.sourceContentId || null],
+  ['attuned', (row) => !!row.attuned]
+];
+
+/**
+ * The inventory the sheet had loaded when the user pressed Save (hidden field inventoryBaseline).
+ * Null when it is missing or malformed, so the caller can fall back to a full replace.
+ */
+function parseInventoryBaseline(form: FormData): InventoryItem[] | null {
+  const raw = form.get('inventoryBaseline');
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed
+      .filter((row) => row && typeof row.id === 'string')
+      .map((row) => ({ ...row, abilityBonuses: row.abilityBonuses ?? {} }) as InventoryItem);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Q6: the sheet Save writes only what the user changed since the sheet loaded.
+ *
+ * Other things change inventory outside the sheet (a forage haul stacking onto a row, VTT item use,
+ * equip and remove actions), so blindly writing every posted row would overwrite them with the
+ * sheet's stale copy. Instead, comparing the posted rows with the baseline the sheet loaded:
+ *   - a row the user did not touch is left alone, whatever the DB now holds;
+ *   - a row the user edited gets only the fields they changed (so their edit wins, and a field they
+ *     left alone keeps any newer DB value);
+ *   - a row with no baseline match is new and is inserted;
+ *   - a baseline row that is no longer posted (removed, or quantity set to 0) is deleted;
+ *   - rows the sheet never knew about are never touched.
+ */
+export async function saveInventoryChanges(
+  client: pg.PoolClient, characterId: string, posted: InventoryItem[], baseline: InventoryItem[]
+): Promise<void> {
+  const baselineById = new Map(baseline.map((row) => [row.id as string, row]));
+  const postedIds = new Set(posted.map((row) => row.id).filter(Boolean));
+
+  const removedIds = [...baselineById.keys()].filter((id) => !postedIds.has(id));
+  if (removedIds.length) {
+    await client.query('DELETE FROM character_inventory_items WHERE character_id = $1 AND id = ANY($2::uuid[])', [characterId, removedIds]);
+  }
+
+  const maxSort = await client.query<{ next: number }>(
+    'SELECT COALESCE(MAX(sort_order) + 1, 0)::int AS next FROM character_inventory_items WHERE character_id = $1', [characterId]
+  );
+  let nextSort = maxSort.rows[0].next;
+
+  for (const row of posted) {
+    const before = row.id ? baselineById.get(row.id) : undefined;
+    if (!before) {
+      await upsertInventoryRow(client, characterId, row, nextSort++);
+      continue;
+    }
+    const changed = INVENTORY_SAVE_FIELDS.filter(([, read]) => read(row) !== read(before));
+    if (!changed.length) continue;
+    const assignments = changed.map(([column], index) => `${column} = $${index + 3}`).join(', ');
     await client.query(
-      `
-        INSERT INTO character_inventory_items
-          (id, character_id, name, category, location, quantity, equipped, is_equipment, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient, damage_rolls, effects, str_bonus, dex_bonus, con_bonus, int_bonus, wis_bonus, cha_bonus, notes, sort_order, source_content_id, attuned)
-        VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
-        ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, category=EXCLUDED.category, location=EXCLUDED.location,
-          quantity=EXCLUDED.quantity, equipped=EXCLUDED.equipped, is_equipment=EXCLUDED.is_equipment,
-          ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
-          attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
-          effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
-          source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
-        WHERE character_inventory_items.character_id = EXCLUDED.character_id
-      `,
-      [
-        row.id || null,
-        characterId,
-        row.name,
-        row.category || 'gear',
-        row.location || (row.equipped ? 'equipped' : 'backpack'),
-        Math.max(0, Number(row.quantity) || 1),
-        row.location === 'equipped' || row.equipped,
-        row.isEquipment,
-        Number(row.acBonus) || 0,
-        Number(row.toHitBonus) || 0,
-        Number(row.damageBonus) || 0,
-        abilityKeys.includes(row.attackAbility) ? row.attackAbility : 'str',
-        row.proficient ?? true,
-        row.damageRolls || '',
-        row.effects || '',
-        Number(row.abilityBonuses.str) || 0,
-        Number(row.abilityBonuses.dex) || 0,
-        Number(row.abilityBonuses.con) || 0,
-        Number(row.abilityBonuses.int) || 0,
-        Number(row.abilityBonuses.wis) || 0,
-        Number(row.abilityBonuses.cha) || 0,
-        row.notes || '',
-        index,
-        row.sourceContentId || null,
-        row.attuned || false
-      ]
+      `UPDATE character_inventory_items SET ${assignments} WHERE id = $1 AND character_id = $2`,
+      [row.id, characterId, ...changed.map(([, read]) => read(row))]
     );
   }
 }

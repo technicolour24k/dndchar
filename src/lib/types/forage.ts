@@ -38,3 +38,20 @@ export type ForageCatalogue = { tables: ForageCatalogueTable[] };
 export type FindLine = { itemId: string; qty: number };
 
 export type ForageChoice = { skillKey: string; areaType: string; category: string; tableId: string };
+
+/** A rolled skill check, as stored in finds.check_json and shown to the finder and the DM. */
+export type ForageCheck = {
+  skillKey: string;
+  skillLabel: string;
+  total: number;
+  /** The kept d20 (after any advantage or disadvantage pool). */
+  natural: number;
+  nat20: boolean;
+  nat1: boolean;
+  /** Source-attributed audit text from rollWithModifiers. */
+  text: string;
+  poolSummary: string;
+};
+
+/** One haul line once it has reached an inventory row. `qty` is what this find added. */
+export type FindResult = { item_id: string; qty: number; inventory_id: string };

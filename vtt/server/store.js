@@ -83,6 +83,9 @@ export function publish(topic, payload) {
 // Narrow allow-list of broadcast() types that are safe and useful to forward
 // to sheet watchers: state changes and append-only log lines, never raw VTT
 // token/map/marker data (that stays participant-only, see filterSessionForRole).
+// NEVER add forage:update, forage:closed or forage:ping here. Watch subscriptions are
+// unauthenticated, and forage payloads carry a player's private view (the DM's loot preview, the
+// finder's check). forage:ping is sent with publish() directly because it carries no details.
 const WATCHABLE_BROADCAST_TYPES = new Set(['combat:state', 'combat:log', 'roll:log', 'game_session:state']);
 
 export function generateRoomCode(existingSessions) {
@@ -115,6 +118,49 @@ export function createSession(id) {
     // broadcastToMatchingSession). Independent of encounterId/combat state -
     // notes are meant to span a whole game night, not just fights.
     gameSessionId: null,
+    // Forage (DM mode only), written only by the forage endpoints. In memory by design: a restart
+    // wipes the room, so a pending request simply ends. forage is keyed by the finder's user id
+    // (the in-flight request, GM sees all of it), forageResults by the same id (the last closed
+    // result, so a finder who wasn't watching still sees it). Self-serve finds live in the DB.
+    forage: {},
+    forageResults: {},
+  };
+}
+
+// A live GM socket for this session, if one is currently connected - used to tell "GM
+// disconnected, gmSocketId is just stale" apart from "GM is still here".
+export function findLiveGmSocket(sockets) {
+  if (!sockets) return null;
+  for (const entry of sockets) {
+    if (entry.role === 'gm' && entry.ws.readyState === entry.ws.OPEN) return entry;
+  }
+  return null;
+}
+
+// The real "is a GM here right now" check (gmSocketId is not enough: it holds a player id).
+export function hasLiveGm(sessionId) {
+  return !!findLiveGmSocket(socketsBySession.get(sessionId));
+}
+
+// Forage runs in DM mode only when a GM socket is live AND that GM joined through the app's VTT
+// link, so gmSocketId is a real account user id. The 'gm' placeholder (a GM who opened the VTT
+// directly) has no account, so they could never act on a request.
+export function dmPresent(session) {
+  return hasLiveGm(session.id) && !!session.gmSocketId && session.gmSocketId !== 'gm';
+}
+
+// What the finder may see of their own request. Never the choice, the loot preview or the table.
+export function forageViewForPlayer(request) {
+  return { id: request.id, stage: request.stage, source: request.source, check: request.check };
+}
+
+// For a non-GM recipient: only their own forage entries survive.
+function ownForage(session, playerId) {
+  const request = playerId ? session.forage?.[playerId] : undefined;
+  const result = playerId ? session.forageResults?.[playerId] : undefined;
+  return {
+    forage: request ? { [playerId]: forageViewForPlayer(request) } : {},
+    forageResults: result ? { [playerId]: result } : {},
   };
 }
 
@@ -153,7 +199,7 @@ export function filterSessionForRole(session, role, playerId) {
   // client can distinguish "no map set yet" from "map set but not revealed"
   // and show an accurate waiting message (see render() in main.js).
   if (session.map && !session.map.revealed) {
-    return { ...session, map: { revealed: false }, tokens: {}, markers: {} };
+    return { ...session, map: { revealed: false }, tokens: {}, markers: {}, ...ownForage(session, playerId) };
   }
 
   const tokens = {};
@@ -167,7 +213,7 @@ export function filterSessionForRole(session, role, playerId) {
     if (shouldPlayerSeeMarker(marker, playerId)) markers[id] = marker;
   }
 
-  return { ...session, tokens, markers };
+  return { ...session, tokens, markers, ...ownForage(session, playerId) };
 }
 
 // Sends a per-recipient payload to every socket in a session. buildPayload

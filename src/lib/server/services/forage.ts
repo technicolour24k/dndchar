@@ -1,7 +1,11 @@
+import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
-import { parseEntryInput, parseTableInput } from '$lib/rules/forage';
-import type { FindTable, FindTableEntry, ForageCatalogue } from '$lib/types/forage';
+import { parseEntryInput, parseTableInput, pickableEntries, rollFind, validateFindLines, type RollDie } from '$lib/rules/forage';
+import { insertCatalogueItem } from '$lib/server/services/catalogue';
+import type {
+  FindLine, FindResult, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
+} from '$lib/types/forage';
 
 // Find tables (forage / loot finder, unit A). A table only points at existing item Containers and
 // grants no mechanics, so any logged-in user may author one (Q2). Editing is owner-or-admin, and
@@ -256,4 +260,287 @@ export function loadForageCatalogue(): Promise<ForageCatalogue> {
       })
     };
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Finds: the write paths for forage hauls (unit B).
+//
+// These are deliberately NOT owner-scoped where a GM or admin acts on a player's character (the
+// getCharacterForRoll posture): the endpoints decide who may call them. After any commit that
+// changes inventory the caller runs emitRealtimeEvent('character:updated', { characterId }).
+// ---------------------------------------------------------------------------------------------
+
+const defaultRollDie: RollDie = (sides) => Math.floor(Math.random() * sides) + 1;
+
+/** A haul line with its item's display name, as shown to the finder and the DM. */
+export type NamedFindLine = { itemId: string; name: string; qty: number };
+
+/** One active table (with entries) from the cached catalogue, or null if archived or unknown. */
+export async function getActiveTable(tableId: string): Promise<ForageCatalogueTable | null> {
+  if (!UUID_PATTERN.test(tableId)) return null;
+  const catalogue = await loadForageCatalogue();
+  return catalogue.tables.find((table) => table.id === tableId) ?? null;
+}
+
+/** Fresh (uncached) entries for some of a table's items, on the transaction's client. */
+async function freshEntries(client: pg.PoolClient, tableId: string, itemIds: string[]): Promise<FindTableEntry[]> {
+  const result = await client.query<EntryRow>(
+    `${ENTRY_SELECT} WHERE e.find_table_id = $1 AND e.item_id = ANY($2::uuid[])`, [tableId, itemIds]
+  );
+  return result.rows.map(mapEntry);
+}
+
+/** Per-row cap, matching addInventoryItem. Stacking never pushes a row past it. */
+const MAX_STACK = 999;
+
+/**
+ * Q1 (stacking): adds a quantity to the character's existing row for this item, else inserts a new
+ * row through the shared catalogue insert path. A row matches when it is the same catalogue item
+ * (source_content_id), not equipped, not attuned, and has no custom notes, so a player's customised
+ * or worn copy is never touched. The oldest match wins. A row that would pass 999 is skipped (a new
+ * row is made instead). Returns the inventory row id that now holds the quantity.
+ */
+async function addToInventory(client: pg.PoolClient, characterId: string, itemId: string, qty: number): Promise<string> {
+  const match = await client.query<{ id: string }>(
+    `SELECT id FROM character_inventory_items
+     WHERE character_id = $1 AND source_content_id = $2 AND equipped = false AND location <> 'equipped'
+       AND attuned = false AND notes = '' AND quantity + $3 <= ${MAX_STACK}
+     ORDER BY sort_order, id LIMIT 1 FOR UPDATE`,
+    [characterId, itemId, qty]
+  );
+  if (match.rowCount) {
+    await client.query('UPDATE character_inventory_items SET quantity = quantity + $2 WHERE id = $1', [match.rows[0].id, qty]);
+    return match.rows[0].id;
+  }
+  return insertCatalogueItem(client, characterId, itemId, qty);
+}
+
+/**
+ * Puts a haul into a character's inventory. Re-reads the table's entries fresh and throws if any
+ * line's item is no longer on the table or has been archived since the roll (an archive race), which
+ * rolls the caller's transaction back. Used by both modes. Returns what was added, per line.
+ */
+export async function insertFindItems(
+  client: pg.PoolClient, input: { characterId: string; tableId: string; lines: FindLine[] }
+): Promise<Array<FindResult & { name: string }>> {
+  const entries = await freshEntries(client, input.tableId, input.lines.map((line) => line.itemId));
+  const byItem = new Map(entries.map((entry) => [entry.itemId, entry]));
+  const added: Array<FindResult & { name: string }> = [];
+  for (const line of input.lines) {
+    const entry = byItem.get(line.itemId);
+    if (!entry || entry.itemArchived) throw new Error('An item in this haul is no longer available.');
+    const inventoryId = await addToInventory(client, input.characterId, line.itemId, line.qty);
+    added.push({ item_id: line.itemId, qty: line.qty, inventory_id: inventoryId, name: entry.itemName });
+  }
+  return added;
+}
+
+function resultsJson(added: Array<FindResult & { name: string }>): string {
+  return JSON.stringify(added.map(({ item_id, qty, inventory_id }) => ({ item_id, qty, inventory_id })));
+}
+
+/** DM mode: the DM approved a haul. One transaction: items into inventory, then the finds row. */
+export async function approveDmFind(input: {
+  characterId: string; finderUserId: string; tableId: string; lines: FindLine[]; nat20: boolean;
+  check: ForageCheck; gameSessionId: string | null; roomCode: string | null;
+}): Promise<{ findId: string; lines: NamedFindLine[] }> {
+  return withTransaction(async (client) => {
+    const added = await insertFindItems(client, input);
+    const row = await client.query<{ id: string }>(
+      `INSERT INTO finds (mode, status, game_session_id, room_code, character_id, finder_user_id, find_table_id,
+         nat20, check_json, results, resolved_at)
+       VALUES ('dm', 'found', $1, $2, $3, $4, $5, $6, $7, $8, now()) RETURNING id`,
+      [input.gameSessionId, input.roomCode, input.characterId, input.finderUserId, input.tableId, input.nat20,
+        JSON.stringify(input.check), resultsJson(added)]
+    );
+    return { findId: row.rows[0].id, lines: added.map((a) => ({ itemId: a.item_id, name: a.name, qty: a.qty })) };
+  });
+}
+
+export type UnmarkedSelfFind = { findId: string; characterId: string; tableId: string; check: ForageCheck; roomCode: string | null };
+
+function mapUnmarked(row: any): UnmarkedSelfFind {
+  return { findId: row.id, characterId: row.character_id, tableId: row.find_table_id, check: row.check_json, roomCode: row.room_code };
+}
+
+/** The user's unmarked self-serve check, if any (the partial unique index allows at most one). */
+export async function getUnmarkedSelfFind(userId: string): Promise<UnmarkedSelfFind | null> {
+  const result = await query(
+    `SELECT id, character_id, find_table_id, check_json, room_code FROM finds WHERE finder_user_id = $1 AND status = 'checked'`, [userId]
+  );
+  return result.rows[0] ? mapUnmarked(result.rows[0]) : null;
+}
+
+/**
+ * Self-serve: logs the rolled check as a 'checked' find. If the user already has an unmarked check
+ * (including a racing second start, which trips the partial unique index with 23505) nothing is
+ * inserted, and the existing one comes back so the caller can reopen it at the mark step.
+ */
+export async function startSelfFind(input: {
+  characterId: string; finderUserId: string; tableId: string; check: ForageCheck;
+  roomCode: string | null; gameSessionId: string | null;
+}): Promise<{ findId: string } | { conflict: 'unmarked_check'; existing: UnmarkedSelfFind | null }> {
+  const existing = await getUnmarkedSelfFind(input.finderUserId);
+  if (existing) return { conflict: 'unmarked_check', existing };
+  try {
+    const result = await query<{ id: string }>(
+      `INSERT INTO finds (mode, status, game_session_id, room_code, character_id, finder_user_id, find_table_id, nat20, check_json)
+       VALUES ('self', 'checked', $1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [input.gameSessionId, input.roomCode, input.characterId, input.finderUserId, input.tableId, input.check.nat20, JSON.stringify(input.check)]
+    );
+    return { findId: result.rows[0].id };
+  } catch (error) {
+    if ((error as { code?: string })?.code === '23505') {
+      return { conflict: 'unmarked_check', existing: await getUnmarkedSelfFind(input.finderUserId) };
+    }
+    throw error;
+  }
+}
+
+export type MarkedSelfFind = {
+  status: 'failed' | 'found';
+  characterId: string;
+  roomCode: string | null;
+  gameSessionId: string | null;
+  check: ForageCheck;
+  lines: NamedFindLine[];
+};
+
+/**
+ * Self-serve: the player marks the check pass or fail. A nat 1 forces a fail. A pass rolls the haul
+ * (two runs on a nat 20), validates it like a DM's approval, and inserts it, all in one transaction
+ * with the find row locked, so a double tap can only ever mark once ('stale' the second time).
+ * 'table_empty' leaves the check unmarked. tableId overrides the stored table (the player's
+ * manual pick when there was no table for their area and category).
+ */
+export async function markSelfFind(input: {
+  findId: string; userId: string; passed: boolean; tableId?: string; rollDie?: RollDie;
+}): Promise<{ ok: true; result: MarkedSelfFind } | { ok: false; error: 'stale' | 'table_empty' | 'bad_table' }> {
+  return withTransaction(async (client) => {
+    const found = await client.query<any>(
+      `SELECT * FROM finds WHERE id = $1 AND finder_user_id = $2 AND status = 'checked' FOR UPDATE`, [input.findId, input.userId]
+    );
+    const find = found.rows[0];
+    if (!find) return { ok: false as const, error: 'stale' as const };
+    const check: ForageCheck = find.check_json;
+    const base = {
+      characterId: find.character_id as string, roomCode: find.room_code as string | null,
+      gameSessionId: find.game_session_id as string | null, check
+    };
+
+    if (!input.passed || check.nat1) {
+      await client.query(`UPDATE finds SET status = 'failed', resolved_at = now() WHERE id = $1`, [find.id]);
+      return { ok: true as const, result: { status: 'failed' as const, ...base, lines: [] } };
+    }
+
+    const tableId = input.tableId || find.find_table_id;
+    if (!UUID_PATTERN.test(tableId)) return { ok: false as const, error: 'bad_table' as const };
+    const table = await client.query<{ type_die: number }>('SELECT type_die FROM find_tables WHERE id = $1 AND is_archived = false', [tableId]);
+    if (!table.rowCount) return { ok: false as const, error: 'bad_table' as const };
+    const entries = (await client.query<EntryRow>(`${ENTRY_SELECT} WHERE e.find_table_id = $1`, [tableId])).rows.map(mapEntry);
+    if (pickableEntries(entries).length === 0) return { ok: false as const, error: 'table_empty' as const };
+
+    const rolled = rollFind(entries, table.rows[0].type_die, !!find.nat20, input.rollDie ?? defaultRollDie);
+    // The server's own haul goes through the same validator as a DM's approval.
+    const valid = validateFindLines(rolled.lines, entries);
+    if (!valid.ok) throw new Error(valid.error);
+    const added = await insertFindItems(client, { characterId: find.character_id, tableId, lines: valid.lines });
+    await client.query(
+      `UPDATE finds SET status = 'found', find_table_id = $2, results = $3, resolved_at = now() WHERE id = $1`,
+      [find.id, tableId, resultsJson(added)]
+    );
+    return {
+      ok: true as const,
+      result: { status: 'found' as const, ...base, lines: added.map((a) => ({ itemId: a.item_id, name: a.name, qty: a.qty })) }
+    };
+  });
+}
+
+/**
+ * Admin undo of a found haul (either mode). Locks the find, then for each result line touches ONLY
+ * the inventory row that find wrote to (by id, and only if it is still this character's row of the
+ * same item): it reduces it by the quantity the find added, and deletes it when that reaches 0 or
+ * below. Anything the player already used, removed or changed is noted rather than guessed at.
+ * No other row is ever affected, so an unrelated stack of the same item the player had before stays
+ * as it was. The find is kept, marked 'reverted', with the notes. Never hard-deleted.
+ */
+export async function revertFind(input: { findId: string; adminUserId: string }): Promise<{
+  note: string; characterId: string; finderUserId: string; roomCode: string | null; gameSessionId: string | null;
+} | null> {
+  return withTransaction(async (client) => {
+    const found = await client.query<any>(`SELECT * FROM finds WHERE id = $1 AND status = 'found' FOR UPDATE`, [input.findId]);
+    const find = found.rows[0];
+    if (!find) return null;
+    const results: FindResult[] = Array.isArray(find.results) ? find.results : [];
+    const names = new Map<string, string>();
+    if (results.length) {
+      const named = await client.query<{ id: string; name: string }>(
+        'SELECT id, name FROM content_definitions WHERE id = ANY($1::uuid[])', [results.map((line) => line.item_id)]
+      );
+      for (const row of named.rows) names.set(row.id, row.name);
+    }
+
+    const notes: string[] = [];
+    for (const line of results) {
+      const name = names.get(line.item_id) ?? 'Unknown item';
+      const row = await client.query<{ id: string; quantity: number; source_content_id: string | null }>(
+        'SELECT id, quantity, source_content_id FROM character_inventory_items WHERE id = $1 AND character_id = $2 FOR UPDATE',
+        [line.inventory_id, find.character_id]
+      );
+      const current = row.rows[0];
+      if (!current) {
+        notes.push(`${name}: already removed by the player`);
+      } else if (current.source_content_id !== line.item_id) {
+        notes.push(`${name}: the row now holds a different item, left alone`);
+      } else if (current.quantity > line.qty) {
+        await client.query('UPDATE character_inventory_items SET quantity = quantity - $2 WHERE id = $1', [current.id, line.qty]);
+        notes.push(`${name}: reduced ${current.quantity} -> ${current.quantity - line.qty}`);
+      } else {
+        await client.query('DELETE FROM character_inventory_items WHERE id = $1', [current.id]);
+        notes.push(current.quantity < line.qty
+          ? `${name}: removed (${current.quantity} left of ${line.qty} found)`
+          : `${name}: removed`);
+      }
+    }
+    const note = notes.join('; ');
+    await client.query(
+      `UPDATE finds SET status = 'reverted', reverted_at = now(), reverted_by_user_id = $2, revert_note = $3 WHERE id = $1`,
+      [find.id, input.adminUserId, note]
+    );
+    return {
+      note, characterId: find.character_id, finderUserId: find.finder_user_id, roomCode: find.room_code,
+      gameSessionId: find.game_session_id
+    };
+  });
+}
+
+/** Every unmarked self-serve check, newest first, so an admin can find a stuck one to clear. */
+export async function listUnmarkedChecks(): Promise<Array<UnmarkedSelfFind & { finderUserId: string; createdAt: string }>> {
+  const result = await query(
+    `SELECT id, character_id, find_table_id, check_json, room_code, finder_user_id, created_at
+     FROM finds WHERE status = 'checked' ORDER BY created_at DESC LIMIT 100`
+  );
+  return result.rows.map((row) => ({ ...mapUnmarked(row), finderUserId: row.finder_user_id, createdAt: row.created_at }));
+}
+
+/**
+ * Admin: closes a stuck unmarked check as a failed find (nothing is added), so the player can
+ * forage again. The row is kept, with a note, never deleted.
+ */
+export async function clearUnmarkedCheck(findId: string): Promise<boolean> {
+  if (!UUID_PATTERN.test(findId)) return false;
+  const result = await query(
+    `UPDATE finds SET status = 'failed', resolved_at = now(), revert_note = 'Unmarked check cleared by an admin.'
+     WHERE id = $1 AND status = 'checked'`, [findId]
+  );
+  return !!result.rowCount;
+}
+
+/**
+ * Suggested checks for every active table, in one query, keyed by table id. DM-side only (Q9): the
+ * tables endpoint calls this only for the GM of a live room.
+ */
+export async function listSuggestedChecks(): Promise<Map<string, string>> {
+  const result = await query<{ id: string; suggested_check: string }>('SELECT id, suggested_check FROM find_tables WHERE is_archived = false');
+  return new Map(result.rows.map((row) => [row.id, row.suggested_check]));
 }

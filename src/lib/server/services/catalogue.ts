@@ -269,6 +269,26 @@ export async function listEffectsForLinking(userId?: string): Promise<Array<{ id
   return result.rows;
 }
 
+// Inserts one new inventory row for an item Container (copying its item fields) and starts its
+// resources. Shared by the sheet's catalogue add (quantity 1) and forage's finds (stacking falls
+// back to this when no matching row exists). Returns the new row id. The caller has already checked
+// the item exists and is live, and owns the transaction.
+export async function insertCatalogueItem(client: pg.PoolClient, characterId: string, contentId: string, quantity = 1): Promise<string> {
+  const definition = await client.query<any>(`SELECT c.name, i.* FROM content_definitions c
+    LEFT JOIN item_definitions i ON i.content_id = c.id WHERE c.id = $1 AND c.content_type = 'item'`, [contentId]);
+  const item = definition.rows[0];
+  if (!item) throw new Error('Catalogue entry not found.');
+  const inventory=await client.query<{id:string}>(`INSERT INTO character_inventory_items
+    (character_id, name, category, quantity, equipped, location, is_equipment, ac_bonus, to_hit_bonus,
+     damage_bonus, attack_ability, damage_rolls, source_content_id, attuned, notes, sort_order)
+    VALUES ($1,$2,$3,$10,false,'backpack',($3 IN ('weapon')),$4,$5,$6,$7,$8,$9,false,'',
+      COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1),0)) RETURNING id`,
+    [characterId, item.name, item.category || 'gear', item.ac_bonus || 0, item.to_hit_bonus || 0,
+      item.damage_bonus || 0, item.attack_ability || 'str', item.damage_rolls || '', contentId, quantity]);
+  await initializeInventoryResources(client,inventory.rows[0].id,characterId,contentId);
+  return inventory.rows[0].id;
+}
+
 export async function addContentToCharacter(userId: string, characterId: string, contentId: string): Promise<void> {
   await withTransaction(async (client) => {
     await assertCharacterOwner(client, userId, characterId);
@@ -277,15 +297,7 @@ export async function addContentToCharacter(userId: string, characterId: string,
     const definition = await client.query<any>(`SELECT c.content_type, c.name, i.* FROM content_definitions c
       LEFT JOIN item_definitions i ON i.content_id = c.id WHERE c.id = $1`, [contentId]);
     if (definition.rows[0]?.content_type === 'item') {
-      const item = definition.rows[0];
-      const inventory=await client.query<{id:string}>(`INSERT INTO character_inventory_items
-        (character_id, name, category, quantity, equipped, location, is_equipment, ac_bonus, to_hit_bonus,
-         damage_bonus, attack_ability, damage_rolls, source_content_id, attuned, notes, sort_order)
-        VALUES ($1,$2,$3,1,false,'backpack',($3 IN ('weapon')),$4,$5,$6,$7,$8,$9,false,'',
-          COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1),0)) RETURNING id`,
-        [characterId, item.name, item.category || 'gear', item.ac_bonus || 0, item.to_hit_bonus || 0,
-          item.damage_bonus || 0, item.attack_ability || 'str', item.damage_rolls || '', contentId]);
-      await initializeInventoryResources(client,inventory.rows[0].id,characterId,contentId);
+      await insertCatalogueItem(client, characterId, contentId, 1);
       return;
     }
     const instance = await client.query<{ id: string }>(
