@@ -730,3 +730,20 @@ describe('senses (minimum op)', () => {
     expect(radii).toEqual({ normalFt: 30, darkFt: 90, trueFt: 30, devilFt: 0 });
   });
 });
+
+describe('status flags (flag:<name>)', () => {
+  it('raises a flag per active effect name and key, and gates modifiers on it', async () => {
+    const { statusFlagsOf, withStatusFlags, modifierConditionMatches, resolvedNumericModifiers } = await import('./dnd5e');
+    expect(statusFlagsOf([{ name: 'Half Cover', effectKey: 'cover_half' }])).toEqual(['half cover', 'half_cover', 'cover_half']);
+    expect(modifierConditionMatches('flag:raging', withStatusFlags({}, [{ name: 'Raging' }]))).toBe(true);
+    expect(modifierConditionMatches('flag:raging', withStatusFlags({}, []))).toBe(false);
+
+    // A weapon's +2 damage gated on flag:raging only applies while a Raging effect is also active.
+    const weapon = { id: 'w', effectId: 'w', effectKey: 'axe', name: 'Axe', modifiers: [
+      { target: 'damage_roll.weapon', modifierType: 'bonus', valueExpression: '2', conditionExpression: 'flag:raging' }
+    ] } as any;
+    const raging = { id: 'r', effectId: 'r', effectKey: 'raging', name: 'Raging', modifiers: [] } as any;
+    expect(resolvedNumericModifiers([weapon], ['damage_roll.weapon'], ['bonus'])).toHaveLength(0);
+    expect(resolvedNumericModifiers([weapon, raging], ['damage_roll.weapon'], ['bonus']).map((b) => b.value)).toEqual([2]);
+  });
+});
