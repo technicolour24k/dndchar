@@ -514,4 +514,143 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect(qtyOf(rows, 'glowcap-mushroom')).toBe(0);
     });
   });
+
+  // Unit D: share, the per-viewer session summary, and the admin undo with a real find and DB.
+  describe('share, session summary and undo (unit D)', () => {
+    const shareRoute = () => import('../../routes/vtt/api/finds/[id]/share/+server');
+    const findsRoute = () => import('../../routes/vtt/api/game-sessions/[id]/finds/+server');
+    let gameId = '';
+    const lines = (...entries: Array<[string, number]>) => entries.map(([key, qty]) => ({ itemId: itemIds[key], qty }));
+    const approve = (qtyLines: any[]) => forage.approveDmFind({
+      characterId, finderUserId: userId, tableId: meadowId, lines: qtyLines, nat20: false,
+      check: { skillKey: 'nature', skillLabel: 'Nature', total: 15, natural: 12, nat20: false, nat1: false, text: '', poolSummary: '' },
+      gameSessionId: gameId, roomCode: ROOM
+    });
+    const share = async (who: any, findId: string) => (await shareRoute()).POST({ locals: { user: who }, params: { id: findId } } as any);
+    const summary = async (who: any) => {
+      const res = await (await findsRoute()).GET({ locals: { user: who }, params: { id: gameId } } as any);
+      return res.json();
+    };
+    const bystander = () => ({ id: crypto.randomUUID(), displayName: 'Bystander', role: 'user' as const });
+    const dmOwner = () => ({ id: otherUserId, displayName: 'IT Other', role: 'user' as const });
+
+    beforeAll(async () => {
+      const g = await query<{ id: string }>(`INSERT INTO game_sessions (owner_user_id, name) VALUES ($1, 'IT session') RETURNING id`, [otherUserId]);
+      gameId = g.rows[0].id;
+      sessions.set(ROOM, createSession(ROOM));
+    });
+
+    it('shares once (owner-checked, one way), the log line names items only on the share, and a second share adds nothing', async () => {
+      await resetFinds();
+      await query('DELETE FROM roll_log_entries WHERE session_id = $1', [ROOM]);
+      const saved = await approve(lines(['moonleaf', 3], ['bitterroot', 2]));
+
+      expect((await share({ id: otherUserId, role: 'user' }, saved.findId)).status).toBe(403);
+      expect((await share(user(), saved.findId)).status).toBe(200);
+      expect((await share(user(), saved.findId)).status).toBe(200);
+
+      const logged = await query<{ message: string; details: any }>('SELECT message, details FROM roll_log_entries WHERE session_id = $1', [ROOM]);
+      expect(logged.rows.length).toBe(1);
+      expect(logged.rows[0].message).toBe('Thorne shared their find: Moonleaf x3, Bitterroot x2.');
+      expect(JSON.stringify(logged.rows[0].details)).not.toContain('Moonleaf');
+      expect((await query('SELECT shared FROM finds WHERE id = $1', [saved.findId])).rows[0].shared).toBe(true);
+    });
+
+    it('a failed or reverted find cannot be shared (409)', async () => {
+      await resetFinds();
+      const saved = await approve(lines(['moonleaf', 1]));
+      await forage.revertFind({ findId: saved.findId, adminUserId: otherUserId });
+      expect((await share(user(), saved.findId)).status).toBe(409);
+      // A failed find is always a self-serve one (a DM-mode find is only logged once approved).
+      const failed = await query<{ id: string }>(
+        `INSERT INTO finds (mode, status, game_session_id, character_id, finder_user_id, find_table_id) VALUES ('self', 'failed', $1, $2, $3, $4) RETURNING id`,
+        [gameId, characterId, userId, meadowId]);
+      expect((await share(user(), failed.rows[0].id)).status).toBe(409);
+    });
+
+    it('redacts per viewer: DM and finder see names, a bystander sees a count, sharing opens it to all', async () => {
+      await resetFinds();
+      const saved = await approve(lines(['moonleaf', 3], ['bitterroot', 2]));
+
+      const asDm = await summary(dmOwner());
+      expect(asDm.isDm).toBe(true);
+      expect(asDm.finds[0]).toMatchObject({ view: 'full', itemCount: 5, canShare: false });
+      expect(asDm.finds[0].items.map((i: any) => i.name).sort()).toEqual(['Bitterroot', 'Moonleaf']);
+
+      expect((await summary(user())).finds[0]).toMatchObject({ view: 'full', canShare: true });
+
+      const asOther = await summary(bystander());
+      expect(asOther.finds[0]).toMatchObject({ view: 'redacted', text: 'Thorne foraged and found 5 items.' });
+      expect(JSON.stringify(asOther)).not.toMatch(/Moonleaf|Bitterroot|Nature|Meadow/);
+
+      // Rev 4: the table name goes to the DM only, never to the finder or a bystander.
+      expect(asDm.finds[0].tableName).toBeTruthy();
+      expect((await summary(user())).finds[0].tableName).toBe('');
+
+      await share(user(), saved.findId);
+      const afterShare = await summary(bystander());
+      expect(afterShare.finds[0]).toMatchObject({ view: 'full', shared: true, canShare: false, tableName: '' });
+      expect(JSON.stringify(afterShare)).not.toMatch(/Meadow/);
+
+      // An unmarked check is never listed, and a find outside any game session isn't here at all.
+      await query(`INSERT INTO finds (mode, status, game_session_id, character_id, finder_user_id, find_table_id) VALUES ('self', 'checked', $1, $2, $3, $4)`,
+        [gameId, characterId, userId, meadowId]);
+      expect((await summary(dmOwner())).finds.length).toBe(1);
+      await query(`UPDATE finds SET game_session_id = NULL WHERE id = $1`, [saved.findId]);
+      expect((await summary(dmOwner())).finds.length).toBe(0);
+    });
+
+    it('the character owner who is not the finder may share', async () => {
+      await resetFinds();
+      const saved = await approve(lines(['moonleaf', 1]));
+      await query('UPDATE finds SET finder_user_id = $2 WHERE id = $1', [saved.findId, otherUserId]);
+      expect((await share(user(), saved.findId)).status).toBe(200); // user() owns the character
+      expect((await share(bystander(), saved.findId)).status).toBe(403);
+      await query('DELETE FROM finds WHERE id = $1', [saved.findId]); // resetFinds only clears the user's own finds
+    });
+
+    it('a shared find that is later undone is redacted for a bystander, with the note kept for the DM', async () => {
+      await resetFinds();
+      const saved = await approve(lines(['moonleaf', 2]));
+      await share(user(), saved.findId);
+      await forage.revertFind({ findId: saved.findId, adminUserId: otherUserId });
+      expect((await summary(bystander())).finds[0]).toMatchObject({ view: 'redacted', text: "Thorne's find was undone by the DM." });
+      expect((await summary(dmOwner())).finds[0]).toMatchObject({ view: 'full', status: 'reverted', revertNote: 'Moonleaf: removed' });
+      // A malformed id is a clean null, not a database error.
+      expect(await forage.revertFind({ findId: 'not-a-uuid', adminUserId: otherUserId })).toBeNull();
+    });
+
+    it('a reverted find shows the note to the DM and a plain line to a bystander', async () => {
+      await resetFinds();
+      const saved = await approve(lines(['moonleaf', 2]));
+      await forage.revertFind({ findId: saved.findId, adminUserId: otherUserId });
+      const asDm = await summary(dmOwner());
+      expect(asDm.finds[0]).toMatchObject({ view: 'full', status: 'reverted', revertNote: 'Moonleaf: removed' });
+      expect((await summary(bystander())).finds[0]).toMatchObject({ view: 'redacted', text: "Thorne's find was undone by the DM." });
+    });
+
+    it('the admin list names items and the inventory row they wrote to, and filters by status', async () => {
+      await resetFinds();
+      const saved = await approve(lines(['moonleaf', 2]));
+      const all = await forage.listFindsForAdmin({ gameSessionId: gameId, characterId });
+      expect(all[0].items[0]).toMatchObject({ name: 'Moonleaf', qty: 2, row: { name: 'Moonleaf', quantity: 2 } });
+      expect((await forage.listFindsForAdmin({ gameSessionId: gameId, status: 'reverted' })).length).toBe(0);
+      expect((await forage.listFindsForAdmin({ gameSessionId: gameId, status: 'dm' })).length).toBe(1);
+      expect((await forage.listFindsForAdmin({ gameSessionId: gameId, status: 'self' })).length).toBe(0);
+      await forage.revertFind({ findId: saved.findId, adminUserId: otherUserId });
+      const after = await forage.listFindsForAdmin({ gameSessionId: gameId, status: 'reverted' });
+      expect(after[0]).toMatchObject({ status: 'reverted', revertNote: 'Moonleaf: removed' });
+      expect(after[0].items[0].row).toBeNull();
+    });
+
+    it('the admin endpoint undo posts the name-free undo line', async () => {
+      await resetFinds();
+      await query('DELETE FROM roll_log_entries WHERE session_id = $1', [ROOM]);
+      const saved = await approve(lines(['moonleaf', 2]));
+      const undone = await call(adminRoute.POST, { id: otherUserId, displayName: 'IT Other', role: 'admin' }, { body: { action: 'undo', findId: saved.findId } });
+      expect(undone.status).toBe(200);
+      const logged = await query<{ message: string }>('SELECT message FROM roll_log_entries WHERE session_id = $1', [ROOM]);
+      expect(logged.rows.map((row) => row.message)).toEqual(["The DM undid Thorne's find."]);
+    });
+  });
 });

@@ -9,7 +9,7 @@ import {
   type ForagePreview, type ForageRequest
 } from '$lib/server/vttForage';
 import {
-  ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, rollForageCheck
+  ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, publishFindChanged, rollForageCheck
 } from '$lib/server/vttForageRoll';
 import { advantageBody, isUuid, parseChoice, shortText } from '$lib/server/vttForageApi';
 import type { ForageCatalogueTable } from '$lib/types/forage';
@@ -184,6 +184,7 @@ async function approveAction(session: any, request: ForageRequest, body: any) {
       rollLogMessage({ characterName: request.characterName, check, outcome: 'found', mode: 'dm', itemCount }),
       forageLogDetails({ check, outcome: 'found', mode: 'dm', itemCount, findId: saved.findId })
     );
+    publishFindChanged(session.gameSessionId ?? null, saved.findId); // Session Notes refetch (no details ride on it)
     return json({ findId: saved.findId, lines: saved.lines });
   } catch (error) {
     // Only reachable before the commit (the getActiveTable await); after closeRequest nothing throws.

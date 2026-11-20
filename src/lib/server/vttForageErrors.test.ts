@@ -10,6 +10,8 @@ const SOURCES = [
   'src/routes/vtt/api/forage/mine/+server.ts',
   'src/routes/vtt/api/forage/tables/+server.ts',
   'src/routes/vtt/api/session/[id]/forage/+server.ts',
+  'src/routes/vtt/api/finds/[id]/share/+server.ts',
+  'src/routes/vtt/api/game-sessions/[id]/finds/+server.ts',
   'src/lib/server/vttForageApi.ts',
   'src/lib/server/vttForageRoll.ts',
   'src/lib/server/services/forage.ts'

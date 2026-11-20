@@ -3,7 +3,7 @@
   let { children } = $props();
   const links=[
     ['/admin/settings','Site Settings'],['/admin/rules/modifiers','Rules Library'],['/admin/items','Items'],
-    ['/admin/magic','Spells'],['/admin/feats','Feats & Features']
+    ['/admin/magic','Spells'],['/admin/feats','Feats & Features'],['/admin/forage','Finds Review']
   ];
   const futureLinks=['Magic Items','Conditions','Races','Backgrounds'];
 </script>

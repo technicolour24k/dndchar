@@ -270,6 +270,8 @@ const ERROR_TEXT = {
   invalid_lines: 'Those quantities were not accepted.',
   session_not_found: 'That room has closed.',
   character_not_found: "That character wasn't found.",
+  forbidden: "That isn't your find to share.",
+  not_shareable: "Only a find that's still standing can be shared.",
   approve_failed: "Couldn't add the haul. Nothing was changed, try again.",
   server_error: 'Something went wrong on the server.',
   network: "Couldn't reach the server."

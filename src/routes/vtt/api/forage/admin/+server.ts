@@ -1,10 +1,10 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { emitRealtimeEvent } from '$lib/server/realtime';
+import { announceUndo, publishFindChanged } from '$lib/server/vttForageRoll';
 import { clearUnmarkedCheck, listUnmarkedChecks, revertFind } from '$lib/server/services/forage';
 import { isUuid } from '$lib/server/vttForageApi';
 
-// Minimal admin-only forage endpoint (the review UI comes in unit D). Admin is the de facto DM
+// Admin-only forage endpoint (the /admin/forage page uses the same services directly). Admin is the de facto DM
 // until campaigns exist (Q7), so only role 'admin' may call it.
 //
 //   GET                                   unmarked self-serve checks, newest first (to find a stuck one)
@@ -26,13 +26,15 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 
   if (body.action === 'clear') {
     const cleared = await clearUnmarkedCheck(body.findId);
-    return cleared ? json({ ok: true }) : json({ error: 'not_found' }, { status: 404 });
+    if (!cleared) return json({ error: 'not_found' }, { status: 404 });
+    publishFindChanged(cleared.gameSessionId, body.findId);
+    return json({ ok: true });
   }
 
   if (body.action === 'undo') {
     const reverted = await revertFind({ findId: body.findId, adminUserId: locals.user!.id });
     if (!reverted) return json({ error: 'not_found' }, { status: 404 });
-    emitRealtimeEvent('character:updated', { characterId: reverted.characterId });
+    await announceUndo(reverted, body.findId);
     return json({ ok: true, note: reverted.note });
   }
 

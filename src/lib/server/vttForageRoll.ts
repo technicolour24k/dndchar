@@ -1,4 +1,4 @@
-import { sessions } from '$vtt/store.js';
+import { sessions, publish } from '$vtt/store.js';
 import { abilityMap, abilityModifier } from '$lib/rules/dnd5e';
 import { characterStatsFor } from '$lib/rules/characterStats';
 import { poolSummary, previewAdvantage, rollWithModifiers, type AdvantageSource } from '$lib/rules/attackRoll';
@@ -6,6 +6,9 @@ import { findSkill, skillCandidates, skillCheckBonus } from '$lib/rules/skills';
 import { getCharacterForRoll } from '$lib/server/services/characters';
 import { logRoll } from '$lib/server/services/rollLog';
 import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAttackAdvantage';
+import { shareLogMessage, undoLogMessage } from '$lib/rules/forage';
+import { query } from '$lib/server/db';
+import { emitRealtimeEvent } from '$lib/server/realtime';
 import type { ForageCheck } from '$lib/types/forage';
 
 // The server-side forage skill check, shared by the DM's "check" action and a self-serve "start".
@@ -142,4 +145,40 @@ export function forageLogDetails(input: {
     pool: input.check.poolSummary, outcome: input.outcome, mode: input.mode, itemCount: input.itemCount,
     ...(input.findId ? { findId: input.findId } : {})
   };
+}
+
+/**
+ * Tells open Session Notes views that a find changed, so they refetch (authenticated, per viewer).
+ * The message carries only the find id. Watch subscriptions are unauthenticated, so nothing about the
+ * haul may ride on it. Not on the watchable broadcast list: it goes straight to the topic.
+ */
+export function publishFindChanged(gameSessionId: string | null, findId: string): void {
+  if (gameSessionId) publish(`game-session:${gameSessionId}`, { type: 'game_session:find', findId });
+}
+
+/**
+ * After a successful share: the public roll-log line WITH item names (an explicit share is the one
+ * way names go public), the Session Notes nudge, and the shared flag on the finder's in-room result
+ * so a reconnect doesn't offer Share again.
+ */
+export async function announceShare(find: {
+  findId: string; finderUserId: string; characterName: string; roomCode: string | null;
+  gameSessionId: string | null; lines: Array<{ name: string; qty: number }>;
+}): Promise<void> {
+  const total = find.lines.reduce((sum, line) => sum + line.qty, 0);
+  await logForageRoll(find.roomCode, shareLogMessage(find.characterName, find.lines), {
+    kind: 'forage', outcome: 'shared', itemCount: total, findId: find.findId
+  });
+  const room = find.roomCode ? sessions.get(find.roomCode) : null;
+  const result = room?.forageResults?.[find.finderUserId];
+  if (result && result.findId === find.findId) result.shared = true;
+  publishFindChanged(find.gameSessionId, find.findId);
+}
+
+/** After an admin undo: refresh the sheet and the VTT token, post the (name-free) line, nudge Session Notes. */
+export async function announceUndo(reverted: { characterId: string; roomCode: string | null; gameSessionId: string | null }, findId: string): Promise<void> {
+  emitRealtimeEvent('character:updated', { characterId: reverted.characterId });
+  const named = await query<{ name: string }>('SELECT name FROM characters WHERE id = $1', [reverted.characterId]);
+  await logForageRoll(reverted.roomCode, undoLogMessage(named.rows[0]?.name ?? 'Someone'), { kind: 'forage', outcome: 'undone', findId });
+  publishFindChanged(reverted.gameSessionId, findId);
 }

@@ -37,6 +37,7 @@ vi.mock('$lib/server/vttForageRoll', () => ({
   ForageRollError: class extends Error { constructor(public code: string) { super(code); } },
   forageLogDetails: () => ({}),
   logForageRoll: async () => {},
+  publishFindChanged: () => {},
   previewForageAdvantage: (...args: unknown[]) => previewSkill(...args),
   previewGenericAdvantage: (...args: unknown[]) => previewGeneric(...args),
   rollForageCheck: (...args: unknown[]) => rollCheck(...args)

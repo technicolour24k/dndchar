@@ -1,10 +1,13 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
-import { parseEntryInput, parseTableInput, pickableEntries, rollFind, validateFindLines, type RollDie } from '$lib/rules/forage';
+import {
+  findCheckSummary, parseEntryInput, parseTableInput, pickableEntries, rollFind, shapeFindForViewer, validateFindLines,
+  type FindForViewer, type RollDie, type SessionFindView
+} from '$lib/rules/forage';
 import { insertCatalogueItem } from '$lib/server/services/catalogue';
 import type {
-  FindLine, FindResult, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
+  FindLine, FindMode, FindResult, FindStatus, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
 } from '$lib/types/forage';
 
 // Find tables (forage / loot finder, unit A). A table only points at existing item Containers and
@@ -474,6 +477,7 @@ export async function markSelfFind(input: {
 export async function revertFind(input: { findId: string; adminUserId: string }): Promise<{
   note: string; characterId: string; finderUserId: string; roomCode: string | null; gameSessionId: string | null;
 } | null> {
+  if (!UUID_PATTERN.test(input.findId)) return null; // a malformed id is a friendly 'nothing to undo', not a 500
   return withTransaction(async (client) => {
     const found = await client.query<any>(`SELECT * FROM finds WHERE id = $1 AND status = 'found' FOR UPDATE`, [input.findId]);
     const find = found.rows[0];
@@ -534,13 +538,14 @@ export async function listUnmarkedChecks(): Promise<Array<UnmarkedSelfFind & { f
  * Admin: closes a stuck unmarked check as a failed find (nothing is added), so the player can
  * forage again. The row is kept, with a note, never deleted.
  */
-export async function clearUnmarkedCheck(findId: string): Promise<boolean> {
-  if (!UUID_PATTERN.test(findId)) return false;
+export async function clearUnmarkedCheck(findId: string): Promise<{ gameSessionId: string | null } | null> {
+  if (!UUID_PATTERN.test(findId)) return null;
   const result = await query(
     `UPDATE finds SET status = 'failed', resolved_at = now(), revert_note = 'Unmarked check cleared by an admin.'
-     WHERE id = $1 AND status = 'checked'`, [findId]
+     WHERE id = $1 AND status = 'checked' RETURNING game_session_id`, [findId]
   );
-  return !!result.rowCount;
+  // The game session id lets the caller nudge open Session Notes views.
+  return result.rows[0] ? { gameSessionId: result.rows[0].game_session_id } : null;
 }
 
 /**
@@ -550,4 +555,179 @@ export async function clearUnmarkedCheck(findId: string): Promise<boolean> {
 export async function listSuggestedChecks(): Promise<Map<string, string>> {
   const result = await query<{ id: string; suggested_check: string }>('SELECT id, suggested_check FROM find_tables WHERE is_archived = false');
   return new Map(result.rows.map((row) => [row.id, row.suggested_check]));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Share, session summary and admin review (unit D)
+// ---------------------------------------------------------------------------------------------
+
+/** Live item names for some ids (content rows are never hard-deleted, so a miss means a bad id). */
+async function itemNamesFor(runner: { query: (sql: string, params: any[]) => Promise<{ rows: any[] }> }, itemIds: string[]): Promise<Map<string, string>> {
+  if (!itemIds.length) return new Map();
+  const named = await runner.query('SELECT id, name FROM content_definitions WHERE id = ANY($1::uuid[])', [itemIds]);
+  return new Map(named.rows.map((row: { id: string; name: string }) => [row.id, row.name]));
+}
+
+function namedLines(results: FindResult[], names: Map<string, string>): Array<{ name: string; qty: number }> {
+  return results.map((line) => ({ name: names.get(line.item_id) ?? 'Unknown item', qty: line.qty }));
+}
+
+export type SharedFind = {
+  findId: string; finderUserId: string; characterId: string; characterName: string;
+  roomCode: string | null; gameSessionId: string | null; lines: Array<{ name: string; qty: number }>;
+};
+
+export type ShareOutcome =
+  | { ok: false; error: 'not_found' | 'forbidden' | 'not_shareable' }
+  | { ok: true; alreadyShared: true }
+  | { ok: true; alreadyShared: false; find: SharedFind };
+
+/**
+ * The finder (or the character's owner) shares a standing find with the party. One way: nothing
+ * un-shares it. Only 'found' finds can be shared (failed and reverted ones have nothing to show).
+ * The row is locked so two quick taps can only share once; the second gets alreadyShared and the
+ * caller posts no second log line. This is the ONLY place item names become public.
+ */
+export async function shareFind(findId: string, userId: string): Promise<ShareOutcome> {
+  if (!UUID_PATTERN.test(findId)) return { ok: false, error: 'not_found' };
+  return withTransaction(async (client): Promise<ShareOutcome> => {
+    const found = await client.query<any>(
+      `SELECT f.*, c.name AS character_name, c.owner_user_id AS character_owner_id
+       FROM finds f JOIN characters c ON c.id = f.character_id WHERE f.id = $1 FOR UPDATE OF f`, [findId]
+    );
+    const find = found.rows[0];
+    if (!find) return { ok: false, error: 'not_found' };
+    if (find.finder_user_id !== userId && find.character_owner_id !== userId) return { ok: false, error: 'forbidden' };
+    if (find.status !== 'found') return { ok: false, error: 'not_shareable' };
+    if (find.shared) return { ok: true, alreadyShared: true };
+    await client.query('UPDATE finds SET shared = true WHERE id = $1', [findId]);
+    const results: FindResult[] = Array.isArray(find.results) ? find.results : [];
+    const names = await itemNamesFor(client, results.map((line) => line.item_id));
+    return {
+      ok: true, alreadyShared: false,
+      find: {
+        findId, finderUserId: find.finder_user_id, characterId: find.character_id, characterName: find.character_name,
+        roomCode: find.room_code, gameSessionId: find.game_session_id, lines: namedLines(results, names)
+      }
+    };
+  });
+}
+
+type FindListRow = {
+  id: string; created_at: string; status: FindStatus; mode: FindMode; shared: boolean; results: FindResult[] | null;
+  check_json: ForageCheck | null; revert_note: string; finder_user_id: string; character_id: string;
+  character_name: string; character_owner_id: string; owner_name: string | null; table_name: string;
+  game_session_id: string | null; game_session_name: string | null; room_code: string | null; nat20: boolean;
+};
+
+const FIND_LIST_SELECT = `
+  SELECT f.id, f.created_at, f.status, f.mode, f.shared, f.results, f.check_json, f.revert_note, f.finder_user_id,
+         f.character_id, f.game_session_id, f.room_code, f.nat20,
+         c.name AS character_name, c.owner_user_id AS character_owner_id, u.display_name AS owner_name,
+         t.name AS table_name, g.name AS game_session_name
+  FROM finds f
+  JOIN characters c ON c.id = f.character_id
+  JOIN users u ON u.id = f.finder_user_id
+  JOIN find_tables t ON t.id = f.find_table_id
+  LEFT JOIN game_sessions g ON g.id = f.game_session_id`;
+
+const resultsOf = (row: FindListRow): FindResult[] => (Array.isArray(row.results) ? row.results : []);
+
+/** Loads live names for every result line of a set of find rows in one query. */
+async function namesForRows(rows: FindListRow[]): Promise<Map<string, string>> {
+  const ids = new Set<string>();
+  for (const row of rows) for (const line of resultsOf(row)) ids.add(line.item_id);
+  return itemNamesFor({ query: (sql, params) => query(sql, params) }, [...ids]);
+}
+
+function toViewerFind(row: FindListRow, names: Map<string, string>): FindForViewer {
+  return {
+    id: row.id, createdAt: row.created_at, status: row.status, mode: row.mode, shared: row.shared,
+    characterName: row.character_name, finderUserId: row.finder_user_id, characterOwnerId: row.character_owner_id,
+    check: row.check_json, tableName: row.table_name, revertNote: row.revert_note,
+    items: namedLines(resultsOf(row), names)
+  };
+}
+
+/**
+ * The Finds section of Session Notes, shaped per viewer by the server so a redacted row never
+ * carries a name. "The DM" is the Game Session owner (Q3) or an admin (the de facto DM until
+ * campaigns). Unmarked checks are never listed. Finds made with no Game Session running aren't
+ * here at all (they only show in the admin review). Null if the game session doesn't exist.
+ */
+export async function listFindsForGameSession(gameSessionId: string, viewer: { id: string; role: string }): Promise<{
+  isDm: boolean; finds: SessionFindView[];
+} | null> {
+  if (!UUID_PATTERN.test(gameSessionId)) return null;
+  const owner = await query<{ owner_user_id: string }>('SELECT owner_user_id FROM game_sessions WHERE id = $1', [gameSessionId]);
+  if (!owner.rowCount) return null;
+  const isDm = owner.rows[0].owner_user_id === viewer.id || viewer.role === 'admin';
+  const rows = await query<FindListRow>(
+    `${FIND_LIST_SELECT} WHERE f.game_session_id = $1 AND f.status <> 'checked' ORDER BY f.created_at DESC LIMIT 200`, [gameSessionId]
+  );
+  const names = await namesForRows(rows.rows);
+  return { isDm, finds: rows.rows.map((row) => shapeFindForViewer(toViewerFind(row, names), { id: viewer.id, isDm })) };
+}
+
+export type AdminFindFilter = { gameSessionId?: string; characterId?: string; status?: string };
+
+export type AdminFindRow = {
+  id: string; createdAt: string; status: FindStatus; mode: FindMode; shared: boolean; characterId: string;
+  characterName: string; ownerName: string; tableName: string; checkSummary: string; nat20: boolean;
+  gameSessionId: string | null; gameSessionName: string | null; roomCode: string | null; revertNote: string;
+  items: Array<{ name: string; qty: number; inventoryId: string; row: { name: string; quantity: number } | null }>;
+};
+
+export const ADMIN_FIND_STATUSES = ['all', 'dm', 'self', 'checked', 'failed', 'found', 'reverted'] as const;
+
+/**
+ * Admin review: newest first, capped at 200. status takes a real status or a mode ('dm' / 'self').
+ * Each item line also shows the inventory row it wrote to as it is NOW (null if it's gone), so the
+ * admin can see what an undo would do.
+ */
+export async function listFindsForAdmin(filter: AdminFindFilter): Promise<AdminFindRow[]> {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (filter.gameSessionId && UUID_PATTERN.test(filter.gameSessionId)) { params.push(filter.gameSessionId); where.push(`f.game_session_id = $${params.length}`); }
+  if (filter.characterId && UUID_PATTERN.test(filter.characterId)) { params.push(filter.characterId); where.push(`f.character_id = $${params.length}`); }
+  if (filter.status === 'dm' || filter.status === 'self') { params.push(filter.status); where.push(`f.mode = $${params.length}`); }
+  else if (filter.status && ['checked', 'failed', 'found', 'reverted'].includes(filter.status)) { params.push(filter.status); where.push(`f.status = $${params.length}`); }
+  const rows = await query<FindListRow>(
+    `${FIND_LIST_SELECT} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY f.created_at DESC LIMIT 200`, params
+  );
+  const names = await namesForRows(rows.rows);
+  const inventoryIds = rows.rows.flatMap((row) => resultsOf(row).map((line) => line.inventory_id)).filter((id) => UUID_PATTERN.test(id ?? ''));
+  const current = new Map<string, { name: string; quantity: number }>();
+  if (inventoryIds.length) {
+    const inv = await query<{ id: string; name: string; quantity: number }>(
+      'SELECT id, name, quantity FROM character_inventory_items WHERE id = ANY($1::uuid[])', [inventoryIds]
+    );
+    for (const row of inv.rows) current.set(row.id, { name: row.name, quantity: row.quantity });
+  }
+  return rows.rows.map((row) => ({
+    id: row.id, createdAt: row.created_at, status: row.status, mode: row.mode, shared: row.shared, characterId: row.character_id,
+    characterName: row.character_name, ownerName: row.owner_name ?? 'Unknown', tableName: row.table_name,
+    checkSummary: findCheckSummary(row.check_json), nat20: row.nat20, gameSessionId: row.game_session_id,
+    gameSessionName: row.game_session_name, roomCode: row.room_code, revertNote: row.revert_note,
+    items: resultsOf(row).map((line) => ({
+      name: names.get(line.item_id) ?? 'Unknown item', qty: line.qty, inventoryId: line.inventory_id, row: current.get(line.inventory_id) ?? null
+    }))
+  }));
+}
+
+/** The dropdown options for the admin filters: only sessions and characters that have finds. */
+export async function listFindFilterOptions(): Promise<{
+  sessions: Array<{ id: string; name: string; createdAt: string }>; characters: Array<{ id: string; name: string }>;
+}> {
+  const [sessionRows, characterRows] = await Promise.all([
+    query<{ id: string; name: string; created_at: string }>(
+      `SELECT g.id, g.name, g.created_at FROM game_sessions g WHERE EXISTS (SELECT 1 FROM finds f WHERE f.game_session_id = g.id)
+       ORDER BY g.created_at DESC LIMIT 100`),
+    query<{ id: string; name: string }>(
+      `SELECT c.id, c.name FROM characters c WHERE EXISTS (SELECT 1 FROM finds f WHERE f.character_id = c.id) ORDER BY c.name LIMIT 200`)
+  ]);
+  return {
+    sessions: sessionRows.rows.map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at })),
+    characters: characterRows.rows
+  };
 }

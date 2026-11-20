@@ -10,7 +10,7 @@ import {
   newRequest, resolveForageRoom, rollLogMessage
 } from '$lib/server/vttForage';
 import {
-  ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, previewGenericAdvantage, rollForageCheck
+  ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, previewGenericAdvantage, publishFindChanged, rollForageCheck
 } from '$lib/server/vttForageRoll';
 import { FORAGE_SELF_SKILLS } from '$lib/rules/skills';
 import { isUuid, loadOwnedCharacter, parseAdvantage, parseSelfChoice, playerUnmarked, shortText } from '$lib/server/vttForageApi';
@@ -147,6 +147,8 @@ async function selfMarkAction(userId: string, body: any) {
     rollLogMessage({ characterName: name, check: result.check, outcome: result.status, mode: 'self', itemCount }),
     forageLogDetails({ check: result.check, outcome: result.status, mode: 'self', itemCount, findId: body.findId })
   );
+  // Open Session Notes views refetch (a detail-free nudge, the list itself is fetched per viewer).
+  publishFindChanged(result.gameSessionId, body.findId);
   if (result.roomCode && sessions.has(result.roomCode)) forageNudge(result.roomCode, userId);
   return json({ status: result.status, lines: result.lines, check: result.check });
 }

@@ -1,4 +1,4 @@
-import type { FindLine, FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
+import type { FindLine, FindMode, FindStatus, FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
 
 // Pure helpers for find tables, plus the roll itself (below). No DB; randomness is injected.
 
@@ -164,4 +164,71 @@ export function validateFindLines(rawLines: unknown, entries: FindTableEntry[], 
 /** "Found 3 items" counts total quantity, not distinct items (Q4). */
 export function forageItemCount(lines: FindLine[]): number {
   return lines.reduce((sum, line) => sum + line.qty, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-viewer finds (unit D). The session summary and the admin list both come through here, so the
+// "who sees item names" rule lives in one pure, tested place.
+// ---------------------------------------------------------------------------------------------
+
+/** "Nature 17", or "Nature natural 20" / "Nature natural 1" when the kept die was a 20 or a 1. */
+export function findCheckSummary(check: { skillLabel?: string; total?: number; nat20?: boolean; nat1?: boolean } | null | undefined): string {
+  if (!check || !check.skillLabel) return '';
+  const roll = check.nat20 ? 'natural 20' : check.nat1 ? 'natural 1' : String(check.total ?? '');
+  return `${check.skillLabel} ${roll}`.trim();
+}
+
+/** What everyone without full access reads. Never contains an item name, a table or a check. */
+export function redactedFindText(status: FindStatus, characterName: string, itemCount: number): string {
+  if (status === 'reverted') return `${characterName}'s find was undone by the DM.`;
+  if (status === 'found' && itemCount > 0) return `${characterName} foraged and found ${itemCount} ${itemCount === 1 ? 'item' : 'items'}.`;
+  return `${characterName} foraged and found nothing of note.`;
+}
+
+/** A find as loaded for the summary: everything, before the viewer is known. */
+export type FindForViewer = {
+  id: string; createdAt: string; status: FindStatus; mode: FindMode; shared: boolean;
+  characterName: string; finderUserId: string; characterOwnerId: string;
+  check: { skillLabel?: string; total?: number; nat20?: boolean; nat1?: boolean } | null;
+  tableName: string; items: Array<{ name: string; qty: number }>; revertNote: string;
+};
+
+export type SessionFindView =
+  | {
+    view: 'full'; id: string; createdAt: string; status: FindStatus; mode: FindMode; shared: boolean; canShare: boolean;
+    characterName: string; checkSummary: string; tableName: string; items: Array<{ name: string; qty: number }>;
+    itemCount: number; revertNote: string;
+  }
+  | { view: 'redacted'; id: string; createdAt: string; status: FindStatus; text: string };
+
+/**
+ * Full detail for the DM (the Game Session owner or an admin), for the finder (and the character's
+ * owner), and for everyone once the find has been shared (while it still stands). Everyone else gets
+ * one line with a count only. canShare is true only for the finder on an unshared, standing find.
+ */
+export function shapeFindForViewer(find: FindForViewer, viewer: { id: string; isDm: boolean }): SessionFindView {
+  const itemCount = find.items.reduce((sum, item) => sum + item.qty, 0);
+  const isFinder = viewer.id === find.finderUserId || viewer.id === find.characterOwnerId;
+  const full = viewer.isDm || isFinder || (find.shared && find.status === 'found');
+  if (!full) {
+    return { view: 'redacted', id: find.id, createdAt: find.createdAt, status: find.status, text: redactedFindText(find.status, find.characterName, itemCount) };
+  }
+  return {
+    view: 'full', id: find.id, createdAt: find.createdAt, status: find.status, mode: find.mode, shared: find.shared,
+    canShare: isFinder && find.status === 'found' && !find.shared,
+    characterName: find.characterName, checkSummary: findCheckSummary(find.check),
+    // Rev 4: players learn nothing about tables, even for their own finds. Only the DM sees the name.
+    tableName: viewer.isDm ? find.tableName : '',
+    items: find.items, itemCount, revertNote: find.revertNote
+  };
+}
+
+/** The public roll-log line for a share. The only place item names go in the log (explicit share). */
+export function shareLogMessage(characterName: string, items: Array<{ name: string; qty: number }>): string {
+  return `${characterName} shared their find: ${items.map((item) => `${item.name} x${item.qty}`).join(', ')}.`;
+}
+
+/** The public roll-log line for an admin undo. No item names. */
+export function undoLogMessage(characterName: string): string {
+  return `The DM undid ${characterName}'s find.`;
 }

@@ -12,7 +12,7 @@
 // rebuild: it updates its own modals and two small spots in the sidebar (the Forage buttons and the
 // GM's "request waiting" line) directly.
 //
-// "Share with party" is Unit D. See the HOOK comment in resultHtml().
+// "Share with party" (unit D) calls POST /vtt/api/finds/[id]/share from the result card.
 
 import {
   addLine, addableEntries, areaOptions, canApprove, canSubmitPicks, canSubmitSelf, categoryOptions, chosenTable,
@@ -412,16 +412,22 @@ export function createForage(deps) {
     }
   }
 
-  // The result step, for both modes. HOOK (Unit D): the "Share with party" button goes next to
-  // Dismiss for an approved haul (result.findId, shared flag). Unit D wires it to
-  // POST /vtt/api/finds/[id]/share. Not built here.
+  // The result step, for both modes. "Share with party" shows for a standing haul (it has a findId and
+  // lines). One way: once shared it becomes a disabled "Shared with the party" note. Item names only
+  // go public through this explicit share.
   function resultHtml(result, msg) {
     let html = `<p><strong>${esc(resultHeadline(result))}</strong></p>${checkHtml(result.check)}`;
-    if (result.lines && result.lines.length) {
+    const hasHaul = !!(result.lines && result.lines.length);
+    if (hasHaul) {
       html += `<ul class="forage-lines">${linesListHtml(result.lines)}</ul>
         <p class="attack-subtext">Added to your inventory. If your character sheet is open, it updates when you're not mid-edit.</p>`;
     }
-    return `${html}${msg}<div class="actions">
+    const share = hasHaul && result.findId
+      ? (result.shared
+        ? '<button type="button" class="secondary" disabled>Shared with the party</button>'
+        : `<button type="button" class="secondary" data-fg-act="share" ${pf.busy ? 'disabled' : ''}>Share with party</button>`)
+      : '';
+    return `${html}${msg}<div class="actions">${share}
       <button type="button" class="secondary" data-fg-act="again">Forage again</button>
       <button type="button" data-fg-act="dismiss" data-fg="primary">Dismiss</button></div>`;
   }
@@ -569,6 +575,27 @@ export function createForage(deps) {
     closePlayer();
   }
 
+  // Shares the finder's standing haul with the party (one way, no undo). Works for both modes: the
+  // result carries the finds row id either way.
+  async function shareResult() {
+    const result = currentResult();
+    if (pf.busy || !result || !result.findId) return;
+    pf.busy = true;
+    pf.message = '';
+    renderPlayer();
+    const res = await api('POST', `/vtt/api/finds/${encodeURIComponent(result.findId)}/share`);
+    pf.busy = false;
+    if (!pf.open) return;
+    if (res.ok) {
+      // Mark the underlying copy (a self-serve result, or the room's DM-mode result) as shared.
+      const target = pf.localResult && pf.localResult.findId === result.findId ? pf.localResult : myServerResult();
+      if (target) target.shared = true;
+    } else {
+      pf.message = errorText(res.data);
+    }
+    renderPlayer();
+  }
+
   playerBody.addEventListener('click', (event) => {
     const act = event.target.closest('[data-fg-act]')?.dataset.fgAct;
     if (!act) return;
@@ -579,6 +606,7 @@ export function createForage(deps) {
     else if (act === 'withdraw') withdrawPlayer();
     else if (act === 'recheck') recheckDm(true);
     else if (act === 'dismiss') dismissResult();
+    else if (act === 'share') shareResult();
     else if (act === 'again') { pf.forceForm = true; pf.message = ''; renderPlayer(); }
   });
   attachPickerEvents(playerBody, () => playerCur);
