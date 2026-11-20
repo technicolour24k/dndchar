@@ -70,8 +70,9 @@ type Recipient = { role: string | null; playerId: string | null };
 /**
  * Is this caller the room's GM? Only an account GM can be: their user id is stored in gmSocketId AND
  * a live GM socket joined with that same id (meta.gmUserId), so a GM who has left stops counting.
- * Known issue (pre-existing POC model): the GM claim itself is unauthenticated, because the ws join
- * just trusts the playerId it is sent. This check can't be stronger than that claim.
+ * In a campaign room the claim is trustworthy: the seat comes from a join ticket issued after a real
+ * membership check (vtt/server/handlers/join.js). In a Quick room it is still the pre-existing POC
+ * model: the ws join just trusts the playerId it is sent, so this can't be stronger than that claim.
  */
 export function isRoomGm(session: { id?: string; gmSocketId?: string | null }, userId: string | null | undefined): boolean {
   if (!userId || session.gmSocketId !== userId) return false;

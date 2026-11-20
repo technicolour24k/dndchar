@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Relative import, not the $vtt alias - store.js lives outside src/ entirely
 // (see vtt/README.md) and this test only needs the plain module, not
 // SvelteKit's alias resolution.
-import { broadcast, createSession, dmPresent, filterSessionForRole, forageViewForPlayer, hasLiveGm, publish, removeWatcher, sessions, setWatches, socketsBySession, watchersByTopic } from '../../../vtt/server/store.js';
+import { broadcast, consumeJoinTicket, createSession, disconnectAllFromRoom, releaseSocket, revokeJoinTickets, revokeRoomTickets, revokeStaleGmTickets, setGmSeat, disconnectUserFromRoom, dmPresent, ensureRoom, filterSessionForRole, forageViewForPlayer, hasLiveGm, issueJoinTicket, joinTickets, publish, removeWatcher, sessions, setWatches, socketsBySession, watchersByTopic } from '../../../vtt/server/store.js';
 
 // A minimal stand-in for a real `ws` WebSocket - just enough for store.js's
 // own OPEN/readyState/send checks (see store.js's broadcast/publish).
@@ -215,6 +215,177 @@ describe('forage fields on the room (vtt-forage unit B)', () => {
 
     it('is true for a live account GM', () => {
       expect(dmPresent(roomWithGm('user-1', true))).toBe(true);
+    });
+  });
+});
+
+describe('campaign rooms: store additions (campaign-system Unit E)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    joinTickets.clear();
+  });
+
+  it('createSession defaults campaignId to null and takes one from options', () => {
+    expect(createSession('QUICK1').campaignId).toBeNull();
+    expect(createSession('ABCDEFGH', { campaignId: 'camp-1' }).campaignId).toBe('camp-1');
+  });
+
+  describe('join tickets', () => {
+    const base = { sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'Ada', role: 'gm', seat: 'primary' };
+
+    it('round trips once: the second consume is null', () => {
+      const token = issueJoinTicket(base);
+      expect(consumeJoinTicket(token)).toMatchObject({ sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'Ada', role: 'gm', seat: 'primary', takeover: false });
+      expect(consumeJoinTicket(token)).toBeNull();
+    });
+
+    it('rejects a missing or non-string token', () => {
+      expect(consumeJoinTicket('nope')).toBeNull();
+      expect(consumeJoinTicket(undefined)).toBeNull();
+    });
+
+    it('expires after 60 seconds, and an expired ticket is still spent', () => {
+      vi.useFakeTimers();
+      const token = issueJoinTicket(base);
+      vi.advanceTimersByTime(61_000);
+      expect(consumeJoinTicket(token)).toBeNull();
+      expect(joinTickets.has(token)).toBe(false);
+    });
+
+    it('sweeps expired tickets when the next one is issued', () => {
+      vi.useFakeTimers();
+      const stale = issueJoinTicket(base);
+      vi.advanceTimersByTime(61_000);
+      issueJoinTicket(base);
+      expect(joinTickets.has(stale)).toBe(false);
+      expect(joinTickets.size).toBe(1);
+    });
+
+    it('a player ticket never carries a seat or takeover, whatever was asked', () => {
+      const token = issueJoinTicket({ ...base, role: 'player', seat: 'primary', takeover: true });
+      expect(consumeJoinTicket(token)).toMatchObject({ role: 'player', seat: null, takeover: false });
+    });
+  });
+
+  describe('revoking tickets', () => {
+    it('revokeJoinTickets drops only that user ticket for that room', () => {
+      const mine = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'A', role: 'player' });
+      const otherRoom = issueJoinTicket({ sessionId: 'ZZZZZZZZ', userId: 'u1', displayName: 'A', role: 'player' });
+      const otherUser = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u2', displayName: 'B', role: 'player' });
+      revokeJoinTickets('ABCDEFGH', 'u1');
+      expect(consumeJoinTicket(mine)).toBeNull();
+      expect(consumeJoinTicket(otherRoom)).not.toBeNull();
+      expect(consumeJoinTicket(otherUser)).not.toBeNull();
+    });
+
+    it('revokeRoomTickets drops every ticket for the room', () => {
+      const a = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'A', role: 'player' });
+      const b = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u2', displayName: 'B', role: 'gm', seat: 'co' });
+      const c = issueJoinTicket({ sessionId: 'ZZZZZZZZ', userId: 'u1', displayName: 'A', role: 'player' });
+      revokeRoomTickets('ABCDEFGH');
+      expect(consumeJoinTicket(a)).toBeNull();
+      expect(consumeJoinTicket(b)).toBeNull();
+      expect(consumeJoinTicket(c)).not.toBeNull();
+    });
+
+    it('revokeStaleGmTickets drops GM tickets whose seat no longer matches, keeps the rest', () => {
+      // u1 was primary and u2 co-DM when the tickets were issued; then they swapped.
+      const oldPrimary = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'A', role: 'gm', seat: 'primary' });
+      const oldCo = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u2', displayName: 'B', role: 'gm', seat: 'co' });
+      const exDm = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u3', displayName: 'C', role: 'gm', seat: 'co' });
+      const player = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u4', displayName: 'D', role: 'player' });
+      const otherRoom = issueJoinTicket({ sessionId: 'ZZZZZZZZ', userId: 'u1', displayName: 'A', role: 'gm', seat: 'primary' });
+      const stillRight = issueJoinTicket({ sessionId: 'ABCDEFGH', userId: 'u2', displayName: 'B', role: 'gm', seat: 'primary' });
+      revokeStaleGmTickets('ABCDEFGH', new Map([['u1', 'co'], ['u2', 'primary']]));
+      expect(consumeJoinTicket(oldPrimary)).toBeNull();
+      expect(consumeJoinTicket(oldCo)).toBeNull();
+      expect(consumeJoinTicket(exDm)).toBeNull();
+      expect(consumeJoinTicket(player)).not.toBeNull();
+      expect(consumeJoinTicket(otherRoom)).not.toBeNull();
+      expect(consumeJoinTicket(stillRight)).not.toBeNull();
+    });
+  });
+
+  describe('seats and releasing sockets', () => {
+    const live = (fields: object) => ({ ...fakeMeta(), ws: { readyState: 1, OPEN: 1, send: vi.fn(), close: vi.fn() }, ...fields });
+
+    it('setGmSeat updates only the named user live GM socket in the room', () => {
+      const gm: any = live({ role: 'gm', playerId: null, gmUserId: 'u1', gmSeat: 'primary' });
+      const other: any = live({ role: 'gm', playerId: null, gmUserId: 'u2', gmSeat: 'primary' });
+      socketsBySession.set('ROOMS', new Set([gm, other]));
+      setGmSeat('ROOMS', 'u1', 'co');
+      expect(gm.gmSeat).toBe('co');
+      expect(other.gmSeat).toBe('primary');
+      expect(() => setGmSeat('NOROOM', 'u1', 'primary')).not.toThrow();
+    });
+
+    it('matches a kick on meta.userId as well as playerId / gmUserId', () => {
+      const viaUserId: any = live({ role: 'player', playerId: 'someone', userId: 'u9' });
+      socketsBySession.set('ROOMU', new Set([viaUserId]));
+      disconnectUserFromRoom('ROOMU', 'u9', 'removed_from_campaign');
+      expect(viaUserId.ws.close).toHaveBeenCalledWith(4001);
+    });
+
+    it('a kick releases the socket: out of the set, seat freed, sessionId cleared', () => {
+      const session: any = createSession('ROOMR');
+      sessions.set('ROOMR', session);
+      const gm: any = live({ role: 'gm', playerId: null, gmUserId: 'u1', gmSeat: 'co', sessionId: 'ROOMR' });
+      session.gmSocketId = 'u1';
+      socketsBySession.set('ROOMR', new Set([gm]));
+      disconnectUserFromRoom('ROOMR', 'u1', 'role_changed');
+      expect(session.gmSocketId).toBeNull();
+      expect(socketsBySession.get('ROOMR')!.size).toBe(0);
+      expect(gm.sessionId).toBeNull();
+      // A later close event is a no-op.
+      expect(() => releaseSocket(gm)).not.toThrow();
+    });
+  });
+
+  describe('ensureRoom', () => {
+    it('creates the room and its socket set once, and keeps its state', () => {
+      const room = ensureRoom('ABCDEFGH', 'camp-1');
+      expect(room.campaignId).toBe('camp-1');
+      expect(socketsBySession.get('ABCDEFGH')).toBeInstanceOf(Set);
+      room.tokens.t1 = { id: 't1' };
+      expect(ensureRoom('ABCDEFGH', 'camp-1')).toBe(room);
+      expect(room.tokens.t1).toBeDefined();
+    });
+
+    it('refuses a room that belongs to another campaign', () => {
+      ensureRoom('ABCDEFGH', 'camp-1');
+      expect(() => ensureRoom('ABCDEFGH', 'camp-2')).toThrow(/different campaign/);
+    });
+  });
+
+  describe('disconnectUserFromRoom', () => {
+    const open = (overrides: object) => ({ ...fakeMeta(), ws: { readyState: 1, OPEN: 1, send: vi.fn(), close: vi.fn() }, ...overrides });
+
+    it('kicks that user as a player and as the GM, and nobody else', () => {
+      const player: any = open({ playerId: 'u1' });
+      const gm: any = open({ role: 'gm', playerId: null, gmUserId: 'u1' });
+      const other: any = open({ playerId: 'u2' });
+      socketsBySession.set('ROOMK', new Set([player, gm, other]));
+
+      disconnectUserFromRoom('ROOMK', 'u1', 'removed_from_campaign');
+
+      for (const kicked of [player, gm]) {
+        expect(JSON.parse(kicked.ws.send.mock.calls[0][0])).toEqual({ type: 'kicked', reason: 'removed_from_campaign' });
+        expect(kicked.ws.close).toHaveBeenCalledWith(4001);
+      }
+      expect(other.ws.close).not.toHaveBeenCalled();
+    });
+
+    it('is a no-op for a room that is not live', () => {
+      expect(() => disconnectUserFromRoom('NOROOM', 'u1', 'role_changed')).not.toThrow();
+    });
+
+    it('disconnectAllFromRoom kicks everyone', () => {
+      const a: any = open({ playerId: 'u1' });
+      const b: any = open({ playerId: 'u2' });
+      socketsBySession.set('ROOMA', new Set([a, b]));
+      disconnectAllFromRoom('ROOMA', 'removed_from_campaign');
+      expect(a.ws.close).toHaveBeenCalledWith(4001);
+      expect(b.ws.close).toHaveBeenCalledWith(4001);
     });
   });
 });

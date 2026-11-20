@@ -1,6 +1,6 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
-import { sessions, socketsBySession, broadcast, setWatches, removeWatcher, findLiveGmSocket } from './store.js';
+import { sessions, socketsBySession, broadcast, setWatches, removeWatcher, releaseSocket, registerReleaseHook } from './store.js';
 import handleJoin from './handlers/join.js';
 import handleTokenEvent, { clearMovePreviewForSocket } from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
@@ -49,6 +49,10 @@ let wss = null;
 export function attachVttWebSocketServer(httpServer) {
   if (wss) return wss;
   wss = new WebSocketServer({ noServer: true });
+
+  // A movement-path preview this socket was planning is dropped whenever it leaves its room
+  // (close, heartbeat terminate, kick, or a hop to another room).
+  registerReleaseHook('movePreview', (meta, session) => clearMovePreviewForSocket(meta, session, broadcast));
 
   const context = {
     sessions,
@@ -167,28 +171,7 @@ export function attachVttWebSocketServer(httpServer) {
       // watch-only socket (sheet/Session Notes modal) has meta.sessionId ===
       // null and must still be cleaned out of watchersByTopic.
       removeWatcher(meta);
-      if (!meta.sessionId) return;
-      const sockets = socketsBySession.get(meta.sessionId);
-      if (sockets) sockets.delete(meta);
-
-      const session = sessions.get(meta.sessionId);
-      if (!session) return;
-
-      // Drop any movement-path preview this socket was planning (also covers the heartbeat
-      // terminate(), which ends in this same close event).
-      clearMovePreviewForSocket(meta, session, broadcast);
-
-      if (meta.role === 'player' && meta.playerId && session.players[meta.playerId]) {
-        // Don't delete the player outright - they should reappear correctly
-        // on reconnect via the same state:full path join.js already uses.
-        session.players[meta.playerId].connected = false;
-        broadcast(meta.sessionId, () => ({ type: 'player:left', playerId: meta.playerId }));
-      } else if (meta.role === 'gm' && meta.gmUserId && session.gmSocketId === meta.gmUserId && !findLiveGmSocket(sockets)) {
-        // Clears for account GMs too (their gmSocketId is their user id, remembered on the socket
-        // as meta.gmUserId; meta.playerId is null for every GM). Skipped when another live GM
-        // socket exists, so a late close from an old socket can't unseat a reconnected GM.
-        session.gmSocketId = null;
-      }
+      releaseSocket(meta);
     });
   });
 

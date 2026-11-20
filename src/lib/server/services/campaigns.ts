@@ -422,9 +422,16 @@ export async function updateCampaignDetails(userId: string, campaignId: string, 
 
 // Rules in canSetRole. The DB's partial unique indexes are the backstop for two simultaneous
 // promotions, so a 23505 on them is turned into the friendly message.
-export async function setMemberRole(userId: string, campaignId: string, targetUserId: string, role: CampaignRole): Promise<void> {
+// Returns the room code and the users this change dropped to a plain player, so the caller can
+// kick them from the live room (they reconnect with a ticket for their new role).
+export async function setMemberRole(
+  userId: string,
+  campaignId: string,
+  targetUserId: string,
+  role: CampaignRole
+): Promise<{ roomCode: string; demotedToPlayer: string[] }> {
   try {
-    await withTransaction(async (client) => {
+    return await withTransaction(async (client) => {
       const locked = await lockCampaign(client, userId, campaignId);
       assertNotArchived(locked);
       const targetRole = roleOf(locked, targetUserId);
@@ -444,6 +451,11 @@ export async function setMemberRole(userId: string, campaignId: string, targetUs
       }
       await set(targetUserId, role);
       await client.query('UPDATE campaigns SET updated_at = now() WHERE id = $1', [campaignId]);
+      const demotedToPlayer: string[] = [];
+      if (role === 'player') demotedToPlayer.push(targetUserId);
+      const oldPrimaryId = locked.members.find((m) => m.role === 'dm')?.userId;
+      if (role === 'dm' && oldPrimaryId && verdict.demoteOldPrimaryTo === 'player') demotedToPlayer.push(oldPrimaryId);
+      return { roomCode: locked.campaign.roomCode, demotedToPlayer };
     });
   } catch (error) {
     if (uniqueViolation(error, ['campaign_members_one_co_dm_idx'])) throw new CampaignError('This campaign already has a co-DM.');
@@ -453,7 +465,7 @@ export async function setMemberRole(userId: string, campaignId: string, targetUs
 }
 
 // Rules in canRemoveMember. Returns the room code and user so the caller can kick live sockets
-// (Unit E adds that).
+// (the campaign page action does, via campaignRooms.ts).
 export async function removeMember(userId: string, campaignId: string, targetUserId: string): Promise<{ roomCode: string; targetUserId: string }> {
   return withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
@@ -562,7 +574,8 @@ export async function setCharacterPartyActive(userId: string, characterId: strin
 // ---------------------------------------------------------------------------------------------
 
 // Primary DM or admin. Stops the invite code and table, releases every character, and clears
-// members' sheet joins to the room. Member rows and game sessions stay for history.
+// members' sheet joins to the room. Member rows and game sessions stay for history. The caller
+// closes the live room (campaignRooms.ts closeCampaignRoom).
 export async function archiveCampaign(userId: string, campaignId: string): Promise<{ roomCode: string }> {
   return withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
@@ -570,6 +583,8 @@ export async function archiveCampaign(userId: string, campaignId: string): Promi
     if (!locked.isAdmin && roleOf(locked, userId) !== 'dm') throw new CampaignError('Only the DM can archive this campaign.');
     await client.query('UPDATE campaigns SET is_archived = true, updated_at = now() WHERE id = $1', [campaignId]);
     await client.query('UPDATE characters SET campaign_id = NULL, party_active = true WHERE campaign_id = $1', [campaignId]);
+    // The table is gone, so its running game session ends with it (nothing could end it later).
+    await client.query('UPDATE game_sessions SET is_active = false, updated_at = now() WHERE campaign_id = $1 AND is_active', [campaignId]);
     await client.query(
       `UPDATE users SET active_vtt_session_id = NULL
        WHERE active_vtt_session_id = $2 AND id IN (SELECT user_id FROM campaign_members WHERE campaign_id = $1)`,
@@ -580,8 +595,10 @@ export async function archiveCampaign(userId: string, campaignId: string): Promi
 }
 
 // Used by the VTT server routes to tell a campaign room from a Quick room.
-export async function getCampaignByRoomCode(roomCode: string): Promise<{ id: string; isArchived: boolean } | null> {
-  const result = await query<{ id: string; is_archived: boolean }>('SELECT id, is_archived FROM campaigns WHERE room_code = $1', [normaliseCode(roomCode)]);
+// Returns the canonical room code too (typed codes are normalised, so "abcd-efgh" matches), which
+// is what callers must use for the room and for users.active_vtt_session_id.
+export async function getCampaignByRoomCode(roomCode: string): Promise<{ id: string; isArchived: boolean; roomCode: string } | null> {
+  const result = await query<{ id: string; is_archived: boolean; room_code: string }>('SELECT id, is_archived, room_code FROM campaigns WHERE room_code = $1', [normaliseCode(roomCode)]);
   const row = result.rows[0];
-  return row ? { id: row.id, isArchived: row.is_archived } : null;
+  return row ? { id: row.id, isArchived: row.is_archived, roomCode: row.room_code } : null;
 }

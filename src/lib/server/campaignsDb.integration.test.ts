@@ -295,7 +295,7 @@ describe.skipIf(!enabled)('campaigns against the local dev DB', () => {
     await campaigns.archiveCampaign(u('dm'), C);
     expect(await charCampaign('p1')).toBeNull();
     await expect(campaigns.archiveCampaign(u('dm'), C)).rejects.toThrow(/already archived/);
-    expect((await campaigns.getCampaignByRoomCode((await codes(C)).room))).toEqual({ id: C, isArchived: true });
+    expect((await campaigns.getCampaignByRoomCode((await codes(C)).room))).toEqual({ id: C, isArchived: true, roomCode: (await codes(C)).room });
     expect(await campaigns.getCampaignByRoomCode('NOSUCHRM')).toBeNull();
   });
 
@@ -331,5 +331,290 @@ describe.skipIf(!enabled)('campaigns against the local dev DB', () => {
     expect((await campaigns.listCampaigns(u('dm'), { q: `${tag} list`, includeArchived: true })).total).toBe(13);
     expect((await campaigns.listCampaigns(u('admin'), { q: `${tag} list` })).total).toBe(13);
     expect((await campaigns.listCampaigns(u('admin'), { q: `${tag} list`, includeArchived: true })).total).toBe(14);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Unit E: campaign rooms. The ticket route, GM-gated room routes, room recreation, game sessions,
+// the sheet's room join, kicks on membership changes and the roll log backlog cap. Everything is
+// called as route handlers / services with a `locals.user` object; no real sockets (those are in
+// vttCampaignJoin.test.ts), only fake socket objects in the in-memory room.
+// ---------------------------------------------------------------------------------------------
+describe.skipIf(!enabled)('campaign rooms against the local dev DB (Unit E)', () => {
+  let R = '';
+  let ROOM_R = '';
+  let sessionIds: string[] = [];
+  const extraRooms: string[] = [];
+
+  const store = () => import('../../../vtt/server/store.js');
+  const ticketRoute = () => import('../../routes/vtt/api/campaigns/[id]/ticket/+server');
+  const combatRoute = () => import('../../routes/vtt/api/session/[id]/combat/+server');
+  const gameSessionRoute = () => import('../../routes/vtt/api/session/[id]/game-session/+server');
+  const sheetRoute = () => import('../../routes/characters/[id]/+page.server');
+  const campaignPageRoute = () => import('../../routes/campaigns/[id]/+page.server');
+  const rooms = () => import('./services/campaignRooms');
+  const gameSessions = () => import('./services/gameSessions');
+
+  const locals = (key: string) => ({ user: { id: u(key), role: key === 'admin' ? 'admin' : 'user', displayName: `IT ${key}` } });
+  const jsonRequest = (body: unknown) => new Request('http://localhost/x', { method: 'POST', body: JSON.stringify(body) });
+  const form = (fields: Record<string, string>) => ({ formData: async () => new URLSearchParams(fields) }) as unknown as Request;
+  const askTicket = async (key: string, body: object, campaignId = R) => {
+    const route = await ticketRoute();
+    const response = await route.POST({ params: { id: campaignId }, request: jsonRequest(body), locals: locals(key) } as any);
+    return { status: response.status, body: await response.json() };
+  };
+  // A fake live socket: enough for the room's GM check and for the kick, and it records both.
+  const fakeSocket = (fields: object) => {
+    const meta: any = { ws: { readyState: 1, OPEN: 1, _closed: [] as number[], _sent: [] as any[] }, ...fields };
+    meta.ws.send = (text: string) => meta.ws._sent.push(JSON.parse(text));
+    meta.ws.close = (code: number) => meta.ws._closed.push(code);
+    return meta;
+  };
+  const seatGm = async (key: string) => {
+    const s = await store();
+    const meta = fakeSocket({ sessionId: ROOM_R, role: 'gm', playerId: null, gmUserId: u(key), gmSeat: 'primary' });
+    s.socketsBySession.get(ROOM_R).add(meta);
+    s.sessions.get(ROOM_R).gmSocketId = u(key);
+    return meta;
+  };
+
+  beforeAll(async () => {
+    R = await newCampaign('dm', `${tag} room`);
+    ROOM_R = (await codes(R)).room;
+    const { invite } = await codes(R);
+    await campaigns.joinCampaignByInviteCode(u('p1'), invite);
+    await campaigns.joinCampaignByInviteCode(u('p2'), invite);
+    await campaigns.setMemberRole(u('dm'), R, u('p1'), 'co_dm');
+  });
+
+  afterAll(async () => {
+    if (!enabled) return;
+    const s = await store();
+    for (const code of [ROOM_R, ...extraRooms]) {
+      s.sessions.delete(code);
+      s.socketsBySession.delete(code);
+    }
+    await query('DELETE FROM roll_log_entries WHERE session_id = ANY($1::text[])', [[ROOM_R, ...extraRooms]]);
+    if (campaignIds.length) await query('DELETE FROM game_sessions WHERE campaign_id = ANY($1::uuid[])', [campaignIds]);
+  });
+
+  it('the ticket route: member -> ticket, wrong asks refused, admin non-member refused', async () => {
+    const player = await askTicket('p2', { role: 'player' });
+    expect(player.status).toBe(200);
+    expect(player.body).toMatchObject({ sessionId: ROOM_R, role: 'player', userId: u('p2'), displayName: 'IT p2' });
+    const s = await store();
+    expect(s.consumeJoinTicket(player.body.ticket)).toMatchObject({ sessionId: ROOM_R, userId: u('p2'), role: 'player', seat: null });
+    expect((await query('SELECT active_vtt_session_id FROM users WHERE id = $1', [u('p2')])).rows[0].active_vtt_session_id).toBe(ROOM_R);
+
+    expect((await askTicket('p2', { role: 'gm' })).body).toEqual({ error: 'not_dm' });
+    // Takeover is passed through for any DM (the join handler decides if it applies); not for players.
+    expect(s.consumeJoinTicket((await askTicket('p1', { role: 'gm', takeover: true })).body.ticket)).toMatchObject({ seat: 'co', takeover: true });
+    expect((await askTicket('p2', { role: 'player', takeover: true })).body).toEqual({ error: 'not_dm' });
+    expect((await askTicket('admin', { role: 'gm' })).body).toEqual({ error: 'not_member' });
+    expect((await askTicket('admin', { role: 'player' })).body).toEqual({ error: 'not_member' });
+    expect((await askTicket('outsider', { role: 'player' })).body).toEqual({ error: 'not_member' });
+    expect((await askTicket('p2', { role: 'banana' })).status).toBe(400);
+    expect((await askTicket('p2', { role: 'player' }, 'not-a-uuid')).status).toBe(404);
+    expect((await askTicket('p2', { role: 'player' }, '00000000-0000-4000-8000-0000000000ff')).status).toBe(404);
+  });
+
+  it('the ticket route: primary DM gets a primary-seat GM ticket, co-DM a co seat, and the room is recreated after a restart', async () => {
+    const s = await store();
+    const primary = await askTicket('dm', { role: 'gm' });
+    expect(primary.status).toBe(200);
+    expect(s.consumeJoinTicket(primary.body.ticket)).toMatchObject({ role: 'gm', seat: 'primary', takeover: false });
+    expect((await query('SELECT active_vtt_session_id FROM users WHERE id = $1', [u('dm')])).rows[0].active_vtt_session_id).toBe(ROOM_R);
+    expect(s.consumeJoinTicket((await askTicket('dm', { role: 'gm', takeover: true })).body.ticket)).toMatchObject({ seat: 'primary', takeover: true });
+    expect(s.consumeJoinTicket((await askTicket('p1', { role: 'gm' })).body.ticket)).toMatchObject({ seat: 'co', takeover: false });
+
+    // Restart: the in-memory room vanishes; an active game session row is re-attached on reopen.
+    const gs = await gameSessions();
+    const gameSessionId = await gs.createGameSession(u('dm'), 'before restart', R);
+    s.sessions.delete(ROOM_R);
+    s.socketsBySession.delete(ROOM_R);
+    await askTicket('p2', { role: 'player' });
+    expect(s.sessions.get(ROOM_R)).toMatchObject({ id: ROOM_R, campaignId: R, gameSessionId });
+  });
+
+  it('a second game session for the campaign ends the first', async () => {
+    const gs = await gameSessions();
+    const first = await gs.createGameSession(u('dm'), 'one', R);
+    const second = await gs.createGameSession(u('dm'), 'two', R);
+    const active = await query<{ id: string }>('SELECT id FROM game_sessions WHERE campaign_id = $1 AND is_active', [R]);
+    expect(active.rows.map((r) => r.id)).toEqual([second]);
+    expect(first).not.toBe(second);
+    sessionIds = [first, second];
+  });
+
+  it('combat and game-session routes: a non-GM in a campaign room gets 403, the seated GM does not', async () => {
+    const s = await store();
+    await askTicket('p2', { role: 'player' }); // makes sure the room is live
+    const combat = await combatRoute();
+    const game = await gameSessionRoute();
+    const call = (route: any, key: string, body: object) => route.POST({ params: { id: ROOM_R }, request: jsonRequest(body), locals: locals(key) } as any);
+
+    // The dm is a DM but holds no seat yet, so is refused too: the seat is what counts.
+    for (const key of ['p2', 'p1', 'outsider', 'admin', 'dm']) {
+      expect((await call(combat, key, { action: 'stop' })).status, key).toBe(403);
+      expect((await call(game, key, { action: 'stop' })).status, key).toBe(403);
+    }
+    expect(await (await call(combat, 'p2', { action: 'stop' })).json()).toEqual({ error: 'not_gm' });
+
+    await seatGm('dm');
+    // The admin still can't act, even with a seated GM present.
+    expect((await call(combat, 'admin', { action: 'stop' })).status).toBe(403);
+    expect((await call(combat, 'dm', { action: 'stop' })).status).toBe(200);
+    // Game-session start records the campaign; ending it works for the GM.
+    const started = await (await call(game, 'dm', { action: 'start', name: 'IT night' })).json();
+    expect((await query('SELECT campaign_id FROM game_sessions WHERE id = $1', [started.gameSessionId])).rows[0].campaign_id).toBe(R);
+    expect(s.sessions.get(ROOM_R).gameSessionId).toBe(started.gameSessionId);
+    expect((await call(game, 'dm', { action: 'stop' })).status).toBe(200);
+    expect((await query('SELECT is_active FROM game_sessions WHERE id = $1', [started.gameSessionId])).rows[0].is_active).toBe(false);
+    s.sessions.get(ROOM_R).gmSocketId = null;
+    s.socketsBySession.get(ROOM_R).clear();
+    sessionIds.push(started.gameSessionId);
+  });
+
+  it('endGameSession: owner, co-DM and admin may end it; a player and an outsider may not', async () => {
+    const gs = await gameSessions();
+    const isActive = async (id: string) => (await query('SELECT is_active FROM game_sessions WHERE id = $1', [id])).rows[0].is_active;
+    for (const [key, shouldEnd] of [['p2', false], ['outsider', false], ['p1', true], ['dm', true], ['admin', true]] as const) {
+      const id = await gs.createGameSession(u('dm'), 'end test', R);
+      await gs.endGameSession(u(key), id);
+      expect(await isActive(id), key).toBe(!shouldEnd);
+    }
+  });
+
+  it('listGameSessionsForUser includes the campaign sessions of a member who never posted', async () => {
+    const gs = await gameSessions();
+    const mine = await gs.listGameSessionsForUser(u('p2'));
+    expect(mine.map((g) => g.id)).toEqual(expect.arrayContaining(sessionIds));
+    expect((await gs.listGameSessionsForUser(u('outsider'))).map((g) => g.id)).not.toContain(sessionIds[0]);
+  });
+
+  it('listFindsForGameSession: a campaign DM (not just the owner or admin) is the DM', async () => {
+    const forage = await import('./services/forage');
+    const view = (key: string) => forage.listFindsForGameSession(sessionIds[0], { id: u(key), role: key === 'admin' ? 'admin' : 'user' });
+    expect((await view('dm'))?.isDm).toBe(true);
+    expect((await view('p1'))?.isDm).toBe(true);
+    expect((await view('admin'))?.isDm).toBe(true);
+    expect((await view('p2'))?.isDm).toBe(false);
+    expect((await view('outsider'))?.isDm).toBe(false);
+  });
+
+  it('the sheet joinRoom accepts a campaign room code only from a real member', async () => {
+    const s = await store();
+    const page = await sheetRoute();
+    const join = (key: string, code: string) => (page.actions as any).joinRoom({ request: form({ roomId: code }), locals: locals(key), params: { id: charIds.p2 } });
+    s.sessions.delete(ROOM_R);
+    s.socketsBySession.delete(ROOM_R);
+    expect(await join('p2', ROOM_R.toLowerCase())).toEqual({ joinedRoom: true });
+    expect(s.sessions.get(ROOM_R)?.campaignId).toBe(R);
+    for (const key of ['outsider', 'admin']) {
+      const refused: any = await join(key, ROOM_R);
+      expect(refused.status, key).toBe(400);
+      expect(refused.data.joinRoomError).toBe('That room code was not found.');
+    }
+  });
+
+  it('roll log backlog: at most the newest 200 rows, oldest first; afterId still returns everything newer', async () => {
+    const { listRollLogEntries } = await import('./services/rollLog');
+    await query(
+      `INSERT INTO roll_log_entries (session_id, message, created_at)
+       SELECT $1, 'roll ' || n, now() - make_interval(secs => 1000 - n) FROM generate_series(1, 230) AS n`,
+      [ROOM_R]
+    );
+    const backlog = await listRollLogEntries(ROOM_R);
+    expect(backlog.length).toBe(200);
+    expect(backlog[0].message).toBe('roll 31');
+    expect(backlog[199].message).toBe('roll 230');
+    const after = await listRollLogEntries(ROOM_R, backlog[150].id);
+    expect(after.length).toBe(49);
+  });
+
+  it('createGameSession: two simultaneous Starts leave exactly one active session', async () => {
+    const gs = await gameSessions();
+    await Promise.all([gs.createGameSession(u('dm'), 'double click', R), gs.createGameSession(u('dm'), 'double click', R)]);
+    const active = await query('SELECT id FROM game_sessions WHERE campaign_id = $1 AND is_active', [R]);
+    expect(active.rows.length).toBe(1);
+  });
+
+  it('joinRoom with a dashed, lower-case code uses the canonical room (no phantom room)', async () => {
+    const s = await store();
+    const page = await sheetRoute();
+    const dashed = `${ROOM_R.slice(0, 4)}-${ROOM_R.slice(4)}`.toLowerCase();
+    s.sessions.delete(ROOM_R);
+    s.socketsBySession.delete(ROOM_R);
+    expect(await (page.actions as any).joinRoom({ request: form({ roomId: dashed }), locals: locals('p2'), params: { id: charIds.p2 } })).toEqual({ joinedRoom: true });
+    expect((await query('SELECT active_vtt_session_id FROM users WHERE id = $1', [u('p2')])).rows[0].active_vtt_session_id).toBe(ROOM_R);
+    expect(s.sessions.has(ROOM_R)).toBe(true);
+    expect(s.sessions.has(dashed.toUpperCase())).toBe(false);
+    expect(s.sessions.has(dashed)).toBe(false);
+  });
+
+  it('removing a member kicks them; demoting the GM-seat holder kicks them; archiving closes the room', async () => {
+    const s = await store();
+    const rooms2 = await rooms();
+    const detail = await campaignPageRoute();
+    const act = (name: string, key: string, fields: Record<string, string>, id: string) =>
+      (detail.actions as any)[name]({ request: form(fields), params: { id }, locals: locals(key) });
+
+    // A fresh campaign so the other tests' state isn't disturbed.
+    const K = await newCampaign('dm', `${tag} kick`);
+    const roomK = (await codes(K)).room;
+    extraRooms.push(roomK);
+    const { invite } = await codes(K);
+    await campaigns.joinCampaignByInviteCode(u('p1'), invite);
+    await campaigns.joinCampaignByInviteCode(u('p2'), invite);
+    await rooms2.openCampaignRoom({ id: K, roomCode: roomK });
+    const socketFor = (fields: object) => {
+      const meta = fakeSocket({ sessionId: roomK, ...fields });
+      s.socketsBySession.get(roomK).add(meta);
+      return meta;
+    };
+
+    // Remove p2: their socket gets kicked, p1's doesn't, and p2's unused ticket is revoked.
+    const p2 = socketFor({ role: 'player', playerId: u('p2') });
+    const p1 = socketFor({ role: 'player', playerId: u('p1') });
+    const p2Ticket = (await askTicket('p2', { role: 'player' }, K)).body.ticket;
+    await act('removeMember', 'dm', { userId: u('p2') }, K);
+    expect(s.consumeJoinTicket(p2Ticket)).toBeNull();
+    expect(p2.ws._closed).toEqual([4001]);
+    expect(p2.ws._sent[0]).toEqual({ type: 'kicked', reason: 'removed_from_campaign' });
+    expect(p1.ws._closed).toEqual([]);
+
+    // Swap: the seated primary DM is swapped with the co-DM by an admin make-primary; the seated
+    // user's rank follows their new role (the old primary keeps the seat as 'co').
+    await campaigns.setMemberRole(u('dm'), K, u('p1'), 'co_dm');
+    const seatedPrimary = socketFor({ role: 'gm', playerId: null, userId: u('dm'), gmUserId: u('dm'), gmSeat: 'primary' });
+    s.sessions.get(roomK).gmSocketId = u('dm');
+    await act('setRole', 'admin', { userId: u('p1'), role: 'dm' }, K);
+    expect(await roles(K)).toMatchObject({ p1: 'dm', dm: 'co_dm' });
+    expect(seatedPrimary.gmSeat).toBe('co');
+    expect(seatedPrimary.ws._closed).toEqual([]);
+    seatedPrimary.role = 'player';
+    s.sessions.get(roomK).gmSocketId = null;
+
+    // Demote the co-DM who holds the seat: kicked with role_changed, and the seat is released.
+    const gm = socketFor({ role: 'gm', playerId: null, userId: u('dm'), gmUserId: u('dm'), gmSeat: 'co' });
+    s.sessions.get(roomK).gmSocketId = u('dm');
+    await act('setRole', 'p1', { userId: u('dm'), role: 'player' }, K);
+    expect(gm.ws._closed).toEqual([4001]);
+    expect(gm.ws._sent[0]).toEqual({ type: 'kicked', reason: 'role_changed' });
+    expect(s.sessions.get(roomK).gmSocketId).toBeNull();
+
+    // Archive (by the new primary p1): everyone is kicked, the room is gone and its game session ends.
+    const other = socketFor({ role: 'player', playerId: u('dm') });
+    const gsId = await (await gameSessions()).createGameSession(u('p1'), 'to be archived', K);
+    await expect(act('archive', 'p1', {}, K)).rejects.toMatchObject({ status: 303 });
+    expect((await query('SELECT is_active FROM game_sessions WHERE id = $1', [gsId])).rows[0].is_active).toBe(false);
+    expect(other.ws._closed).toEqual([4001]);
+    expect(s.sessions.has(roomK)).toBe(false);
+    expect((await askTicket('p1', { role: 'player' }, K)).body).toEqual({ error: 'not_member' });
+    expect(s.sessions.has(roomK)).toBe(false);
+    // And a sheet can't join an archived campaign's room either.
+    const sheet = await sheetRoute();
+    const refused: any = await (sheet.actions as any).joinRoom({ request: form({ roomId: roomK }), locals: locals('p1'), params: { id: charIds.p1 } });
+    expect(refused.status).toBe(400);
   });
 });

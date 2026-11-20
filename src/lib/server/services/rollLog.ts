@@ -79,6 +79,8 @@ export async function leaveRoom(userId: string): Promise<void> {
   await query('UPDATE users SET active_vtt_session_id = NULL WHERE id = $1', [userId]);
 }
 
+export const ROLL_LOG_BACKLOG_LIMIT = 200;
+
 export async function listRollLogEntries(sessionId: string, afterId?: string): Promise<RollLogEntry[]> {
   if (afterId) {
     const result = await query<any>(
@@ -89,9 +91,11 @@ export async function listRollLogEntries(sessionId: string, afterId?: string): P
     );
     return result.rows.map(toEntry);
   }
+  // A campaign room keeps its rows forever, so the join backlog is capped: the newest
+  // ROLL_LOG_BACKLOG_LIMIT rows, returned oldest first.
   const result = await query<any>(
-    'SELECT * FROM roll_log_entries WHERE session_id = $1 ORDER BY created_at ASC',
-    [sessionId]
+    'SELECT * FROM roll_log_entries WHERE session_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2',
+    [sessionId, ROLL_LOG_BACKLOG_LIMIT]
   );
-  return result.rows.map(toEntry);
+  return result.rows.map(toEntry).reverse();
 }

@@ -6,7 +6,8 @@ import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
-import { addCharacterToCampaign, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
+import { openCampaignRoomForMember } from '$lib/server/services/campaignRooms';
+import { addCharacterToCampaign, getCampaignByRoomCode, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
 import { getRoomGameSessionId, logSessionNote } from '$lib/server/services/gameSessions';
@@ -254,8 +255,21 @@ export const actions = {
     // VTT rooms are in-memory only (vtt/server/store.js) - validate against the
     // live sessions Map directly rather than any DB table, same supported
     // SvelteKit-into-vtt/server import already used by the combat start/stop route.
-    if (!sessions.has(roomId)) return fail(400, { joinRoomError: 'That room code was not found.' });
-    await query('UPDATE users SET active_vtt_session_id = $1 WHERE id = $2', [roomId, locals.user!.id]);
+    // A campaign's table has a fixed room code and may not be live yet (a restart wipes it): a real
+    // member (admin override does not apply) opens it on demand. Anyone else gets the same message
+    // as a wrong code, so a campaign room code reveals nothing.
+    // The canonical code comes from the campaign row (a dashed or lower-case entry still matches),
+    // so no phantom room is ever created or saved under a mistyped spelling.
+    const campaign = await getCampaignByRoomCode(roomId);
+    let joinCode = roomId;
+    if (campaign) {
+      joinCode = campaign.roomCode;
+      const role = campaign.isArchived ? null : await openCampaignRoomForMember({ id: campaign.id, roomCode: joinCode }, locals.user!.id);
+      if (!role) return fail(400, { joinRoomError: 'That room code was not found.' });
+    } else if (!sessions.has(roomId)) {
+      return fail(400, { joinRoomError: 'That room code was not found.' });
+    }
+    await query('UPDATE users SET active_vtt_session_id = $1 WHERE id = $2', [joinCode, locals.user!.id]);
     return { joinedRoom: true };
   },
   // Explicit opt-out - the room join is plain persisted account state (it

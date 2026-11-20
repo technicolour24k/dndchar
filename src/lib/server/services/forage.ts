@@ -6,6 +6,7 @@ import {
   type FindForViewer, type RollDie, type SessionFindView
 } from '$lib/rules/forage';
 import { insertCatalogueItem } from '$lib/server/services/catalogue';
+import { isCampaignDm } from '$lib/server/services/access';
 import type {
   FindLine, FindMode, FindResult, FindStatus, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
 } from '$lib/types/forage';
@@ -685,17 +686,19 @@ function toViewerFind(row: FindListRow, names: Map<string, string>): FindForView
 
 /**
  * The Finds section of Session Notes, shaped per viewer by the server so a redacted row never
- * carries a name. "The DM" is the Game Session owner (Q3) or an admin (the de facto DM until
- * campaigns). Unmarked checks are never listed. Finds made with no Game Session running aren't
+ * carries a name. "The DM" is the Game Session owner (Q3), an admin, or a real DM (primary or co-DM)
+ * of the session's campaign. Unmarked checks are never listed. Finds made with no Game Session running aren't
  * here at all (they only show in the admin review). Null if the game session doesn't exist.
  */
 export async function listFindsForGameSession(gameSessionId: string, viewer: { id: string; role: string }): Promise<{
   isDm: boolean; finds: SessionFindView[];
 } | null> {
   if (!UUID_PATTERN.test(gameSessionId)) return null;
-  const owner = await query<{ owner_user_id: string }>('SELECT owner_user_id FROM game_sessions WHERE id = $1', [gameSessionId]);
+  const owner = await query<{ owner_user_id: string; campaign_id: string | null }>('SELECT owner_user_id, campaign_id FROM game_sessions WHERE id = $1', [gameSessionId]);
   if (!owner.rowCount) return null;
-  const isDm = owner.rows[0].owner_user_id === viewer.id || viewer.role === 'admin';
+  const sessionCampaignId = owner.rows[0].campaign_id;
+  const isDm = owner.rows[0].owner_user_id === viewer.id || viewer.role === 'admin'
+    || (!!sessionCampaignId && await isCampaignDm({ query: (text, params) => query(text, params) }, viewer.id, sessionCampaignId));
   const rows = await query<FindListRow>(
     `${FIND_LIST_SELECT} WHERE f.game_session_id = $1 AND f.status <> 'checked' ORDER BY f.created_at DESC LIMIT 200`, [gameSessionId]
   );
