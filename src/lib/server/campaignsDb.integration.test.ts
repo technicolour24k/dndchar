@@ -408,8 +408,8 @@ describe.skipIf(!enabled)('campaign rooms against the local dev DB (Unit E)', ()
 
     expect((await askTicket('p2', { role: 'gm' })).body).toEqual({ error: 'not_dm' });
     // Takeover is passed through for any DM (the join handler decides if it applies); not for players.
-    expect(s.consumeJoinTicket((await askTicket('p1', { role: 'gm', takeover: true })).body.ticket)).toMatchObject({ seat: 'co', takeover: true });
-    expect((await askTicket('p2', { role: 'player', takeover: true })).body).toEqual({ error: 'not_dm' });
+    expect(s.consumeJoinTicket((await askTicket('p1', { role: 'gm', takeoverOf: 'self' })).body.ticket)).toMatchObject({ seat: 'co', takeoverOf: 'self' });
+    expect((await askTicket('p2', { role: 'player', takeoverOf: 'self' })).body).toEqual({ error: 'not_dm' });
     expect((await askTicket('admin', { role: 'gm' })).body).toEqual({ error: 'not_member' });
     expect((await askTicket('admin', { role: 'player' })).body).toEqual({ error: 'not_member' });
     expect((await askTicket('outsider', { role: 'player' })).body).toEqual({ error: 'not_member' });
@@ -422,10 +422,10 @@ describe.skipIf(!enabled)('campaign rooms against the local dev DB (Unit E)', ()
     const s = await store();
     const primary = await askTicket('dm', { role: 'gm' });
     expect(primary.status).toBe(200);
-    expect(s.consumeJoinTicket(primary.body.ticket)).toMatchObject({ role: 'gm', seat: 'primary', takeover: false });
+    expect(s.consumeJoinTicket(primary.body.ticket)).toMatchObject({ role: 'gm', seat: 'primary', takeoverOf: null });
     expect((await query('SELECT active_vtt_session_id FROM users WHERE id = $1', [u('dm')])).rows[0].active_vtt_session_id).toBe(ROOM_R);
-    expect(s.consumeJoinTicket((await askTicket('dm', { role: 'gm', takeover: true })).body.ticket)).toMatchObject({ seat: 'primary', takeover: true });
-    expect(s.consumeJoinTicket((await askTicket('p1', { role: 'gm' })).body.ticket)).toMatchObject({ seat: 'co', takeover: false });
+    expect(s.consumeJoinTicket((await askTicket('dm', { role: 'gm', takeoverOf: 'co' })).body.ticket)).toMatchObject({ seat: 'primary', takeoverOf: 'co' });
+    expect(s.consumeJoinTicket((await askTicket('p1', { role: 'gm' })).body.ticket)).toMatchObject({ seat: 'co', takeoverOf: null });
 
     // Restart: the in-memory room vanishes; an active game session row is re-attached on reopen.
     const gs = await gameSessions();
@@ -616,5 +616,87 @@ describe.skipIf(!enabled)('campaign rooms against the local dev DB (Unit E)', ()
     const sheet = await sheetRoute();
     const refused: any = await (sheet.actions as any).joinRoom({ request: form({ roomId: roomK }), locals: locals('p1'), params: { id: charIds.p1 } });
     expect(refused.status).toBe(400);
+  });
+
+  it('a character leaving the campaign (or its player being removed) takes its token off the live map', async () => {
+    const s = await store();
+    const rooms2 = await rooms();
+    const detail = await campaignPageRoute();
+    const act = (name: string, key: string, fields: Record<string, string>, id: string) =>
+      (detail.actions as any)[name]({ request: form(fields), params: { id }, locals: locals(key) });
+
+    const T = await newCampaign('dm', `${tag} tokens`);
+    const roomT = (await codes(T)).room;
+    extraRooms.push(roomT);
+    await campaigns.joinCampaignByInviteCode(u('p2'), (await codes(T)).invite);
+    await makeCharacter('tokA', 'p2');
+    await makeCharacter('tokB', 'p2');
+    await makeCharacter('tokDm', 'dm');
+    for (const [key, owner] of [['tokA', 'p2'], ['tokB', 'p2'], ['tokDm', 'dm']]) {
+      await campaigns.addCharacterToCampaign(u(owner), charIds[key], T);
+    }
+    const session = await rooms2.openCampaignRoom({ id: T, roomCode: roomT });
+    session.tokens = {
+      a: { id: 'a', type: 'pc', characterId: charIds.tokA },
+      b: { id: 'b', type: 'pc', characterId: charIds.tokB },
+      dm: { id: 'dm', type: 'pc', characterId: charIds.tokDm },
+      goblin: { id: 'goblin', type: 'enemy' }
+    };
+    const gm = fakeSocket({ sessionId: roomT, role: 'gm', playerId: null, gmUserId: u('dm') });
+    s.socketsBySession.get(roomT).add(gm);
+
+    // "No, just the character": only that character's token goes.
+    await act('removeCharacter', 'dm', { characterId: charIds.tokA }, T);
+    expect(Object.keys(s.sessions.get(roomT).tokens).sort()).toEqual(['b', 'dm', 'goblin']);
+    expect(gm.ws._sent).toContainEqual({ type: 'token:remove:bulk', tokenIds: ['a'] });
+
+    // "Yes, remove the player too": the rest of their characters' tokens go; others stay.
+    await act('removeMember', 'dm', { userId: u('p2') }, T);
+    expect(Object.keys(s.sessions.get(roomT).tokens).sort()).toEqual(['dm', 'goblin']);
+    expect(gm.ws._sent).toContainEqual({ type: 'token:remove:bulk', tokenIds: ['b'] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Unit F: the /vtt lobby list (membership only) and the campaign-aware picker rows.
+// ---------------------------------------------------------------------------------------------
+describe.skipIf(!enabled)('VTT lobby and picker queries (Unit F)', () => {
+  it('membersOnly drops the admin override (a non-member admin has no table), but keeps real memberships', async () => {
+    const F = await newCampaign('dm', `${tag} lobby`);
+    const q = `${tag} lobby`;
+    // Normal list: the admin sees it through the override. Lobby list: they don't.
+    expect((await campaigns.listCampaigns(u('admin'), { q })).total).toBe(1);
+    expect((await campaigns.listCampaigns(u('admin'), { q, membersOnly: true })).total).toBe(0);
+    // includeArchived is ignored for a members-only list (archived campaigns have no table).
+    expect((await campaigns.listCampaigns(u('admin'), { q, membersOnly: true, includeArchived: true })).total).toBe(0);
+    // A real member sees it with their role; once the admin joins, they see it too.
+    expect((await campaigns.listCampaigns(u('dm'), { q, membersOnly: true })).items[0]).toMatchObject({ id: F, myRole: 'dm' });
+    await campaigns.joinCampaignByInviteCode(u('admin'), (await codes(F)).invite);
+    expect((await campaigns.listCampaigns(u('admin'), { q, membersOnly: true })).items[0]).toMatchObject({ id: F, myRole: 'player' });
+    // Archived: gone from a members-only list for the DM as well.
+    await campaigns.archiveCampaign(u('dm'), F);
+    expect((await campaigns.listCampaigns(u('dm'), { q, membersOnly: true, includeArchived: true })).total).toBe(0);
+  });
+
+  it('picker rows: the GM gets the active party with owners, a player only their own', async () => {
+    const G = await newCampaign('dm', `${tag} picker`);
+    const { invite } = await codes(G);
+    await campaigns.joinCampaignByInviteCode(u('p1'), invite);
+    await campaigns.joinCampaignByInviteCode(u('p2'), invite);
+    await campaigns.addCharacterToCampaign(u('p1'), charIds.p1, G);
+    await campaigns.addCharacterToCampaign(u('p2'), charIds.p2, G);
+    await campaigns.setCharacterPartyActive(u('p2'), charIds.p2, false);
+
+    const gm = await campaigns.listCampaignPickerCharacters(G, u('dm'), true);
+    expect(gm.map((c) => c.id)).toEqual([charIds.p1]); // p2's character is benched, so not offered
+    expect(gm[0]).toMatchObject({ ownerUserId: u('p1'), ownerName: 'IT p1' });
+
+    // A player sees their own characters in this campaign, benched or not, and never someone else's.
+    expect((await campaigns.listCampaignPickerCharacters(G, u('p2'), false)).map((c) => c.id)).toEqual([charIds.p2]);
+    expect((await campaigns.listCampaignPickerCharacters(G, u('p1'), false)).map((c) => c.id)).toEqual([charIds.p1]);
+    // Someone with nothing in the campaign gets an empty list, and a character moved elsewhere drops out.
+    expect(await campaigns.listCampaignPickerCharacters(G, u('outsider'), false)).toEqual([]);
+    await campaigns.removeCharacterFromCampaign(u('p1'), charIds.p1);
+    expect(await campaigns.listCampaignPickerCharacters(G, u('dm'), true)).toEqual([]);
   });
 });

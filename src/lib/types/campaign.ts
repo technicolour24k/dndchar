@@ -65,3 +65,14 @@ export type CampaignCharacterOption = {
   campaignId: string | null;
   campaignName: string | null;
 };
+
+// One row of the VTT character picker in a campaign room (id, name, owner, class summary and HP).
+export type CampaignPickerCharacter = {
+  id: string;
+  name: string;
+  ownerUserId: string;
+  ownerName: string;
+  classes: CharacterClass[];
+  hpCurrent: number;
+  hpMax: number;
+};

@@ -25,12 +25,24 @@ npm run build && npm start   # production, also one process (node server.js)
 ```
 
 Click **VTT** in the top nav (requires being logged in - same account system
-as the rest of the app). That hits `/vtt`, which redirects to the static
-client with your account's id/display name baked in as `?playerId=` /
-`?playerName=`, so you're never asked to type a name separately. Opening
+as the rest of the app). That hits `/vtt`, the lobby (see "Campaign tables and
+Quick rooms" below). Its Quick room link opens the static client with your
+account's id/display name baked in as `?playerId=` / `?playerName=`, so you're
+never asked to type a name separately. Opening
 `/vtt-app/index.html` directly (no query params) still works standalone, with
 manual name entry and a per-browser random id - handy for testing without
 going through login.
+
+## Campaign tables and Quick rooms
+
+`/vtt` is a lobby. It lists the campaigns you belong to (with "Open as DM" for a DM or co-DM, and "Open as player"), and keeps a "Quick room" link for throwaway rooms.
+
+- **Campaign room.** Each campaign has one long-lived room with a fixed 8-character code, created in memory on demand (a server restart empties it, the next open recreates it and re-attaches the active game session). It can only be joined with a **ticket**: the static client POSTs `/vtt/api/campaigns/<id>/ticket { role, takeoverOf }` (a SvelteKit route that has the login cookie and the database, and checks real campaign membership), then sends `{ type: 'join', sessionId, ticket }` on the websocket. Tickets are single use and last 60 seconds, so every connect and reconnect fetches a new one. The socket takes the user id, display name, role and GM-seat rank from the ticket and ignores whatever else the message says. A join without a ticket gets `join:error ticket_required`.
+- **GM seat** (one per room). The primary DM takes it; the co-DM can when the primary is absent. If it is held, `join:error gm_seat_taken` carries `canTakeOver: true` and `heldBy` ('self' for the same user's older socket, 'other' for the co-DM). A ticket asked for with `takeoverOf: 'self'` (replace my own older socket) or `'co'` (the primary DM replacing the co-DM) replaces the holder, but only if that matches who holds the seat at join time (otherwise the asker just gets `gm_seat_taken` again, so a seat that changed hands in between is never taken silently): the old socket gets `gm:replaced` and closes with 4002, and the client rejoins as a player. Only the primary DM over the co-DM, or a DM over their own older socket, can take over; a co-DM never takes the seat from the primary (`gm_already_claimed`). A site admin who is not a member gets no ticket and is never the GM.
+- **Kicks.** Removing a member, a member leaving, demoting a DM to player, and archiving a campaign send `kicked` (reason `removed_from_campaign` or `role_changed`) and close the socket with 4001. Unused tickets for that user or room are revoked first.
+- **Client.** `static/vtt-app/campaign.js` runs the connection story (fresh ticket per attempt, takeover prompt, reconnects, notices); its decisions are pure functions in `static/vtt-app/shared/campaignJoin.js`. Opening the page with `?campaignId=` switches it on; without that the page is the Quick room flow, unchanged.
+- **Character picker.** `GET /vtt/api/characters?roomId=<code>`: in a campaign room the GM gets every active-party character with its owner (the token is created owned by that player), anyone else gets their own characters in the campaign.
+- **Quick rooms** (typed 6-character code, no campaign) behave exactly as before: no tickets, the first GM in wins, no auth on the socket.
 
 ## Architecture
 
@@ -69,9 +81,12 @@ vtt/server/           - plain untyped JS (@ts-nocheck) by design: it has to be
     map.js                - map:set
 
 src/routes/vtt/
-  +page.server.ts         - redirects to /vtt-app/index.html with the signed-in
+  +page.svelte,
+  +page.server.ts         - the lobby: the user's campaign tables plus a Quick
+                             room link to /vtt-app/index.html with the signed-in
                              user's id/name (auth already enforced by
                              hooks.server.ts for any non-public route)
+  api/campaigns/[id]/ticket/+server.ts - POST, one-use join ticket for a campaign room
   api/session/+server.ts   - POST, creates a room, returns { sessionId }
   api/upload/+server.ts    - POST multipart image, writes to data/vtt-uploads/
   api/uploads/[filename]/+server.ts - GET, serves an uploaded image back

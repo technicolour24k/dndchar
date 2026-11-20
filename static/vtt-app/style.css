@@ -453,3 +453,11 @@ body {
   .forage-modal { width: 94vw; padding: 14px; }
   .forage-row { flex-wrap: wrap; }
 }
+
+/* Campaign tables (campaign.js): the notice card sits above every other modal, the banner is a
+   passing message at the top of the screen. */
+#campaignNotice { z-index: 500; }
+#campaignNotice .modal { width: 340px; max-width: 92vw; }
+#campaignNotice .actions { flex-wrap: wrap; }
+#campaignBanner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; padding: 8px 14px; border-radius: 6px; background: #2a2d36; border: 1px solid #4a7fff; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+#campaignBanner[hidden] { display: none; }

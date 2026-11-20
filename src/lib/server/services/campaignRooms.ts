@@ -1,6 +1,6 @@
 import { query } from '$lib/server/db';
 import { getCampaignAccess } from '$lib/server/services/access';
-import { disconnectAllFromRoom, disconnectUserFromRoom, ensureRoom, revokeJoinTickets, revokeRoomTickets, revokeStaleGmTickets, sessions, setGmSeat, socketsBySession } from '$vtt/store.js';
+import { disconnectAllFromRoom, disconnectUserFromRoom, ensureRoom, revokeJoinTickets, revokeRoomTickets, broadcast, revokeStaleGmTickets, sessions, setGmSeat, socketsBySession } from '$vtt/store.js';
 
 // A campaign's table: the in-memory VTT room that has the campaign's fixed room code. The room
 // state (map, tokens) lives in memory only, by agreement; what survives a restart is the code and
@@ -95,5 +95,45 @@ export async function syncGmSeats(campaignId: string, roomCode: string | undefin
     for (const [userId, seat] of seatByUser) setGmSeat(roomCode, userId, seat);
   } catch (err) {
     console.error('syncGmSeats failed (membership change was saved):', err);
+  }
+}
+
+/**
+ * Takes the tokens of characters that are no longer in a campaign off that campaign's live map:
+ * a character removed from the campaign (or moved to another one), or every character of a player
+ * who was removed or left. Checks every live campaign room in one query, so callers don't need to
+ * know which room the character was in, and broadcasts one token:remove:bulk per room it changed.
+ *
+ * Best-effort, called AFTER the change committed: an error is logged, never thrown.
+ */
+export async function pruneDepartedCharacterTokens() {
+  try {
+    // Live campaign rooms and the character tokens on their maps.
+    const rooms: { roomCode: string; campaignId: string; tokens: { id: string; characterId: string }[] }[] = [];
+    for (const [roomCode, session] of sessions as Map<string, any>) {
+      if (!session.campaignId) continue;
+      const tokens = Object.values(session.tokens ?? {}).filter((t: any) => t?.characterId) as { id: string; characterId: string }[];
+      if (tokens.length) rooms.push({ roomCode, campaignId: session.campaignId, tokens });
+    }
+    if (!rooms.length) return;
+
+    const ids = [...new Set(rooms.flatMap((room) => room.tokens.map((t) => t.characterId)))];
+    const found = await query<{ id: string; campaign_id: string | null }>(
+      'SELECT id, campaign_id FROM characters WHERE id = ANY($1::uuid[])',
+      [ids]
+    );
+    const campaignOf = new Map(found.rows.map((row) => [row.id, row.campaign_id]));
+
+    for (const room of rooms) {
+      // A deleted character (no row) also goes.
+      const gone = room.tokens.filter((t) => campaignOf.get(t.characterId) !== room.campaignId).map((t) => t.id);
+      if (!gone.length) continue;
+      const session = sessions.get(room.roomCode);
+      if (!session) continue;
+      for (const id of gone) delete session.tokens[id];
+      broadcast(room.roomCode, () => ({ type: 'token:remove:bulk', tokenIds: gone }));
+    }
+  } catch (err) {
+    console.error('pruneDepartedCharacterTokens failed (the campaign change was saved):', err);
   }
 }

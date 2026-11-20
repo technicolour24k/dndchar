@@ -28,15 +28,18 @@ function liveGmSocketExcept(sockets, except) {
 //
 //   who asks      | seat empty | held by co-DM                       | held by primary DM
 //   primary DM    | takes it   | gm_seat_taken (canTakeOver); with    | gm_seat_taken (canTakeOver) if it
-//                 |            | ticket.takeover the co-DM is replaced| is their own socket (second tab or
-//                 |            |                                      | a stale one after sleep), else n/a
+//                 |            | takeoverOf:'co' replaces it          | is their own socket (second tab or
+//                 |            | (takeoverOf:'self' if it is theirs)  | a stale one after sleep), with
+//                 |            |                                      | takeoverOf:'self'; else n/a
 //   co-DM         | takes it   | gm_seat_taken (canTakeOver) if it is | gm_already_claimed, never takeover
-//                 |            | their own socket, else n/a           |
+//                 |            | their own socket (takeoverOf:'self'),|
+//                 |            | else n/a                             |
 //   player ticket | can never be GM, whatever the message says
 //
 // So a takeover is allowed in exactly two cases: the primary DM over the co-DM, and a DM over their
-// OWN older socket (which the new socket then replaces). The ticket route lets any DM ask for
-// takeover; this handler is what decides whether it applies. A stale claim (gmSocketId set but no
+// OWN older socket (which the new socket then replaces). The ticket route lets any DM ask for a
+// takeover and records WHICH kind (takeoverOf 'self' or 'co'); this handler applies it only if it
+// matches who holds the seat at join time, otherwise the asker gets gm_seat_taken and is asked again. A stale claim (gmSocketId set but no
 // live GM socket) is reclaimable by either DM without a takeover.
 //
 // A socket that is already in a room and joins another is first released from the old room (same
@@ -92,8 +95,19 @@ function handleJoin(meta, msg, context) {
         meta.ws.send(JSON.stringify({ type: 'join:error', reason: 'gm_already_claimed' }));
         return;
       }
-      if (!ticket.takeover) {
-        meta.ws.send(JSON.stringify({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true }));
+      // The ticket must ask for the takeover that matches who holds the seat RIGHT NOW. 'self' only
+      // replaces the asker's own older socket, 'co' only the co-DM (primary DM asking). If the seat
+      // changed hands after the client was told (say the stale socket closed and the co-DM sat down),
+      // the intent no longer matches and the client gets the normal question instead of a displacement.
+      const intentMatches =
+        (ticket.takeoverOf === 'self' && sameUser) || (ticket.takeoverOf === 'co' && primaryOverCo && !sameUser);
+      if (!intentMatches) {
+        // heldBy tells the client whether the seat holder is the asker's own older socket (a second
+        // tab, a refresh, a stale socket after sleep: the client takes over without asking on an
+        // automatic reconnect) or somebody else (the co-DM: the client asks first).
+        meta.ws.send(JSON.stringify({
+          type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: sameUser ? 'self' : 'other'
+        }));
         return;
       }
       replacedGm = liveGm;

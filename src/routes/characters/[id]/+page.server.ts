@@ -6,7 +6,7 @@ import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
-import { openCampaignRoomForMember } from '$lib/server/services/campaignRooms';
+import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
 import { addCharacterToCampaign, getCampaignByRoomCode, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/rollLog';
@@ -71,10 +71,13 @@ export const actions = {
   setCampaign: async ({ request, params, locals }) => {
     const form = await request.formData();
     const result = await attempt(() => addCharacterToCampaign(locals.user!.id, params.id, String(form.get('campaignId') || '')));
+    // A move out of another campaign takes the token off that campaign's live map.
+    if (result.ok) await pruneDepartedCharacterTokens();
     return result.ok ? { campaignDone: true } : fail(400, { campaignError: result.failure.data.error });
   },
   leaveCampaign: async ({ params, locals }) => {
     const result = await attempt(() => removeCharacterFromCampaign(locals.user!.id, params.id));
+    if (result.ok) await pruneDepartedCharacterTokens();
     return result.ok ? { campaignDone: true } : fail(400, { campaignError: result.failure.data.error });
   },
   setPartyActive: async ({ request, params, locals }) => {

@@ -8,6 +8,7 @@ import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/move
 import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
+import { createCampaignClient } from './campaign.js';
 import { drawTargetRings } from './render/targeting.js';
 import { getTokensInShape } from './render/shapeGeometry.js';
 
@@ -56,8 +57,9 @@ const joinCodeInput = document.getElementById('joinCodeInput');
 // user). Falls back to manual name entry + a per-browser random id when the
 // page is opened standalone, so the tool still works outside the main app.
 const accountParams = new URLSearchParams(location.search);
-const accountPlayerId = accountParams.get('playerId');
-const accountPlayerName = accountParams.get('playerName');
+// `let` because a campaign table's join ticket (campaign.js) is the authority on who we are.
+let accountPlayerId = accountParams.get('playerId');
+let accountPlayerName = accountParams.get('playerName');
 
 let ws = null;
 let role = null; // 'gm' | 'player'
@@ -582,17 +584,28 @@ function getPersistentPlayerName() {
 
 function connect(joinPayload) {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${protocol}://${location.host}/vtt-ws`);
+  const socket = new WebSocket(`${protocol}://${location.host}/vtt-ws`);
+  ws = socket;
 
-  ws.addEventListener('open', () => ws.send(JSON.stringify(joinPayload)));
-  ws.addEventListener('message', (ev) => handleMessage(JSON.parse(ev.data)));
-  ws.addEventListener('close', () => {
+  ws.addEventListener('open', () => socket.send(JSON.stringify(joinPayload)));
+  ws.addEventListener('message', (ev) => {
+    // A replaced socket (e.g. we took the seat on a newer one) must not drive the UI any more.
+    if (ws === socket) handleMessage(JSON.parse(ev.data));
+  });
+  ws.addEventListener('close', (ev) => {
     // Drop pending character-sync debounces: the reconnect's state:full runs a
     // full syncOwnedCharacterTokens() catch-up anyway.
     for (const timer of characterSyncDebounceTimers.values()) clearTimeout(timer);
     characterSyncDebounceTimers.clear();
     // The server clears our plan for everyone else on close; drop ours and everyone else's here.
     clearAllMovePreviews();
+    // Campaign tables: a join ticket is single use, so a reconnect needs a fresh one - campaign.js
+    // fetches it (and decides whether to retry at all after a kick or a takeover).
+    if (campaignClient.active) {
+      // Ignore the close of a socket we already replaced (a stale one can close late).
+      if (ws === socket) campaignClient.onClose(ev.code);
+      return;
+    }
     // Only auto-retry after a successful join - a bad room code shouldn't loop.
     if (session) setTimeout(() => connect(joinPayload), 1500);
   });
@@ -626,7 +639,21 @@ function clearAllMovePreviews() {
 
 function handleMessage(msg) {
   switch (msg.type) {
+    // Campaign tables: the server's seat/kick messages. campaign.js decides what to show and
+    // whether to reconnect; the socket's close follows straight after.
+    case 'kicked':
+      campaignClient.onKicked(msg.reason);
+      break;
+
+    case 'gm:replaced':
+      campaignClient.onGmReplaced();
+      break;
+
     case 'join:error':
+      if (campaignClient.active) {
+        campaignClient.onJoinError(msg);
+        break;
+      }
       if (msg.reason === 'session_not_found') loginError.textContent = 'Room not found.';
       else if (msg.reason === 'gm_already_claimed') loginError.textContent = 'This room already has a GM connected.';
       else loginError.textContent = msg.reason;
@@ -639,6 +666,7 @@ function handleMessage(msg) {
       session = msg.session;
       session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
+      if (campaignClient.active) campaignClient.onJoined();
       // render() first - it computes currentRenderedTokens (vision-filtered
       // for a player), which renderSidebar()'s "other tokens in view" list
       // now reads from; the reverse order would show a stale/empty list
@@ -2705,22 +2733,30 @@ const characterPickerList = document.getElementById('characterPickerList');
 async function openCharacterPicker() {
   characterPickerModal.classList.add('visible');
   characterPickerList.innerHTML = '';
-  characterPickerStatus.textContent = 'Loading your characters…';
+  characterPickerStatus.textContent = campaignClient.active ? 'Loading the party…' : 'Loading your characters…';
   try {
-    const res = await fetch('/vtt/api/characters');
+    // In a campaign room the server decides the list: the GM gets the whole active party, a player
+    // gets their own characters in this campaign. In a Quick room it is the caller's own list.
+    const res = await fetch('/vtt/api/characters?roomId=' + encodeURIComponent(sessionId || ''));
     if (!res.ok) throw new Error('failed');
     const characters = await res.json();
     if (!characters.length) {
-      characterPickerStatus.textContent = 'No characters found - create one in the main app first.';
+      characterPickerStatus.textContent = campaignClient.active
+        ? (role === 'gm'
+          ? 'No party characters to add yet. Players add theirs from the campaign page.'
+          : 'None of your characters are in this campaign yet. Add one from its campaign page.')
+        : 'No characters found - create one in the main app first.';
       return;
     }
     characterPickerStatus.textContent = '';
     characterPickerList.innerHTML = characters
       .map((c) => {
         const classSummary = (c.classes || []).map((cls) => `${cls.className} ${cls.level}`).join(' / ') || 'No class';
+        // The GM sees whose character it is; the name stays clean for the token (data attribute below).
+        const ownerTag = c.ownerName && c.ownerUserId !== accountPlayerId ? ` (${c.ownerName})` : '';
         return `
-          <div class="character-picker-item" data-character-id="${escapeHtml(c.id)}">
-            <div class="name">${escapeHtml(c.name)}</div>
+          <div class="character-picker-item" data-character-id="${escapeHtml(c.id)}" data-owner-id="${escapeHtml(c.ownerUserId || '')}" data-character-name="${escapeHtml(c.name)}">
+            <div class="name">${escapeHtml(c.name)}${escapeHtml(ownerTag)}</div>
             <div class="summary">${escapeHtml(classSummary)} - HP ${c.hpCurrent}/${c.hpMax}</div>
           </div>
         `;
@@ -2742,7 +2778,11 @@ characterPickerList.addEventListener('click', async (e) => {
   const item = e.target.closest('.character-picker-item');
   if (!item) return;
   const characterId = item.dataset.characterId;
-  const characterName = item.querySelector('.name').textContent;
+  const characterName = item.dataset.characterName;
+  // The GM puts a player's character on the map as that player's token, so they can move it.
+  // Your own characters keep the old behaviour (ownerId = playerId, which is null for a GM).
+  const pickedOwnerId = item.dataset.ownerId;
+  const tokenOwnerId = pickedOwnerId && pickedOwnerId !== accountPlayerId ? pickedOwnerId : playerId;
   closeCharacterPicker();
 
   const res = await fetch('/vtt/api/characters/' + characterId);
@@ -2756,7 +2796,7 @@ characterPickerList.addEventListener('click', async (e) => {
       id: `token-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       name: characterName,
       type: 'pc',
-      ownerId: playerId,
+      ownerId: tokenOwnerId,
       x: Math.round(map.widthPx / 2),
       y: Math.round(map.heightPx / 2),
       imageUrl: null,
@@ -3327,7 +3367,9 @@ function playerListHtml() {
 }
 
 function roomInfoHtml(roleLabel) {
-  return `<div id="roomInfo"><strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+  // A campaign table shows the campaign's name above its (long, fixed) room code.
+  const campaignLine = campaignClient.campaignName ? `<strong>${escapeHtml(campaignClient.campaignName)}</strong><br/>Room: ` : '';
+  return `<div id="roomInfo">${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${combatControlHtml()}
     ${forage.forageControlHtml()}
@@ -5099,6 +5141,25 @@ function wirePlayerSidebar() {
 // live in forage.js. Created last so every helper it borrows above exists. It never calls
 // renderSidebar(): it updates its own modals and two small sidebar spots directly.
 // ---------------------------------------------------------------------------
+// Campaign tables (campaign-system unit F): ticket fetch, seat takeover, kicks and reconnects. Quick
+// rooms never touch it (campaignClient.active stays false). Created before forage so it is ready
+// for the first join.
+const campaignClient = createCampaignClient({
+  connect,
+  closeSocket: () => { if (ws) ws.close(); },
+  // The ticket is the authority on who we are and which role we hold at this table.
+  setIdentity: ({ roomCode, role: newRole, userId, displayName }) => {
+    sessionId = roomCode;
+    role = newRole;
+    playerName = displayName;
+    // A GM keeps playerId = null, exactly as the Quick room create flow does.
+    playerId = newRole === 'player' ? userId : null;
+    accountPlayerId = userId;
+    accountPlayerName = displayName;
+  },
+});
+campaignClient.start();
+
 const forage = createForage({
   getSession: () => session,
   getRole: () => role,

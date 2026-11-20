@@ -1,7 +1,7 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
-import { closeCampaignRoom, kickFromCampaignRoom, syncGmSeats } from '$lib/server/services/campaignRooms';
+import { closeCampaignRoom, kickFromCampaignRoom, pruneDepartedCharacterTokens, syncGmSeats } from '$lib/server/services/campaignRooms';
 import {
   addCharacterToCampaign,
   archiveCampaign,
@@ -75,6 +75,8 @@ export const actions = {
       kickFromCampaignRoom(result.value?.roomCode, result.value?.targetUserId, 'removed_from_campaign');
       // Removing the primary promotes the co-DM, whose seated socket is now 'primary'.
       await syncGmSeats(params.id, result.value?.roomCode);
+      // Their characters left the campaign, so their tokens leave the live map.
+      await pruneDepartedCharacterTokens();
     }
     return result.ok ? { saved: 'removed' } : result.failure;
   },
@@ -84,6 +86,7 @@ export const actions = {
     if (!result.ok) return result.failure;
     kickFromCampaignRoom(result.value?.roomCode, locals.user!.id, 'removed_from_campaign');
     await syncGmSeats(params.id, result.value?.roomCode);
+    await pruneDepartedCharacterTokens();
     throw redirect(303, '/campaigns');
   },
 
@@ -97,12 +100,16 @@ export const actions = {
   addCharacter: async ({ request, params, locals }) => {
     const form = await request.formData();
     const result = await attempt(() => addCharacterToCampaign(locals.user!.id, String(form.get('characterId') || ''), params.id));
+    // Moving a character in from another campaign takes its token off that campaign's map.
+    if (result.ok) await pruneDepartedCharacterTokens();
     return result.ok ? { saved: 'character' } : result.failure;
   },
 
   removeCharacter: async ({ request, params, locals }) => {
     const form = await request.formData();
     const result = await attempt(() => removeCharacterFromCampaign(locals.user!.id, String(form.get('characterId') || ''), params.id));
+    // The character left the campaign, so its token leaves the live map.
+    if (result.ok) await pruneDepartedCharacterTokens();
     return result.ok ? { saved: 'character' } : result.failure;
   },
 

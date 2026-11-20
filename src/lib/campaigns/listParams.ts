@@ -16,14 +16,14 @@ export function parseListParams(params: URLSearchParams, isAdmin: boolean): List
   return { q, page, includeArchived };
 }
 
-/** A /campaigns link for the given page, keeping the search and the archived flag. */
-export function listHref(opts: ListParams): string {
+/** A list link (default /campaigns, the /vtt lobby passes '/vtt') for the given page, keeping the search and the archived flag. */
+export function listHref(opts: ListParams, base = '/campaigns'): string {
   const search = new URLSearchParams();
   if (opts.q) search.set('q', opts.q);
   if (opts.includeArchived) search.set('archived', '1');
   if (opts.page > 1) search.set('page', String(opts.page));
   const text = search.toString();
-  return text ? `/campaigns?${text}` : '/campaigns';
+  return text ? `${base}?${text}` : base;
 }
 
 /** "ABCDEFGHJK" -> "ABCDE-FGHJK" (the form people read out and type). */

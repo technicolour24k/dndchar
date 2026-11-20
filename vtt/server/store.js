@@ -150,10 +150,13 @@ const JOIN_TICKET_TTL_MS = 60 * 1000;
 // Issued by the SvelteKit ticket route after it has checked the user's real campaign membership.
 // join.js takes identity, role and GM-seat rights from the ticket and ignores what the client
 // sends. `seat` is the GM-seat rank: 'primary' (the primary DM), 'co' (the co-DM) or null (a
-// player ticket, which can never become GM). `takeover` is only ever true for the primary DM.
+// player ticket, which can never become GM). `takeoverOf` is the takeover the client is asking for:
+// 'self' (replace the asker's OWN older GM socket) or 'co' (the primary DM replacing the co-DM).
+// join.js applies it only if it matches who actually holds the seat at join time, so a stale
+// intent (the seat changed hands since the client was told) can't displace somebody else.
 // Sweeps expired tickets on each issue so abandoned ones can't pile up.
-/** @param {{ sessionId: string, userId: string, displayName: string, role: string, seat?: string | null, takeover?: boolean }} ticket */
-export function issueJoinTicket({ sessionId, userId, displayName, role, seat = null, takeover = false }) {
+/** @param {{ sessionId: string, userId: string, displayName: string, role: string, seat?: string | null, takeoverOf?: 'self' | 'co' | null }} ticket */
+export function issueJoinTicket({ sessionId, userId, displayName, role, seat = null, takeoverOf = null }) {
   const now = Date.now();
   for (const [token, ticket] of joinTickets) {
     if (ticket.expiresAt <= now) joinTickets.delete(token);
@@ -165,7 +168,7 @@ export function issueJoinTicket({ sessionId, userId, displayName, role, seat = n
     displayName,
     role: role === 'gm' ? 'gm' : 'player',
     seat: role === 'gm' ? seat : null,
-    takeover: role === 'gm' && !!takeover,
+    takeoverOf: role === 'gm' && (takeoverOf === 'self' || takeoverOf === 'co') ? takeoverOf : null,
     expiresAt: now + JOIN_TICKET_TTL_MS,
   });
   return token;

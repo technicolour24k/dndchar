@@ -3,10 +3,13 @@
   import { page } from '$app/state';
   import type { SubmitFunction } from '@sveltejs/kit';
   import { formatInviteCode, roleLabel } from '$lib/campaigns/listParams';
+  import { canOpenAsGm, tableHref } from '$lib/campaigns/vttLinks';
   import { totalLevel } from '$lib/rules/dnd5e';
 
   let { data, form } = $props();
 
+  // Identity for the table links (the static VTT client shows the name before the ticket answers).
+  const me = $derived({ id: data.viewerId, name: page.data.user?.displayName ?? '' });
   const campaign = $derived(data.campaign);
   const access = $derived(data.access);
   const archived = $derived(campaign.isArchived);
@@ -27,6 +30,20 @@
       if (!confirm(message)) cancel();
     };
   }
+
+  // Removing someone else's character as a DM asks whether the player should go too. Only offered
+  // when this viewer may remove that player (data.controls already encodes the rank rules, e.g. a
+  // co-DM can't remove the primary DM); otherwise it's the plain confirm.
+  type PendingRemoval = { characterId: string; name: string; ownerUserId: string; ownerName: string };
+  let removing = $state<PendingRemoval | null>(null);
+  function canAlsoRemoveOwner(ownerUserId: string) {
+    return access.canManage && ownerUserId !== data.viewerId && !!data.controls[ownerUserId]?.remove;
+  }
+  // Close the popup once the chosen form has gone through, then refresh the page data as usual.
+  const closeAfterSubmit: SubmitFunction = () => async ({ update }) => {
+    removing = null;
+    await update();
+  };
 
   // Copy with the clipboard API; fall back to selecting the field so the user can press Ctrl+C.
   async function copy(text: string, label: string, field: HTMLInputElement | null) {
@@ -107,10 +124,18 @@
                 </label>
                 <noscript><button type="submit" class="compact-button">Save</button></noscript>
               </form>
-              <form method="POST" action="?/removeCharacter" use:enhance={confirmFirst(`Remove ${c.name} from the campaign?`)}>
-                <input type="hidden" name="characterId" value={c.id} />
-                <button type="submit" class="text-button danger-text">Remove</button>
-              </form>
+              {#if canAlsoRemoveOwner(c.ownerUserId)}
+                <button
+                  type="button"
+                  class="text-button danger-text"
+                  onclick={() => (removing = { characterId: c.id, name: c.name, ownerUserId: c.ownerUserId, ownerName: c.ownerName })}
+                >Remove</button>
+              {:else}
+                <form method="POST" action="?/removeCharacter" use:enhance={confirmFirst(`Remove ${c.name} from the campaign?`)}>
+                  <input type="hidden" name="characterId" value={c.id} />
+                  <button type="submit" class="text-button danger-text">Remove</button>
+                </form>
+              {/if}
             </div>
           {/if}
         </li>
@@ -250,11 +275,17 @@
       </section>
     {/if}
 
-    {#if !archived}
+    <!-- Real members only: a site admin who isn't a member gets no table ticket, so no link. -->
+    {#if !archived && access.role}
       <section class="panel campaign-box">
         <div class="campaign-row">
           <h2>Table</h2>
-          <a class="button-link compact-link" href="/vtt">Open table</a>
+          <span class="campaign-box-foot">
+            {#if canOpenAsGm(access.role)}
+              <a class="button-link compact-link" href={tableHref(campaign.id, 'gm', me)}>Open as DM</a>
+            {/if}
+            <a class="button-link compact-link" href={tableHref(campaign.id, 'player', me)}>Open as player</a>
+          </span>
         </div>
       </section>
     {/if}
@@ -295,3 +326,28 @@
     {/if}
   </div>
 </div>
+
+<svelte:window onkeydown={(e) => { if (e.key === 'Escape' && removing) removing = null; }} />
+
+{#if removing}
+  <!-- "Remove the player as well?" Yes removes the member (which takes all their characters out and
+       kicks them from the table); No removes just this character. Clicking the backdrop cancels. -->
+  <div class="modal-backdrop" role="presentation" onpointerdown={(e) => { if (e.target === e.currentTarget) removing = null; }}>
+    <div class="panel remove-character-modal" role="dialog" aria-modal="true" aria-labelledby="remove-character-title">
+      <h2 id="remove-character-title">Remove {removing.name}?</h2>
+      <p>Do you want to remove {removing.ownerName} from the campaign as well?</p>
+      <p class="muted">Removing the player takes all their characters out of the campaign and removes them from the table.</p>
+      <div class="remove-character-actions">
+        <form method="POST" action="?/removeMember" use:enhance={closeAfterSubmit}>
+          <input type="hidden" name="userId" value={removing.ownerUserId} />
+          <button type="submit" class="compact-button danger">Yes, remove {removing.ownerName} too</button>
+        </form>
+        <form method="POST" action="?/removeCharacter" use:enhance={closeAfterSubmit}>
+          <input type="hidden" name="characterId" value={removing.characterId} />
+          <button type="submit" class="compact-button">No, just the character</button>
+        </form>
+        <button type="button" class="text-button" onclick={() => (removing = null)}>Cancel</button>
+      </div>
+    </div>
+  </div>
+{/if}

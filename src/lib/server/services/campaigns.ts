@@ -10,6 +10,7 @@ import type {
   CampaignCharacterOption,
   CampaignListPage,
   CampaignMember,
+  CampaignPickerCharacter,
   CampaignRole,
   CampaignSummary
 } from '$lib/types/campaign';
@@ -132,12 +133,16 @@ export async function createCampaign(userId: string, name: string, description =
 
 // Anyone signed in; they only see what they may. Non-admins see the non-archived campaigns they
 // belong to. Admins see every campaign (archived ones only with includeArchived).
+// membersOnly drops the admin override: the /vtt lobby lists tables the user can really sit at, and a
+// non-member admin gets no ticket (the ticket route checks real membership), so it never shows them.
 export async function listCampaigns(
   userId: string,
-  opts: { q?: string; page?: number; includeArchived?: boolean } = {}
+  opts: { q?: string; page?: number; includeArchived?: boolean; membersOnly?: boolean } = {}
 ): Promise<CampaignListPage> {
   const q = String(opts.q ?? '').trim().slice(0, 80);
-  const includeArchived = Boolean(opts.includeArchived);
+  const membersOnly = Boolean(opts.membersOnly);
+  // Archived campaigns have no table, so a members-only list never includes them.
+  const includeArchived = Boolean(opts.includeArchived) && !membersOnly;
   // Escape LIKE wildcards so a "%" or "_" typed in the box is matched literally.
   const escaped = q.replace(/[\\%_]/g, '\\$&');
   // Capped so a silly page number can't overflow OFFSET (the past-the-end fallback does the rest).
@@ -158,13 +163,13 @@ export async function listCampaigns(
         FROM campaigns cp
         JOIN users u ON u.id = $1
         LEFT JOIN campaign_members m ON m.campaign_id = cp.id AND m.user_id = $1
-        WHERE (u.role = 'admin' OR m.user_id IS NOT NULL)
+        WHERE ((u.role = 'admin' AND NOT $5::boolean) OR m.user_id IS NOT NULL)
           AND (cp.is_archived = false OR (u.role = 'admin' AND $3::boolean))
           AND lower(cp.name) LIKE '%' || lower($2) || '%' ESCAPE '\\'
         ORDER BY lower(cp.name), cp.created_at, cp.id
         LIMIT ${CAMPAIGNS_PAGE_SIZE} OFFSET $4
       `,
-      [userId, escaped, includeArchived, offset]
+      [userId, escaped, includeArchived, offset, membersOnly]
     );
 
   let page = requested;
@@ -346,6 +351,50 @@ export async function listCampaignCharactersForUser(userId: string): Promise<Cam
     });
   }
   return groups;
+}
+
+// The VTT character picker for a campaign room. The room's GM sees every character the campaign has
+// flagged active in the party, whoever owns it (so they can place it as that player's token); anyone
+// else sees only their own characters in this campaign. Callers decide which with `forGm`; the
+// route proves it with isRoomGm, this function never trusts a client flag.
+export async function listCampaignPickerCharacters(
+  campaignId: string,
+  userId: string,
+  forGm: boolean
+): Promise<CampaignPickerCharacter[]> {
+  const rows = await query<{ id: string; name: string; owner_user_id: string; owner_name: string }>(
+    `SELECT c.id, c.name, c.owner_user_id, u.display_name AS owner_name
+     FROM characters c JOIN users u ON u.id = c.owner_user_id
+     WHERE c.campaign_id = $1 AND ($3::boolean = false OR c.party_active) AND ($3::boolean OR c.owner_user_id = $2)
+     ORDER BY lower(c.name), c.id`,
+    [campaignId, userId, forGm]
+  );
+  if (rows.rows.length === 0) return [];
+  const ids = rows.rows.map((row) => row.id);
+  const classRows = await query<{ character_id: string; class_name: string; level: number; subclass_name: string }>(
+    'SELECT character_id, class_name, level, subclass_name FROM character_classes WHERE character_id = ANY($1::uuid[]) ORDER BY sort_order ASC',
+    [ids]
+  );
+  const hpRows = await query<{ character_id: string; current_value: number; max_value: number }>(
+    `SELECT character_id, current_value, max_value FROM character_resources WHERE resource_key = 'hp' AND character_id = ANY($1::uuid[])`,
+    [ids]
+  );
+  const classesById = new Map<string, CharacterClass[]>();
+  for (const cl of classRows.rows) {
+    const list = classesById.get(cl.character_id) ?? [];
+    list.push({ className: cl.class_name, level: cl.level, subclassName: cl.subclass_name });
+    classesById.set(cl.character_id, list);
+  }
+  const hpById = new Map(hpRows.rows.map((r) => [r.character_id, r]));
+  return rows.rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    ownerUserId: row.owner_user_id,
+    ownerName: row.owner_name,
+    classes: classesById.get(row.id) ?? [],
+    hpCurrent: hpById.get(row.id)?.current_value ?? 0,
+    hpMax: hpById.get(row.id)?.max_value ?? 0
+  }));
 }
 
 // The user's own live campaigns (not archived), for the sheet's campaign picker. Unpaged: it is a

@@ -33,7 +33,26 @@
     </div>
 
     <div class="error" id="loginError"></div>
+
+    <!-- Campaign tables (campaign.js): opened from /vtt with ?campaignId=, so none of the above
+         applies. Create/Join and the name field are hidden and this status line shows instead. -->
+    <div id="campaignJoining" style="display:none;">
+      <p id="campaignJoiningText" style="margin:0;"></p>
+      <p class="hint"><a href="/vtt" style="color:#8fb0ff;">Back to the table lobby</a></p>
+    </div>
   </div>
+
+  <!-- Campaign notices (campaign.js): errors, kicks and the seat takeover offer. A small card over
+       everything, with buttons the script fills in. -->
+  <div id="campaignNotice" class="modal-overlay">
+    <div class="modal">
+      <h2 id="campaignNoticeTitle"></h2>
+      <p id="campaignNoticeText" style="margin:0;font-size:13px;color:#ccc;line-height:1.4;"></p>
+      <div class="actions" id="campaignNoticeActions"></div>
+    </div>
+  </div>
+  <!-- A passing message that doesn't block play (e.g. "The DM has taken the GM seat."). -->
+  <div id="campaignBanner" hidden></div>
 
   <div id="app">
     <div id="sidebar"></div>

@@ -235,7 +235,7 @@ describe('campaign rooms: store additions (campaign-system Unit E)', () => {
 
     it('round trips once: the second consume is null', () => {
       const token = issueJoinTicket(base);
-      expect(consumeJoinTicket(token)).toMatchObject({ sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'Ada', role: 'gm', seat: 'primary', takeover: false });
+      expect(consumeJoinTicket(token)).toMatchObject({ sessionId: 'ABCDEFGH', userId: 'u1', displayName: 'Ada', role: 'gm', seat: 'primary', takeoverOf: null });
       expect(consumeJoinTicket(token)).toBeNull();
     });
 
@@ -262,8 +262,14 @@ describe('campaign rooms: store additions (campaign-system Unit E)', () => {
     });
 
     it('a player ticket never carries a seat or takeover, whatever was asked', () => {
-      const token = issueJoinTicket({ ...base, role: 'player', seat: 'primary', takeover: true });
-      expect(consumeJoinTicket(token)).toMatchObject({ role: 'player', seat: null, takeover: false });
+      const token = issueJoinTicket({ ...base, role: 'player', seat: 'primary', takeoverOf: 'co' });
+      expect(consumeJoinTicket(token)).toMatchObject({ role: 'player', seat: null, takeoverOf: null });
+    });
+
+    it('keeps takeoverOf self or co on a GM ticket and drops anything else', () => {
+      expect(consumeJoinTicket(issueJoinTicket({ ...base, takeoverOf: 'self' }))).toMatchObject({ takeoverOf: 'self' });
+      expect(consumeJoinTicket(issueJoinTicket({ ...base, takeoverOf: 'co' }))).toMatchObject({ takeoverOf: 'co' });
+      expect(consumeJoinTicket(issueJoinTicket({ ...base, takeoverOf: 'everyone' as never }))).toMatchObject({ takeoverOf: null });
     });
   });
 

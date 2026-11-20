@@ -62,8 +62,8 @@ const send = (client: Client, msg: object) => client.ws.send(JSON.stringify(msg)
 const outcome = (client: Client) => Promise.race([client.next('state:full'), client.next('join:error')]);
 
 const ROOM = 'CAMPRM01';
-const gmTicket = (userId: string, seat: 'primary' | 'co', takeover = false, sessionId = ROOM) =>
-  issueJoinTicket({ sessionId, userId, displayName: userId, role: 'gm', seat, takeover });
+const gmTicket = (userId: string, seat: 'primary' | 'co', takeoverOf: 'self' | 'co' | null = null, sessionId = ROOM) =>
+  issueJoinTicket({ sessionId, userId, displayName: userId, role: 'gm', seat, takeoverOf });
 const playerTicket = (userId: string, sessionId = ROOM) =>
   issueJoinTicket({ sessionId, userId, displayName: userId, role: 'player', seat: null });
 
@@ -103,7 +103,7 @@ describe('ticketed joins to a campaign room', () => {
   it('rejects a ticket issued for another room', async () => {
     freshRoom();
     freshRoom('camp-2', 'CAMPRM02');
-    const { result } = await joinWith(gmTicket('dm-1', 'primary', false, 'CAMPRM02'));
+    const { result } = await joinWith(gmTicket('dm-1', 'primary', null, 'CAMPRM02'));
     expect(result).toEqual({ type: 'join:error', reason: 'bad_ticket' });
     expect(sessions.get(ROOM).gmSocketId).toBeNull();
     sessions.delete('CAMPRM02');
@@ -150,14 +150,14 @@ describe('GM seat', () => {
     const session = freshRoom();
     await joinWith(gmTicket('co-1', 'co'));
     const { result } = await joinWith(gmTicket('dm-1', 'primary'));
-    expect(result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true });
+    expect(result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: 'other' });
     expect(session.gmSocketId).toBe('co-1');
   });
 
   it('takeover: the co-DM is told and closed (4002), the primary holds the seat afterwards', async () => {
     const session = freshRoom();
     const co = (await joinWith(gmTicket('co-1', 'co'))).client;
-    const { result } = await joinWith(gmTicket('dm-1', 'primary', true));
+    const { result } = await joinWith(gmTicket('dm-1', 'primary', 'co'));
     expect(result.type).toBe('state:full');
     expect((await co.next('gm:replaced')).type).toBe('gm:replaced');
     expect(await co.closed).toBe(4002);
@@ -179,8 +179,8 @@ describe('GM seat', () => {
   it('a second tab of the seat holder is offered a takeover, and a takeover ticket replaces their own old socket', async () => {
     const session = freshRoom();
     const old = (await joinWith(gmTicket('dm-1', 'primary'))).client;
-    expect((await joinWith(gmTicket('dm-1', 'primary'))).result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true });
-    const { result } = await joinWith(gmTicket('dm-1', 'primary', true));
+    expect((await joinWith(gmTicket('dm-1', 'primary'))).result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: 'self' });
+    const { result } = await joinWith(gmTicket('dm-1', 'primary', 'self'));
     expect(result.type).toBe('state:full');
     expect((await old.next('gm:replaced')).type).toBe('gm:replaced');
     expect(await old.closed).toBe(4002);
@@ -193,12 +193,32 @@ describe('GM seat', () => {
   it('the co-DM can take over from their own stale socket, but still not from the primary', async () => {
     const session = freshRoom();
     const old = (await joinWith(gmTicket('co-1', 'co'))).client;
-    expect((await joinWith(gmTicket('co-1', 'co'))).result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true });
-    expect((await joinWith(gmTicket('co-1', 'co', true))).result.type).toBe('state:full');
+    expect((await joinWith(gmTicket('co-1', 'co'))).result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: 'self' });
+    expect((await joinWith(gmTicket('co-1', 'co', 'self'))).result.type).toBe('state:full');
     expect(await old.closed).toBe(4002);
     // The primary then takes the seat from the co-DM, and a co-DM asking with takeover is refused.
-    await joinWith(gmTicket('dm-1', 'primary', true));
-    expect((await joinWith(gmTicket('co-1', 'co', true))).result).toEqual({ type: 'join:error', reason: 'gm_already_claimed' });
+    await joinWith(gmTicket('dm-1', 'primary', 'co'));
+    expect((await joinWith(gmTicket('co-1', 'co', 'co'))).result).toEqual({ type: 'join:error', reason: 'gm_already_claimed' });
+    expect(session.gmSocketId).toBe('dm-1');
+  });
+
+  // The race the client can't see: it was told the seat is its own stale socket (heldBy 'self'), the
+  // stale socket closed, the co-DM sat down, and only then does the takeoverOf:'self' ticket arrive.
+  it('a self takeover ticket does not displace a co-DM who took the seat in the meantime', async () => {
+    const session = freshRoom();
+    const co = (await joinWith(gmTicket('co-1', 'co'))).client;
+    const { result } = await joinWith(gmTicket('dm-1', 'primary', 'self'));
+    expect(result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: 'other' });
+    expect(session.gmSocketId).toBe('co-1');
+    expect(isRoomGm(session, 'co-1')).toBe(true);
+    expect(co.ws.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it('a co takeover ticket does nothing once the seat is the asker own socket (and not the other way round)', async () => {
+    const session = freshRoom();
+    await joinWith(gmTicket('dm-1', 'primary'));
+    // 'co' intent but the holder is the asker themself: not the situation it was issued for.
+    expect((await joinWith(gmTicket('dm-1', 'primary', 'co'))).result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: 'self' });
     expect(session.gmSocketId).toBe('dm-1');
   });
 
@@ -208,7 +228,7 @@ describe('GM seat', () => {
     await joinWith(gmTicket('dm-1', 'primary'));
     setGmSeat(ROOM, 'dm-1', 'co');
     const { result } = await joinWith(gmTicket('co-1', 'primary'));
-    expect(result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true });
+    expect(result).toEqual({ type: 'join:error', reason: 'gm_seat_taken', canTakeOver: true, heldBy: 'other' });
     expect(session.gmSocketId).toBe('dm-1');
   });
 
@@ -258,7 +278,7 @@ describe('revocation, room hopping and kicks releasing the seat', () => {
     const roomA = freshRoom('camp-1', 'HOPROOMA');
     freshRoom('camp-2', 'HOPROOMB');
     const client = await connect();
-    send(client, { type: 'join', sessionId: 'HOPROOMA', ticket: gmTicket('dm-1', 'primary', false, 'HOPROOMA') });
+    send(client, { type: 'join', sessionId: 'HOPROOMA', ticket: gmTicket('dm-1', 'primary', null, 'HOPROOMA') });
     await client.next('state:full');
     expect(roomA.gmSocketId).toBe('dm-1');
     send(client, { type: 'join', sessionId: 'HOPROOMB', ticket: playerTicket('dm-1', 'HOPROOMB') });

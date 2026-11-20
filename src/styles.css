@@ -2871,3 +2871,8 @@ button.text-button.danger-text:hover {
   margin: 12px 0 8px;
   font-size: 15px;
 }
+
+/* Campaign page: "remove the player as well?" popup. */
+.remove-character-modal { width: min(460px, 100%); display: grid; gap: 10px; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); }
+.remove-character-modal h2, .remove-character-modal p { margin: 0; }
+.remove-character-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
