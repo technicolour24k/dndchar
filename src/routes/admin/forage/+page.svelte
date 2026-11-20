@@ -35,7 +35,7 @@
     <p class="eyebrow">Administration</p>
     <h1>Finds Review</h1>
     <p class="muted">
-      Every forage find, newest first (200 at most). Find tables are edited at <a href="/forage/tables">/forage/tables</a>.
+      Every forage find, newest first (200 at most). Find tables belong to campaigns and are edited at <a href="/forage/tables">/forage/tables</a>.
     </p>
   </div>
 </section>
@@ -56,7 +56,7 @@
     <div class="admin-find">
       <div class="admin-find-head">
         <strong>{check.characterName}</strong>
-        <span class="muted">{check.ownerName} - {when(check.createdAt)}{#if check.checkSummary} - {check.checkSummary}{/if} - {check.tableName}</span>
+        <span class="muted">{check.ownerName} - {when(check.createdAt)}{#if check.checkSummary} - {check.checkSummary}{/if} - {check.campaignName ?? 'No campaign'} - {check.tableName}</span>
       </div>
       <form method="POST" action={actionUrl('clearCheck')} use:enhance>
         <input type="hidden" name="findId" value={check.id} />
@@ -71,6 +71,15 @@
 <section class="panel stack">
   <h2>Finds</h2>
   <form method="GET" class="admin-find-filters">
+    <label>Campaign
+      <select name="campaign">
+        <option value="">All campaigns</option>
+        <option value="none" selected={data.filter.campaign === 'none'}>No campaign (older finds)</option>
+        {#each data.options.campaigns as campaign (campaign.id)}
+          <option value={campaign.id} selected={data.filter.campaign === campaign.id}>{campaign.name}</option>
+        {/each}
+      </select>
+    </label>
     <label>Session
       <select name="session">
         <option value="">All sessions</option>
@@ -107,7 +116,7 @@
         <span class="muted">{find.ownerName} - {when(find.createdAt)}</span>
       </div>
       <p class="muted">
-        {find.tableName}{#if find.checkSummary} - {find.checkSummary}{/if}{#if find.nat20} (nat 20, two runs){/if}
+        {find.campaignName ?? 'No campaign'} - {find.tableName}{#if find.checkSummary} - {find.checkSummary}{/if}{#if find.nat20} (nat 20, two runs){/if}
         {#if find.gameSessionName} - session: {find.gameSessionName}{:else} - no game session{/if}
       </p>
       {#if find.items.length}
@@ -126,7 +135,7 @@
         <p class="muted">No items.</p>
       {/if}
       {#if find.revertNote}<p class="muted">Note: {find.revertNote}</p>{/if}
-      {#if find.status === 'found'}
+      {#if find.status === 'found' && find.items.length > 0}
         <form method="POST" action={actionUrl('undoFind')} use:enhance={confirmUndo(find.characterName)}>
           <input type="hidden" name="findId" value={find.id} />
           <button type="submit" class="danger">Undo</button>

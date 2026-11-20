@@ -8,7 +8,8 @@ export type FindTableEntry = {
   itemId: string;
   itemName: string;
   itemCategory: string;
-  weight: number;
+  /** Percent chance (0 = Off, never found), rolled on its own: d100 <= chance. */
+  chance: number;
   qtyDie: number;
   itemArchived: boolean;
   sortOrder: number;
@@ -16,10 +17,13 @@ export type FindTableEntry = {
 
 export type FindTable = {
   id: string;
+  /** The campaign this table belongs to (every table belongs to exactly one). */
+  campaignId: string;
+  /** Only filled by the authoring list; the cached catalogue leaves it blank. */
+  campaignName: string;
   name: string;
   areaType: string;
   category: string;
-  typeDie: number;
   /** DM-side reminder only. Never sent to players (Q9). */
   suggestedCheck: string;
   isArchived: boolean;
@@ -31,7 +35,7 @@ export type FindTable = {
 
 /** A table plus its entries, as the cached catalogue holds them (active tables only). */
 // Player-safe by design (Q9): no suggestedCheck. That DM-side reminder is read separately.
-export type ForageCatalogueTable = Omit<FindTable, 'ownerName' | 'entryCount' | 'suggestedCheck'> & { entries: FindTableEntry[] };
+export type ForageCatalogueTable = Omit<FindTable, 'ownerName' | 'entryCount' | 'suggestedCheck' | 'campaignName'> & { entries: FindTableEntry[] };
 export type ForageCatalogue = { tables: ForageCatalogueTable[] };
 
 /** One rolled or approved result line. */
@@ -56,8 +60,17 @@ export type ForageCheck = {
 /** One haul line once it has reached an inventory row. `qty` is what this find added. */
 export type FindResult = { item_id: string; qty: number; inventory_id: string };
 
+/**
+ * Why a character can't forage right now. Campaign-level facts only: never anything about individual
+ * tables (Rev 4), so a player learns "your campaign has none" and nothing more.
+ */
+export type ForageUnavailableReason = 'no_campaign' | 'wrong_room' | 'no_tables';
+
 /** GET /vtt/api/forage/mine: the finder's private forage state (what the character sheet reads). */
 export type ForageMine = {
+  /** Can this character forage right now? Absent on an old server (treated as available). */
+  available?: boolean;
+  unavailableReason?: ForageUnavailableReason | null;
   /** Server clock at response time (ms), for comparing lastDm.closedAt without trusting the client clock. */
   serverNow?: number;
   roomId: string | null;

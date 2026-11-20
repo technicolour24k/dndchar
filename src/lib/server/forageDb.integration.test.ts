@@ -5,8 +5,11 @@ import { createSession, sessions, socketsBySession, setWatches, watchersByTopic 
 
 // DB-backed forage harness. SKIPPED unless FORAGE_DB_TEST=1, so the normal suite never touches a
 // database. It talks to whatever DATABASE_URL points at, so only ever run it against the LOCAL dev
-// DB (localhost / dndchar_dev) after `npm run db:seed:forage-test`. It creates one throwaway user
-// (plus character, inventory, finds, roll-log rows) and deletes them all in afterAll.
+// DB (localhost / dndchar_dev) after `npm run db:seed:forage-test` (it needs the seed's items and
+// its "Forage Test Campaign" tables, which it COPIES). Find tables belong to campaigns, so it creates
+// throwaway users, three throwaway campaigns (A: the main one with the copied tables, a DM, a co-DM
+// and the player; B: one pickable table of its own; C: only an empty table), the character, finds,
+// roll-log rows, and deletes them all in afterAll. It never touches Main Campaign.
 //
 //   (DATABASE_URL must be unset in the shell; .env.local supplies the local one)
 //   FORAGE_DB_TEST=1 npx vitest run src/lib/server/forageDb.integration.test.ts
@@ -23,15 +26,27 @@ const characters = await import('./services/characters');
 
 const tag = `zzforage${crypto.randomBytes(4).toString('hex')}`;
 const ROOM = `IT${tag.slice(-6).toUpperCase()}`;
-const gmId = crypto.randomUUID();
+const gmId = crypto.randomUUID(); // the primary DM of campaign A (a real user row, so the membership is real)
 let userId = '';
 let otherUserId = '';
+let coDmId = '';
+let authorId = ''; // wrote a table in campaign A but is not a DM of it
 let characterId = '';
+let campaignA = '';
+let campaignB = '';
+let campaignC = '';
+let otherTableId = ''; // campaign B's pickable table
 let meadowId = '';
 let itemIds: Record<string, string> = {};
 
 const user = () => ({ id: userId, displayName: 'IT Player', role: 'user' as const });
+const QUICK = `IQ${tag.slice(-6).toUpperCase()}`; // a Quick room (no campaign)
 const gmUser = () => ({ id: gmId, displayName: 'IT GM', role: 'user' as const });
+const campaignCodes = (n: number) => ({
+  invite: crypto.randomBytes(8).toString('hex').toUpperCase().replace(/[01]/g, 'A').slice(0, 10),
+  room: `${tag.slice(-5).toUpperCase().replace(/[01]/g, 'A')}${'XYZ'[n - 1]}AB`
+});
+const setCampaign = (id: string | null) => query('UPDATE characters SET campaign_id = $2 WHERE id = $1', [characterId, id]);
 const adminUser = () => ({ id: gmId, displayName: 'IT Admin', role: 'admin' as const });
 
 async function call(handler: any, who: any, init: { body?: unknown; params?: Record<string, string>; search?: string } = {}) {
@@ -75,24 +90,73 @@ beforeAll(async () => {
     throw new Error(`Refusing to run: database host "${target.hostname}" is not local.`);
   }
   const host = new URL(env.DATABASE_URL ?? 'postgres://none@none/none').hostname;
-  const u = await query<{ id: string }>(`INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Player', 'x') RETURNING id`, [`${tag}@example.invalid`]);
-  userId = u.rows[0].id;
-  const o = await query<{ id: string }>(`INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Other', 'x') RETURNING id`, [`${tag}-o@example.invalid`]);
-  otherUserId = o.rows[0].id;
-  const c = await query<{ id: string }>(`INSERT INTO characters (owner_user_id, name) VALUES ($1, 'Thorne') RETURNING id`, [userId]);
+  const newUser = async (suffix: string, name: string, id?: string) => (await query<{ id: string }>(
+    `INSERT INTO users (id, email, display_name, password_hash) VALUES (COALESCE($3::uuid, gen_random_uuid()), $1, $2, 'x') RETURNING id`,
+    [`${tag}${suffix}@example.invalid`, name, id ?? null]
+  )).rows[0].id;
+  userId = await newUser('', 'IT Player');
+  otherUserId = await newUser('-o', 'IT Other');
+  await newUser('-dm', 'IT GM', gmId);
+  coDmId = await newUser('-co', 'IT Co-DM');
+  authorId = await newUser('-au', 'IT Author');
+
+  // Three throwaway campaigns. Their codes only have to satisfy the CHECK patterns and be unique.
+  const newCampaign = async (label: string, n: number) => {
+    const codes = campaignCodes(n);
+    return (await query<{ id: string }>(
+      'INSERT INTO campaigns (name, invite_code, room_code) VALUES ($1, $2, $3) RETURNING id', [`${tag} ${label}`, codes.invite, codes.room]
+    )).rows[0].id;
+  };
+  campaignA = await newCampaign('A', 1);
+  campaignB = await newCampaign('B', 2);
+  campaignC = await newCampaign('C', 3);
+  for (const [uid, role] of [[gmId, 'dm'], [coDmId, 'co_dm'], [userId, 'player']] as const) {
+    await query('INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1, $2, $3)', [campaignA, uid, role]);
+  }
+  const c = await query<{ id: string }>(`INSERT INTO characters (owner_user_id, name, campaign_id) VALUES ($1, 'Thorne', $2) RETURNING id`, [userId, campaignA]);
   characterId = c.rows[0].id;
-  const t = await query<{ id: string }>(`SELECT id FROM find_tables WHERE area_type = 'meadow' AND category = 'plant' AND is_archived = false`);
-  meadowId = t.rows[0].id;
+
+  // Campaign A gets copies of the seed's three tables (the original author is someone who is not a DM).
+  const seeds = await query<{ id: string }>(
+    `SELECT t.id FROM find_tables t JOIN campaigns cp ON cp.id = t.campaign_id WHERE cp.name = 'Forage Test Campaign' AND NOT t.is_archived`);
+  if (!seeds.rows.length) throw new Error('Run npm run db:seed:forage-test first (it creates the Forage Test Campaign tables).');
+  for (const seed of seeds.rows) {
+    const copy = await query<{ id: string; area_type: string; category: string }>(
+      `INSERT INTO find_tables (name, area_type, category, suggested_check, owner_user_id, campaign_id)
+       SELECT name, area_type, category, suggested_check, $2, $3 FROM find_tables WHERE id = $1 RETURNING id, area_type, category`,
+      [seed.id, authorId, campaignA]
+    );
+    await query(
+      `INSERT INTO find_table_entries (find_table_id, item_id, chance, qty_die, sort_order)
+       SELECT $2, item_id, chance, qty_die, sort_order FROM find_table_entries WHERE find_table_id = $1`, [seed.id, copy.rows[0].id]
+    );
+    if (copy.rows[0].area_type === 'meadow' && copy.rows[0].category === 'plant') meadowId = copy.rows[0].id;
+  }
   const items = await query<{ id: string; content_key: string }>(`SELECT id, content_key FROM content_definitions WHERE content_key LIKE 'test:forage:%'`);
   itemIds = Object.fromEntries(items.rows.map((row) => [row.content_key.replace('test:forage:', ''), row.id]));
+
+  // B: one pickable table of its own. C: only an empty table (so C has "no tables" for foraging).
+  otherTableId = (await query<{ id: string }>(
+    `INSERT INTO find_tables (name, area_type, category, suggested_check, campaign_id) VALUES ('Tundra - furs', 'tundra', 'fur', '', $1) RETURNING id`, [campaignB]
+  )).rows[0].id;
+  await query('INSERT INTO find_table_entries (find_table_id, item_id, chance, qty_die) VALUES ($1, $2, 30, 2)', [otherTableId, itemIds.moonleaf]);
+  await query(`INSERT INTO find_tables (name, area_type, category, suggested_check, campaign_id) VALUES ('Reef - pearls', 'reef', 'gem', '', $1)`, [campaignC]);
   console.info('[forage integration] database host', host);
 });
 
 afterAll(async () => {
   if (!enabled || !userId) return;
   await query('DELETE FROM roll_log_entries WHERE session_id = $1', [ROOM]);
-  await query('DELETE FROM users WHERE id = ANY($1::uuid[])', [[userId, otherUserId]]);
+  // Finds hold foreign keys to the tables and campaigns, so they go first; then tables, campaigns, users.
+  await query('DELETE FROM finds WHERE finder_user_id = ANY($1::uuid[]) OR character_id = ANY($2::uuid[])', [[userId, otherUserId], characterId ? [characterId] : []]);
+  const campaignIds = [campaignA, campaignB, campaignC].filter(Boolean);
+  await query('DELETE FROM game_sessions WHERE owner_user_id = ANY($1::uuid[])', [[userId, otherUserId, gmId]]);
+  await query('DELETE FROM find_tables WHERE campaign_id = ANY($1::uuid[])', [campaignIds]);
+  await query('DELETE FROM campaigns WHERE id = ANY($1::uuid[])', [campaignIds]);
+  await query('DELETE FROM users WHERE id = ANY($1::uuid[])', [[userId, otherUserId, gmId, coDmId, authorId]]);
   sessions.delete(ROOM);
+  sessions.delete(QUICK);
+  socketsBySession.delete(QUICK);
   socketsBySession.delete(ROOM);
   watchersByTopic.clear();
 });
@@ -127,10 +191,13 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
 
       // Force a pass-able check (not a nat 1) so the result does not depend on the dice.
       await query(`UPDATE finds SET check_json = jsonb_set(check_json, '{nat1}', 'false') WHERE id = $1`, [first.body.findId]);
+      // Math.random 0 makes every d100 a 1, so every pickable entry is found (the chances are random otherwise).
+      const dice = vi.spyOn(Math, 'random').mockReturnValue(0);
       const marked = await call(playerRoute.POST, user(), { body: { action: 'self_mark', findId: first.body.findId, passed: true } });
+      dice.mockRestore();
       expect(marked.status).toBe(200);
       expect(marked.body.status).toBe('found');
-      expect(marked.body.lines.length).toBeGreaterThan(0);
+      expect(marked.body.lines.length).toBe(4); // meadow: moonleaf, silverthorn, bitterroot, glowcap (moss is Off, stalk archived)
       const rows = await inventory();
       expect(rows.length).toBe(marked.body.lines.length);
 
@@ -139,6 +206,21 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect(stale.body.error).toBe('stale');
       const stored = await query('SELECT area_type, category, find_table_id FROM finds WHERE id = $1', [first.body.findId]);
       expect(stored.rows[0]).toMatchObject({ area_type: 'meadow', category: 'plant', find_table_id: meadowId });
+    });
+
+    it('a pass where every d100 misses is a found find with no items, and the player is just told nothing turned up', async () => {
+      await resetFinds();
+      const start = await call(playerRoute.POST, user(), { body: startBody() });
+      await query(`UPDATE finds SET check_json = jsonb_set(check_json, '{nat1}', 'false') WHERE id = $1`, [start.body.findId]);
+      // Math.random 0.999 makes every d100 a 100, above every chance in the meadow table (the top is 50).
+      const dice = vi.spyOn(Math, 'random').mockReturnValue(0.999);
+      const marked = await call(playerRoute.POST, user(), { body: { action: 'self_mark', findId: start.body.findId, passed: true } });
+      dice.mockRestore();
+      expect(marked.status).toBe(200);
+      expect(marked.body).toMatchObject({ status: 'found', lines: [] });
+      expect(await inventory()).toEqual([]);
+      const row = await query('SELECT status, results FROM finds WHERE id = $1', [start.body.findId]);
+      expect(row.rows[0]).toMatchObject({ status: 'found', results: [] });
     });
 
     it('an area + category with no table rolls and marks like any other, and a pass finds nothing', async () => {
@@ -202,7 +284,7 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
 
     beforeAll(() => {
       if (!enabled) return;
-      const session: any = createSession(ROOM);
+      const session: any = createSession(ROOM, { campaignId: campaignA });
       session.gmSocketId = gmId;
       session.players = { [userId]: { id: userId, name: 'IT Player', tokenIds: [], connected: true } };
       sessions.set(ROOM, session);
@@ -254,9 +336,12 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       const withdrawLive = await call(playerRoute.POST, user(), { body: { action: 'withdraw', requestId } });
       expect(withdrawLive.status).toBe(409);
 
-      // Mark pass (force the die so a nat 1 cannot make this flaky).
+      // Mark pass (force the die so a nat 1 cannot make this flaky). Math.random 0 makes every d100 a 1,
+      // so the preview rolls every pickable entry (chances are random otherwise).
       session.forage[userId].check.nat1 = false;
+      const dice = vi.spyOn(Math, 'random').mockReturnValue(0);
       const passed = await gmAct({ action: 'mark', requestId, passed: true });
+      dice.mockRestore();
       expect(passed.status).toBe(200);
       expect(passed.body.request.stage).toBe('preview');
       const preview = session.forage[userId].preview;
@@ -271,7 +356,7 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect((await gmAct({ action: 'approve', requestId, lines: [{ itemId: itemIds.moonleaf, qty: 5000 }] })).status).toBe(400);
       expect(session.forage[userId].stage).toBe('preview');
 
-      // Edit (add Glowcap, a weight-1 entry) and approve; a double approve makes one find.
+      // Edit (add Glowcap, a 5% entry) and approve; a double approve makes one find.
       const approve = { action: 'approve', requestId, lines: [{ itemId: itemIds.moonleaf, qty: 3 }, { itemId: itemIds['glowcap-mushroom'], qty: 1 }] };
       const [a, b] = await Promise.all([gmAct(approve), gmAct(approve)]);
       expect([a.status, b.status].sort()).toEqual([200, 409]);
@@ -368,7 +453,7 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
 
   describe('tables endpoint (Q9)', () => {
     it('suggestedCheck is absent for a player and present for the room GM', async () => {
-      const player = await call(tablesRoute.GET, user(), { search: `?roomId=${ROOM}` });
+      const player = await call(tablesRoute.GET, user(), { search: `?roomId=${ROOM}&characterId=${characterId}` });
       // Rev 4: a player gets the short skill list and separate area / category lists, no table names or counts.
       expect(player.body.skills).toHaveLength(6);
       expect(player.body.tables).toBeUndefined();
@@ -378,8 +463,200 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect(JSON.stringify(player.body)).not.toContain('Nature DC');
       const gmView = await call(tablesRoute.GET, gmUser(), { search: `?roomId=${ROOM}` });
       expect(gmView.body.tables.find((t: any) => t.id === meadowId).suggestedCheck).toBe('Nature DC 12');
+      // Only this campaign's tables: B's Tundra table is neither in the GM's list nor the player's tags.
+      expect(gmView.body.tables.some((t: any) => t.id === otherTableId)).toBe(false);
+      expect(player.body.areas).not.toContain('tundra');
       const gmNoRoom = await call(tablesRoute.GET, gmUser());
       expect(gmNoRoom.body.tables).toBeUndefined();
+    });
+  });
+
+  // Campaign system Unit G: find tables belong to a campaign, and forage is disabled without one.
+  describe('campaign scoping (unit G)', () => {
+    const mine = (search = '') => call(mineRoute.GET, user(), { search: `?characterId=${characterId}${search}` });
+    const actorOf = (id: string, role: 'user' | 'admin' = 'user') => forage.loadForageActor({ id, role });
+    const tableForm = (fields: Record<string, string>) => {
+      const data = new FormData();
+      for (const [key, value] of Object.entries(fields)) data.set(key, value);
+      return data;
+    };
+    const meadowFields = { tableId: '', name: 'Meadow - plants', areaType: 'meadow', category: 'plant', suggestedCheck: 'Nature DC 12' };
+    const liveRoom = (code: string, campaignId: string | null) => {
+      const session: any = createSession(code, { campaignId });
+      session.players = { [userId]: { id: userId, name: 'IT Player', tokenIds: [], connected: true } };
+      sessions.set(code, session);
+      return session;
+    };
+
+    it('a character with no campaign cannot forage: mine says no_campaign and start is a 409', async () => {
+      await resetFinds();
+      await setCampaign(null);
+      try {
+        expect((await mine()).body).toMatchObject({ available: false, unavailableReason: 'no_campaign' });
+        const start = await call(playerRoute.POST, user(), { body: startBody({ tableId: undefined }) });
+        expect(start.status).toBe(409);
+        expect(start.body).toEqual({ error: 'forage_unavailable', reason: 'no_campaign' });
+        expect((await query('SELECT 1 FROM finds WHERE finder_user_id = $1', [userId])).rowCount).toBe(0);
+        // Their tag lists are empty too: no campaign, so no tables to hint at.
+        expect((await call(tablesRoute.GET, user(), { search: `?characterId=${characterId}` })).body.areas).toEqual([]);
+      } finally {
+        await setCampaign(campaignA);
+      }
+    });
+
+    it("a Quick room or another campaign's room is wrong_room, in both modes", async () => {
+      await resetFinds();
+      const other = `IO${tag.slice(-6).toUpperCase()}`;
+      liveRoom(QUICK, null);
+      liveRoom(other, campaignB);
+      try {
+        for (const room of [QUICK, other]) {
+          expect((await mine(`&roomId=${room}`)).body).toMatchObject({ available: false, unavailableReason: 'wrong_room', inRoom: true });
+          const start = await call(playerRoute.POST, user(), { body: startBody({ roomId: room }) });
+          expect(start.status).toBe(409);
+          expect(start.body).toEqual({ error: 'forage_unavailable', reason: 'wrong_room' });
+        }
+        // Its own campaign's room is fine.
+        expect((await mine(`&roomId=${ROOM}`)).body).toMatchObject({ available: true, unavailableReason: null });
+      } finally {
+        sessions.delete(QUICK);
+        sessions.delete(other);
+      }
+    });
+
+    it('a campaign whose only table is empty is no_tables', async () => {
+      await resetFinds();
+      await setCampaign(campaignC);
+      try {
+        expect((await mine()).body).toMatchObject({ available: false, unavailableReason: 'no_tables' });
+        const start = await call(playerRoute.POST, user(), { body: startBody({ tableId: undefined }) });
+        expect(start.body).toEqual({ error: 'forage_unavailable', reason: 'no_tables' });
+      } finally {
+        await setCampaign(campaignA);
+      }
+    });
+
+    it("an unmarked check can still be marked after its campaign's tables are archived, and then forage is off", async () => {
+      await resetFinds();
+      const co = await actorOf(coDmId);
+      const started = await call(playerRoute.POST, user(), { body: startBody() });
+      expect(started.status).toBe(200);
+      await query(`UPDATE finds SET check_json = jsonb_set(check_json, '{nat1}', 'false') WHERE id = $1`, [started.body.findId]);
+      const active = (await query<{ id: string }>('SELECT id FROM find_tables WHERE campaign_id = $1 AND NOT is_archived', [campaignA])).rows.map((r) => r.id);
+      for (const id of active) await forage.toggleFindTableArchived(co, tableForm({ tableId: id }));
+      try {
+        const state = (await mine()).body;
+        expect(state).toMatchObject({ available: false, unavailableReason: 'no_tables' });
+        expect(state.unmarkedSelf.findId).toBe(started.body.findId); // so the sheet keeps the button live
+        const again = await call(playerRoute.POST, user(), { body: startBody() });
+        expect(again.status).toBe(409);
+        expect(again.body.error).toBe('resume');
+        const marked = await call(playerRoute.POST, user(), { body: { action: 'self_mark', findId: started.body.findId, passed: true } });
+        expect(marked.status).toBe(200);
+        expect(marked.body).toMatchObject({ status: 'failed', lines: [] }); // nothing to pay out, but no stuck check
+        const next = await call(playerRoute.POST, user(), { body: startBody() });
+        expect(next.body).toEqual({ error: 'forage_unavailable', reason: 'no_tables' });
+      } finally {
+        for (const id of active) await forage.toggleFindTableArchived(co, tableForm({ tableId: id })); // restore
+      }
+      expect((await call(playerRoute.POST, user(), { body: startBody() })).status).toBe(200);
+    });
+
+    it('records the campaign on every find (self-serve and DM approved)', async () => {
+      await resetFinds();
+      const started = await call(playerRoute.POST, user(), { body: startBody() });
+      const row = await query('SELECT campaign_id FROM finds WHERE id = $1', [started.body.findId]);
+      expect(row.rows[0].campaign_id).toBe(campaignA);
+      await query(`UPDATE finds SET status = 'failed' WHERE id = $1`, [started.body.findId]);
+      const saved = await forage.approveDmFind({
+        characterId, finderUserId: userId, tableId: meadowId, lines: [{ itemId: itemIds.moonleaf, qty: 1 }], nat20: false,
+        check: { skillKey: 'nature', skillLabel: 'Nature', total: 15, natural: 12, nat20: false, nat1: false, text: '', poolSummary: '' },
+        gameSessionId: null, roomCode: null
+      });
+      expect((await query('SELECT campaign_id FROM finds WHERE id = $1', [saved.findId])).rows[0].campaign_id).toBe(campaignA);
+      // The admin review names the campaign and can filter by it.
+      const all = await forage.listFindsForAdmin({ characterId });
+      expect(all.every((find) => find.campaignName === `${tag} A`)).toBe(true);
+      expect((await forage.listFindsForAdmin({ characterId, campaignId: campaignA })).length).toBe(all.length);
+      expect((await forage.listFindsForAdmin({ characterId, campaignId: campaignB })).length).toBe(0);
+      expect((await forage.listFindsForAdmin({ characterId, campaignId: 'none' })).length).toBe(0);
+    });
+
+    it("the 037 backfill sets a find's campaign from its table and leaves table-less finds NULL", async () => {
+      await resetFinds();
+      const withTable = (await query<{ id: string }>(
+        `INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id) VALUES ('self', 'failed', $1, $2, $3) RETURNING id`, [characterId, userId, otherTableId]
+      )).rows[0].id;
+      const noTable = (await query<{ id: string }>(
+        `INSERT INTO finds (mode, status, character_id, finder_user_id) VALUES ('self', 'failed', $1, $2) RETURNING id`, [characterId, userId]
+      )).rows[0].id;
+      // The same statement as migration 037, limited to this test's rows.
+      await query(
+        `UPDATE finds f SET campaign_id = t.campaign_id FROM find_tables t WHERE f.find_table_id = t.id AND f.campaign_id IS NULL AND f.id = ANY($1::uuid[])`, [[withTable, noTable]]
+      );
+      expect((await query('SELECT campaign_id FROM finds WHERE id = $1', [withTable])).rows[0].campaign_id).toBe(campaignB);
+      expect((await query('SELECT campaign_id FROM finds WHERE id = $1', [noTable])).rows[0].campaign_id).toBeNull();
+    });
+
+    it("the room GM can only pick a table of the room's campaign (another campaign's table is bad_table)", async () => {
+      await resetFinds();
+      const start = await call(playerRoute.POST, user(), { body: startBody({ roomId: ROOM }) });
+      expect(start.body.mode).toBe('dm');
+      const requestId = start.body.request.id;
+      const gmAct = (body: Record<string, unknown>) => call(gmRoute.POST, gmUser(), { body, params: { id: ROOM } });
+      const foreign = await gmAct({ action: 'check', requestId, skillKey: 'nature', tableId: otherTableId });
+      expect(foreign.status).toBe(400);
+      expect(foreign.body.error).toBe('bad_table');
+      expect((await gmAct({ action: 'check', requestId, skillKey: 'nature', tableId: meadowId })).status).toBe(200);
+      expect((await gmAct({ action: 'cancel', requestId })).status).toBe(200);
+    });
+
+    it('who may manage tables: the campaign DM and co-DM and admins, never a player, the author who is not a DM, or another campaign DM', async () => {
+      // otherUserId becomes the DM of campaign B for this test only.
+      await query(`INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1, $2, 'dm')`, [campaignB, otherUserId]);
+      try {
+        const dm = await actorOf(gmId);
+        const co = await actorOf(coDmId);
+        const author = await actorOf(authorId); // wrote the copied tables, but is not a member of anything
+        const player = await actorOf(userId);
+        const bDm = await actorOf(otherUserId);
+        const admin = await actorOf(gmId, 'admin');
+        expect(dm.dmCampaignIds).toEqual([campaignA]);
+        expect(co.dmCampaignIds).toEqual([campaignA]);
+        expect(author.dmCampaignIds).toEqual([]);
+        expect(player.dmCampaignIds).toEqual([]);
+        expect(bDm.dmCampaignIds).toEqual([campaignB]);
+
+        const edit = (actor: any) => forage.updateFindTable(actor, tableForm({ ...meadowFields, tableId: meadowId }));
+        expect(await edit(co)).toBe(meadowId);
+        expect(await edit(dm)).toBe(meadowId);
+        expect(await edit(admin)).toBe(meadowId);
+        for (const nope of [author, player, bDm]) await expect(edit(nope)).rejects.toThrow(/Only a DM of this table's campaign/);
+        // Adding an entry goes through the same gate.
+        await expect(forage.removeFindTableEntry(author, tableForm({ tableId: meadowId, itemId: itemIds.moonleaf }))).rejects.toThrow(/Only a DM/);
+
+        // The authoring list shows only what you may edit; a player sees nothing.
+        expect((await forage.listFindTables(co)).every((t) => t.campaignId === campaignA)).toBe(true);
+        expect((await forage.listFindTables(co)).some((t) => t.id === meadowId)).toBe(true);
+        expect(await forage.listFindTables(player)).toEqual([]);
+        expect(await forage.listFindTables(author)).toEqual([]);
+        const everything = (await forage.listFindTables(admin)).map((t) => t.id);
+        expect(everything).toContain(meadowId);
+        expect(everything).toContain(otherTableId);
+        expect((await forage.listEditableCampaigns(bDm)).map((c) => c.id)).toEqual([campaignB]);
+
+        // Creating: into your own campaign only; the duplicate message names the campaign.
+        const createFields = { name: 'Another meadow', areaType: 'meadow', category: 'plant' };
+        await expect(forage.createFindTable(co, tableForm({ ...createFields, campaignId: campaignA }))).rejects.toThrow(/already an active table for meadow \+ plant in/);
+        await expect(forage.createFindTable(co, tableForm({ ...createFields, campaignId: campaignB }))).rejects.toThrow(/DM of/);
+        await expect(forage.createFindTable(author, tableForm({ ...createFields, campaignId: campaignA }))).rejects.toThrow(/DM of/);
+        // The same area + category is fine in another campaign (the unique index is per campaign).
+        const made = await forage.createFindTable(bDm, tableForm({ ...createFields, campaignId: campaignB }));
+        expect(made).toBeTruthy();
+        expect((await forage.countActiveFindTables(campaignB))).toBe(2);
+      } finally {
+        await query('DELETE FROM campaign_members WHERE campaign_id = $1 AND user_id = $2', [campaignB, otherUserId]);
+      }
     });
   });
 
@@ -397,6 +674,15 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       characterId, finderUserId: userId, tableId: meadowId, lines: qtyLines, nat20: false,
       check: { skillKey: 'nature', skillLabel: 'Nature', total: 15, natural: 12, nat20: false, nat1: false, text: '', poolSummary: '' },
       gameSessionId: null, roomCode: null
+    });
+
+    it('an empty haul (a pass that found nothing) is logged as a found find with no results', async () => {
+      await resetFinds();
+      const saved = await approve([]);
+      expect(saved.lines).toEqual([]);
+      const find = await query('SELECT status, results FROM finds WHERE id = $1', [saved.findId]);
+      expect(find.rows[0]).toMatchObject({ status: 'found', results: [] });
+      expect(await inventory()).toEqual([]);
     });
 
     it('stacks onto a matching row, skips equipped or noted rows, and an archived item rolls the whole thing back', async () => {
@@ -564,7 +850,7 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
     beforeAll(async () => {
       const g = await query<{ id: string }>(`INSERT INTO game_sessions (owner_user_id, name) VALUES ($1, 'IT session') RETURNING id`, [otherUserId]);
       gameId = g.rows[0].id;
-      sessions.set(ROOM, createSession(ROOM));
+      sessions.set(ROOM, createSession(ROOM, { campaignId: campaignA }));
     });
 
     it('shares once (owner-checked, one way), the log line names items only on the share, and a second share adds nothing', async () => {
@@ -709,11 +995,28 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       expect(Object.keys(res.body.finds[0]).sort()).toEqual(['createdAt', 'id', 'items', 'mode', 'revertNote', 'shared', 'status']);
     });
 
+    it('an empty find (a pass that found nothing) is left out of the list, cannot be shared and cannot be undone', async () => {
+      await resetFinds();
+      const real = await forage.approveDmFind({
+        characterId, finderUserId: userId, tableId: meadowId, lines: [{ itemId: itemIds.moonleaf, qty: 1 }], nat20: false, check, gameSessionId: null, roomCode: null
+      });
+      const empty = await forage.approveDmFind({
+        characterId, finderUserId: userId, tableId: meadowId, lines: [], nat20: false, check, gameSessionId: null, roomCode: null
+      });
+      expect((await get(user())).body.finds.map((f: any) => f.id)).toEqual([real.findId]);
+      expect(await forage.shareFind(empty.findId, userId)).toEqual({ ok: false, error: 'not_shareable' });
+      expect((await query('SELECT shared FROM finds WHERE id = $1', [empty.findId])).rows[0].shared).toBe(false);
+      expect(await forage.revertFind({ findId: empty.findId, adminUserId: otherUserId })).toBeNull();
+      expect((await query('SELECT status FROM finds WHERE id = $1', [empty.findId])).rows[0].status).toBe('found');
+    });
+
     it('is owner-checked and capped at ten', async () => {
       await resetFinds();
       expect((await get({ id: otherUserId, displayName: 'IT Other', role: 'user' })).status).toBe(404);
       for (let i = 0; i < 12; i++) {
-        await query(`INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id) VALUES ('self', 'found', $1, $2, $3)`, [characterId, userId, meadowId]);
+        // A real result line is needed: finds with no items are left out of the list.
+        await query(`INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id, results) VALUES ('self', 'found', $1, $2, $3, $4)`,
+          [characterId, userId, meadowId, JSON.stringify([{ item_id: itemIds.moonleaf, qty: 1, inventory_id: crypto.randomUUID() }])]);
       }
       expect((await get(user())).body.finds.length).toBe(10);
     });

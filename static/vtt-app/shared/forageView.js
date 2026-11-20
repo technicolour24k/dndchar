@@ -97,6 +97,14 @@ export function chosenTable(tables, picks) {
 }
 
 /** One line under the pickers: which table was resolved, and whether it can be used. */
+// DM-only short label for an entry's chance, e.g. "Rare 10%". Mirrors CHANCE_OPTIONS in src/lib/rules/forage.ts
+// (a test keeps them in step). Players never see it: only the GM popup's add-item list uses it.
+const CHANCE_NAMES = { 100: 'Guaranteed', 50: 'Very Common', 30: 'Common', 20: 'Uncommon', 10: 'Rare', 5: 'Very Rare', 1: 'Ultra Rare' };
+export function chanceLabel(chance) {
+  if (!chance) return 'Off';
+  return CHANCE_NAMES[chance] ? `${CHANCE_NAMES[chance]} ${chance}%` : `${chance}%`;
+}
+
 export function tableLineText(table, picks) {
   if (!table) return `No table for ${picks.areaType || '?'} + ${picks.category || '?'}. Pick one below.`;
   if (table.pickableCount === 0) return `${table.name} is empty, so there is nothing to find.`;
@@ -180,10 +188,37 @@ export function resultHeadline(result) {
 
 // --- Button labels -------------------------------------------------------------------------
 
+// --- Unavailable (find tables belong to campaigns) -------------------------------------------------
+
+// Why a character can't forage. Campaign-level reasons only, never anything about individual tables
+// (Rev 4), so a player learns "your DM hasn't set it up" and nothing more. The server's codes are
+// 'no_campaign' | 'wrong_room' | 'no_tables'.
+const UNAVAILABLE_TEXT = {
+  no_campaign: 'Add this character to a campaign to forage.',
+  wrong_room: "Foraging isn't available in this room.",
+  no_tables: "Your DM hasn't set up foraging for this campaign yet."
+};
+
+export function forageUnavailableText(reason) {
+  return UNAVAILABLE_TEXT[reason] || "Foraging isn't available right now.";
+}
+
+/**
+ * The reason to show instead of a live Forage button, or '' when the button should work. Unavailable
+ * only counts when there's nothing in flight to finish: a pending request, an unmarked check or a
+ * waiting result keeps the button live, so a started forage can always be completed.
+ */
+export function forageUnavailableReason(mine, characterId) {
+  if (!mine || mine.available !== false) return '';
+  if (forageBlocker(mine, characterId) || lastDmFor(mine, characterId)) return '';
+  return mine.unavailableReason || 'no_tables';
+}
+
 /** The label on a token card's Forage button. */
-export function forageButtonLabel({ pending, hasResult }) {
+export function forageButtonLabel({ pending, hasResult, unavailable = '' }) {
   if (pending) return 'Forage (waiting)';
   if (hasResult) return 'Forage (result)';
+  if (unavailable) return 'Forage (unavailable)';
   return 'Forage';
 }
 
@@ -241,7 +276,8 @@ export function addableEntries(tableEntries, lines) {
 }
 
 export function canApprove(lines) {
-  return lines.length > 0 && lines.every((line) => Number.isInteger(line.qty) && line.qty >= 1 && line.qty <= MAX_QTY);
+  // An empty haul can be approved: with independent chances a pass can find nothing.
+  return lines.every((line) => Number.isInteger(line.qty) && line.qty >= 1 && line.qty <= MAX_QTY);
 }
 
 export function linesPayload(lines) {
@@ -330,9 +366,9 @@ export function recentFindItemsText(find) {
   return items.length ? items.map((item) => `${item.qty}x ${item.name}`).join(', ') : 'Nothing recorded';
 }
 
-/** Share is offered only on a standing find that hasn't been shared yet. */
+/** Share is offered only on a standing find with items that hasn't been shared yet. */
 export function canShareRecent(find) {
-  return !!find && find.status === 'found' && !find.shared;
+  return !!find && find.status === 'found' && !find.shared && Array.isArray(find.items) && find.items.length > 0;
 }
 
 /** Short status words for a row: shared, undone (with the note), self-served. Empty parts are dropped. */
@@ -369,11 +405,13 @@ const ERROR_TEXT = {
   not_shareable: "Only a find that's still standing can be shared.",
   approve_failed: "Couldn't add the haul. Nothing was changed, try again.",
   server_error: 'Something went wrong on the server.',
+  forage_unavailable: "Foraging isn't available right now.",
   network: "Couldn't reach the server."
 };
 
 export function errorText(data) {
   const code = data && data.error;
   if (code === 'invalid_lines' && data.message) return data.message;
+  if (code === 'forage_unavailable') return forageUnavailableText(data.reason);
   return ERROR_TEXT[code] || 'Something went wrong.';
 }

@@ -13,7 +13,7 @@ import {
   ForageRollError, forageLogDetails, logForageRoll, previewForageAdvantage, previewGenericAdvantage, publishFindChanged, rollForageCheck
 } from '$lib/server/vttForageRoll';
 import { FORAGE_SELF_SKILLS } from '$lib/rules/skills';
-import { isUuid, loadOwnedCharacter, parseAdvantage, parseSelfChoice, playerUnmarked, shortText } from '$lib/server/vttForageApi';
+import { checkForageAvailability, isUuid, loadOwnedCharacter, parseAdvantage, parseSelfChoice, playerUnmarked, shortText } from '$lib/server/vttForageApi';
 
 // Player-facing forage actions (vtt-forage plan, unit B). All writes are HTTP, the socket only
 // notifies. Every character action first checks the character is the caller's own. The mode is
@@ -24,6 +24,11 @@ import { isUuid, loadOwnedCharacter, parseAdvantage, parseSelfChoice, playerUnma
 // the skill, area, category and table. Anything else in the body is ignored. In self-serve mode the
 // player picks from a short skill list plus an area and category (never a table: the server resolves
 // it). A combination with nothing to find rolls and marks like any other, and a pass finds nothing.
+//
+// Campaigns (Unit G): find tables belong to a campaign, so a character can only forage when it is in
+// a campaign, any live room it forages in is that campaign's room, and the campaign has a table with
+// something pickable. Otherwise start answers 409 forage_unavailable with a campaign-level reason
+// (never anything about individual tables). An in-flight forage can always be resumed and marked.
 //
 // Statuses: 400 bad input, 403 not allowed in that room, 404 not your character, 409 a conflict the
 // client can act on ('resume' carries the existing in-flight forage so the popup can reopen it).
@@ -87,8 +92,17 @@ async function startAction(userId: string, displayName: string, body: any) {
   if (room.error) return err(room.error, 403);
   const session = room.session;
 
+  // An in-flight DM request is resumed even if forage has since become unavailable, so the finder is
+  // never stuck. (An unmarked self check was handled above. The check-and-set below stays the real guard.)
+  const inFlight = findPendingForUser(userId);
+  if (inFlight) return err('resume', 409, { pending: forageViewForPlayer(inFlight.request), roomId: inFlight.session.id });
+
+  // Disabled without a campaign, in the wrong room, or with no tables to forage (campaign-level facts only).
+  const availability = await checkForageAvailability(owned, session);
+  if (!availability.available) return err('forage_unavailable', 409, { reason: availability.reason });
+
   // Self-serve picks are validated up front (this awaits). In DM mode they are never read.
-  const selfPicked = session && dmPresent(session) ? null : await parseSelfChoice(body);
+  const selfPicked = session && dmPresent(session) ? null : await parseSelfChoice(body, owned.campaignId);
   if (selfPicked && 'error' in selfPicked) return err(selfPicked.error, 400);
 
   // One forage in flight per user, across rooms and modes.
@@ -120,7 +134,7 @@ async function startAction(userId: string, displayName: string, body: any) {
   });
   const started = await startSelfFind({
     characterId, finderUserId: userId, tableId: picked.choice.tableId, areaType: picked.choice.areaType, category: picked.choice.category, check,
-    roomCode: session?.id ?? null, gameSessionId: session?.gameSessionId ?? null
+    roomCode: session?.id ?? null, gameSessionId: session?.gameSessionId ?? null, campaignId: owned.campaignId
   });
   if ('conflict' in started) return err('resume', 409, { unmarkedSelf: playerUnmarked(started.existing) });
   return json({ mode: 'self', findId: started.findId, check });

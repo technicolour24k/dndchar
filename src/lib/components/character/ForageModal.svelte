@@ -5,8 +5,8 @@
   import { FORAGE_SELF_SKILLS, SKILL_CHECKS } from '$lib/rules/skills';
   import type { ForageCheck, ForageMine } from '$lib/types/forage';
   import {
-    canShareRecent, canSubmitSelf, defaultSelfPicks, dmResult, errorText, forageAdvReadout, forageBlocker, LAST_PICKS_KEY,
-    lastDmFor, natBadgeText, parseSavedPicks, recentFindItemsText, recentFindStatusText,
+    canShareRecent, canSubmitSelf, defaultSelfPicks, dmResult, errorText, forageAdvReadout, forageBlocker, forageUnavailableReason,
+    forageUnavailableText, LAST_PICKS_KEY, lastDmFor, natBadgeText, parseSavedPicks, recentFindItemsText, recentFindStatusText,
     resultHeadline, selfAreas, selfCategories, selfResult, tagLabel
   } from '../../../../static/vtt-app/shared/forageView.js';
 
@@ -98,6 +98,8 @@
   let recentMessage = $state('');
 
   const dm = $derived(mine?.dmPresent === true && !forceSelf);
+  // Can't forage right now (no campaign, wrong room, no tables)? Empty when something in flight can still be finished.
+  const off = $derived(forageUnavailableReason(mine, characterId));
   const pending = $derived(mine?.pending ?? null);
   const markTarget = $derived(
     selfCheck
@@ -114,7 +116,7 @@
     loading ? 'loading' : pending ? 'waiting' : markTarget ? 'mark' : result && !showForm ? 'result' : 'form'
   );
   const readout = $derived(forageAdvReadout({ sources, disabled, adv: advCount, dis: disCount }));
-  const canForage = $derived(!busy && advStatus !== 'loading' && (dm || canSubmitSelf(options, picks)));
+  const canForage = $derived(!off && !busy && advStatus !== 'loading' && (dm || canSubmitSelf(options, picks)));
   // Withdraw follows the server's canWithdraw: stage 'requested', or no live DM (never while approving).
   const canWithdraw = $derived(!!pending && pending.stage !== 'approving' && (pending.stage === 'requested' || mine?.dmPresent === false));
 
@@ -132,14 +134,14 @@
 
   // Self-serve needs the pickers' options; DM mode needs only the generic sources preview.
   $effect(() => {
-    if (loading || dm || options || optionsLoading) return;
+    if (loading || dm || off || options || optionsLoading) return;
     untrack(() => void loadOptions());
   });
   async function loadOptions() {
     optionsLoading = true;
     optionsFailed = false;
     message = '';
-    const res = await api('GET', `${API}/tables`);
+    const res = await api('GET', `${API}/tables?characterId=${encodeURIComponent(characterId)}`);
     optionsLoading = false;
     if (!res.ok) { message = errorText(res.data); optionsFailed = true; return; }
     options = { areas: res.data.areas ?? [], categories: res.data.categories ?? [] };
@@ -228,6 +230,8 @@
       await onRefresh();
     } else {
       message = errorText(res.data);
+      // Forage became unavailable since the popup opened: refresh so the popup shows the reason.
+      if (res.data.error === 'forage_unavailable') await onRefresh();
     }
     busy = false;
   }
@@ -447,7 +451,9 @@
         <button type="button" class="roll-options-roll" bind:this={primaryButton} onclick={dismiss}>Dismiss</button>
       </div>
     {:else}
-      {#if dm}
+      {#if off}
+        <p class="forage-warn">{forageUnavailableText(off)}</p>
+      {:else if dm}
         <p>The DM will call the check.</p>
         {@render advPanel()}
       {:else if options && picks}
@@ -472,7 +478,7 @@
         {@render advPanel()}
       {/if}
       {#if message}<p class="forage-error" role="alert">{message}</p>{/if}
-      {#if !dm && !options && optionsFailed}
+      {#if !off && !dm && !options && optionsFailed}
         <div class="roll-options-actions forage-actions">
           <button type="button" class="secondary" onclick={() => void loadOptions()}>Retry</button>
         </div>
@@ -508,7 +514,7 @@
 
       <div class="roll-options-actions forage-actions">
         <button type="button" class="secondary" onclick={onClose}>Close</button>
-        {#if dm || (options && picks)}
+        {#if !off && (dm || (options && picks))}
           <button type="button" class="roll-options-roll" bind:this={primaryButton} disabled={!canForage} onclick={submit}>Forage</button>
         {/if}
       </div>

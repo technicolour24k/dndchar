@@ -419,6 +419,7 @@ body {
 .forage-queue button,
 .forage-sidebar-line button,
 .forageBtn { min-height: 44px; min-width: 44px; }
+.forageBtn.forage-off { opacity: .55; }
 .forage-modal .adv-step { width: 44px; height: 44px; }
 .forage-modal .adv-source { min-height: 44px; }
 .forage-modal .adv-source input { width: 22px; height: 22px; }

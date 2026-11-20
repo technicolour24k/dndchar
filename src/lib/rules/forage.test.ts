@@ -1,13 +1,48 @@
 import { describe, expect, it } from 'vitest';
-import { forageItemCount, isPickable, normaliseTag, parseEntryInput, parseTableInput, pickableEntries, resolveTable, rollFind, validateFindLines, weightedPickDistinct } from './forage';
+import { CHANCE_OPTIONS, forageAvailability, forageItemCount, isPickable, tablesForCampaign, normaliseTag, parseEntryInput, parseTableInput, pickableEntries, resolveTable, rollFind, rollFindRun, validateFindLines } from './forage';
 import type { FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
 
 function table(overrides: Partial<ForageCatalogueTable> = {}): ForageCatalogueTable {
   return {
-    id: 't1', name: 'Meadow - plants', areaType: 'meadow', category: 'plant', typeDie: 6,
+    id: 't1', campaignId: 'c1', name: 'Meadow - plants', areaType: 'meadow', category: 'plant',
     isArchived: false, ownerUserId: null, pickableCount: 0, entries: [], ...overrides
   };
 }
+
+describe('tablesForCampaign', () => {
+  it("keeps only that campaign's active tables", () => {
+    const tables = [table({ id: 'a' }), table({ id: 'b', campaignId: 'c2' }), table({ id: 'c', isArchived: true })];
+    expect(tablesForCampaign(tables, 'c1').map((t) => t.id)).toEqual(['a']);
+    expect(tablesForCampaign(tables, null)).toEqual([]);
+  });
+});
+
+describe('forageAvailability', () => {
+  const tables = [table({ pickableCount: 2 }), table({ id: 'x', campaignId: 'c2', pickableCount: 5 })];
+  const base = { characterCampaignId: 'c1', roomCampaignId: 'c1', inLiveRoom: true, tables };
+
+  it("is available in its own campaign's room, or with no room at all", () => {
+    expect(forageAvailability(base)).toEqual({ available: true });
+    expect(forageAvailability({ ...base, inLiveRoom: false, roomCampaignId: null })).toEqual({ available: true });
+  });
+  it('needs a campaign', () => {
+    expect(forageAvailability({ ...base, characterCampaignId: null })).toEqual({ available: false, reason: 'no_campaign' });
+  });
+  it("is wrong_room in a Quick room or another campaign's room", () => {
+    expect(forageAvailability({ ...base, roomCampaignId: null })).toEqual({ available: false, reason: 'wrong_room' });
+    expect(forageAvailability({ ...base, roomCampaignId: 'c2' })).toEqual({ available: false, reason: 'wrong_room' });
+  });
+  it("is no_tables when the campaign has none, none active, or none pickable (another campaign's tables don't count)", () => {
+    expect(forageAvailability({ ...base, tables: [] })).toEqual({ available: false, reason: 'no_tables' });
+    expect(forageAvailability({ ...base, tables: [table({ isArchived: true, pickableCount: 3 })] })).toEqual({ available: false, reason: 'no_tables' });
+    expect(forageAvailability({ ...base, tables: [table({ pickableCount: 0 })] })).toEqual({ available: false, reason: 'no_tables' });
+    expect(forageAvailability({ ...base, tables: [tables[1]] })).toEqual({ available: false, reason: 'no_tables' });
+  });
+  it('checks the campaign first, then the room, then the tables', () => {
+    expect(forageAvailability({ ...base, characterCampaignId: null, roomCampaignId: 'c2', tables: [] }).available).toBe(false);
+    expect(forageAvailability({ ...base, roomCampaignId: 'c2', tables: [] })).toEqual({ available: false, reason: 'wrong_room' });
+  });
+});
 
 describe('normaliseTag', () => {
   it('trims, lower-cases and collapses whitespace', () => {
@@ -18,16 +53,14 @@ describe('normaliseTag', () => {
 });
 
 describe('parseTableInput', () => {
-  const ok = { name: 'Meadow - plants', areaType: 'Meadow', category: ' Plant', typeDie: '6', suggestedCheck: 'Nature DC 12' };
+  const ok = { name: 'Meadow - plants', areaType: 'Meadow', category: ' Plant', suggestedCheck: 'Nature DC 12' };
 
   it('normalises area type and category', () => {
-    expect(parseTableInput(ok)).toMatchObject({ areaType: 'meadow', category: 'plant', typeDie: 6 });
+    expect(parseTableInput(ok)).toMatchObject({ areaType: 'meadow', category: 'plant' });
   });
-  it('rejects bad names, tags and type dice', () => {
+  it('rejects bad names, tags and suggested checks', () => {
     expect(() => parseTableInput({ ...ok, name: '  ' })).toThrow(/name/i);
     expect(() => parseTableInput({ ...ok, areaType: '' })).toThrow(/area/i);
-    expect(() => parseTableInput({ ...ok, typeDie: 0 })).toThrow(/type die/i);
-    expect(() => parseTableInput({ ...ok, typeDie: 101 })).toThrow(/type die/i);
     expect(() => parseTableInput({ ...ok, suggestedCheck: 'x'.repeat(81) })).toThrow(/suggested/i);
   });
 });
@@ -35,30 +68,37 @@ describe('parseTableInput', () => {
 describe('parseEntryInput', () => {
   it('rejects qty die 0, -1 and 1.5 with the agreed message', () => {
     for (const bad of [0, -1, 1.5, '1.5']) {
-      expect(() => parseEntryInput({ weight: 1, qtyDie: bad })).toThrow('Quantity die must be 1 or more (1 means always one).');
+      expect(() => parseEntryInput({ chance: 30, qtyDie: bad })).toThrow('Quantity die must be 1 or more (1 means always one).');
     }
   });
   it('rejects qty die 101', () => {
-    expect(() => parseEntryInput({ weight: 1, qtyDie: 101 })).toThrow(/100 or fewer/);
+    expect(() => parseEntryInput({ chance: 30, qtyDie: 101 })).toThrow(/100 or fewer/);
   });
   it('accepts qty die 1 and 100', () => {
-    expect(parseEntryInput({ weight: 1, qtyDie: 1 }).qtyDie).toBe(1);
-    expect(parseEntryInput({ weight: 1, qtyDie: '100' }).qtyDie).toBe(100);
+    expect(parseEntryInput({ chance: 30, qtyDie: 1 }).qtyDie).toBe(1);
+    expect(parseEntryInput({ chance: 30, qtyDie: '100' }).qtyDie).toBe(100);
   });
-  it('accepts weight 0 but rejects negatives and huge values', () => {
-    expect(parseEntryInput({ weight: 0, qtyDie: 1 }).weight).toBe(0);
-    expect(() => parseEntryInput({ weight: -1, qtyDie: 1 })).toThrow(/weight/i);
-    expect(() => parseEntryInput({ weight: 1001, qtyDie: 1 })).toThrow(/weight/i);
+  it('accepts exactly the dropdown chances, including 0 (Off), as numbers or strings', () => {
+    expect(CHANCE_OPTIONS.map((option) => option.percent)).toEqual([100, 50, 30, 20, 10, 5, 1, 0]);
+    for (const { percent } of CHANCE_OPTIONS) {
+      expect(parseEntryInput({ chance: percent, qtyDie: 1 }).chance).toBe(percent);
+      expect(parseEntryInput({ chance: String(percent), qtyDie: 1 }).chance).toBe(percent);
+    }
+  });
+  it('rejects any other chance', () => {
+    for (const bad of [-1, 2, 25, 101, 1.5, '', 'abc', undefined]) {
+      expect(() => parseEntryInput({ chance: bad, qtyDie: 1 })).toThrow('Pick a chance from the list.');
+    }
   });
 });
 
 describe('pickable entries', () => {
-  it('excludes weight 0 and archived items', () => {
-    expect(isPickable({ weight: 0, itemArchived: false })).toBe(false);
-    expect(isPickable({ weight: 3, itemArchived: true })).toBe(false);
-    expect(isPickable({ weight: 3, itemArchived: false })).toBe(true);
+  it('excludes Off (chance 0) and archived items', () => {
+    expect(isPickable({ chance: 0, itemArchived: false })).toBe(false);
+    expect(isPickable({ chance: 30, itemArchived: true })).toBe(false);
+    expect(isPickable({ chance: 1, itemArchived: false })).toBe(true);
     const entries = [
-      { weight: 1, itemArchived: false }, { weight: 0, itemArchived: false }, { weight: 2, itemArchived: true }
+      { chance: 10, itemArchived: false }, { chance: 0, itemArchived: false }, { chance: 20, itemArchived: true }
     ];
     expect(pickableEntries(entries)).toHaveLength(1);
   });
@@ -91,61 +131,78 @@ function scripted(values: number[]) {
   return { rollDie, calls };
 }
 
-function entry(itemId: string, weight: number, qtyDie = 1, itemArchived = false): FindTableEntry {
-  return { itemId, itemName: `Item ${itemId}`, itemCategory: 'consumable', weight, qtyDie, itemArchived, sortOrder: 0 };
+function entry(itemId: string, chance: number, qtyDie = 1, itemArchived = false): FindTableEntry {
+  return { itemId, itemName: `Item ${itemId}`, itemCategory: 'consumable', chance, qtyDie, itemArchived, sortOrder: 0 };
 }
 
-describe('weightedPickDistinct', () => {
-  it('never picks weight 0 or archived entries', () => {
-    const entries = [entry('a', 0), entry('b', 3, 1, true), entry('c', 2)];
-    const picked = weightedPickDistinct(entries, 3, (sides) => sides);
-    expect(picked.map((e) => e.itemId)).toEqual(['c']);
+// Each pickable entry is rolled on its own: a d100 first, then (only if found) its quantity die.
+describe('rollFindRun (independent chances)', () => {
+  it('Guaranteed (100) is found even on the highest d100', () => {
+    expect(rollFindRun([entry('a', 100)], scripted([100, 1]).rollDie)).toEqual([{ itemId: 'a', qty: 1 }]);
   });
 
-  it('passes the shrinking total weight to rollDie and walks the cumulative weights', () => {
-    const entries = [entry('a', 5), entry('b', 3), entry('c', 2)];
-    const { rollDie, calls } = scripted([6, 1]); // 6 lands in b (5 < 6 <= 8); then 1 lands in a
-    const picked = weightedPickDistinct(entries, 2, rollDie);
-    expect(picked.map((e) => e.itemId)).toEqual(['b', 'a']);
-    expect(calls).toEqual([10, 7]);
+  it('is found when d100 equals the chance, and not when it is one above', () => {
+    for (const { percent } of CHANCE_OPTIONS.filter((option) => option.percent > 0 && option.percent < 100)) {
+      expect(rollFindRun([entry('a', percent)], scripted([percent, 1]).rollDie)).toHaveLength(1);
+      expect(rollFindRun([entry('a', percent)], scripted([percent + 1, 1]).rollDie)).toEqual([]);
+    }
+  });
+
+  it('never finds an Off entry, and never rolls for it', () => {
+    const { rollDie, calls } = scripted([1, 1, 1]);
+    expect(rollFindRun([entry('a', 0)], rollDie)).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it('never finds an archived entry, even a Guaranteed one, and never rolls for it', () => {
+    const { rollDie, calls } = scripted([1, 1, 1]);
+    expect(rollFindRun([entry('a', 100, 1, true)], rollDie)).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it('rolls each entry independently: several can be found, or none', () => {
+    const entries = [entry('a', 50), entry('b', 20), entry('c', 5)];
+    // a: d100 50 -> found. b: d100 21 -> missed. c: d100 5 -> found.
+    expect(rollFindRun(entries, scripted([50, 1, 21, 5, 1]).rollDie).map((l) => l.itemId)).toEqual(['a', 'c']);
+    expect(rollFindRun(entries, scripted([51, 21, 6]).rollDie)).toEqual([]);
+  });
+
+  it('rolls the qty die only for found entries, in table order, and a d1 is always 1', () => {
+    const entries = [entry('a', 50, 4), entry('b', 10, 6), entry('c', 100, 1)];
+    // a: d100 40 found, qty d4 = 3. b: d100 11 missed (no qty roll). c: d100 1 found, qty d1 = 1.
+    const { rollDie, calls } = scripted([40, 3, 11, 1, 1]);
+    expect(rollFindRun(entries, rollDie)).toEqual([{ itemId: 'a', qty: 3 }, { itemId: 'c', qty: 1 }]);
+    expect(calls).toEqual([100, 4, 100, 100, 1]);
   });
 });
 
 describe('rollFind', () => {
-  it('caps the type roll at the pickable count', () => {
-    const entries = [entry('a', 1), entry('b', 1), entry('c', 1), entry('d', 0)];
-    // type roll 6 -> capped to 3; picks roll 1 each; qty die 1 -> 1 each
-    const { lines, runs } = rollFind(entries, 6, false, (sides) => (sides === 6 ? 6 : 1));
+  it('is one run normally', () => {
+    const { lines, runs } = rollFind([entry('a', 100, 6)], false, scripted([1, 4]).rollDie);
     expect(runs).toBe(1);
-    expect(lines.map((l) => l.itemId).sort()).toEqual(['a', 'b', 'c']);
-  });
-
-  it('rolls a qty die per pick, and a d1 is always 1', () => {
-    const entries = [entry('a', 1, 4), entry('b', 1, 1)];
-    // type roll 2, pick rolls 1 then 1, qty a = 3, qty b = 1 (d1)
-    const { lines } = rollFind(entries, 2, false, scripted([2, 1, 1, 3, 1]).rollDie);
-    expect(lines).toEqual([{ itemId: 'a', qty: 3 }, { itemId: 'b', qty: 1 }]);
+    expect(lines).toEqual([{ itemId: 'a', qty: 4 }]);
   });
 
   it('runs twice on a nat 20 and merges quantities by item', () => {
-    const entries = [entry('a', 1, 6)];
-    // run 1: type 1, pick 1, qty 4. run 2: type 1, pick 1, qty 5
-    const { lines, runs } = rollFind(entries, 1, true, scripted([1, 1, 4, 1, 1, 5]).rollDie);
+    const entries = [entry('a', 100, 6), entry('b', 10)];
+    // run 1: a found qty 4, b missed (d100 50). run 2: a found qty 5, b found (d100 10).
+    const { lines, runs } = rollFind(entries, true, scripted([1, 4, 50, 1, 5, 10, 1]).rollDie);
     expect(runs).toBe(2);
-    expect(lines).toEqual([{ itemId: 'a', qty: 9 }]);
+    expect(lines).toEqual([{ itemId: 'a', qty: 9 }, { itemId: 'b', qty: 1 }]);
   });
 
-  it('gives no lines when nothing is pickable, without rolling', () => {
+  it('can find nothing, and gives no lines (without rolling) when nothing is pickable', () => {
+    expect(rollFind([entry('a', 5)], false, scripted([100]).rollDie).lines).toEqual([]);
     const { rollDie, calls } = scripted([]);
-    expect(rollFind([entry('a', 0), entry('b', 2, 1, true)], 6, true, rollDie).lines).toEqual([]);
+    expect(rollFind([entry('a', 0), entry('b', 100, 1, true)], true, rollDie).lines).toEqual([]);
     expect(calls).toEqual([]);
   });
 });
 
 describe('validateFindLines', () => {
-  const entries = [entry('a', 3), entry('z', 0), entry('x', 2, 1, true)];
+  const entries = [entry('a', 30), entry('z', 0), entry('x', 20, 1, true)];
 
-  it('accepts valid lines, including a weight-0 entry', () => {
+  it('accepts valid lines, including an Off entry', () => {
     const result = validateFindLines([{ itemId: 'a', qty: 2 }, { itemId: 'z', qty: 999 }], entries);
     expect(result).toEqual({ ok: true, lines: [{ itemId: 'a', qty: 2 }, { itemId: 'z', qty: 999 }] });
   });
@@ -158,11 +215,19 @@ describe('validateFindLines', () => {
     ['qty 1.5', [{ itemId: 'a', qty: 1.5 }]],
     ['a string qty', [{ itemId: 'a', qty: '2' }]],
     ['a duplicate', [{ itemId: 'a', qty: 1 }, { itemId: 'a', qty: 1 }]],
-    ['an empty list', []],
+    ['an empty list (by default)', []],
     ['not an array', 'lines'],
     ['more than 50 lines', Array.from({ length: 51 }, () => ({ itemId: 'a', qty: 1 }))]
   ])('rejects %s', (_label, lines) => {
     expect(validateFindLines(lines, entries).ok).toBe(false);
+  });
+});
+
+describe('validateFindLines with allowEmpty', () => {
+  const entries = [entry('a', 30)];
+  it('accepts an empty list, but still rejects a non-array', () => {
+    expect(validateFindLines([], entries, 999, true)).toEqual({ ok: true, lines: [] });
+    expect(validateFindLines('lines', entries, 999, true).ok).toBe(false);
   });
 });
 

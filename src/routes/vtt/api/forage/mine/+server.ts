@@ -4,7 +4,7 @@ import { sessions, dmPresent, forageViewForPlayer } from '$vtt/store.js';
 import { query } from '$lib/server/db';
 import { getUnmarkedSelfFind } from '$lib/server/services/forage';
 import { findPendingForUser, resolveForageRoom } from '$lib/server/vttForage';
-import { loadOwnedCharacter, playerUnmarked, shortText } from '$lib/server/vttForageApi';
+import { checkForageAvailability, loadOwnedCharacter, playerUnmarked, shortText } from '$lib/server/vttForageApi';
 
 // The finder's private forage state, owner-checked. This is the "fetch" half of the sheet's
 // nudge-plus-fetch delivery (the room only ever pushes a detail-free forage:ping), and what a popup
@@ -18,6 +18,9 @@ import { loadOwnedCharacter, playerUnmarked, shortText } from '$lib/server/vttFo
 //   unmarkedSelf a self-serve check waiting to be marked (with its character's name)
 //   pendingCharacter the character the pending request is for, so a sheet can tell "mine" from
 //                a different character's (one forage in flight per USER, not per character)
+//   available    can this character start a forage right now? (a campaign, the right room, a campaign with
+//                tables). unavailableReason is 'no_campaign' | 'wrong_room' | 'no_tables' | null: campaign-level
+//                only, never anything about individual tables.
 //   serverNow    the server clock, so a client can compare lastDm.closedAt without trusting its own clock
 export const GET: RequestHandler = async ({ locals, url }) => {
   const userId = locals.user!.id;
@@ -47,7 +50,11 @@ export const GET: RequestHandler = async ({ locals, url }) => {
     unmarkedSelf = { ...unmarked, characterName: named.rows[0]?.name ?? 'your character' };
   }
 
+  const availability = await checkForageAvailability(owned, session);
+
   return json({
+    available: availability.available,
+    unavailableReason: availability.available ? null : availability.reason,
     serverNow: Date.now(),
     roomId: session?.id ?? null,
     inRoom: !!session,

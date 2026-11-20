@@ -290,6 +290,21 @@
       </section>
     {/if}
 
+    {#if data.findTableCount !== null}
+      <section class="panel campaign-box">
+        <div class="campaign-row">
+          <h2>Foraging</h2>
+          <span class="campaign-box-foot">
+            <span class="muted">Find tables: {data.findTableCount} active</span>
+            <a class="button-link compact-link" href="/forage/tables">Manage</a>
+          </span>
+        </div>
+        {#if data.findTableCount === 0}
+          <p class="muted">Foraging is off for this campaign until it has a find table with something to find.</p>
+        {/if}
+      </section>
+    {/if}
+
     {#if access.canManage && !archived}
       <section class="panel campaign-box">
         <h2>Settings</h2>

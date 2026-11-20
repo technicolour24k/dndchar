@@ -1,4 +1,6 @@
-import type { FindLine, FindMode, FindStatus, FindTableEntry, ForageCatalogue, ForageCatalogueTable } from '$lib/types/forage';
+import type {
+  FindLine, FindMode, FindStatus, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageUnavailableReason
+} from '$lib/types/forage';
 
 // Pure helpers for find tables, plus the roll itself (below). No DB; randomness is injected.
 
@@ -20,13 +22,12 @@ export type ParsedTableInput = {
   name: string;
   areaType: string;
   category: string;
-  typeDie: number;
   suggestedCheck: string;
 };
 
 /** Validates the table form fields. Throws an Error with a user-facing message. */
 export function parseTableInput(raw: {
-  name?: unknown; areaType?: unknown; category?: unknown; typeDie?: unknown; suggestedCheck?: unknown;
+  name?: unknown; areaType?: unknown; category?: unknown; suggestedCheck?: unknown;
 }): ParsedTableInput {
   const name = String(raw.name ?? '').trim();
   if (!name || name.length > 80) throw new Error('Table name must be 1 to 80 characters.');
@@ -34,32 +35,81 @@ export function parseTableInput(raw: {
   if (!areaType || areaType.length > 40) throw new Error('Area type must be 1 to 40 characters.');
   const category = normaliseTag(raw.category);
   if (!category || category.length > 40) throw new Error('Category must be 1 to 40 characters.');
-  const typeDie = parseInteger(raw.typeDie);
-  if (typeDie === null || typeDie < 1 || typeDie > 100) throw new Error('Type die must be a whole number from 1 to 100.');
   const suggestedCheck = String(raw.suggestedCheck ?? '').trim();
   if (suggestedCheck.length > 80) throw new Error('Suggested check must be 80 characters or fewer.');
-  return { name, areaType, category, typeDie, suggestedCheck };
+  return { name, areaType, category, suggestedCheck };
 }
 
-export type ParsedEntryInput = { weight: number; qtyDie: number };
+/**
+ * The chance choices for a find table entry: a label and the stored percent. Each pickable entry is
+ * rolled on its own (d100 <= chance), so these percentages are true. 0 is "Off": the entry stays on
+ * the table but is never found (and doesn't count as pickable). Off goes last in the dropdown.
+ * migration 038's CHECK constraint must list the same values.
+ */
+export const CHANCE_OPTIONS: ReadonlyArray<{ label: string; percent: number }> = [
+  { label: 'Guaranteed (100% chance)', percent: 100 },
+  { label: 'Very Common (50% chance)', percent: 50 },
+  { label: 'Common (30% chance)', percent: 30 },
+  { label: 'Uncommon (20% chance)', percent: 20 },
+  { label: 'Rare (10% chance)', percent: 10 },
+  { label: 'Very Rare (5% chance)', percent: 5 },
+  { label: 'Ultra Rare (1% chance)', percent: 1 },
+  { label: 'Off (never found)', percent: 0 }
+];
 
-/** Validates one entry's weight and quantity die. Throws an Error with a user-facing message. */
-export function parseEntryInput(raw: { weight?: unknown; qtyDie?: unknown }): ParsedEntryInput {
-  const weight = parseInteger(raw.weight);
-  if (weight === null || weight < 0 || weight > 1000) throw new Error('Weight must be a whole number from 0 to 1000.');
+/** What a new entry starts at (Common). */
+export const DEFAULT_CHANCE = 30;
+
+export type ParsedEntryInput = { chance: number; qtyDie: number };
+
+/** Validates one entry's chance and quantity die. Throws an Error with a user-facing message. */
+export function parseEntryInput(raw: { chance?: unknown; qtyDie?: unknown }): ParsedEntryInput {
+  const chance = parseInteger(raw.chance);
+  if (chance === null || !CHANCE_OPTIONS.some((option) => option.percent === chance)) {
+    throw new Error('Pick a chance from the list.');
+  }
   const qtyDie = parseInteger(raw.qtyDie);
   if (qtyDie === null || qtyDie < 1) throw new Error('Quantity die must be 1 or more (1 means always one).');
   if (qtyDie > 100) throw new Error('Quantity die must be 100 or fewer.');
-  return { weight, qtyDie };
+  return { chance, qtyDie };
 }
 
-/** An entry can be rolled if it has weight and its item is not archived. */
-export function isPickable(entry: Pick<FindTableEntry, 'weight' | 'itemArchived'>): boolean {
-  return entry.weight > 0 && !entry.itemArchived;
+/** An entry can be rolled if it has a chance above 0 (not Off) and its item is not archived. */
+export function isPickable(entry: Pick<FindTableEntry, 'chance' | 'itemArchived'>): boolean {
+  return entry.chance > 0 && !entry.itemArchived;
 }
 
-export function pickableEntries<T extends Pick<FindTableEntry, 'weight' | 'itemArchived'>>(entries: T[]): T[] {
+export function pickableEntries<T extends Pick<FindTableEntry, 'chance' | 'itemArchived'>>(entries: T[]): T[] {
   return entries.filter(isPickable);
+}
+
+/** One campaign's active tables (find tables belong to a campaign, there are no shared ones). */
+export function tablesForCampaign<T extends { campaignId: string; isArchived: boolean }>(tables: T[], campaignId: string | null | undefined): T[] {
+  if (!campaignId) return [];
+  return tables.filter((table) => !table.isArchived && table.campaignId === campaignId);
+}
+
+export type ForageAvailability = { available: true } | { available: false; reason: ForageUnavailableReason };
+
+/**
+ * Can this character forage right now? Campaign-level facts only (the result says nothing about
+ * individual tables, so a player never learns which combinations exist).
+ *  - no campaign -> 'no_campaign'
+ *  - the forage lands in a live room that isn't the character's campaign room (a Quick room, or
+ *    another campaign's) -> 'wrong_room'
+ *  - the campaign has no active table with something pickable -> 'no_tables'
+ * Inside an available campaign, an area + category with no table still rolls and finds nothing.
+ */
+export function forageAvailability(input: {
+  characterCampaignId: string | null | undefined;
+  roomCampaignId: string | null | undefined;
+  inLiveRoom: boolean;
+  tables: Array<{ campaignId: string; isArchived: boolean; pickableCount: number }>;
+}): ForageAvailability {
+  if (!input.characterCampaignId) return { available: false, reason: 'no_campaign' };
+  if (input.inLiveRoom && input.roomCampaignId !== input.characterCampaignId) return { available: false, reason: 'wrong_room' };
+  const usable = tablesForCampaign(input.tables, input.characterCampaignId).some((table) => table.pickableCount > 0);
+  return usable ? { available: true } : { available: false, reason: 'no_tables' };
 }
 
 /** The active table for an area type + category, or null. Archived tables never match. */
@@ -84,48 +134,26 @@ export const MAX_FIND_QTY = 999;
 const MAX_FIND_LINES = 50;
 
 /**
- * Picks `count` DISTINCT entries by weight. Only pickable entries are considered. Each pick rolls
- * one die over the remaining total weight and walks the cumulative weights, then removes the pick,
- * so the total shrinks. Stops early if nothing pickable is left.
+ * One run: every pickable entry is rolled on its own. d100 <= chance means it is found, then its
+ * quantity die (1dN, d1 is always one) is rolled. So a run can find several items, or none. Dice are
+ * rolled in table order: the d100 for an entry, then (only if found) its quantity die.
  */
-export function weightedPickDistinct<T extends Pick<FindTableEntry, 'weight' | 'itemArchived'>>(
-  entries: T[], count: number, rollDie: RollDie
-): T[] {
-  const pool = pickableEntries(entries);
-  const picked: T[] = [];
-  while (picked.length < count && pool.length > 0) {
-    const total = pool.reduce((sum, entry) => sum + entry.weight, 0);
-    let roll = rollDie(total);
-    let index = 0;
-    for (; index < pool.length - 1; index++) {
-      if (roll <= pool[index].weight) break;
-      roll -= pool[index].weight;
-    }
-    picked.push(pool[index]);
-    pool.splice(index, 1);
+export function rollFindRun(entries: FindTableEntry[], rollDie: RollDie): FindLine[] {
+  const lines: FindLine[] = [];
+  for (const entry of pickableEntries(entries)) {
+    if (rollDie(100) <= entry.chance) lines.push({ itemId: entry.itemId, qty: rollDie(entry.qtyDie) });
   }
-  return picked;
-}
-
-/** One run: roll the type die (capped at the pickable count), pick that many, then a qty die each. */
-export function rollFindRun(entries: FindTableEntry[], typeDie: number, rollDie: RollDie): FindLine[] {
-  const pickable = pickableEntries(entries).length;
-  if (pickable === 0) return [];
-  const count = Math.min(rollDie(typeDie), pickable);
-  return weightedPickDistinct(entries, count, rollDie).map((entry) => ({
-    itemId: entry.itemId,
-    qty: rollDie(entry.qtyDie)
-  }));
+  return lines;
 }
 
 /** A full find: one run, or two on a nat 20. Lines are merged by item so repeats stack. */
 export function rollFind(
-  entries: FindTableEntry[], typeDie: number, nat20: boolean, rollDie: RollDie
+  entries: FindTableEntry[], nat20: boolean, rollDie: RollDie
 ): { lines: FindLine[]; runs: number } {
   const runs = nat20 ? 2 : 1;
   const merged = new Map<string, number>();
   for (let run = 0; run < runs; run++) {
-    for (const line of rollFindRun(entries, typeDie, rollDie)) {
+    for (const line of rollFindRun(entries, rollDie)) {
       merged.set(line.itemId, (merged.get(line.itemId) ?? 0) + line.qty);
     }
   }
@@ -136,11 +164,13 @@ export type ValidatedLines = { ok: true; lines: FindLine[] } | { ok: false; erro
 
 /**
  * Checks lines a client sent for approval (and the server's own self-serve haul, same rules).
- * 1..50 lines, each an item on THIS table with a live item (any weight, so the DM can add a
- * weight-0 entry by hand), whole-number qty 1..cap, no duplicates.
+ * 1..50 lines (or none at all when allowEmpty: a successful forage can find nothing), each an item
+ * on THIS table with a live item (any chance, so the DM can add an Off entry by hand), whole-number
+ * qty 1..cap, no duplicates.
  */
-export function validateFindLines(rawLines: unknown, entries: FindTableEntry[], cap = MAX_FIND_QTY): ValidatedLines {
-  if (!Array.isArray(rawLines) || rawLines.length === 0) return { ok: false, error: 'There is nothing to approve.' };
+export function validateFindLines(rawLines: unknown, entries: FindTableEntry[], cap = MAX_FIND_QTY, allowEmpty = false): ValidatedLines {
+  if (!Array.isArray(rawLines)) return { ok: false, error: 'There is nothing to approve.' };
+  if (rawLines.length === 0 && !allowEmpty) return { ok: false, error: 'There is nothing to approve.' };
   if (rawLines.length > MAX_FIND_LINES) return { ok: false, error: `At most ${MAX_FIND_LINES} lines.` };
   const byItem = new Map(entries.map((entry) => [entry.itemId, entry]));
   const seen = new Set<string>();
@@ -215,7 +245,7 @@ export function shapeFindForViewer(find: FindForViewer, viewer: { id: string; is
   }
   return {
     view: 'full', id: find.id, createdAt: find.createdAt, status: find.status, mode: find.mode, shared: find.shared,
-    canShare: isFinder && find.status === 'found' && !find.shared,
+    canShare: isFinder && find.status === 'found' && !find.shared && itemCount > 0, // nothing to share on an empty find
     characterName: find.characterName, checkSummary: findCheckSummary(find.check),
     // Rev 4: players learn nothing about tables, even for their own finds. Only the DM sees the name.
     tableName: viewer.isDm ? find.tableName : '',

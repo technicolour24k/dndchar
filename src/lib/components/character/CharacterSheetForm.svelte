@@ -9,7 +9,7 @@
   import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
   import ForageModal from '$lib/components/character/ForageModal.svelte';
   import { readOnlyLock } from '$lib/ui/readOnlyLock';
-  import { forageBadgeText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
+  import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
   import type { ForageMine } from '$lib/types/forage';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
@@ -211,6 +211,11 @@
   const forageOwner = $derived(!readOnly && !!currentUserId && currentUserId === character.ownerUserId);
   let forageMine = $state<ForageMine | null>(null);
   const forageBadge = $derived(forageBadgeText(forageMine, character.id));
+  // Find tables belong to campaigns: with no campaign, the wrong room, or a campaign with no tables the
+  // button looks off with a plain reason (never anything about tables); a click still opens the popup,
+  // which re-checks with the server and shows the reason or the form. A forage already in flight
+  // or a result waiting keeps it live so it can be finished.
+  const forageOff = $derived(forageUnavailableReason(forageMine, character.id));
   // A find landed while the sheet had unsaved edits, so the new rows wait for Save (see haulLanded).
   let haulWaitingForSave = $state(false);
   // DM-approved hauls already dealt with (by request id), so one result never reloads the sheet twice.
@@ -2034,10 +2039,11 @@
             <div class="ability-popup-links">
               <button type="button" class="text-button" data-viewer-ok onclick={() => (savingThrowsOpen = true)}>Saving Throws</button>
               <button type="button" class="text-button" data-viewer-ok onclick={() => (skillChecksOpen = true)}>Skill Checks</button>
-              <!-- Always enabled: the server decides DM vs self-serve when Forage is pressed. -->
+              <!-- Enabled unless the server says forage is unavailable; it decides DM vs self-serve when pressed. -->
               {#if forageOwner}
-                <button type="button" class="text-button" onclick={() => (forageOpen = true)}>
+                <button type="button" class="text-button" class:forage-off={!!forageOff} title={forageOff ? forageUnavailableText(forageOff) : undefined} onclick={() => (forageOpen = true)}>
                   <span>Forage</span>{#if forageBadge}<span class="forage-status-badge">{forageBadge}</span>{/if}
+                  {#if forageOff}<span class="forage-unavailable-note">{forageUnavailableText(forageOff)}</span>{/if}
                 </button>
               {/if}
             </div>

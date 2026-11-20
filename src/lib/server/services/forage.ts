@@ -2,7 +2,7 @@ import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
 import {
-  findCheckSummary, parseEntryInput, parseTableInput, pickableEntries, rollFind, shapeFindForViewer, validateFindLines,
+  DEFAULT_CHANCE, findCheckSummary, parseEntryInput, parseTableInput, pickableEntries, rollFind, shapeFindForViewer, validateFindLines,
   type FindForViewer, type RollDie, type SessionFindView
 } from '$lib/rules/forage';
 import { insertCatalogueItem } from '$lib/server/services/catalogue';
@@ -11,28 +11,32 @@ import type {
   FindLine, FindMode, FindResult, FindStatus, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
 } from '$lib/types/forage';
 
-// Find tables (forage / loot finder, unit A). A table only points at existing item Containers and
-// grants no mechanics, so any logged-in user may author one (Q2). Editing is owner-or-admin, and
-// every table is usable by everyone. When the campaign system lands, tables should gain a
-// campaign_id and campaign-DM scoping instead of being global to the whole group.
+// Find tables (forage / loot finder). A table only points at existing item Containers and grants no
+// mechanics. Every table belongs to exactly one campaign (migration 037, campaign system Unit G).
+// There are no shared tables: a campaign with no active table that has something pickable has
+// foraging disabled. Editing is for the primary DM or co-DM of the table's campaign, plus site
+// admins. The author (owner_user_id) is provenance only and grants nothing.
 
-/** The bits of the signed-in user the permission check needs. */
-export type ForageActor = { id: string; role: 'user' | 'admin' };
+/**
+ * The bits of the signed-in user the permission check needs. dmCampaignIds are the campaigns where
+ * they are the primary DM or co-DM (real roles: admin is not a DM, it has its own override).
+ */
+export type ForageActor = { id: string; role: 'user' | 'admin'; dmCampaignIds: string[] };
 
 type TableRow = {
-  id: string; name: string; area_type: string; category: string; type_die: number; suggested_check: string;
+  id: string; campaign_id: string; campaign_name: string | null; name: string; area_type: string; category: string; suggested_check: string;
   is_archived: boolean; owner_user_id: string | null; owner_name: string | null;
   entry_count: number; pickable_count: number;
 };
 
 type EntryRow = {
   find_table_id: string; item_id: string; item_name: string; item_category: string | null;
-  weight: number; qty_die: number; sort_order: number; item_archived: boolean;
+  chance: number; qty_die: number; sort_order: number; item_archived: boolean;
 };
 
 function mapTable(row: TableRow): FindTable {
   return {
-    id: row.id, name: row.name, areaType: row.area_type, category: row.category, typeDie: row.type_die,
+    id: row.id, campaignId: row.campaign_id, campaignName: row.campaign_name ?? '', name: row.name, areaType: row.area_type, category: row.category,
     suggestedCheck: row.suggested_check, isArchived: row.is_archived, ownerUserId: row.owner_user_id,
     ownerName: row.owner_name, entryCount: row.entry_count, pickableCount: row.pickable_count
   };
@@ -40,31 +44,65 @@ function mapTable(row: TableRow): FindTable {
 
 function mapEntry(row: EntryRow): FindTableEntry {
   return {
-    itemId: row.item_id, itemName: row.item_name, itemCategory: row.item_category ?? 'gear', weight: row.weight,
+    itemId: row.item_id, itemName: row.item_name, itemCategory: row.item_category ?? 'gear', chance: row.chance,
     qtyDie: row.qty_die, itemArchived: row.item_archived, sortOrder: row.sort_order
   };
 }
 
 const ENTRY_SELECT = `
-  SELECT e.find_table_id, e.item_id, c.name AS item_name, i.category AS item_category, e.weight, e.qty_die,
+  SELECT e.find_table_id, e.item_id, c.name AS item_name, i.category AS item_category, e.chance, e.qty_die,
          e.sort_order, c.is_archived AS item_archived
   FROM find_table_entries e
   JOIN content_definitions c ON c.id = e.item_id
   LEFT JOIN item_definitions i ON i.content_id = c.id`;
 
-/** Every table (archived included) with counts, for the authoring page. */
-export async function listFindTables(): Promise<FindTable[]> {
+/**
+ * The signed-in user as a ForageActor: their role plus the campaigns they are a real DM of (primary
+ * or co-DM, archived campaigns excluded). One small query.
+ */
+export async function loadForageActor(user: { id: string; role: 'user' | 'admin' }): Promise<ForageActor> {
+  const result = await query<{ campaign_id: string }>(
+    `SELECT m.campaign_id FROM campaign_members m JOIN campaigns c ON c.id = m.campaign_id
+     WHERE m.user_id = $1 AND m.role IN ('dm', 'co_dm') AND NOT c.is_archived`, [user.id]
+  );
+  return { id: user.id, role: user.role, dmCampaignIds: result.rows.map((row) => row.campaign_id) };
+}
+
+/** The campaigns this actor may add tables to: their DM campaigns, or every live campaign for an admin. */
+export async function listEditableCampaigns(actor: ForageActor): Promise<Array<{ id: string; name: string }>> {
+  const result = await query<{ id: string; name: string }>(
+    `SELECT id, name FROM campaigns WHERE NOT is_archived AND ($1::boolean OR id = ANY($2::uuid[])) ORDER BY lower(name), created_at`,
+    [actor.role === 'admin', actor.dmCampaignIds]
+  );
+  return result.rows;
+}
+
+/** How many active tables a campaign has (the campaign page's "Find tables: N active" line). */
+export async function countActiveFindTables(campaignId: string): Promise<number> {
+  if (!UUID_PATTERN.test(campaignId)) return 0;
+  const result = await query<{ count: number }>('SELECT COUNT(*)::int AS count FROM find_tables WHERE campaign_id = $1 AND NOT is_archived', [campaignId]);
+  return result.rows[0]?.count ?? 0;
+}
+
+/**
+ * Every table (archived included) with counts, for the authoring page, but only the ones this actor
+ * may edit: their DM campaigns' tables, or all of them for an admin. The authoring page is
+ * DM-only, so a player never sees a table name here.
+ */
+export async function listFindTables(actor: ForageActor): Promise<FindTable[]> {
   const result = await query<TableRow>(`
-    SELECT t.id, t.name, t.area_type, t.category, t.type_die, t.suggested_check, t.is_archived,
+    SELECT t.id, t.campaign_id, cp.name AS campaign_name, t.name, t.area_type, t.category, t.suggested_check, t.is_archived,
            t.owner_user_id, u.display_name AS owner_name,
            COUNT(e.item_id)::int AS entry_count,
-           COUNT(e.item_id) FILTER (WHERE e.weight > 0 AND NOT c.is_archived)::int AS pickable_count
+           COUNT(e.item_id) FILTER (WHERE e.chance > 0 AND NOT c.is_archived)::int AS pickable_count
     FROM find_tables t
+    JOIN campaigns cp ON cp.id = t.campaign_id
     LEFT JOIN users u ON u.id = t.owner_user_id
     LEFT JOIN find_table_entries e ON e.find_table_id = t.id
     LEFT JOIN content_definitions c ON c.id = e.item_id
-    GROUP BY t.id, u.display_name
-    ORDER BY t.area_type, t.category, t.name`);
+    WHERE $1::boolean OR t.campaign_id = ANY($2::uuid[])
+    GROUP BY t.id, cp.name, u.display_name
+    ORDER BY lower(cp.name), t.area_type, t.category, t.name`, [actor.role === 'admin', actor.dmCampaignIds]);
   return result.rows.map(mapTable);
 }
 
@@ -75,23 +113,25 @@ export async function getFindTableEntries(tableId: string): Promise<FindTableEnt
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// The service's own permission gate: owner or admin. Throws a user-facing Error.
-// A malformed id is "not found" rather than Postgres's raw 22P02 text.
+// The service's own permission gate: a DM of the table's campaign, or an admin. Throws a user-facing
+// Error. A malformed id is "not found" rather than Postgres's raw 22P02 text.
 async function requireEditableTable(actor: ForageActor, tableId: string): Promise<void> {
   if (!UUID_PATTERN.test(tableId)) throw new Error('Find table not found.');
-  const result = await query<{ owner_user_id: string | null }>('SELECT owner_user_id FROM find_tables WHERE id = $1', [tableId]);
+  const result = await query<{ campaign_id: string }>('SELECT campaign_id FROM find_tables WHERE id = $1', [tableId]);
   if (!result.rowCount) throw new Error('Find table not found.');
-  const owner = result.rows[0].owner_user_id;
-  if (actor.role !== 'admin' && owner !== actor.id) throw new Error('You can only edit find tables you created.');
+  if (!canEditFindTable(actor, { campaignId: result.rows[0].campaign_id })) {
+    throw new Error("Only a DM of this table's campaign can edit it.");
+  }
 }
 
-export function canEditFindTable(actor: ForageActor, table: Pick<FindTable, 'ownerUserId'>): boolean {
-  return actor.role === 'admin' || table.ownerUserId === actor.id;
+/** Admin, or the primary DM / co-DM of the table's campaign. The original author no longer matters. */
+export function canEditFindTable(actor: ForageActor, table: Pick<FindTable, 'campaignId'>): boolean {
+  return actor.role === 'admin' || actor.dmCampaignIds.includes(table.campaignId);
 }
 
 /**
  * Adds canEdit to each table and blanks suggestedCheck for anyone who can't edit it (Q9: only the
- * owner and admins see that DM-side reminder in authoring).
+ * campaign's DMs and admins see that DM-side reminder in authoring).
  */
 export function tablesForActor(actor: ForageActor, tables: FindTable[]): (FindTable & { canEdit: boolean })[] {
   return tables.map((table) => {
@@ -110,10 +150,10 @@ export async function getSuggestedCheck(tableId: string): Promise<string> {
   return result.rows[0]?.suggested_check ?? '';
 }
 
-// 23505 on the one-active-table-per-area+category index becomes a friendly message.
-function friendlyTableError(error: unknown, areaType: string, category: string): Error {
+// 23505 on the one-active-table-per-campaign+area+category index becomes a friendly message.
+function friendlyTableError(error: unknown, areaType: string, category: string, campaignName = 'this campaign'): Error {
   if ((error as { code?: string })?.code === '23505') {
-    return new Error(`There's already an active table for ${areaType} + ${category}.`);
+    return new Error(`There's already an active table for ${areaType} + ${category} in ${campaignName}.`);
   }
   return error instanceof Error ? error : new Error('Could not save the find table.');
 }
@@ -121,18 +161,24 @@ function friendlyTableError(error: unknown, areaType: string, category: string):
 export async function createFindTable(actor: ForageActor, form: FormData): Promise<string> {
   const input = parseTableInput({
     name: form.get('name'), areaType: form.get('areaType'), category: form.get('category'),
-    typeDie: form.get('typeDie'), suggestedCheck: form.get('suggestedCheck')
+    suggestedCheck: form.get('suggestedCheck')
   });
+  // The table goes into one campaign the actor is a DM of (any live campaign for an admin).
+  const campaignId = String(form.get('campaignId') || '');
+  if (!UUID_PATTERN.test(campaignId)) throw new Error('Pick a campaign for this table.');
+  if (!canEditFindTable(actor, { campaignId })) throw new Error('You can only add tables to campaigns you are a DM of.');
+  const campaign = await query<{ name: string; is_archived: boolean }>('SELECT name, is_archived FROM campaigns WHERE id = $1', [campaignId]);
+  if (!campaign.rowCount || campaign.rows[0].is_archived) throw new Error('That campaign was not found.');
   try {
     const result = await query<{ id: string }>(
-      `INSERT INTO find_tables (name, area_type, category, type_die, suggested_check, owner_user_id)
+      `INSERT INTO find_tables (name, area_type, category, suggested_check, owner_user_id, campaign_id)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [input.name, input.areaType, input.category, input.typeDie, input.suggestedCheck, actor.id]
+      [input.name, input.areaType, input.category, input.suggestedCheck, actor.id, campaignId]
     );
     invalidateReferenceData('forage:create-table');
     return result.rows[0].id;
   } catch (error) {
-    throw friendlyTableError(error, input.areaType, input.category);
+    throw friendlyTableError(error, input.areaType, input.category, campaign.rows[0].name);
   }
 }
 
@@ -141,13 +187,13 @@ export async function updateFindTable(actor: ForageActor, form: FormData): Promi
   await requireEditableTable(actor, tableId);
   const input = parseTableInput({
     name: form.get('name'), areaType: form.get('areaType'), category: form.get('category'),
-    typeDie: form.get('typeDie'), suggestedCheck: form.get('suggestedCheck')
+    suggestedCheck: form.get('suggestedCheck')
   });
   try {
     await query(
-      `UPDATE find_tables SET name = $2, area_type = $3, category = $4, type_die = $5, suggested_check = $6,
+      `UPDATE find_tables SET name = $2, area_type = $3, category = $4, suggested_check = $5,
          updated_at = now() WHERE id = $1`,
-      [tableId, input.name, input.areaType, input.category, input.typeDie, input.suggestedCheck]
+      [tableId, input.name, input.areaType, input.category, input.suggestedCheck]
     );
   } catch (error) {
     throw friendlyTableError(error, input.areaType, input.category);
@@ -176,7 +222,7 @@ export async function addFindTableEntry(actor: ForageActor, form: FormData): Pro
   await requireEditableTable(actor, tableId);
   const itemId = String(form.get('itemId') || '');
   if (!itemId) throw new Error('Pick an item to add.');
-  const { weight, qtyDie } = parseEntryInput({ weight: form.get('weight') || 1, qtyDie: form.get('qtyDie') || 1 });
+  const { chance, qtyDie } = parseEntryInput({ chance: form.get('chance') ?? DEFAULT_CHANCE, qtyDie: form.get('qtyDie') || 1 });
 
   // Postgres can't CHECK across tables, so the "is an item Container" rule lives here.
   if (!UUID_PATTERN.test(itemId)) throw new Error('That is not an item.');
@@ -188,10 +234,10 @@ export async function addFindTableEntry(actor: ForageActor, form: FormData): Pro
 
   // Never overwrite a tuned entry: a repeat add is refused (edit it in the entries list instead).
   const added = await query(
-    `INSERT INTO find_table_entries (find_table_id, item_id, weight, qty_die, sort_order)
+    `INSERT INTO find_table_entries (find_table_id, item_id, chance, qty_die, sort_order)
      VALUES ($1, $2, $3, $4, COALESCE((SELECT MAX(sort_order) + 1 FROM find_table_entries WHERE find_table_id = $1), 0))
      ON CONFLICT (find_table_id, item_id) DO NOTHING`,
-    [tableId, itemId, weight, qtyDie]
+    [tableId, itemId, chance, qtyDie]
   );
   if (!added.rowCount) throw new Error('That item is already on this table.');
   await query('UPDATE find_tables SET updated_at = now() WHERE id = $1', [tableId]);
@@ -199,21 +245,21 @@ export async function addFindTableEntry(actor: ForageActor, form: FormData): Pro
   return tableId;
 }
 
-/** Saves weight and qty die for every entry on the page in one go (fields entryItem/weight/qtyDie, repeated). */
+/** Saves chance and qty die for every entry on the page in one go (fields entryItem/chance/qtyDie, repeated). */
 export async function updateFindTableEntries(actor: ForageActor, form: FormData): Promise<string> {
   const tableId = String(form.get('tableId') || '');
   await requireEditableTable(actor, tableId);
   const itemIds = form.getAll('entryItem').map(String);
-  const weights = form.getAll('weight');
+  const chances = form.getAll('chance');
   const qtyDice = form.getAll('qtyDie');
   // Validate everything before writing anything.
   if (!itemIds.every((id) => UUID_PATTERN.test(id))) throw new Error('Item not found.');
-  const parsed = itemIds.map((itemId, index) => ({ itemId, ...parseEntryInput({ weight: weights[index], qtyDie: qtyDice[index] }) }));
+  const parsed = itemIds.map((itemId, index) => ({ itemId, ...parseEntryInput({ chance: chances[index], qtyDie: qtyDice[index] }) }));
   await withTransaction(async (client) => {
     for (const entry of parsed) {
       await client.query(
-        'UPDATE find_table_entries SET weight = $3, qty_die = $4 WHERE find_table_id = $1 AND item_id = $2',
-        [tableId, entry.itemId, entry.weight, entry.qtyDie]
+        'UPDATE find_table_entries SET chance = $3, qty_die = $4 WHERE find_table_id = $1 AND item_id = $2',
+        [tableId, entry.itemId, entry.chance, entry.qtyDie]
       );
     }
     await client.query('UPDATE find_tables SET updated_at = now() WHERE id = $1', [tableId]);
@@ -244,7 +290,7 @@ export async function removeFindTableEntry(actor: ForageActor, form: FormData): 
 export function loadForageCatalogue(): Promise<ForageCatalogue> {
   return cachedReference('forage-catalogue', async () => {
     const tables = await query<TableRow>(`
-      SELECT t.id, t.name, t.area_type, t.category, t.type_die, '' AS suggested_check, t.is_archived,
+      SELECT t.id, t.campaign_id, NULL::text AS campaign_name, t.name, t.area_type, t.category, '' AS suggested_check, t.is_archived,
              t.owner_user_id, NULL::text AS owner_name, 0 AS entry_count, 0 AS pickable_count
       FROM find_tables t WHERE t.is_archived = false ORDER BY t.area_type, t.category`);
     const entries = await query<EntryRow>(`${ENTRY_SELECT}
@@ -259,8 +305,8 @@ export function loadForageCatalogue(): Promise<ForageCatalogue> {
     return {
       tables: tables.rows.map((row) => {
         const list = byTable.get(row.id) ?? [];
-        const { ownerName: _ownerName, entryCount: _entryCount, suggestedCheck: _suggestedCheck, ...table } = mapTable(row);
-        return { ...table, entries: list, pickableCount: list.filter((entry) => entry.weight > 0 && !entry.itemArchived).length };
+        const { ownerName: _ownerName, entryCount: _entryCount, suggestedCheck: _suggestedCheck, campaignName: _campaignName, ...table } = mapTable(row);
+        return { ...table, entries: list, pickableCount: list.filter((entry) => entry.chance > 0 && !entry.itemArchived).length };
       })
     };
   });
@@ -343,7 +389,10 @@ function resultsJson(added: Array<FindResult & { name: string }>): string {
   return JSON.stringify(added.map(({ item_id, qty, inventory_id }) => ({ item_id, qty, inventory_id })));
 }
 
-/** DM mode: the DM approved a haul. One transaction: items into inventory, then the finds row. */
+/**
+ * DM mode: the DM approved a haul. One transaction: items into inventory, then the finds row. The
+ * find's campaign is the table's (the route has already checked the table is the room's campaign's).
+ */
 export async function approveDmFind(input: {
   characterId: string; finderUserId: string; tableId: string; lines: FindLine[]; nat20: boolean;
   check: ForageCheck; gameSessionId: string | null; roomCode: string | null;
@@ -352,8 +401,8 @@ export async function approveDmFind(input: {
     const added = await insertFindItems(client, input);
     const row = await client.query<{ id: string }>(
       `INSERT INTO finds (mode, status, game_session_id, room_code, character_id, finder_user_id, find_table_id,
-         nat20, check_json, results, resolved_at)
-       VALUES ('dm', 'found', $1, $2, $3, $4, $5, $6, $7, $8, now()) RETURNING id`,
+         nat20, check_json, results, resolved_at, campaign_id)
+       VALUES ('dm', 'found', $1, $2, $3, $4, $5, $6, $7, $8, now(), (SELECT campaign_id FROM find_tables WHERE id = $5)) RETURNING id`,
       [input.gameSessionId, input.roomCode, input.characterId, input.finderUserId, input.tableId, input.nat20,
         JSON.stringify(input.check), resultsJson(added)]
     );
@@ -383,17 +432,17 @@ export async function getUnmarkedSelfFind(userId: string): Promise<UnmarkedSelfF
  */
 export async function startSelfFind(input: {
   characterId: string; finderUserId: string; tableId: string | null; areaType: string; category: string; check: ForageCheck;
-  roomCode: string | null; gameSessionId: string | null;
+  roomCode: string | null; gameSessionId: string | null; campaignId?: string | null;
 }): Promise<{ findId: string } | { conflict: 'unmarked_check'; existing: UnmarkedSelfFind | null }> {
   const existing = await getUnmarkedSelfFind(input.finderUserId);
   if (existing) return { conflict: 'unmarked_check', existing };
   try {
     const result = await query<{ id: string }>(
       `INSERT INTO finds (mode, status, game_session_id, room_code, character_id, finder_user_id, find_table_id,
-         area_type, category, nat20, check_json)
-       VALUES ('self', 'checked', $1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+         area_type, category, nat20, check_json, campaign_id)
+       VALUES ('self', 'checked', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
       [input.gameSessionId, input.roomCode, input.characterId, input.finderUserId, input.tableId, input.areaType, input.category,
-        input.check.nat20, JSON.stringify(input.check)]
+        input.check.nat20, JSON.stringify(input.check), input.campaignId ?? null]
     );
     return { findId: result.rows[0].id };
   } catch (error) {
@@ -420,7 +469,9 @@ export type MarkedSelfFind = {
  * The table is the one fixed at start (the player never picks or changes it). If there was none (an
  * area + category with no table), or it has since been archived or has nothing pickable, a pass
  * can't pay out, so the find closes as 'failed' with empty results and a note. The player just sees
- * that they found nothing, exactly as for a failed check.
+ * that they found nothing, exactly as for a failed check. A pass on a live table rolls every
+ * pickable entry on its own chance, so it can also come up empty: that closes as 'found' with no
+ * results (a real pass that found nothing).
  */
 export async function markSelfFind(input: {
   findId: string; userId: string; passed: boolean; rollDie?: RollDie;
@@ -449,14 +500,16 @@ export async function markSelfFind(input: {
     };
     if (!tableId) return closeNothingToFind('No table for this area and category, so there was nothing to find.');
     const gone = 'Table empty or archived at mark time, nothing was added.';
-    const table = await client.query<{ type_die: number }>('SELECT type_die FROM find_tables WHERE id = $1 AND is_archived = false', [tableId]);
+    const table = await client.query('SELECT 1 FROM find_tables WHERE id = $1 AND is_archived = false', [tableId]);
     if (!table.rowCount) return closeNothingToFind(gone);
     const entries = (await client.query<EntryRow>(`${ENTRY_SELECT} WHERE e.find_table_id = $1`, [tableId])).rows.map(mapEntry);
     if (pickableEntries(entries).length === 0) return closeNothingToFind(gone);
 
-    const rolled = rollFind(entries, table.rows[0].type_die, !!find.nat20, input.rollDie ?? defaultRollDie);
-    // The server's own haul goes through the same validator as a DM's approval.
-    const valid = validateFindLines(rolled.lines, entries);
+    const rolled = rollFind(entries, !!find.nat20, input.rollDie ?? defaultRollDie);
+    // The server's own haul goes through the same validator as a DM's approval. An empty haul is fine:
+    // the pass found nothing, so the find is logged as 'found' with no results (the player is told
+    // "You didn't find anything", the roll log says "found nothing of note").
+    const valid = validateFindLines(rolled.lines, entries, undefined, true);
     if (!valid.ok) throw new Error(valid.error);
     const added = await insertFindItems(client, { characterId: find.character_id, tableId, lines: valid.lines });
     await client.query(
@@ -487,6 +540,7 @@ export async function revertFind(input: { findId: string; adminUserId: string })
     const find = found.rows[0];
     if (!find) return null;
     const results: FindResult[] = Array.isArray(find.results) ? find.results : [];
+    if (results.length === 0) return null; // an empty find has nothing to undo (the admin page says so)
     const names = new Map<string, string>();
     if (results.length) {
       const named = await client.query<{ id: string; name: string }>(
@@ -553,11 +607,13 @@ export async function clearUnmarkedCheck(findId: string): Promise<{ gameSessionI
 }
 
 /**
- * Suggested checks for every active table, in one query, keyed by table id. DM-side only (Q9): the
- * tables endpoint calls this only for the GM of a live room.
+ * Suggested checks for one campaign's active tables, in one query, keyed by table id. DM-side only
+ * (Q9): the tables endpoint calls this only for the GM of a live room, with that room's campaign.
  */
-export async function listSuggestedChecks(): Promise<Map<string, string>> {
-  const result = await query<{ id: string; suggested_check: string }>('SELECT id, suggested_check FROM find_tables WHERE is_archived = false');
+export async function listSuggestedChecks(campaignId: string): Promise<Map<string, string>> {
+  const result = await query<{ id: string; suggested_check: string }>(
+    'SELECT id, suggested_check FROM find_tables WHERE is_archived = false AND campaign_id = $1', [campaignId]
+  );
   return new Map(result.rows.map((row) => [row.id, row.suggested_check]));
 }
 
@@ -604,8 +660,9 @@ export async function shareFind(findId: string, userId: string): Promise<ShareOu
     if (find.finder_user_id !== userId && find.character_owner_id !== userId) return { ok: false, error: 'forbidden' };
     if (find.status !== 'found') return { ok: false, error: 'not_shareable' };
     if (find.shared) return { ok: true, alreadyShared: true };
-    await client.query('UPDATE finds SET shared = true WHERE id = $1', [findId]);
     const results: FindResult[] = Array.isArray(find.results) ? find.results : [];
+    if (results.length === 0) return { ok: false, error: 'not_shareable' }; // an empty find has nothing to show
+    await client.query('UPDATE finds SET shared = true WHERE id = $1', [findId]);
     const names = await itemNamesFor(client, results.map((line) => line.item_id));
     return {
       ok: true, alreadyShared: false,
@@ -628,14 +685,15 @@ export const RECENT_FINDS_LIMIT = 10;
 /**
  * A character's last few standing or undone finds, newest first, so the owner can share a find after
  * its result card is gone (a self-serve find made outside any game session had no other way).
- * Failed and unmarked checks are left out: they have nothing to show or share. The caller must have
+ * Failed and unmarked checks, and found finds with no items, are left out: they have nothing to show or share (and empty ones would push real hauls out of the window). The caller must have
  * owner-checked the character. The query never touches find_tables, so a table can't leak.
  */
 export async function listRecentFindsForCharacter(characterId: string, limit = RECENT_FINDS_LIMIT): Promise<RecentFind[]> {
   if (!UUID_PATTERN.test(characterId)) return [];
   const rows = await query<{ id: string; created_at: string; status: 'found' | 'reverted'; mode: FindMode; shared: boolean; results: FindResult[] | null; revert_note: string }>(
     `SELECT id, created_at, status, mode, shared, results, revert_note FROM finds
-     WHERE character_id = $1 AND status IN ('found', 'reverted') ORDER BY created_at DESC LIMIT $2`,
+     WHERE character_id = $1 AND status IN ('found', 'reverted')
+       AND NOT (status = 'found' AND results = '[]'::jsonb) ORDER BY created_at DESC LIMIT $2`,
     [characterId, Math.max(1, Math.min(limit, 50))]
   );
   const ids = new Set<string>();
@@ -652,19 +710,21 @@ type FindListRow = {
   check_json: ForageCheck | null; revert_note: string; finder_user_id: string; character_id: string;
   character_name: string; character_owner_id: string; owner_name: string | null; table_name: string;
   game_session_id: string | null; game_session_name: string | null; room_code: string | null; nat20: boolean;
+  campaign_name: string | null;
 };
 
 const FIND_LIST_SELECT = `
   SELECT f.id, f.created_at, f.status, f.mode, f.shared, f.results, f.check_json, f.revert_note, f.finder_user_id,
          f.character_id, f.game_session_id, f.room_code, f.nat20,
-         c.name AS character_name, c.owner_user_id AS character_owner_id, u.display_name AS owner_name,
+         c.name AS character_name, c.owner_user_id AS character_owner_id, u.display_name AS owner_name, cp.name AS campaign_name,
          -- A self-serve find of an area + category with no table names what was searched for instead.
          COALESCE(t.name, 'No table (' || f.area_type || ', ' || f.category || ')') AS table_name, g.name AS game_session_name
   FROM finds f
   JOIN characters c ON c.id = f.character_id
   JOIN users u ON u.id = f.finder_user_id
   LEFT JOIN find_tables t ON t.id = f.find_table_id
-  LEFT JOIN game_sessions g ON g.id = f.game_session_id`;
+  LEFT JOIN game_sessions g ON g.id = f.game_session_id
+  LEFT JOIN campaigns cp ON cp.id = f.campaign_id`;
 
 const resultsOf = (row: FindListRow): FindResult[] => (Array.isArray(row.results) ? row.results : []);
 
@@ -706,12 +766,15 @@ export async function listFindsForGameSession(gameSessionId: string, viewer: { i
   return { isDm, finds: rows.rows.map((row) => shapeFindForViewer(toViewerFind(row, names), { id: viewer.id, isDm })) };
 }
 
-export type AdminFindFilter = { gameSessionId?: string; characterId?: string; status?: string };
+/** campaignId is a campaign uuid, or 'none' for the older finds made before campaigns existed. */
+export type AdminFindFilter = { gameSessionId?: string; characterId?: string; status?: string; campaignId?: string };
 
 export type AdminFindRow = {
   id: string; createdAt: string; status: FindStatus; mode: FindMode; shared: boolean; characterId: string;
   characterName: string; ownerName: string; tableName: string; checkSummary: string; nat20: boolean;
   gameSessionId: string | null; gameSessionName: string | null; roomCode: string | null; revertNote: string;
+  /** The campaign the forage ran in; null for finds made before campaigns existed. */
+  campaignName: string | null;
   items: Array<{ name: string; qty: number; inventoryId: string; row: { name: string; quantity: number } | null }>;
 };
 
@@ -727,6 +790,8 @@ export async function listFindsForAdmin(filter: AdminFindFilter): Promise<AdminF
   const params: unknown[] = [];
   if (filter.gameSessionId && UUID_PATTERN.test(filter.gameSessionId)) { params.push(filter.gameSessionId); where.push(`f.game_session_id = $${params.length}`); }
   if (filter.characterId && UUID_PATTERN.test(filter.characterId)) { params.push(filter.characterId); where.push(`f.character_id = $${params.length}`); }
+  if (filter.campaignId === 'none') where.push('f.campaign_id IS NULL');
+  else if (filter.campaignId && UUID_PATTERN.test(filter.campaignId)) { params.push(filter.campaignId); where.push(`f.campaign_id = $${params.length}`); }
   if (filter.status === 'dm' || filter.status === 'self') { params.push(filter.status); where.push(`f.mode = $${params.length}`); }
   else if (filter.status && ['checked', 'failed', 'found', 'reverted'].includes(filter.status)) { params.push(filter.status); where.push(`f.status = $${params.length}`); }
   const rows = await query<FindListRow>(
@@ -745,7 +810,7 @@ export async function listFindsForAdmin(filter: AdminFindFilter): Promise<AdminF
     id: row.id, createdAt: row.created_at, status: row.status, mode: row.mode, shared: row.shared, characterId: row.character_id,
     characterName: row.character_name, ownerName: row.owner_name ?? 'Unknown', tableName: row.table_name,
     checkSummary: findCheckSummary(row.check_json), nat20: row.nat20, gameSessionId: row.game_session_id,
-    gameSessionName: row.game_session_name, roomCode: row.room_code, revertNote: row.revert_note,
+    gameSessionName: row.game_session_name, roomCode: row.room_code, revertNote: row.revert_note, campaignName: row.campaign_name,
     items: resultsOf(row).map((line) => ({
       name: names.get(line.item_id) ?? 'Unknown item', qty: line.qty, inventoryId: line.inventory_id, row: current.get(line.inventory_id) ?? null
     }))
@@ -755,16 +820,20 @@ export async function listFindsForAdmin(filter: AdminFindFilter): Promise<AdminF
 /** The dropdown options for the admin filters: only sessions and characters that have finds. */
 export async function listFindFilterOptions(): Promise<{
   sessions: Array<{ id: string; name: string; createdAt: string }>; characters: Array<{ id: string; name: string }>;
+  campaigns: Array<{ id: string; name: string }>;
 }> {
-  const [sessionRows, characterRows] = await Promise.all([
+  const [sessionRows, characterRows, campaignRows] = await Promise.all([
     query<{ id: string; name: string; created_at: string }>(
       `SELECT g.id, g.name, g.created_at FROM game_sessions g WHERE EXISTS (SELECT 1 FROM finds f WHERE f.game_session_id = g.id)
        ORDER BY g.created_at DESC LIMIT 100`),
     query<{ id: string; name: string }>(
-      `SELECT c.id, c.name FROM characters c WHERE EXISTS (SELECT 1 FROM finds f WHERE f.character_id = c.id) ORDER BY c.name LIMIT 200`)
+      `SELECT c.id, c.name FROM characters c WHERE EXISTS (SELECT 1 FROM finds f WHERE f.character_id = c.id) ORDER BY c.name LIMIT 200`),
+    query<{ id: string; name: string }>(
+      `SELECT cp.id, cp.name FROM campaigns cp WHERE EXISTS (SELECT 1 FROM finds f WHERE f.campaign_id = cp.id) ORDER BY lower(cp.name) LIMIT 100`)
   ]);
   return {
     sessions: sessionRows.rows.map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at })),
-    characters: characterRows.rows
+    characters: characterRows.rows,
+    campaigns: campaignRows.rows
   };
 }

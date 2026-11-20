@@ -1,5 +1,5 @@
 import { query } from '$lib/server/db';
-import { normaliseTag, resolveTable } from '$lib/rules/forage';
+import { forageAvailability, normaliseTag, resolveTable, tablesForCampaign, type ForageAvailability } from '$lib/rules/forage';
 import { FORAGE_SELF_SKILLS, findSkill } from '$lib/rules/skills';
 import { parseAttackOptions } from '$lib/server/vttAttackAdvantage';
 import { getActiveTable, loadForageCatalogue } from '$lib/server/services/forage';
@@ -19,29 +19,50 @@ export function shortText(value: unknown, max = 200): string {
 }
 
 /**
- * The character (owner-scoped) with its owner's active room, in one query. Null if the character
- * isn't the user's. Every player-facing action starts here.
+ * The character (owner-scoped) with its owner's active room and its campaign, in one query. Null if
+ * the character isn't the user's. Every player-facing action starts here. Forage stays owner-only
+ * on purpose (a DM foraging "as" a player is stand-in play, a later feature), so a campaign DM does
+ * not get through this check for someone else's character.
  */
-export async function loadOwnedCharacter(userId: string, characterId: unknown): Promise<{ name: string; activeRoomId: string | null } | null> {
+export async function loadOwnedCharacter(userId: string, characterId: unknown): Promise<{
+  name: string; activeRoomId: string | null; campaignId: string | null;
+} | null> {
   if (!isUuid(characterId)) return null;
-  const result = await query<{ name: string; active_vtt_session_id: string | null }>(
-    `SELECT c.name, u.active_vtt_session_id FROM characters c JOIN users u ON u.id = c.owner_user_id
+  const result = await query<{ name: string; active_vtt_session_id: string | null; campaign_id: string | null }>(
+    `SELECT c.name, u.active_vtt_session_id, c.campaign_id FROM characters c JOIN users u ON u.id = c.owner_user_id
      WHERE c.id = $1 AND c.owner_user_id = $2`,
     [characterId, userId]
   );
   const row = result.rows[0];
-  return row ? { name: row.name, activeRoomId: row.active_vtt_session_id } : null;
+  return row ? { name: row.name, activeRoomId: row.active_vtt_session_id, campaignId: row.campaign_id ?? null } : null;
+}
+
+/**
+ * Can this character forage right now? `session` is the live room the forage resolves to (or
+ * null/undefined for none). The answer is campaign-level only (see forageAvailability): it never
+ * says anything about individual tables, so it is safe to send to the player.
+ */
+export async function checkForageAvailability(
+  character: { campaignId: string | null }, session: { campaignId?: string | null } | null | undefined
+): Promise<ForageAvailability> {
+  const catalogue = await loadForageCatalogue();
+  return forageAvailability({
+    characterCampaignId: character.campaignId, roomCampaignId: session?.campaignId ?? null, inLiveRoom: !!session, tables: catalogue.tables
+  });
 }
 
 /**
  * Validates the picks from a request body. The skill must be one of the 18, and the table must be
- * an active one with something pickable (a table with nothing to roll can't be foraged).
+ * an active one of the ROOM'S campaign with something pickable (a table with nothing to roll can't
+ * be foraged). A Quick room has no campaign, so it has no usable table.
  */
-export async function parseChoice(body: any): Promise<{ choice: ForageChoice; tableName: string } | { error: 'bad_skill' | 'bad_table' | 'table_empty' }> {
+export async function parseChoice(
+  body: any, roomCampaignId: string | null
+): Promise<{ choice: ForageChoice; tableName: string } | { error: 'bad_skill' | 'bad_table' | 'table_empty' }> {
   const skillKey = shortText(body?.skillKey, 40);
   if (!findSkill(skillKey)) return { error: 'bad_skill' };
   const table = await getActiveTable(shortText(body?.tableId, 40));
-  if (!table) return { error: 'bad_table' };
+  if (!table || !roomCampaignId || table.campaignId !== roomCampaignId) return { error: 'bad_table' };
   if (table.pickableCount === 0) return { error: 'table_empty' };
   const options = parseAttackOptions(body);
   return {
@@ -83,9 +104,10 @@ export function parseAdvantage(body: any): ForageChoice['advantage'] {
  * from area + category: the player never names a table (a tableId in the body is ignored). Any area
  * + category is accepted, with or without a table behind it: one with no pickable table gets a null
  * tableId, rolls and marks exactly like any other, and a pass just finds nothing. So a player can't
- * tell from the popup which combinations have a table.
+ * tell from the popup which combinations have a table. The table is looked up in the CHARACTER'S
+ * campaign only (the caller has already checked that campaign can forage).
  */
-export async function parseSelfChoice(body: any): Promise<
+export async function parseSelfChoice(body: any, campaignId: string | null): Promise<
   { choice: Omit<ForageChoice, 'tableId'> & { tableId: string | null } } | { error: 'skill_not_allowed' | 'bad_pick' }
 > {
   const skillKey = shortText(body?.skillKey, 40);
@@ -93,7 +115,7 @@ export async function parseSelfChoice(body: any): Promise<
   const areaType = normaliseTag(shortText(body?.areaType, 80));
   const category = normaliseTag(shortText(body?.category, 80));
   if (!areaType || !category) return { error: 'bad_pick' };
-  const table = resolveTable(await loadForageCatalogue(), areaType, category);
+  const table = resolveTable({ tables: tablesForCampaign((await loadForageCatalogue()).tables, campaignId) }, areaType, category);
   const tableId = table && table.pickableCount > 0 ? table.id : null;
   return { choice: { skillKey, areaType, category, tableId, advantage: parseAdvantage(body) } };
 }

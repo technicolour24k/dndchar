@@ -25,7 +25,7 @@ export type ForagePreview = {
   nat20: boolean;
   runs: number;
   lines: Array<{ itemId: string; name: string; qty: number }>;
-  tableEntries: Array<{ itemId: string; name: string; weight: number; qtyDie: number; archived: boolean }>;
+  tableEntries: Array<{ itemId: string; name: string; chance: number; qtyDie: number; archived: boolean }>;
 };
 
 /** The in-memory DM-mode request. The GM sees all of it, the finder only forageViewForPlayer. */

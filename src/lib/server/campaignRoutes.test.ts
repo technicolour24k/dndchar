@@ -29,6 +29,9 @@ vi.mock('$lib/server/services/access', async (importOriginal) => ({
   getCampaignAccess: (...args: unknown[]) => getCampaignAccess(...args)
 }));
 vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: vi.fn() }));
+// The campaign page's "Find tables: N active" line (DMs and admins only) reads the forage service.
+const countActiveFindTables = vi.fn();
+vi.mock('$lib/server/services/forage', () => ({ countActiveFindTables: (...args: unknown[]) => countActiveFindTables(...args) }));
 
 const { CampaignError } = await import('$lib/server/campaignError');
 const list = await import('../../routes/campaigns/+page.server');
@@ -160,6 +163,17 @@ describe('/campaigns/[id] load', () => {
     expect(Object.values(data.controls.dm).some(Boolean)).toBe(false);
     expect(data.leave).toMatchObject({ show: true, allowed: true });
     expect(data.viaAdmin).toBe(false);
+    // The forage line is for DMs and admins: a player gets null and the count isn't even queried.
+    expect(data.findTableCount).toBeNull();
+    expect(countActiveFindTables).not.toHaveBeenCalled();
+  });
+
+  it('a DM sees how many active find tables the campaign has', async () => {
+    svc.getCampaignPage.mockResolvedValue(page('co_dm'));
+    countActiveFindTables.mockResolvedValue(2);
+    const data: any = await detail.load({ params: { id: CAMPAIGN }, locals: { user } } as any);
+    expect(data.findTableCount).toBe(2);
+    expect(countActiveFindTables).toHaveBeenCalledWith(CAMPAIGN);
   });
 
   it('an admin who is not a DM sees the override banner and can make a primary DM', async () => {

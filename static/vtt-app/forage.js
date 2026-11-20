@@ -16,10 +16,10 @@
 
 import {
   addLine, addableEntries, areaOptions, canApprove, canSubmitPicks, canSubmitSelf, categoryOptions, chosenTable,
-  defaultPicks, defaultSelfPicks, dmResult, errorText, forageButtonLabel, LAST_GM_PICKS_KEY, LAST_PICKS_KEY,
+  defaultPicks, defaultSelfPicks, dmResult, errorText, forageButtonLabel, forageUnavailableReason, forageUnavailableText, LAST_GM_PICKS_KEY, LAST_PICKS_KEY,
   linesPayload, natBadgeText, canShareRecent, recentFindItemsText, recentFindStatusText, parseQty, parseSavedPicks, pickableTables, queueLabel,
   removeLine, requestSignature, resolveTable, resultHeadline, selfAreas, selfCategories,
-  selfResult, setLineQty, sortedRequests, tagLabel, tableLineText
+  selfResult, setLineQty, sortedRequests, tagLabel, tableLineText, chanceLabel
 } from './shared/forageView.js';
 
 const PLAYER_API = '/vtt/api/forage';
@@ -286,6 +286,8 @@ export function createForage(deps) {
     if (!pf.open || pf.tokenId !== tokenId) return; // closed or switched while loading
     applyMine(mineRes.ok ? mineRes.data : null);
     pf.adv = newAdv(null);
+    // Find tables belong to campaigns: when forage is off for this character the popup just says why.
+    if (offReason()) { pf.loading = false; renderPlayer(); refreshButtons(); return; }
     // In DM mode the player picks nothing, so the pickers' data is only fetched when there is no DM.
     if (!dmMode()) await loadSelfOptions();
     if (!pf.open || pf.tokenId !== tokenId) return;
@@ -297,10 +299,15 @@ export function createForage(deps) {
   // A DM is present and will run the check (the server still decides at submit time).
   const dmMode = () => pf.mine?.dmPresent === true;
 
+  // Is forage off for the popup's character (no campaign, wrong room, no tables)? '' when it works, or
+  // when something already started can still be finished (the server keeps those resumable).
+  const offReason = () => forageUnavailableReason(pf.mine, pf.characterId);
+
   // The self-serve pickers' data: a short skill list and separate area and category tag lists (never
   // pairs). The server sends no table names, ids or counts to a player.
   async function loadSelfOptions() {
-    const res = await api('GET', `${PLAYER_API}/tables?roomId=${encodeURIComponent(deps.getSessionId())}`);
+    // The tables are the CHARACTER'S campaign's, so the server needs to know which character (owner-checked).
+    const res = await api('GET', `${PLAYER_API}/tables?roomId=${encodeURIComponent(deps.getSessionId())}&characterId=${encodeURIComponent(pf.characterId)}`);
     if (!res.ok) { pf.message = errorText(res.data); return; }
     pf.skills = res.data.skills;
     pf.options = { areas: res.data.areas || [], categories: res.data.categories || [] };
@@ -311,6 +318,7 @@ export function createForage(deps) {
   function applyMine(mine) {
     pf.mine = mine;
     if (!mine) return;
+    rememberAvailability(pf.characterId, mine);
     const session = getSession();
     session.forage = session.forage || {};
     session.forageResults = session.forageResults || {};
@@ -379,7 +387,9 @@ export function createForage(deps) {
     } else {
       // form
       const dm = dmMode();
-      if (!dm && !(pf.options && pf.picks)) {
+      if (offReason()) {
+        html += `<p class="forage-warn">${esc(forageUnavailableText(offReason()))}</p>${msg}<div class="actions">${closeBtn()}</div>`;
+      } else if (!dm && !(pf.options && pf.picks)) {
         // No DM and the pickers' data didn't load (or there is nothing to forage for).
         html += `${msg}${recentHtml()}<div class="actions">${closeBtn()}</div>`;
       } else {
@@ -853,14 +863,16 @@ export function createForage(deps) {
       ? draft.lines.map((l) => `<li><span class="forage-line-name">${esc(l.name)}</span>
           <input type="number" min="1" max="999" inputmode="numeric" class="forage-qty" data-fg-qty="${esc(l.itemId)}" value="${l.qty}" aria-label="Quantity of ${esc(l.name)}" />
           <button type="button" class="secondary" data-fg-remove="${esc(l.itemId)}" aria-label="Remove ${esc(l.name)}">×</button></li>`).join('')
-      : '<li class="attack-subtext">No items. Add one, or reroll.</li>';
+      : '<li class="attack-subtext">Nothing found this roll. Add an item, reroll, or approve as nothing found.</li>';
     const addable = addableEntries(request.preview.tableEntries, draft.lines);
     const select = gmBody.querySelector('[data-fg="addSelect"]');
     select.innerHTML = addable.length
-      ? addable.map((e) => `<option value="${esc(e.itemId)}">${esc(e.name)}${e.weight === 0 ? ' (weight 0)' : ''}</option>`).join('')
+      ? addable.map((e) => `<option value="${esc(e.itemId)}">${esc(e.name)} (${esc(chanceLabel(e.chance))})</option>`).join('')
       : '<option value="">Nothing else on this table</option>';
     gmBody.querySelector('[data-fg-act="addLine"]').disabled = !addable.length;
-    gmBody.querySelector('[data-fg="approve"]').disabled = !canApprove(draft.lines) || gm.busy;
+    const approveBtn = gmBody.querySelector('[data-fg="approve"]');
+    approveBtn.disabled = !canApprove(draft.lines) || gm.busy;
+    approveBtn.textContent = draft.lines.length ? 'Approve' : 'Approve (nothing found)';
   }
 
   // A reroll or table change must replace the GM's edits with the fresh server lines.
@@ -998,17 +1010,55 @@ export function createForage(deps) {
   // ---------------------------------------------------------------------------------------------
   function forageButtonHtml(token) {
     if (!token.characterId || token.type === 'prop' || !deps.isAccountLinked()) return '';
-    const label = forageButtonLabel(buttonState(token));
-    return `<button type="button" class="secondary forageBtn" data-forage-token="${esc(token.id)}" title="Look for plants, ore and other finds">${label}</button>`;
+    const state = buttonState(token);
+    const title = state.unavailable ? forageUnavailableText(state.unavailable) : 'Look for plants, ore and other finds';
+    return `<button type="button" class="secondary forageBtn" data-forage-token="${esc(token.id)}" title="${esc(title)}">${forageButtonLabel(state)}</button>`;
+  }
+
+  // Per-character "is forage off?" for the token-card buttons, learned from GET /forage/mine (the same
+  // answer the sheet uses). Unknown or stale (over a minute) entries are fetched when a button is drawn.
+  // An in-flight forage or a waiting result keeps the button live, so a started forage can be finished.
+  const availability = new Map(); // "room|characterId" -> { reason, at }
+  const availKey = (characterId) => `${deps.getSessionId()}|${characterId}`;
+  const asking = new Set();
+  const AVAILABILITY_TTL_MS = 60000;
+
+  function rememberAvailability(characterId, mine) {
+    if (characterId) availability.set(availKey(characterId), { reason: forageUnavailableReason(mine, characterId), at: Date.now() });
+  }
+
+  async function askAvailability(characterId, force = false) {
+    if (asking.has(characterId) && !force) return;
+    asking.add(characterId);
+    const res = await api('GET', `${PLAYER_API}/mine?characterId=${encodeURIComponent(characterId)}&roomId=${encodeURIComponent(deps.getSessionId())}`);
+    asking.delete(characterId);
+    if (res.ok) rememberAvailability(characterId, res.data);
+    refreshButtons();
+  }
+
+  function unavailableFor(characterId) {
+    const known = availability.get(availKey(characterId));
+    if (!known || Date.now() - known.at > AVAILABILITY_TTL_MS) setTimeout(() => askAvailability(characterId), 0);
+    return known ? known.reason : '';
   }
 
   function buttonState(token) {
     const pending = myPending();
     const result = currentResult();
+    const hasResult = !!result && (!result.characterId || result.characterId === token.characterId);
     return {
       pending: !!pending, // the finder only ever has one in flight
-      hasResult: !!result && (!result.characterId || result.characterId === token.characterId)
+      hasResult,
+      unavailable: !pending && !hasResult && !pf.self ? unavailableFor(token.characterId) : ''
     };
+  }
+
+  function applyButtonState(button, token) {
+    const state = buttonState(token);
+    button.textContent = forageButtonLabel(state);
+    // Never hard-disabled: the answer is cached, so a click re-checks with the server (see the click handler).
+    button.classList.toggle('forage-off', !!state.unavailable);
+    button.title = state.unavailable ? forageUnavailableText(state.unavailable) : 'Look for plants, ore and other finds';
   }
 
   function refreshButtons() {
@@ -1016,12 +1066,35 @@ export function createForage(deps) {
     if (!session || deps.getRole() !== 'player') return;
     document.querySelectorAll('.forageBtn').forEach((button) => {
       const token = session.tokens?.[button.dataset.forageToken];
-      if (token) button.textContent = forageButtonLabel(buttonState(token));
+      if (token) applyButtonState(button, token);
     });
+  }
+
+  // GM side: whether this room can be foraged at all. Find tables belong to campaigns, so a Quick room
+  // has none and a campaign with no table that has something pickable has foraging off. Fetched at most
+  // once a minute, when the sidebar is drawn (the list is the room's campaign's tables, GM only).
+  const gmInfo = { quick: false, pickable: null, at: 0, asking: false };
+  async function refreshGmInfo() {
+    if (gmInfo.asking || Date.now() - gmInfo.at < 60000) return;
+    gmInfo.asking = true;
+    const res = await api('GET', `${PLAYER_API}/tables?roomId=${encodeURIComponent(deps.getSessionId())}`);
+    gmInfo.asking = false;
+    gmInfo.at = Date.now();
+    if (!res.ok || !Array.isArray(res.data.tables)) return;
+    gmInfo.quick = res.data.unavailableReason === 'wrong_room';
+    gmInfo.pickable = pickableTables(res.data.tables).length;
+    refreshSidebarLine();
+  }
+  function gmInfoHtml() {
+    const text = gmInfo.quick ? "Foraging isn't available in Quick rooms."
+      : gmInfo.pickable === 0 ? 'No find tables for this campaign yet. <a href="/forage/tables" target="_blank" rel="noopener">Set them up</a>'
+        : '';
+    return text ? `<div class="forage-sidebar-line"><span class="attack-subtext">${text}</span></div>` : '';
   }
 
   function forageControlHtml() {
     if (deps.getRole() !== 'gm') return '';
+    refreshGmInfo();
     return `<div id="forageControl">${sidebarLineHtml()}</div>`;
   }
   function sidebarLineHtml() {
@@ -1030,7 +1103,7 @@ export function createForage(deps) {
     const notice = gm.notice && !gm.open
       ? `<div class="forage-sidebar-line"><span>${esc(gm.notice)}</span><button type="button" data-forage-dismiss>Dismiss</button></div>`
       : '';
-    if (!reqs.length) return notice;
+    if (!reqs.length) return `${notice}${gmInfoHtml()}`;
     const more = reqs.length > 1 ? ` (+${reqs.length - 1} more waiting)` : '';
     return `${notice}<div class="forage-sidebar-line"><span>Forage request from ${esc(reqs[0].playerName)}${more}</span><button type="button" data-forage-open>Open</button></div>`;
   }
@@ -1056,8 +1129,31 @@ export function createForage(deps) {
       return;
     }
     const button = event.target.closest('.forageBtn');
-    if (button) openPlayerForage(button.dataset.forageToken);
+    if (button) clickForage(button);
   });
+
+  // A button that looks unavailable may be stale (the cache is up to a minute old), so a click asks the
+  // server again. Now available: open forage. Still off: show the reason on the button's card.
+  async function clickForage(button) {
+    const tokenId = button.dataset.forageToken;
+    if (!button.classList.contains('forage-off')) { openPlayerForage(tokenId); return; }
+    const token = getSession()?.tokens?.[tokenId];
+    if (!token?.characterId) return;
+    await askAvailability(token.characterId, true);
+    if (unavailableFor(token.characterId)) {
+      button.title = forageUnavailableText(unavailableFor(token.characterId));
+      showOffNotice(button, button.title);
+    } else openPlayerForage(tokenId);
+  }
+  function showOffNotice(button, text) {
+    let note = button.parentElement?.querySelector('.forage-off-note');
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'attack-subtext forage-off-note';
+      button.insertAdjacentElement('afterend', note);
+    }
+    note.textContent = text;
+  }
 
   // ---------------------------------------------------------------------------------------------
   // Message hooks (called from main.js's handleMessage)

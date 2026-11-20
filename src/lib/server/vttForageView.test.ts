@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 // The same file the browser loads (the VTT client is unbundled), tested from here.
 import { FORAGE_SELF_SKILLS } from '$lib/rules/skills';
+import { CHANCE_OPTIONS } from '$lib/rules/forage';
 import {
   SELF_SKILL_KEYS, canSubmitSelf, defaultSelfPicks, selfAreas, selfCategories, tagLabel,
   addLine, addableEntries, areaOptions, canApprove, canSubmitPicks, categoryOptions, chosenTable, defaultPicks,
   errorText, forageButtonLabel, parseQty, parseSavedPicks, removeLine, requestSignature, resolveTable,
   resultHeadline, selfResult, setLineQty, sortedRequests, tableLineText,
-  approvedHaulKey, forageBlocker, haulDecision, canShareRecent, forageAdvReadout, forageBadgeText, lastDmFor, recentFindItemsText, recentFindStatusText
+  forageUnavailableReason, forageUnavailableText,
+  approvedHaulKey, forageBlocker, haulDecision, canShareRecent, forageAdvReadout, forageBadgeText, lastDmFor, recentFindItemsText, recentFindStatusText, chanceLabel
 } from '../../../static/vtt-app/shared/forageView.js';
 
 const tables = [
@@ -87,9 +89,9 @@ describe('haul editing', () => {
     expect(addLine(lines, entries[0])).toBe(lines);
   });
 
-  it('only approves a non-empty list of valid quantities', () => {
+  it('approves valid quantities, and an empty haul (a pass can find nothing)', () => {
     expect(canApprove(lines)).toBe(true);
-    expect(canApprove([])).toBe(false);
+    expect(canApprove([])).toBe(true);
     expect(canApprove([{ itemId: 'a', name: 'x', qty: 0 }])).toBe(false);
   });
 });
@@ -112,6 +114,9 @@ describe('results, labels and errors', () => {
     expect(forageButtonLabel({ pending: true, hasResult: true })).toBe('Forage (waiting)');
     expect(forageButtonLabel({ pending: false, hasResult: true })).toBe('Forage (result)');
     expect(forageButtonLabel({ pending: false, hasResult: false })).toBe('Forage');
+    expect(forageButtonLabel({ pending: false, hasResult: false, unavailable: 'no_tables' })).toBe('Forage (unavailable)');
+    // Something already in flight wins over "unavailable", so it can still be finished.
+    expect(forageButtonLabel({ pending: true, hasResult: false, unavailable: 'no_tables' })).toBe('Forage (waiting)');
   });
 
   it('maps error codes to friendly text', () => {
@@ -210,6 +215,7 @@ describe('character sheet forage helpers', () => {
     expect(recentFindItemsText({ items: [] })).toBe('Nothing recorded');
     expect(canShareRecent(find)).toBe(true);
     expect(canShareRecent({ ...find, shared: true })).toBe(false);
+    expect(canShareRecent({ ...find, items: [] })).toBe(false); // an empty find has nothing to share
     expect(canShareRecent({ ...find, status: 'reverted' })).toBe(false);
     expect(recentFindStatusText(find)).toBe('self-served');
     expect(recentFindStatusText({ ...find, shared: true, mode: 'dm' })).toBe('DM-approved · shared with the party');
@@ -257,5 +263,47 @@ describe('character sheet forage helpers', () => {
       expect(haulDecision({ ...base, mine: { lastDm: { ...mine(2000).lastDm, outcome: 'failed' } }, handled: new Set() }).action).toBe('none');
       expect(haulDecision({ ...base, mine: null, handled: new Set() }).action).toBe('none');
     });
+  });
+});
+
+describe('unavailable forage (find tables belong to campaigns)', () => {
+  const CHAR = 'c1';
+  const off = (reason: string, extra: object = {}) => ({ available: false, unavailableReason: reason, pending: null, unmarkedSelf: null, lastDm: null, ...extra });
+
+  it('words each reason at campaign level only, never about tables', () => {
+    expect(forageUnavailableText('no_campaign')).toBe('Add this character to a campaign to forage.');
+    expect(forageUnavailableText('wrong_room')).toBe("Foraging isn't available in this room.");
+    expect(forageUnavailableText('no_tables')).toBe("Your DM hasn't set up foraging for this campaign yet.");
+    expect(forageUnavailableText('whatever')).toBe("Foraging isn't available right now.");
+    for (const reason of ['no_campaign', 'wrong_room', 'no_tables']) expect(forageUnavailableText(reason)).not.toMatch(/\d|table name/i);
+  });
+
+  it('gives the reason only when unavailable and nothing is in flight', () => {
+    expect(forageUnavailableReason(null, CHAR)).toBe('');
+    expect(forageUnavailableReason({ available: true }, CHAR)).toBe('');
+    expect(forageUnavailableReason({}, CHAR)).toBe(''); // an older server says nothing
+    expect(forageUnavailableReason(off('no_tables'), CHAR)).toBe('no_tables');
+    expect(forageUnavailableReason(off('no_campaign'), CHAR)).toBe('no_campaign');
+  });
+
+  it('stays live while a forage can still be finished (pending, unmarked check or a waiting result)', () => {
+    expect(forageUnavailableReason(off('no_tables', { pending: { id: 'r' }, pendingCharacter: { id: CHAR, name: 'A' } }), CHAR)).toBe('');
+    expect(forageUnavailableReason(off('no_tables', { unmarkedSelf: { findId: 'f', characterId: CHAR, check: {} } }), CHAR)).toBe('');
+    expect(forageUnavailableReason(off('no_tables', { lastDm: { requestId: 'q', characterId: CHAR, outcome: 'failed', closedAt: 1 } }), CHAR)).toBe('');
+  });
+
+  it('turns the server refusal into the same plain text', () => {
+    expect(errorText({ error: 'forage_unavailable', reason: 'wrong_room' })).toBe("Foraging isn't available in this room.");
+    expect(errorText({ error: 'forage_unavailable' })).toBe("Foraging isn't available right now.");
+  });
+});
+
+describe('chanceLabel', () => {
+  // The client's copy of the names has to stay in step with the editor's CHANCE_OPTIONS.
+  it('matches every CHANCE_OPTIONS entry', () => {
+    for (const option of CHANCE_OPTIONS) {
+      const name = option.label.replace(/ \(.*\)$/, '');
+      expect(chanceLabel(option.percent)).toBe(option.percent === 0 ? 'Off' : `${name} ${option.percent}%`);
+    }
   });
 });

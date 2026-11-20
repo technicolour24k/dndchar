@@ -18,6 +18,10 @@ const finder = { id: 'finder', isDm: false };
 const bystander = { id: 'other', isDm: false };
 
 describe('shapeFindForViewer', () => {
+  it('never offers Share on a find with no items', () => {
+    expect(shapeFindForViewer(find({ items: [] }), finder)).toMatchObject({ view: 'full', canShare: false, itemCount: 0 });
+  });
+
   it('gives the DM the full row, without a Share button', () => {
     const row = shapeFindForViewer(find(), dm);
     expect(row).toMatchObject({ view: 'full', mode: 'self', checkSummary: 'Nature 17', tableName: 'Secret Meadow Table', itemCount: 5, canShare: false });

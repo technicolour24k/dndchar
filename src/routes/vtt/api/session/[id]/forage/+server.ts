@@ -86,7 +86,7 @@ async function previewAction(session: any, request: ForageRequest, body: any) {
 // The GM rolls the check, possibly after changing the player's picks.
 async function checkAction(session: any, request: ForageRequest, body: any) {
   if (request.stage !== 'requested') return wrongStage(request);
-  const picked = await parseChoice(body);
+  const picked = await parseChoice(body, session.campaignId ?? null);
   if ('error' in picked) return err(picked.error, picked.error === 'table_empty' ? 409 : 400);
 
   const check = await rollForageCheck({
@@ -109,7 +109,7 @@ function previewFor(table: ForageCatalogueTable, nat20: boolean, rolled: { lines
     tableId: table.id, tableName: table.name, nat20, runs: rolled.runs,
     lines: rolled.lines.map((line) => ({ itemId: line.itemId, name: names.get(line.itemId) ?? 'Unknown item', qty: line.qty })),
     tableEntries: table.entries.map((entry) => ({
-      itemId: entry.itemId, name: entry.itemName, weight: entry.weight, qtyDie: entry.qtyDie, archived: entry.itemArchived
+      itemId: entry.itemId, name: entry.itemName, chance: entry.chance, qtyDie: entry.qtyDie, archived: entry.itemArchived
     }))
   };
 }
@@ -117,11 +117,12 @@ function previewFor(table: ForageCatalogueTable, nat20: boolean, rolled: { lines
 // Rolls (or rerolls) the haul on a table and moves the request to the preview stage.
 async function rollIntoPreview(session: any, request: ForageRequest, tableId: string) {
   const table = await getActiveTable(tableId);
-  if (!table) return err('bad_table', 400);
+  // The table must belong to this room's campaign (a Quick room has none, so no table is usable).
+  if (!table || !session.campaignId || table.campaignId !== session.campaignId) return err('bad_table', 400);
   if (table.pickableCount === 0) return err('table_empty', 409);
   if (!stillLive(session, request)) return err('stale_request', 409);
   const nat20 = !!request.check?.nat20;
-  request.preview = previewFor(table, nat20, rollFind(table.entries, table.typeDie, nat20, (sides) => Math.floor(Math.random() * sides) + 1));
+  request.preview = previewFor(table, nat20, rollFind(table.entries, nat20, (sides) => Math.floor(Math.random() * sides) + 1));
   if (table.id !== request.choice.tableId) {
     const suggestedCheck = await getSuggestedCheck(table.id);
     if (!stillLive(session, request)) return err('stale_request', 409);
@@ -159,8 +160,9 @@ async function approveAction(session: any, request: ForageRequest, body: any) {
   const check = request.check;
   try {
     const table = await getActiveTable(preview.tableId);
-    if (!table) { request.stage = 'preview'; return err('bad_table', 400); }
-    const valid = validateFindLines(body?.lines, table.entries);
+    if (!table || !session.campaignId || table.campaignId !== session.campaignId) { request.stage = 'preview'; return err('bad_table', 400); }
+    // allowEmpty: a pass can find nothing, and the DM approves that as it stands.
+    const valid = validateFindLines(body?.lines, table.entries, undefined, true);
     if (!valid.ok) { request.stage = 'preview'; return err('invalid_lines', 400, { message: valid.error }); }
 
     let saved;
