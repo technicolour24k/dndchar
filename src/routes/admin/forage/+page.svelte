@@ -1,5 +1,6 @@
 <script lang="ts">
   import { enhance } from '$app/forms';
+  import type { SubmitFunction } from '@sveltejs/kit';
 
   let { data, form } = $props();
 
@@ -21,9 +22,10 @@
     ({ found: 'Found', reverted: 'Undone', failed: 'Failed', checked: 'Unmarked check' } as Record<string, string>)[status] ?? status;
 
   // Plain confirm before an undo: it changes the player's inventory.
-  function confirmUndo(characterName: string) {
-    return (event: SubmitEvent) => {
-      if (!confirm(`Undo ${characterName}'s find? This reduces or removes the inventory rows it added.`)) event.preventDefault();
+  // Asks first, through enhance's cancel() (enhance ignores preventDefault() from onsubmit).
+  function confirmUndo(characterName: string): SubmitFunction {
+    return ({ cancel }) => {
+      if (!confirm(`Undo ${characterName}'s find? This reduces or removes the inventory rows it added.`)) cancel();
     };
   }
 </script>
@@ -125,7 +127,7 @@
       {/if}
       {#if find.revertNote}<p class="muted">Note: {find.revertNote}</p>{/if}
       {#if find.status === 'found'}
-        <form method="POST" action={actionUrl('undoFind')} use:enhance onsubmit={confirmUndo(find.characterName)}>
+        <form method="POST" action={actionUrl('undoFind')} use:enhance={confirmUndo(find.characterName)}>
           <input type="hidden" name="findId" value={find.id} />
           <button type="submit" class="danger">Undo</button>
         </form>

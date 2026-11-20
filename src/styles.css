@@ -2876,3 +2876,86 @@ button.text-button.danger-text:hover {
 .remove-character-modal { width: min(460px, 100%); display: grid; gap: 10px; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); }
 .remove-character-modal h2, .remove-character-modal p { margin: 0; }
 .remove-character-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
+
+/* Creatures page: compact template cards. Layout reuses .campaigns-layout / .card-grid. */
+.creature-grid {
+  align-items: start;
+}
+
+.creature-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.creature-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.creature-thumb {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  object-fit: cover;
+  font-size: 14px;
+}
+
+.creature-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.creature-title h3 {
+  font-size: 16px;
+}
+
+.creature-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.creature-stats strong {
+  color: var(--text);
+}
+
+.creature-actions {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.creature-edit > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.creature-edit[open] > summary {
+  margin-bottom: 8px;
+}
+
+.creature-form {
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.creature-numbers {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 6px 8px;
+}
+
+.creature-numbers label {
+  font-size: 12px;
+}
