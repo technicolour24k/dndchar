@@ -13,7 +13,7 @@
   import type { ForageMine } from '$lib/types/forage';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
-    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, defaultRollChoices, poolSummary,
+    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
   import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
@@ -2109,7 +2109,7 @@
                   {item.name}
                 </span>
                 <span>{item.attackAbility.toUpperCase()}</span>
-                <span>{signed(item.toHitBonus)}</span>
+                <span>{signed(weaponToHitBonus(character.modifierSources, item, abilityScores, prof, classRows))}</span>
                 <span>{damageSummary(item)}</span>
                 <span>{item.notes || '-'}</span>
                 <button type="button" class="compact-button dice-button" onclick={() => askAttackRoll(item)}>
