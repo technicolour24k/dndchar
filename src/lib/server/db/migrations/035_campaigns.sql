@@ -17,7 +17,7 @@
 --
 -- The migration also creates ONE empty campaign, 'Main Campaign', with the fixed id
 -- 00000000-0000-4000-8000-000000000001: no members, no characters. An admin assigns its DMs.
--- Migration 036 (find tables) moves existing data into it by this id.
+-- Migration 037 (find tables; 036 is the sheet-version column) moves existing data into it by this id.
 
 CREATE TABLE IF NOT EXISTS campaigns (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

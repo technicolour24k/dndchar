@@ -29,6 +29,8 @@
     activeVttSessionId = null,
     activeGameSessionId = null,
     currentUserId = null,
+    access = null,
+    ownerName = null,
     onVersionHistory
   }: {
     character: CharacterDetail;
@@ -39,6 +41,9 @@
     activeVttSessionId?: string | null;
     activeGameSessionId?: string | null;
     currentUserId?: string | null;
+    // Why this user may edit the sheet (owner, campaign DM or the admin override); drives the badge.
+    access?: { isOwner: boolean; isCampaignDm: boolean; viaAdmin: boolean } | null;
+    ownerName?: string | null;
     onVersionHistory?: () => void;
   } = $props();
 
@@ -132,6 +137,24 @@
     { key: 'junk', label: 'Junk' },
     { key: 'misc', label: 'Misc' }
   ]);
+  // Stale-save guard: the sheet version this form last knew about, posted as a hidden field with
+  // Save. It follows the server's value on every reload, EXCEPT while there are unsaved local edits
+  // (then someone else's save must still be caught, so it stays at what the edits were made against).
+  // A successful save sets it straight from the save response, so the user's own earlier save never
+  // makes their next one look stale, including saves made through the in-place saveSheetNow path.
+  let sheetToken = $state(untrack(() => character.sheetVersion));
+  $effect(() => {
+    // Tracks ONLY the server's version: reading hasUnsavedChanges untracked stops this re-running (and
+    // briefly resetting the token to a not-yet-reloaded value) the moment a save clears that flag.
+    const serverVersion = character.sheetVersion;
+    if (!untrack(() => hasUnsavedChanges)) sheetToken = serverVersion;
+  });
+  // Set when the server refused a Save as stale; the banner offers a reload.
+  let staleSheet = $state(false);
+  function reloadSheet() {
+    hasUnsavedChanges = false; // so the beforeunload prompt does not ask about edits we are discarding
+    window.location.reload();
+  }
   const inventoryRows = $derived(character.inventory);
   // What the inventory looked like when this sheet was loaded (and after each reload). Posted with
   // Save so the server can tell which rows and fields the user actually changed, and leave the rest
@@ -1291,13 +1314,22 @@
       headers: { 'x-sveltekit-action': 'true' }
     });
     let ok = false;
+    let stale = false;
     try {
-      ok = response.ok && deserialize(await response.text()).type === 'success';
+      const parsed = deserialize(await response.text());
+      ok = parsed.type === 'success';
+      if (parsed.type === 'success') {
+        const next = (parsed.data as { sheetVersion?: number } | undefined)?.sheetVersion;
+        if (typeof next === 'number') sheetToken = next;
+      } else if (parsed.type === 'failure') {
+        stale = Boolean((parsed.data as { staleSheet?: boolean } | undefined)?.staleSheet);
+      }
     } catch {
       // Non-JSON error page (e.g. a 500) - treat as a failed save.
     }
     if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; }
-    saveStatus = ok ? 'Saved' : 'Save failed';
+    staleSheet = stale;
+    saveStatus = ok ? 'Saved' : stale ? 'Not saved' : 'Save failed';
     return ok;
   }
 
@@ -1714,8 +1746,13 @@
       // after a form action), but this keeps that rerun scoped to this route's own
       // depends('app:character-sheet') rather than also re-running unrelated layout loads.
       await update({ reset: false, invalidateAll: false });
-      if (result.type === 'success') { hasUnsavedChanges = false; haulWaitingForSave = false; }
-      saveStatus = result.type === 'success' ? 'Saved' : 'Save failed';
+      if (result.type === 'success') {
+        hasUnsavedChanges = false; haulWaitingForSave = false; staleSheet = false;
+        const next = (result.data as { sheetVersion?: number } | undefined)?.sheetVersion;
+        if (typeof next === 'number') sheetToken = next;
+      }
+      staleSheet = result.type === 'failure' && Boolean((result.data as { staleSheet?: boolean } | undefined)?.staleSheet);
+      saveStatus = result.type === 'success' ? 'Saved' : staleSheet ? 'Not saved' : 'Save failed';
       await invalidate('app:character-sheet');
     };
   }}
@@ -1723,6 +1760,13 @@
   onchange={markUnsavedIfSheetField}
 >
   <input name="inventoryBaseline" type="hidden" value={inventoryBaselineJson} />
+  <input name="sheetVersion" type="hidden" value={sheetToken} />
+  {#if staleSheet}
+    <div class="panel stale-sheet-banner" role="alert">
+      <span>Someone else saved this sheet. Reload to see their changes.</span>
+      <button type="button" class="compact-button" onclick={reloadSheet}>Reload</button>
+    </div>
+  {/if}
   <section class="panel sheet-header compact">
     <div>
       <p class="eyebrow">D&D 5E 2014</p>
@@ -1730,6 +1774,17 @@
       <p class="muted">
         {race || character.ancestry || 'Unknown origin'} - {classes.className} {classes.level}
       </p>
+      {#if access && !access.isOwner}
+        <!-- Someone other than the owner is editing: say so, and whose sheet it is. -->
+        <p class="editing-as-line">
+          {#if access.isCampaignDm}
+            <span class="badge">Editing as DM</span>
+          {:else if access.viaAdmin}
+            <span class="badge badge-admin">Editing as site admin</span>
+          {/if}
+          {#if ownerName}<span class="muted">{ownerName}'s character</span>{/if}
+        </p>
+      {/if}
       <p class="campaign-badge-line">
         {#if character.campaignId}
           <a class="text-button" href={`/campaigns/${character.campaignId}`}>Campaign: {character.campaignName}</a>

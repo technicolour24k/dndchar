@@ -38,9 +38,9 @@ describe('decideCharacterAccess', () => {
     expect(decideCharacterAccess(facts({ isAdmin: true }))).toMatchObject({ canView: true, canEdit: true, canAct: false, isCampaignDm: false, viaAdmin: true });
   });
 
-  it('admin who is also a plain member is not viaAdmin; admin never counts as a DM', () => {
+  it('admin who is also a plain member edits via admin; admin never counts as a DM', () => {
     const access = decideCharacterAccess(facts({ isAdmin: true, memberRole: 'player' }));
-    expect(access.viaAdmin).toBe(false);
+    expect(access.viaAdmin).toBe(true);
     expect(access.isCampaignDm).toBe(false);
     expect(access.canAct).toBe(false);
   });

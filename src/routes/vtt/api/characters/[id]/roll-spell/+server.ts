@@ -1,6 +1,8 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
+import { query } from '$lib/server/db';
 import { getCharacter } from '$lib/server/services/characters';
+import { getCharacterAccess } from '$lib/server/services/access';
 import { castCharacterSpell, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
 import { resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, totalLevel } from '$lib/rules/dnd5e';
 import { characterStatsFor, resolveSpellcastingAbility } from '$lib/rules/characterStats';
@@ -18,6 +20,11 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   const body = await request.json().catch(() => ({}));
   const instanceId = typeof body?.instanceId === 'string' ? body.instanceId : '';
   if (!instanceId) return json({ error: 'missing_instance' }, { status: 400 });
+
+  // Act check once, up front: owner or campaign DM/co-DM only. A site admin can edit a sheet but
+  // does not cast for a player, so they get a 404. The getCharacter calls below then re-check edit.
+  const access = await getCharacterAccess({ query }, locals.user!.id, characterId);
+  if (!access?.canAct) return json({ error: 'not_found' }, { status: 404 });
 
   const spell = await getPreparedSpellDamageSource(characterId, instanceId);
   if (!spell) return json({ error: 'spell_not_found' }, { status: 404 });

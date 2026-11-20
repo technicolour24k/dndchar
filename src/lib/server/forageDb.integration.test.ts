@@ -319,7 +319,9 @@ describe.skipIf(!enabled)('forage against the local dev DB', () => {
       const requestId = start.body.request.id;
       await gmAct({ action: 'check', requestId, skillKey: 'nature', tableId: meadowId });
       const session: any = sessions.get(ROOM);
+      // Force a natural 1 (and clear a natural 20 the dice may have rolled, which would win in the wording).
       session.forage[userId].check.nat1 = true;
+      session.forage[userId].check.nat20 = false;
       session.forage[userId].check.natural = 1;
       const marked = await gmAct({ action: 'mark', requestId, passed: true });
       expect(marked.body.outcome).toBe('failed');

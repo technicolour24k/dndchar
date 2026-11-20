@@ -28,7 +28,7 @@ export type CharacterAccess = {
   canAct: boolean;
   isOwner: boolean;
   isCampaignDm: boolean;
-  /** True when access exists only because of the admin override. */
+  /** True when the EDIT right exists only because of the admin override (a plain member can view, not edit). */
   viaAdmin: boolean;
 };
 
@@ -52,7 +52,7 @@ export function decideCharacterAccess(facts: AccessFacts): CharacterAccess {
     canAct: isOwner || isCampaignDm,
     isOwner,
     isCampaignDm,
-    viaAdmin: facts.isAdmin && !(isOwner || isMember)
+    viaAdmin: facts.isAdmin && !(isOwner || isCampaignDm)
   };
 }
 

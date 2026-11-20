@@ -1,6 +1,7 @@
 import { error, json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { query } from '$lib/server/db';
+import { getCharacterAccess } from '$lib/server/services/access';
 import { listEncountersForCharacter } from '$lib/server/services/encounters';
 import { listGameSessionsForUser } from '$lib/server/services/gameSessions';
 
@@ -13,8 +14,10 @@ import { listGameSessionsForUser } from '$lib/server/services/gameSessions';
 // listGameSessionsForUser() is already user-scoped (a player's own joined sessions across
 // every character), so it needs no character-specific check at all.
 export const GET: RequestHandler = async ({ params, locals }) => {
-  const owned = await query('SELECT 1 FROM characters WHERE id = $1 AND owner_user_id = $2', [params.id, locals.user!.id]);
-  if (!owned.rowCount) throw error(404, 'Character not found.');
+  // TEMPORARY (campaign system Unit C): canEdit, so a DM or admin editing the sheet can open its
+  // Activity Log, and plain members still 404. Unit D switches this to canView.
+  const access = await getCharacterAccess({ query }, locals.user!.id, params.id!);
+  if (!access?.canEdit) throw error(404, 'Character not found.');
 
   const [encounterHistory, gameSessionHistory] = await Promise.all([
     listEncountersForCharacter(params.id!),

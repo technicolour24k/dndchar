@@ -1,8 +1,9 @@
 import { error, fail } from '@sveltejs/kit';
 import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
+import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { getCharacter, listItemCategories, restoreCharacterVersion, spendHitDice, updateCharacter } from '$lib/server/services/characters';
+import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
 import { addCharacterToCampaign, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
@@ -20,8 +21,16 @@ import { poolSummary } from '$lib/rules/attackRoll';
 // re-running the whole page tree (see the Narrow refresh changes below/in the form).
 export async function load({ params, locals, depends }) {
   depends('app:character-sheet');
-  const character = await getCharacter(locals.user!.id, params.id);
-  if (!character) throw error(404, 'Character not found.');
+  // Refuses anyone who can't edit (owner, campaign DM/co-DM, admin). The access flags tell the sheet
+  // WHY (owner / DM / admin override) so it can show an "Editing as ..." badge. Unit D widens this
+  // to viewers and uses the same flags for the read-only sheet.
+  const loaded = await getCharacterWithAccess(locals.user!.id, params.id);
+  if (!loaded) throw error(404, 'Character not found.');
+  const { character, access } = loaded;
+  // The owner's display name, only needed when someone else is editing the sheet.
+  const ownerName = access.isOwner
+    ? null
+    : (await query<{ display_name: string }>('SELECT display_name FROM users WHERE id = $1', [character.ownerUserId])).rows[0]?.display_name ?? null;
 
   // Independent reads, so they can run concurrently rather than one round-trip each.
   const [itemCategories, myCampaigns, activeVttSessionId, activeEncounterId, activeGameSessionId] = await Promise.all([
@@ -45,6 +54,8 @@ export async function load({ params, locals, depends }) {
 
   return {
     character,
+    access,
+    ownerName,
     itemCategories,
     myCampaigns,
     activeVttSessionId,
@@ -72,9 +83,17 @@ export const actions = {
   },
   save: async ({ request, params, locals }) => {
     const form = await request.formData();
-    await updateCharacter(locals.user!.id, params.id, form, 'Manual save');
+    let sheetVersion: number;
+    try {
+      sheetVersion = await updateCharacter(locals.user!.id, params.id, form, 'Manual save');
+    } catch (error) {
+      // Stale-save guard: someone else saved since this sheet loaded. Nothing was written.
+      if (error instanceof StaleSheetError) return fail(409, { staleSheet: true, error: error.message });
+      throw error;
+    }
     emitRealtimeEvent('character:updated', { characterId: params.id });
-    return { saved: true };
+    // The new version goes back to the sheet so its next Save is not mistaken for a stale one.
+    return { saved: true, sheetVersion };
   },
   restoreVersion: async ({ request, params, locals }) => {
     const form = await request.formData();
@@ -108,16 +127,16 @@ export const actions = {
     const rawLocation = String(form.get('location') || 'backpack');
     const location = ['equipped', 'backpack', 'misc'].includes(rawLocation) ? rawLocation : 'backpack';
     const notes = String(form.get('notes') || '');
+    // Owner, campaign DM/co-DM or admin (the shared edit rule), then a plain insert.
+    try { await assertCanEditCharacter({ query }, locals.user!.id, params.id); } catch { return fail(403, { error: 'Character not found.' }); }
     const result = await query(`
-      WITH owned AS (SELECT id FROM characters WHERE id=$1 AND owner_user_id=$2)
       INSERT INTO character_inventory_items
         (character_id, name, category, location, quantity, equipped, is_equipment,
          ac_bonus, to_hit_bonus, damage_bonus, attack_ability, proficient,
          damage_rolls, effects, notes, sort_order)
-      SELECT $1, $3, $4, $7, $5, false, false, 0, 0, 0, 'str', true, '', '', $6,
-        COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1), 0)
-      FROM owned
-    `, [params.id, locals.user!.id, name, category, quantity, notes, location]);
+      VALUES ($1, $2, $3, $6, $4, false, false, 0, 0, 0, 'str', true, '', '', $5,
+        COALESCE((SELECT max(sort_order)+1 FROM character_inventory_items WHERE character_id=$1), 0))
+    `, [params.id, name, category, quantity, notes, location]);
     if (!result.rowCount) return fail(403, { error: 'Character not found.' });
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { contentUpdated: true };
@@ -133,6 +152,7 @@ export const actions = {
     const inventoryId = String(form.get('inventoryId') || '');
     const equipped = String(form.get('equipped')) === 'true';
     if (!inventoryId) return fail(400, { error: 'Missing item.' });
+    try { await assertCanEditCharacter({ query }, locals.user!.id, params.id); } catch { return fail(403, { error: 'Item not found.' }); }
     const result = await query(`
       UPDATE character_inventory_items
       SET equipped = $3,
@@ -140,8 +160,7 @@ export const actions = {
           is_equipment = true
       WHERE id = $1
         AND character_id = $2
-        AND EXISTS (SELECT 1 FROM characters WHERE id = $2 AND owner_user_id = $4)
-    `, [inventoryId, params.id, equipped, locals.user!.id]);
+    `, [inventoryId, params.id, equipped]);
     if (!result.rowCount) return fail(403, { error: 'Item not found.' });
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { contentUpdated: true };
@@ -152,12 +171,12 @@ export const actions = {
     const form = await request.formData();
     const inventoryId = String(form.get('inventoryId') || '');
     if (!inventoryId) return fail(400, { error: 'Missing item.' });
+    try { await assertCanEditCharacter({ query }, locals.user!.id, params.id); } catch { return fail(403, { error: 'Item not found.' }); }
     const result = await query(`
       DELETE FROM character_inventory_items
       WHERE id = $1
         AND character_id = $2
-        AND EXISTS (SELECT 1 FROM characters WHERE id = $2 AND owner_user_id = $3)
-    `, [inventoryId, params.id, locals.user!.id]);
+    `, [inventoryId, params.id]);
     if (!result.rowCount) return fail(403, { error: 'Item not found.' });
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { contentUpdated: true };
@@ -282,10 +301,10 @@ export const actions = {
     const sessionId = await getUserVttSessionId(locals.user!.id);
     if (!sessionId) return { loggedRoll: false }; // not in a room - nothing to log, not an error
 
-    const nameRow = await query<{ name: string }>(
-      'SELECT name FROM characters WHERE id = $1 AND owner_user_id = $2',
-      [params.id, locals.user!.id]
-    );
+    // Only someone who can ACT for the character (owner, campaign DM/co-DM) logs a roll as them. A
+    // site admin editing the sheet, or a viewer, never has a roll logged under the character's name.
+    try { await assertCanActForCharacter({ query }, locals.user!.id, params.id); } catch { return { loggedRoll: false }; }
+    const nameRow = await query<{ name: string }>('SELECT name FROM characters WHERE id = $1', [params.id]);
     const name = nameRow.rows[0]?.name || 'A character';
     await logRoll(sessionId, `${name} rolled a ${total} on ${label}${summary ? ` (${summary})` : ''}.`,
       { label, total, breakdown, natural, ...(pool ? { pool } : {}), ...(manualDamageDice ? { manualDamageDice } : {}) });

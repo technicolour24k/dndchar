@@ -2821,3 +2821,21 @@ button.text-button.danger-text:hover {
     margin: 4vh auto;
   }
 }
+
+/* Sheet: editing someone else's character (campaign DM / site admin), and the stale-save banner (Unit C) */
+.editing-as-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0;
+}
+
+.stale-sheet-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  border: 1px solid var(--danger);
+}

@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
+import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
 import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
@@ -291,7 +292,7 @@ export async function insertCatalogueItem(client: pg.PoolClient, characterId: st
 
 export async function addContentToCharacter(userId: string, characterId: string, contentId: string): Promise<void> {
   await withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanEdit(client, userId, characterId);
     const visible = await client.query('SELECT id FROM content_definitions WHERE id=$1 AND is_archived=false', [contentId]);
     if (!visible.rowCount) throw new Error('Catalogue entry not found.');
     const definition = await client.query<any>(`SELECT c.content_type, c.name, i.* FROM content_definitions c
@@ -311,39 +312,40 @@ export async function addContentToCharacter(userId: string, characterId: string,
 }
 
 export async function removeContentFromCharacter(userId: string, characterId: string, instanceId: string): Promise<void> {
-  const result = await query(`DELETE FROM character_content_instances USING characters
-    WHERE character_content_instances.id = $1 AND character_content_instances.character_id = $2
-      AND characters.id = character_content_instances.character_id AND characters.owner_user_id = $3`,
-    [instanceId, characterId, userId]);
+  await assertCanEditCharacter({ query }, userId, characterId);
+  const result = await query(`DELETE FROM character_content_instances WHERE id = $1 AND character_id = $2`,
+    [instanceId, characterId]);
   if (!result.rowCount) throw new Error('Character content not found.');
 }
 
 export async function setCharacterContentState(userId: string, characterId: string, instanceId: string, form: FormData): Promise<void> {
-  const result = await query(`UPDATE character_content_instances i SET
+  await assertCanEditCharacter({ query }, userId, characterId);
+  const result = await query(`UPDATE character_content_instances SET
       is_known = $1, is_prepared = $2, is_active = $3, notes = $4
-    FROM characters c WHERE i.id = $5 AND i.character_id = $6 AND c.id = i.character_id AND c.owner_user_id = $7`,
+    WHERE id = $5 AND character_id = $6`,
     [form.get('isKnown') === 'true', form.get('isPrepared') === 'true', form.get('isActive') === 'true',
-      String(form.get('notes') || ''), instanceId, characterId, userId]);
+      String(form.get('notes') || ''), instanceId, characterId]);
   if (!result.rowCount) throw new Error('Character content not found.');
   await syncCharacterSpellSlots(userId, characterId);
 }
 
 export async function useContentResource(userId: string, characterId: string, resourceId: string, delta: number): Promise<void> {
   await withTransaction(async (client) => {
+    await assertCanEdit(client, userId, characterId);
     const result = await client.query<{ character_content_id: string; content_id: string }>(`UPDATE character_content_resources r SET current_value = GREATEST(0, LEAST(max_value, current_value + $1))
-      FROM character_content_instances i, characters c
+      FROM character_content_instances i
       WHERE r.id = $2 AND i.id = r.character_content_id AND i.character_id = $3
-        AND c.id = i.character_id AND c.owner_user_id = $4
-      RETURNING r.character_content_id, i.content_id`, [delta, resourceId, characterId, userId]);
+      RETURNING r.character_content_id, i.content_id`, [delta, resourceId, characterId]);
     if (!result.rowCount) throw new Error('Resource not found.');
     if(delta<0)await executeContentActions(client,characterId,result.rows[0].content_id,['on_use'],{instanceId:result.rows[0].character_content_id});
   });
 }
 
 export async function useInventoryResource(userId:string,characterId:string,resourceId:string,delta:number):Promise<void>{
+  await assertCanEditCharacter({query},userId,characterId);
   const result=await query(`UPDATE character_inventory_resources resource SET current_value=GREATEST(0,LEAST(max_value,current_value+$1))
-    FROM character_inventory_items inventory,characters character WHERE resource.id=$2 AND inventory.id=resource.inventory_item_id
-      AND inventory.character_id=$3 AND character.id=inventory.character_id AND character.owner_user_id=$4`,[delta,resourceId,characterId,userId]);
+    FROM character_inventory_items inventory WHERE resource.id=$2 AND inventory.id=resource.inventory_item_id
+      AND inventory.character_id=$3`,[delta,resourceId,characterId]);
   if(!result.rowCount)throw new Error('Item resource not found.');
 }
 
@@ -397,7 +399,7 @@ export async function listCharacterContent(characterId: string): Promise<Charact
 }
 
 export async function castCharacterSpell(userId:string,characterId:string,form:FormData):Promise<ActionResult[]>{
-  return withTransaction(async(client)=>{await assertCharacterOwner(client,userId,characterId);
+  return withTransaction(async(client)=>{await assertCanAct(client,userId,characterId);
     const accessId=String(form.get('spellAccessId')||'');let spellId='';let instanceId:string|undefined;
     if(accessId){
       const inventoryId=String(form.get('inventoryItemId')||'');
@@ -459,15 +461,15 @@ export async function listSpellSlots(characterId: string): Promise<SpellSlot[]> 
 
 export async function syncCharacterSpellSlots(userId: string, characterId: string): Promise<void> {
   await withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanEdit(client, userId, characterId);
     await syncSpellSlotsWithClient(client, characterId);
   });
 }
 
 export async function spendSpellSlot(userId: string, characterId: string, type: 'standard' | 'pact', level: number, delta: number): Promise<void> {
-  const result = await query(`UPDATE character_spell_slots s SET current_slots = GREATEST(0, LEAST(max_slots, current_slots + $1))
-    FROM characters c WHERE s.character_id = $2 AND s.slot_type = $3 AND s.slot_level = $4
-      AND c.id = s.character_id AND c.owner_user_id = $5`, [delta, characterId, type, level, userId]);
+  await assertCanEditCharacter({ query }, userId, characterId);
+  const result = await query(`UPDATE character_spell_slots SET current_slots = GREATEST(0, LEAST(max_slots, current_slots + $1))
+    WHERE character_id = $2 AND slot_type = $3 AND slot_level = $4`, [delta, characterId, type, level]);
   if (!result.rowCount) throw new Error('Spell slot not found.');
 }
 
@@ -475,7 +477,7 @@ export type ResourceActionResult=ActionResult;
 
 export async function useInventoryCatalogueItem(userId: string, characterId: string, inventoryId: string): Promise<ResourceActionResult[]> {
   return withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanAct(client, userId, characterId);
     const item = await client.query<any>(`SELECT source_content_id,quantity FROM character_inventory_items
       WHERE id=$1 AND character_id=$2 AND quantity>0 FOR UPDATE`, [inventoryId, characterId]);
     if (!item.rowCount) throw new Error('Inventory item is unavailable.');
@@ -495,7 +497,7 @@ export async function useInventoryCatalogueItem(userId: string, characterId: str
 
 export async function triggerCharacterContentActions(userId:string,characterId:string,instanceId:string):Promise<ResourceActionResult[]>{
   return withTransaction(async(client)=>{
-    await assertCharacterOwner(client,userId,characterId);
+    await assertCanAct(client,userId,characterId);
     const instance=await client.query<{content_id:string}>(`SELECT content_id FROM character_content_instances
       WHERE id=$1 AND character_id=$2`,[instanceId,characterId]);
     if(!instance.rowCount)throw new Error('Character content not found.');
@@ -505,7 +507,7 @@ export async function triggerCharacterContentActions(userId:string,characterId:s
 
 export async function restCharacter(userId: string, characterId: string, rest: 'short_rest' | 'long_rest'): Promise<void> {
   await withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanEdit(client, userId, characterId);
     const periods = rest === 'long_rest' ? ['short_rest', 'long_rest'] : ['short_rest'];
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
       FROM content_resource_definitions d, character_content_instances i
@@ -529,7 +531,7 @@ export async function getCombatClock(characterId: string): Promise<{ roundNumber
 
 export async function advanceCharacterRound(userId: string, characterId: string): Promise<void> {
   await withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanEdit(client, userId, characterId);
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 2, 1)
       ON CONFLICT (character_id) DO UPDATE SET round_number = character_combat_clocks.round_number + 1,
         turn_number = 1, updated_at = now()`, [characterId]);
@@ -544,7 +546,7 @@ export async function advanceCharacterRound(userId: string, characterId: string)
 
 export async function advanceCharacterTurn(userId: string, characterId: string): Promise<void> {
   await withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanEdit(client, userId, characterId);
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1,1,2)
       ON CONFLICT (character_id) DO UPDATE SET turn_number=character_combat_clocks.turn_number+1, updated_at=now()`, [characterId]);
     await client.query(`UPDATE active_character_effects SET remaining_rounds=GREATEST(0,remaining_rounds-1)
@@ -564,7 +566,7 @@ export async function advanceCharacterTurn(userId: string, characterId: string):
 // because a new battle starts.
 export async function newBattle(userId: string, characterId: string): Promise<void> {
   await withTransaction(async (client) => {
-    await assertCharacterOwner(client, userId, characterId);
+    await assertCanEdit(client, userId, characterId);
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 1, 1)
       ON CONFLICT (character_id) DO UPDATE SET round_number = 1, turn_number = 1, updated_at = now()`, [characterId]);
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
@@ -577,9 +579,19 @@ export async function newBattle(userId: string, characterId: string): Promise<vo
   });
 }
 
-async function assertCharacterOwner(client: pg.PoolClient, userId: string, characterId: string): Promise<void> {
-  const owned = await client.query('SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2', [characterId, userId]);
-  if (!owned.rowCount) throw new Error('Character not found.');
+// Two helpers, and the split matters. Use the right one for any new character write here.
+//  - assertCanEdit: BOOKKEEPING. Owner, campaign DM/co-DM or site admin may correct a sheet: add or
+//    remove content, set known/prepared, adjust resources and spell slots, rests, combat clock.
+//  - assertCanAct: PLAYING the character. Casting a spell, using a consumable and firing on_use
+//    effects spend the player's slots and items, so only the owner or a campaign DM/co-DM may do
+//    them. A site admin is an override, not the player, and is refused (same rule as the VTT
+//    roll-item / roll-spell routes and logRoll). Stand-in play will widen canAct later, not canEdit.
+// Both throw 'Character not found.' when the check fails.
+async function assertCanEdit(client: pg.PoolClient, userId: string, characterId: string): Promise<void> {
+  await assertCanEditCharacter(client, userId, characterId);
+}
+async function assertCanAct(client: pg.PoolClient, userId: string, characterId: string): Promise<void> {
+  await assertCanActForCharacter(client, userId, characterId);
 }
 
 // Known limitation (accepted, left as-is - see the overridable-sheet-stats plan and

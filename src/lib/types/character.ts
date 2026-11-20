@@ -140,6 +140,8 @@ export type CharacterDetail = {
   spellSlots: import('$lib/types/content').SpellSlot[];
   combatClock: { roundNumber: number; turnNumber: number };
   updatedAt: string;
+  /** Bumped by every whole-sheet write; the sheet posts it back with Save (stale-save guard). */
+  sheetVersion: number;
 };
 
 export type CharacterListItem = {

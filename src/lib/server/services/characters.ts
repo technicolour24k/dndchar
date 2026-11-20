@@ -7,6 +7,7 @@ import { resolveCharacterModifierSources } from '$lib/server/services/rule-engin
 import { applyCharacterEffect } from '$lib/server/services/effects';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { logCombatEvent } from '$lib/server/services/combatLog';
+import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
 import type {
   AbilityKey,
@@ -37,6 +38,7 @@ type CharacterRow = {
   campaign_id: string | null;
   campaign_name: string | null;
   party_active: boolean;
+  sheet_version: number;
 };
 
 type CharacterSnapshot = {
@@ -149,13 +151,14 @@ const metadataFields = [
   'hair'
 ];
 
-function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof CharacterRow | 'ownerUserId' | 'systemKey' | 'metadata' | 'updatedAt' | 'campaignId' | 'campaignName' | 'partyActive'>): CharacterDetail {
+function mapCharacterRow(row: CharacterRow, detail: Omit<CharacterDetail, keyof CharacterRow | 'ownerUserId' | 'systemKey' | 'metadata' | 'updatedAt' | 'campaignId' | 'campaignName' | 'partyActive' | 'sheetVersion'>): CharacterDetail {
   return {
     id: row.id,
     ownerUserId: row.owner_user_id,
     campaignId: row.campaign_id,
     campaignName: row.campaign_name,
     partyActive: row.party_active,
+    sheetVersion: row.sheet_version,
     name: row.name,
     ancestry: row.ancestry,
     background: row.background,
@@ -170,7 +173,7 @@ export async function listCharacters(userId: string): Promise<CharacterListItem[
   const characters = await query<CharacterRow>(
     `
       SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
-             c.campaign_id, cp.name AS campaign_name, c.party_active
+             c.campaign_id, cp.name AS campaign_name, c.party_active, c.sheet_version
       FROM characters c
       LEFT JOIN campaigns cp ON cp.id = c.campaign_id
       WHERE c.owner_user_id = $1
@@ -252,20 +255,33 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   });
 }
 
+// Loads the full sheet for someone who may edit it: the owner, a DM (primary or co-DM) of the
+// character's campaign, or a site admin. TEMPORARY gate (campaign system Unit C): it is canEdit, so
+// plain campaign members still get null (the route turns that into a 404). Unit D widens this to
+// canView and adds the read-only sheet. Everything that loads a sheet (the VTT pull-through and
+// the encounter page included) goes through here, so they all follow.
 export async function getCharacter(userId: string, characterId: string): Promise<CharacterDetail | null> {
+  return (await getCharacterWithAccess(userId, characterId))?.character ?? null;
+}
+
+// Same as getCharacter, but also hands back the access flags it already worked out, so the sheet's
+// load() does not run the access query a second time.
+export async function getCharacterWithAccess(userId: string, characterId: string): Promise<{ character: CharacterDetail; access: CharacterAccess } | null> {
+  const access = await getCharacterAccess({ query }, userId, characterId);
+  if (!access?.canEdit) return null;
   const result = await query<CharacterRow>(
     `
       SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
-             c.campaign_id, cp.name AS campaign_name, c.party_active
+             c.campaign_id, cp.name AS campaign_name, c.party_active, c.sheet_version
       FROM characters c
       LEFT JOIN campaigns cp ON cp.id = c.campaign_id
-      WHERE c.id = $1 AND c.owner_user_id = $2
+      WHERE c.id = $1
     `,
-    [characterId, userId]
+    [characterId]
   );
   const row = result.rows[0];
   if (!row) return null;
-  return loadCharacterDetail(row);
+  return { character: await loadCharacterDetail(row), access };
 }
 
 // Same computed character detail as getCharacter, but without the owner
@@ -281,7 +297,7 @@ export async function getCharacterForRoll(characterId: string): Promise<Characte
   const result = await query<CharacterRow>(
     `
       SELECT c.id, c.owner_user_id, c.name, c.ancestry, c.background, c.system_key, c.metadata_json, c.updated_at,
-             c.campaign_id, cp.name AS campaign_name, c.party_active
+             c.campaign_id, cp.name AS campaign_name, c.party_active, c.sheet_version
       FROM characters c
       LEFT JOIN campaigns cp ON cp.id = c.campaign_id
       WHERE c.id = $1
@@ -328,15 +344,36 @@ export async function listItemCategories(): Promise<ItemCategory[]> {
   }
 }
 
-export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<void> {
+// Thrown by updateCharacter when the sheet being saved is older than what is in the database (the
+// owner, a DM or an admin saved in between). The route turns it into a 409 and the sheet asks the
+// user to reload. Nothing has been written when it is thrown.
+export class StaleSheetError extends Error {
+  constructor() {
+    super('Someone else saved this sheet. Reload to see their changes.');
+    this.name = 'StaleSheetError';
+  }
+}
+
+// Whole-sheet save. Owner, campaign DM/co-DM and site admin may call it (assertCanEditCharacter).
+// Returns the sheet's new version number so the sheet can carry it into its next save.
+//
+// Stale-save guard: the sheet posts the `sheetVersion` it loaded. characters.sheet_version is bumped
+// only by whole-sheet writes (this and a version restore), so button actions, forage finds and VTT
+// HP changes never make an open sheet refuse its next Save. A missing field (a tab opened before
+// this shipped) skips the check.
+export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<number> {
   const resources = parseResources(form);
   const newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
   let previousHp: number | null = null;
   let characterName = '';
 
+  let newVersion = 0;
   await withTransaction(async (client) => {
-    const owned = await client.query('SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2', [characterId, userId]);
-    if (!owned.rowCount) throw new Error('Character not found.');
+    await assertCanEditCharacter(client, userId, characterId);
+    // FOR UPDATE: two simultaneous saves queue here, so the second sees the first's new version.
+    const current = await client.query<{ sheet_version: number }>('SELECT sheet_version FROM characters WHERE id = $1 FOR UPDATE', [characterId]);
+    const loadedRaw = String(form.get('sheetVersion') ?? '').trim();
+    if (loadedRaw !== '' && Number(loadedRaw) !== current.rows[0]?.sheet_version) throw new StaleSheetError();
 
     // Read the pre-update HP before replaceResources overwrites it, so a
     // change can be reported as a delta ("takes 12 damage") rather than just
@@ -351,15 +388,17 @@ export async function updateCharacter(userId: string, characterId: string, form:
     const overrides = parseStatOverridesField(form);
     const metadataPatch = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
 
-    await client.query(
+    const updated = await client.query<{ sheet_version: number }>(
       `
         UPDATE characters
         SET name = $1,
             ancestry = $2,
             background = $3,
             metadata_json = metadata_json || $4::jsonb,
-            updated_at = now()
+            updated_at = now(),
+            sheet_version = sheet_version + 1
         WHERE id = $5
+        RETURNING sheet_version
       `,
       [
         characterName,
@@ -369,6 +408,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
         characterId
       ]
     );
+    newVersion = updated.rows[0].sheet_version;
 
     await replaceClasses(client, characterId, parseClasses(form));
     await replaceAbilities(client, characterId, parseAbilities(form));
@@ -399,9 +439,15 @@ export async function updateCharacter(userId: string, characterId: string, form:
       await logCombatEvent(encounterId, message, { type: 'sheet_hp_change', delta });
     }
   }
+  return newVersion;
 }
 
+// TEMPORARY gate (campaign system Unit C): canEdit, so a DM or admin who can edit the sheet can see
+// and restore its versions, and plain members still get an empty list. Unit D switches this to
+// canView (viewers see the history, only editors may restore).
 export async function listVersions(userId: string, characterId: string): Promise<CharacterVersion[]> {
+  const access = await getCharacterAccess({ query }, userId, characterId);
+  if (!access?.canEdit) return [];
   const result = await query<{
     id: string;
     character_id: string;
@@ -409,14 +455,13 @@ export async function listVersions(userId: string, characterId: string): Promise
     change_summary: string;
   }>(
     `
-      SELECT character_versions.id, character_versions.character_id, character_versions.created_at, character_versions.change_summary
+      SELECT id, character_id, created_at, change_summary
       FROM character_versions
-      JOIN characters ON characters.id = character_versions.character_id
-      WHERE character_versions.character_id = $1 AND characters.owner_user_id = $2
-      ORDER BY character_versions.created_at DESC
+      WHERE character_id = $1
+      ORDER BY created_at DESC
       LIMIT 20
     `,
-    [characterId, userId]
+    [characterId]
   );
 
   return result.rows.map((row) => ({
@@ -427,22 +472,23 @@ export async function listVersions(userId: string, characterId: string): Promise
   }));
 }
 
+// Owner, campaign DM/co-DM or site admin (assertCanEditCharacter). The snapshot is looked up by
+// character id only; the edit check above is what gates it. A restore is a whole-sheet write, so
+// applySnapshot bumps sheet_version too.
 export async function restoreCharacterVersion(userId: string, characterId: string, versionId: string): Promise<void> {
   return await withTransaction(async (client) => {
+    await assertCanEditCharacter(client, userId, characterId);
     const version = await client.query<{
       character_id: string;
       created_at: string;
       snapshot_json: CharacterSnapshot;
     }>(
       `
-        SELECT character_versions.character_id, character_versions.created_at, character_versions.snapshot_json
+        SELECT character_id, created_at, snapshot_json
         FROM character_versions
-        JOIN characters ON characters.id = character_versions.character_id
-        WHERE character_versions.id = $1
-          AND character_versions.character_id = $2
-          AND characters.owner_user_id = $3
+        WHERE id = $1 AND character_id = $2
       `,
-      [versionId, characterId, userId]
+      [versionId, characterId]
     );
     const row = version.rows[0];
     if (!row) throw new Error('Version not found.');
@@ -540,7 +586,8 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
           background = $3,
           system_key = $4,
           metadata_json = $5::jsonb,
-          updated_at = now()
+          updated_at = now(),
+          sheet_version = sheet_version + 1
       WHERE id = $6
     `,
     [
@@ -1452,11 +1499,7 @@ export async function spendHitDice(
   hpGained: number
 ): Promise<void> {
   await withTransaction(async (client) => {
-    const owned = await client.query(
-      'SELECT id FROM characters WHERE id = $1 AND owner_user_id = $2',
-      [characterId, userId]
-    );
-    if (!owned.rowCount) throw new Error('Character not found.');
+    await assertCanEditCharacter(client, userId, characterId);
 
     // Decrement hit dice pool for this class. `defaultMax` only seeds max_value on first
     // INSERT (a pool that doesn't exist yet) - the ON CONFLICT branch deliberately does NOT

@@ -7,11 +7,14 @@
   let {
     character,
     campaigns,
-    form
+    form,
+    isOwner = true
   }: {
     character: CharacterDetail;
     campaigns: { id: string; name: string }[];
     form?: { campaignError?: string } | null;
+    /** Only the owner adds or moves a character between campaigns; a DM or admin can still toggle and remove. */
+    isOwner?: boolean;
   } = $props();
 
   let choice = $state('');
@@ -48,7 +51,9 @@
       </div>
     {/if}
 
-    {#if options.length === 0}
+    {#if !isOwner}
+      <!-- A DM or site admin editing someone else's character: no add/move, that is the owner's call. -->
+    {:else if options.length === 0}
       <p class="muted">
         {#if campaigns.length === 0}
           You are not in any campaign yet. <a class="text-button" href="/campaigns">Create or join one</a>.
