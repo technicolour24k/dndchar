@@ -463,3 +463,13 @@ body {
 #campaignNotice .actions { flex-wrap: wrap; }
 #campaignBanner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; padding: 8px 14px; border-radius: 6px; background: #2a2d36; border: 1px solid #4a7fff; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
 #campaignBanner[hidden] { display: none; }
+#overworldBanner { position: fixed; top: 52px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 6px; background: #2a2d36; border: 1px solid #4a7fff; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
+#overworldBanner[hidden] { display: none; }
+#overworldBanner button { margin: 0; padding: 4px 10px; width: auto; }
+#overworldOverlay { position: fixed; inset: 0; height: 100dvh; z-index: 600; display: flex; flex-direction: column; background: #111; }
+#overworldOverlay[hidden] { display: none; }
+#overworldBar { display: flex; align-items: center; gap: 12px; padding: 6px 10px; background: #1b1d24; color: #eee; font-size: 13px; }
+#overworldBar a { color: #8fb0ff; margin-left: auto; }
+#overworldBar button { margin: 0; padding: 4px 12px; width: auto; }
+#overworldFrameHost { flex: 1; min-height: 0; }
+#overworldFrameHost iframe { width: 100%; height: 100%; border: 0; display: block; background: #111; }

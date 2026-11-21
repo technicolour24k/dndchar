@@ -9,6 +9,7 @@ import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.j
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
 import { createCampaignClient } from './campaign.js';
+import { createOverworld } from './overworld.js';
 import { drawTargetRings } from './render/targeting.js';
 import { getTokensInShape } from './render/shapeGeometry.js';
 
@@ -967,6 +968,11 @@ function handleMessage(msg) {
       forage.onClosed(msg);
       break;
 
+    // A DM shared an overworld map (campaign tables only).
+    case 'overworld:granted':
+      overworld.onGranted(msg);
+      break;
+
     default:
       break;
   }
@@ -1539,7 +1545,7 @@ canvas.addEventListener('contextmenu', (e) => {
 // Keyboard shortcuts, only while planning and never while typing in a control (so Backspace in
 // a text box does not undo a waypoint).
 window.addEventListener('keydown', (e) => {
-  if (!movePlan || isEditableControl(document.activeElement)) return;
+  if (!movePlan || overworld.isOpen() || isEditableControl(document.activeElement)) return;
   // A focused button keeps its own Enter/Space behaviour, and a visible modal owns the keyboard.
   if (document.activeElement && document.activeElement.tagName === 'BUTTON') return;
   if (document.querySelector('.modal-overlay.visible')) return;
@@ -3378,6 +3384,7 @@ function roomInfoHtml(roleLabel) {
   const campaignLine = campaignClient.campaignName ? `<strong>${escapeHtml(campaignClient.campaignName)}</strong><br/>Room: ` : '';
   return `<div id="roomInfo">${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
+    ${overworld.buttonHtml()}
     ${combatControlHtml()}
     ${forage.forageControlHtml()}
     ${combatLogHtml()}
@@ -3918,6 +3925,7 @@ function wireGmSidebar() {
   wireSessionNotesControls();
 
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
+  overworld.wire();
   document.getElementById('openSoundboardBtn').addEventListener('click', openSoundboardModal);
 
   document.getElementById('showMovementRangesToggle').addEventListener('change', (e) => {
@@ -5077,6 +5085,7 @@ function wirePlayerSidebar() {
   document.getElementById('addCharacterTokenBtn').addEventListener('click', openCharacterPicker);
   wireSessionNotesControls();
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
+  overworld.wire();
 
   // Delegated, so it keeps working when updateOtherTokensInViewList swaps the
   // list's innerHTML on token:move.
@@ -5151,6 +5160,9 @@ function wirePlayerSidebar() {
 // Campaign tables (campaign-system unit F): ticket fetch, seat takeover, kicks and reconnects. Quick
 // rooms never touch it (campaignClient.active stays false). Created before forage so it is ready
 // for the first join.
+// Overworld maps (overworld-map plan, Unit F): a button and full-screen overlay at campaign tables only.
+const overworld = createOverworld({ getCampaignId: () => campaignClient.campaignId });
+
 const campaignClient = createCampaignClient({
   connect,
   closeSocket: () => { if (ws) ws.close(); },
