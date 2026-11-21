@@ -1,9 +1,12 @@
 <script lang="ts">
   import '../styles.css';
   import { env } from '$env/dynamic/public';
+  import { page } from '$app/state';
 
   let { data, children } = $props();
   const appName = env.PUBLIC_APP_NAME || 'D&D Character Manager';
+  // ?embed=1 (the overworld inside the VTT's overlay) hides the top bar so the page fills the frame.
+  const embed = $derived(page.url.searchParams.get('embed') === '1');
 </script>
 
 <svelte:head>
@@ -15,8 +18,8 @@
      never worked: :root's own derivations in src/styles.css only ever
      resolve against :root, and this div is a descendant, not an ancestor,
      of <body>, so it could never reach the page background either. -->
-<div class="app-frame">
-  {#if data.user}
+<div class="app-frame" class:embed>
+  {#if data.user && !embed}
     <header class="topbar">
       <a class="brand" href="/dashboard">
         <span class="brand-mark">d20</span>

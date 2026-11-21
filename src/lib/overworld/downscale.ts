@@ -27,7 +27,15 @@ export function targetSize(
   };
 }
 
-export type PreparedImage = { blob: Blob; width: number; height: number; type: string };
+// width/height are the size being uploaded; originalWidth/originalHeight are the picked file's own size.
+export type PreparedImage = {
+  blob: Blob;
+  width: number;
+  height: number;
+  type: string;
+  originalWidth: number;
+  originalHeight: number;
+};
 
 const ACCEPTED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 // A JPEG or WebP already inside the limits and smaller than this goes up untouched.
@@ -76,7 +84,7 @@ export async function prepareMapImage(file: File): Promise<PreparedImage> {
 
     // Already fine: don't re-encode (and lose quality) for nothing.
     if (!target.scaled && file.type !== 'image/png' && file.size <= UNTOUCHED_MAX_BYTES) {
-      return { blob: file, width: decoded.width, height: decoded.height, type: file.type };
+      return { blob: file, width: decoded.width, height: decoded.height, type: file.type, originalWidth: decoded.width, originalHeight: decoded.height };
     }
 
     const canvas = document.createElement('canvas');
@@ -91,7 +99,7 @@ export async function prepareMapImage(file: File): Promise<PreparedImage> {
     let blob = await toBlob(canvas, 'image/webp');
     if (!blob || blob.type !== 'image/webp') blob = await toBlob(canvas, 'image/jpeg');
     if (!blob) throw new Error('This image is too big for this device to resize. Try uploading it from a computer.');
-    return { blob, width: target.width, height: target.height, type: blob.type };
+    return { blob, width: target.width, height: target.height, type: blob.type, originalWidth: decoded.width, originalHeight: decoded.height };
   } finally {
     decoded.close();
   }

@@ -104,7 +104,8 @@ export type OverworldErrorCode =
   | 'route_changed'
   | 'archived'
   | 'bad_image'
-  | 'too_large';
+  | 'too_large'
+  | 'length_required';
 
 // ---- What the overworld service hands to page loaders (Units C onwards) ----
 
@@ -116,6 +117,10 @@ export type MapListItem = {
   imageUrl: string;
   // Pins this viewer can see.
   pinCount: number;
+  // For the DM settings forms (scale shown, and the replace-image shape warning).
+  imageWidth: number;
+  imageHeight: number;
+  milesAcross: number | null;
 };
 
 export type MapList = {

@@ -290,6 +290,37 @@
       </section>
     {/if}
 
+    {#if data.overworld}
+      <section class="panel campaign-box">
+        <div class="campaign-row">
+          <h2>Overworld</h2>
+          <span class="campaign-box-foot">
+            <a class="button-link compact-link" href="/campaigns/{campaign.id}/overworld">
+              {data.overworld.viewer.canManage ? 'Manage maps' : 'All maps'}
+            </a>
+          </span>
+        </div>
+        {#if data.overworld.maps.length === 0}
+          <p class="muted">{data.overworld.viewer.canManage ? 'No maps yet.' : "Your DM hasn't shared a map yet."}</p>
+        {:else}
+          <ul class="member-list">
+            {#each data.overworld.maps.slice(0, 5) as map (map.id)}
+              <li>
+                <div class="member-name">
+                  <strong>{map.name}</strong>
+                  {#if data.overworld.viewer.canManage && !map.granted}<span class="badge badge-muted">Not shared yet</span>{/if}
+                </div>
+                <a class="button-link compact-link" href="/campaigns/{campaign.id}/overworld/{map.id}">Open</a>
+              </li>
+            {/each}
+          </ul>
+          {#if data.overworld.maps.length > 5}
+            <p class="muted">and {data.overworld.maps.length - 5} more.</p>
+          {/if}
+        {/if}
+      </section>
+    {/if}
+
     {#if data.findTableCount !== null}
       <section class="panel campaign-box">
         <div class="campaign-row">

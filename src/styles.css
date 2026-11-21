@@ -2961,3 +2961,48 @@ button.text-button.danger-text:hover {
 .creature-numbers label {
   font-size: 12px;
 }
+
+/* Overworld: embedded mode (no top bar) and the compact map rows on the list page. */
+.app-frame.embed .page-shell {
+  padding: 10px;
+}
+
+.ow-settings {
+  flex: 1 1 100%;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ow-settings > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.ow-settings form {
+  display: grid;
+  gap: 8px;
+  align-items: end;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.ow-settings form .full-row {
+  grid-column: 1 / -1;
+}
+
+.ow-settings h3 {
+  margin: 6px 0 0;
+  font-size: 13px;
+}
+
+.ow-row-note {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 13px;
+}
+
+.ow-pick-info {
+  font-size: 13px;
+  color: var(--muted);
+}

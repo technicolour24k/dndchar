@@ -192,7 +192,7 @@ export async function listMapsForViewer(userId: string, campaignId: string): Pro
   const dm = isOverworldDm(viewer);
   const rows = await query(
     `
-      SELECT m.id, m.name, m.image_file, m.granted_at, m.archived_at,
+      SELECT m.id, m.name, m.image_file, m.image_width, m.image_height, m.miles_across, m.granted_at, m.archived_at,
         (SELECT count(*)::int FROM overworld_pins p
           WHERE p.map_id = m.id AND (p.visibility = 'everyone' OR p.created_by_user_id = $2 OR $3::boolean)) AS pin_count
       FROM overworld_maps m
@@ -208,7 +208,10 @@ export async function listMapsForViewer(userId: string, campaignId: string): Pro
       name: r.name as string,
       granted: r.granted_at !== null,
       imageUrl: mapImageUrl(campaignId, r.id, r.image_file),
-      pinCount: r.pin_count as number
+      pinCount: r.pin_count as number,
+      imageWidth: r.image_width as number,
+      imageHeight: r.image_height as number,
+      milesAcross: r.miles_across as number | null
     }));
   return { viewer: { canManage: canManageMaps(viewer) }, maps };
 }
@@ -301,15 +304,15 @@ export async function getMapImageForViewer(userId: string, campaignId: string, m
 
 type MapFields = { name: string; milesAcross: number | null };
 
-// Cheap permission check before an image file is written, so a refused upload never touches disk.
-// The real check is repeated inside the transaction.
-async function preCheckManage(userId: string, campaignId: string): Promise<void> {
+// Cheap permission check before an image file is written (or an upload body is read), so a refused
+// upload never touches disk. The real check is repeated inside the transaction.
+export async function assertCanManageMaps(userId: string, campaignId: string): Promise<void> {
   const viewer = await writerViewer({ query }, userId, campaignId);
   if (!canManageMaps(viewer)) throw new OverworldError('forbidden', 'Only a DM can manage maps.');
 }
 
 export async function createMap(userId: string, campaignId: string, fields: MapFields, image: ValidatedImage): Promise<string> {
-  await preCheckManage(userId, campaignId);
+  await assertCanManageMaps(userId, campaignId);
   const mapId = await storeImageThenRun(campaignId, image, (fileName) =>
     withTransaction(async (client) => {
       const viewer = await writerViewer(client, userId, campaignId);
@@ -327,7 +330,7 @@ export async function createMap(userId: string, campaignId: string, fields: MapF
 }
 
 export async function replaceMapImage(userId: string, campaignId: string, mapId: string, image: ValidatedImage): Promise<void> {
-  await preCheckManage(userId, campaignId);
+  await assertCanManageMaps(userId, campaignId);
   const oldFile = await storeImageThenRun(campaignId, image, (fileName) =>
     withTransaction(async (client) => {
       const { map } = await gateManage(client, userId, campaignId, mapId);

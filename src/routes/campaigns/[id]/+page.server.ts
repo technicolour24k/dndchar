@@ -2,6 +2,7 @@ import { error, fail, redirect } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
+import { listMapsForViewer } from '$lib/server/services/overworld';
 import { closeCampaignRoom, kickFromCampaignRoom, pruneDepartedCharacterTokens, syncGmSeats } from '$lib/server/services/campaignRooms';
 import {
   addCharacterToCampaign,
@@ -37,6 +38,8 @@ export async function load({ params, locals }) {
     hasNoDm: !page.members.some((m) => m.role === 'dm'),
     // DMs and admins get a "Find tables: N active" line (foraging needs at least one table). Null for everyone else.
     findTableCount: page.access.canManage && !archived ? await countActiveFindTables(page.campaign.id) : null,
+    // Maps this viewer may open (campaign role only, so null for a non-member, site admin or not).
+    overworld: await listMapsForViewer(user.id, params.id),
     // The admin banner is for people who only have access through the override.
     viaAdmin: page.access.isAdmin && !page.access.isDm
   };
