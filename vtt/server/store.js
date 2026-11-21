@@ -33,11 +33,16 @@ function getGlobalStore() {
       // Extra per-socket clean-up registered by the ws layer (name -> fn(meta, session)), run by
       // releaseSocket. On the global store so every module instance sees the same hooks.
       releaseHooks: new Map(),
+      // Overworld live route preview (Unit G): one-use tickets and the sockets joined per map.
+      overworldLiveTickets: new Map(),
+      overworldLiveByMap: new Map(),
     };
   }
   // A store created before tickets existed (a long-running dev process after HMR) lacks the map.
   globalThis[GLOBAL_KEY].joinTickets ??= new Map();
   globalThis[GLOBAL_KEY].releaseHooks ??= new Map();
+  globalThis[GLOBAL_KEY].overworldLiveTickets ??= new Map();
+  globalThis[GLOBAL_KEY].overworldLiveByMap ??= new Map();
   return globalThis[GLOBAL_KEY];
 }
 
@@ -46,6 +51,8 @@ export const socketsBySession = getGlobalStore().socketsBySession;
 export const watchersByTopic = getGlobalStore().watchersByTopic;
 export const joinTickets = getGlobalStore().joinTickets;
 const releaseHooks = getGlobalStore().releaseHooks;
+const overworldLiveTickets = getGlobalStore().overworldLiveTickets;
+const overworldLiveByMap = getGlobalStore().overworldLiveByMap;
 
 const MAX_WATCH_TOPICS = 10;
 
@@ -417,6 +424,147 @@ export function broadcast(sessionId, buildPayload) {
     const watcherPayload = buildPayload({ role: 'watcher', playerId: null });
     if (watcherPayload && WATCHABLE_BROADCAST_TYPES.has(watcherPayload.type)) {
       publish(roomTopic, watcherPayload);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Overworld live route preview (Unit G)
+// ---------------------------------------------------------------------------------------------
+// A ticketed per-map channel on this same socket server. The SvelteKit ticket route checks the
+// viewer can see the map (campaign role only) and issues a one-use ticket; the socket then joins
+// the map's set. Previews are relayed, never stored. The server stamps the drawer's identity from
+// the ticket, and a private preview only reaches who could see the saved route (the drawer's own
+// sockets and campaign DMs, the same rule as canSeeItem in src/lib/overworld/rules.ts).
+
+const OVERWORLD_LIVE_TICKET_TTL_MS = 60 * 1000;
+export const PREVIEW_MIN_GAP_MS = 100; // at most 10 frames/s per socket, extras dropped
+export const PREVIEW_IDLE_MS = 30 * 1000; // a preview nobody refreshes for this long clears itself
+const MAX_PREVIEW_POINTS = 201;
+
+/** @param {{ campaignId: string, mapId: string, userId: string, displayName: string, isDm: boolean }} t */
+export function issueOverworldLiveTicket({ campaignId, mapId, userId, displayName, isDm }) {
+  const now = Date.now();
+  for (const [token, ticket] of overworldLiveTickets) {
+    if (ticket.expiresAt <= now) overworldLiveTickets.delete(token);
+  }
+  const token = crypto.randomBytes(24).toString('base64url');
+  overworldLiveTickets.set(token, { campaignId, mapId, userId, displayName, isDm: !!isDm, expiresAt: now + OVERWORLD_LIVE_TICKET_TTL_MS });
+  return token;
+}
+
+// Single use, like consumeJoinTicket.
+export function consumeOverworldLiveTicket(token) {
+  if (typeof token !== 'string') return null;
+  const ticket = overworldLiveTickets.get(token);
+  if (!ticket) return null;
+  overworldLiveTickets.delete(token);
+  return ticket.expiresAt > Date.now() ? ticket : null;
+}
+
+// Who sees a preview from `sender`: every other socket on the map for 'everyone'; for 'private' only
+// the drawer's own other sockets and DMs. `sockets` are metas with a `.live` (see joinOverworldLive).
+export function previewRecipients(sender, sockets, visibility) {
+  const out = [];
+  for (const meta of sockets) {
+    if (meta === sender || !meta.live) continue;
+    if (visibility === 'everyone' || meta.live.userId === sender.live.userId || meta.live.isDm) out.push(meta);
+  }
+  return out;
+}
+
+function sendTo(metas, payload) {
+  const message = JSON.stringify(payload);
+  for (const meta of metas) if (meta.ws.readyState === meta.ws.OPEN) meta.ws.send(message);
+}
+
+// Takes the ticket's identity onto the socket and files it under its map. Leaves any earlier map first.
+export function joinOverworldLive(meta, ticket) {
+  leaveOverworldLive(meta);
+  meta.live = {
+    ...ticket,
+    previewId: crypto.randomBytes(6).toString('hex'),
+    lastFrameAt: 0,
+    visibility: null, // set while a preview is showing
+    timer: null,
+  };
+  let set = overworldLiveByMap.get(ticket.mapId);
+  if (!set) overworldLiveByMap.set(ticket.mapId, (set = new Set()));
+  set.add(meta);
+}
+
+// Stops this socket's preview (if showing) and tells whoever was seeing it.
+export function clearOverworldPreview(meta) {
+  const live = meta.live;
+  if (!live) return;
+  clearTimeout(live.timer);
+  live.timer = null;
+  if (live.visibility === null) return;
+  const set = overworldLiveByMap.get(live.mapId);
+  if (set) sendTo(previewRecipients(meta, set, live.visibility), { type: 'overworld:preview:clear', previewId: live.previewId });
+  live.visibility = null;
+}
+
+export function leaveOverworldLive(meta) {
+  if (!meta.live) return;
+  clearOverworldPreview(meta);
+  const set = overworldLiveByMap.get(meta.live.mapId);
+  if (set) {
+    set.delete(meta);
+    if (set.size === 0) overworldLiveByMap.delete(meta.live.mapId);
+  }
+  meta.live = null;
+}
+
+// Validates and relays one preview frame. Malformed frames and frames over the rate limit are
+// dropped silently (the client resends the full list anyway, so a drop only costs a few ms).
+export function relayOverworldPreview(meta, msg, now = Date.now()) {
+  const live = meta.live;
+  if (!live) return false;
+  const { points, visibility, colour } = msg;
+  if (visibility !== 'everyone' && visibility !== 'private') return false;
+  if (typeof colour !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(colour)) return false;
+  if (!Array.isArray(points) || points.length < 1 || points.length > MAX_PREVIEW_POINTS) return false;
+  const clean = [];
+  for (const p of points) {
+    if (!p || typeof p.x !== 'number' || typeof p.y !== 'number') return false;
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) return false;
+    clean.push({ x: p.x, y: p.y });
+  }
+  if (now - live.lastFrameAt < PREVIEW_MIN_GAP_MS) return false;
+  live.lastFrameAt = now;
+  const set = overworldLiveByMap.get(live.mapId);
+  const recipients = set ? previewRecipients(meta, set, visibility) : [];
+  // Visibility changed mid-draw: whoever saw the old one but may not see the new one is cleared.
+  if (set && live.visibility !== null && live.visibility !== visibility) {
+    sendTo(previewRecipients(meta, set, live.visibility).filter((m) => !recipients.includes(m)), { type: 'overworld:preview:clear', previewId: live.previewId });
+  }
+  live.visibility = visibility;
+  clearTimeout(live.timer);
+  live.timer = setTimeout(() => clearOverworldPreview(meta), PREVIEW_IDLE_MS);
+  live.timer.unref?.();
+  if (set) {
+    sendTo(recipients, {
+      type: 'overworld:preview',
+      previewId: live.previewId,
+      drawerName: live.displayName,
+      points: clean,
+      visibility,
+      colour,
+    });
+  }
+  return true;
+}
+
+// Rights removed: closes preview sockets (4003) matching `filter(meta.live)` and revokes matching
+// unspent tickets. Clients that are still allowed just reconnect with a fresh ticket.
+export function closeOverworldLive(filter) {
+  for (const [token, ticket] of overworldLiveTickets) if (filter(ticket)) overworldLiveTickets.delete(token);
+  for (const set of [...overworldLiveByMap.values()]) {
+    for (const meta of [...set]) {
+      if (!filter(meta.live)) continue;
+      leaveOverworldLive(meta);
+      meta.ws.close(4003);
     }
   }
 }

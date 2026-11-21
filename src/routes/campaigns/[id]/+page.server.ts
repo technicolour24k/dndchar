@@ -3,6 +3,7 @@ import { attempt } from '$lib/server/campaignAction';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
 import { listMapsForViewer } from '$lib/server/services/overworld';
+import { dropCampaignPreviews, dropUserPreviews } from '$lib/server/overworldNotify';
 import { closeCampaignRoom, kickFromCampaignRoom, pruneDepartedCharacterTokens, syncGmSeats } from '$lib/server/services/campaignRooms';
 import {
   addCharacterToCampaign,
@@ -67,7 +68,10 @@ export const actions = {
     if (!ROLES.includes(role)) return fail(400, { error: 'Unknown role.' });
     const result = await attempt(() => setMemberRole(locals.user!.id, params.id, String(form.get('userId') || ''), role));
     if (result.ok) {
-      for (const id of result.value?.demotedToPlayer ?? []) kickFromCampaignRoom(result.value?.roomCode, id, 'role_changed');
+      for (const id of result.value?.demotedToPlayer ?? []) {
+        kickFromCampaignRoom(result.value?.roomCode, id, 'role_changed');
+        dropUserPreviews(params.id, id);
+      }
       // A swap or admin "make primary" changes who outranks whom, so refresh seated GMs' rank.
       await syncGmSeats(params.id, result.value?.roomCode);
     }
@@ -79,6 +83,7 @@ export const actions = {
     const result = await attempt(() => removeMember(locals.user!.id, params.id, String(form.get('userId') || '')));
     if (result.ok) {
       kickFromCampaignRoom(result.value?.roomCode, result.value?.targetUserId, 'removed_from_campaign');
+      if (result.value?.targetUserId) dropUserPreviews(params.id, result.value.targetUserId);
       // Removing the primary promotes the co-DM, whose seated socket is now 'primary'.
       await syncGmSeats(params.id, result.value?.roomCode);
       // Their characters left the campaign, so their tokens leave the live map.
@@ -91,6 +96,7 @@ export const actions = {
     const result = await attempt(() => leaveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     kickFromCampaignRoom(result.value?.roomCode, locals.user!.id, 'removed_from_campaign');
+    dropUserPreviews(params.id, locals.user!.id);
     await syncGmSeats(params.id, result.value?.roomCode);
     await pruneDepartedCharacterTokens();
     throw redirect(303, '/campaigns');
@@ -100,6 +106,7 @@ export const actions = {
     const result = await attempt(() => archiveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     closeCampaignRoom(result.value?.roomCode);
+    dropCampaignPreviews(params.id);
     throw redirect(303, '/campaigns');
   },
 
