@@ -1,9 +1,20 @@
 import { error } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { parsePinInput } from '$lib/overworld/input';
+import { parsePinInput, parseRouteFields, parseRoutePoints } from '$lib/overworld/input';
 import { assertDeclaredSize, attemptOverworld, MAX_FORM_REQUEST_BYTES } from '$lib/server/overworldAction';
 import { OverworldError } from '$lib/server/overworldError';
-import { createPin, deletePin, getMapView, movePin, updatePin } from '$lib/server/services/overworld';
+import {
+  appendRouteLegs,
+  createPin,
+  createRoute,
+  deletePin,
+  deleteRoute,
+  deleteRouteLeg,
+  getMapView,
+  movePin,
+  updatePin,
+  updateRoute
+} from '$lib/server/services/overworld';
 
 // The map viewer. Every action forwards to the overworld service, which does the real permission
 // check (campaign role only; a non-member, site admin or not, gets 404). What load computes (canEdit,
@@ -26,6 +37,7 @@ async function readForm(request: Request): Promise<FormData> {
 }
 
 const pinIdOf = (form: FormData) => String(form.get('pinId') || '');
+const routeIdOf = (form: FormData) => String(form.get('routeId') || '');
 
 export const actions: Actions = {
   addPin: async ({ request, params, locals }) => {
@@ -55,6 +67,57 @@ export const actions: Actions = {
       await movePin(locals.user!.id, params.id, params.mapId, pinIdOf(form), { x: parsed.fields.x!, y: parsed.fields.y! });
     });
     return result.ok ? { done: 'moved' } : result.failure;
+  },
+
+  // Routes. `points` is a JSON array of {x, y} (0..1); N points are N - 1 legs.
+  saveRoute: async ({ request, params, locals }) => {
+    const result = await attemptOverworld(async () => {
+      const form = await readForm(request);
+      const points = parseRoutePoints(form.get('points'));
+      if (!points.ok) throw new OverworldError('invalid', points.reason);
+      const fields = parseRouteFields(form);
+      if (!fields.ok) throw new OverworldError('invalid', fields.reason);
+      return createRoute(locals.user!.id, params.id, params.mapId, points.points, fields.fields);
+    });
+    return result.ok ? { done: 'route-saved', routeId: result.value } : result.failure;
+  },
+
+  // Continue a route from its end: `points` starts at the end the client saw; the service refuses
+  // with route_changed (409) if the real end has moved.
+  continueRoute: async ({ request, params, locals }) => {
+    const result = await attemptOverworld(async () => {
+      const form = await readForm(request);
+      const points = parseRoutePoints(form.get('points'));
+      if (!points.ok) throw new OverworldError('invalid', points.reason);
+      await appendRouteLegs(locals.user!.id, params.id, params.mapId, routeIdOf(form), points.points[0], points.points);
+    });
+    return result.ok ? { done: 'route-continued' } : result.failure;
+  },
+
+  updateRoute: async ({ request, params, locals }) => {
+    const result = await attemptOverworld(async () => {
+      const form = await readForm(request);
+      const fields = parseRouteFields(form);
+      if (!fields.ok) throw new OverworldError('invalid', fields.reason);
+      await updateRoute(locals.user!.id, params.id, params.mapId, routeIdOf(form), fields.fields);
+    });
+    return result.ok ? { done: 'route-updated' } : result.failure;
+  },
+
+  deleteLeg: async ({ request, params, locals }) => {
+    const result = await attemptOverworld(async () => {
+      const form = await readForm(request);
+      return deleteRouteLeg(locals.user!.id, params.id, params.mapId, routeIdOf(form), String(form.get('legId') || ''));
+    });
+    return result.ok ? { done: 'leg-deleted', routeDeleted: result.value.routeDeleted } : result.failure;
+  },
+
+  deleteRoute: async ({ request, params, locals }) => {
+    const result = await attemptOverworld(async () => {
+      const form = await readForm(request);
+      await deleteRoute(locals.user!.id, params.id, params.mapId, routeIdOf(form));
+    });
+    return result.ok ? { done: 'route-deleted' } : result.failure;
   },
 
   deletePin: async ({ request, params, locals }) => {

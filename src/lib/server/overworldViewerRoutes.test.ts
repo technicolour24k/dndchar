@@ -10,7 +10,12 @@ const svc = {
   createPin: vi.fn(),
   updatePin: vi.fn(),
   movePin: vi.fn(),
-  deletePin: vi.fn()
+  deletePin: vi.fn(),
+  createRoute: vi.fn(),
+  appendRouteLegs: vi.fn(),
+  updateRoute: vi.fn(),
+  deleteRouteLeg: vi.fn(),
+  deleteRoute: vi.fn()
 };
 vi.mock('$lib/server/services/overworld', () => svc);
 
@@ -20,6 +25,8 @@ const route = await import('../../routes/campaigns/[id]/overworld/[mapId]/+page.
 const ME = '11111111-1111-4111-8111-111111111111';
 const CAMPAIGN = '22222222-2222-4222-8222-222222222222';
 const MAP = '33333333-3333-4333-8333-333333333333';
+const ROUTE = '55555555-5555-4555-8555-555555555555';
+const LEG = '66666666-6666-4666-8666-666666666666';
 const PIN = '44444444-4444-4444-8444-444444444444';
 const locals = { user: { id: ME } };
 const params = { id: CAMPAIGN, mapId: MAP };
@@ -106,5 +113,64 @@ describe('pin actions', () => {
       expect(((await run(action, big)) as any).status).toBe(413);
     }
     expect(formData).not.toHaveBeenCalled();
+  });
+});
+
+describe('route actions', () => {
+  const pts = JSON.stringify([{ x: 0.1, y: 0.1 }, { x: 0.2, y: 0.2 }, { x: 0.3, y: 0.2 }]);
+
+  it('saveRoute parses points and fields and forwards the user and params', async () => {
+    svc.createRoute.mockResolvedValue(ROUTE);
+    const { request: req } = request({ points: pts, label: ' Road ', colour: 'teal', visibility: 'private' });
+    expect(await run(route.actions.saveRoute, req)).toEqual({ done: 'route-saved', routeId: ROUTE });
+    expect(svc.createRoute).toHaveBeenCalledWith(
+      ME, CAMPAIGN, MAP,
+      [{ x: 0.1, y: 0.1 }, { x: 0.2, y: 0.2 }, { x: 0.3, y: 0.2 }],
+      { label: 'Road', colour: 'teal', visibility: 'private' }
+    );
+  });
+  it('saveRoute: bad points or colour are an inline 400 and nothing is saved', async () => {
+    const bad: Record<string, string>[] = [
+      { points: 'nope' },
+      { points: JSON.stringify([{ x: 0.1, y: 0.1 }]) },
+      { points: JSON.stringify([{ x: 0.1, y: 0.1 }, { x: 1.5, y: 0.2 }]) },
+      { points: pts, colour: 'pink' }
+    ];
+    for (const fields of bad) expect(((await run(route.actions.saveRoute, request(fields).request)) as any).status).toBe(400);
+    expect(svc.createRoute).not.toHaveBeenCalled();
+  });
+  it('continueRoute starts from the first point; route_changed is a 409 inline error', async () => {
+    expect(await run(route.actions.continueRoute, request({ routeId: ROUTE, points: pts }).request)).toEqual({ done: 'route-continued' });
+    expect(svc.appendRouteLegs).toHaveBeenCalledWith(ME, CAMPAIGN, MAP, ROUTE, { x: 0.1, y: 0.1 }, expect.any(Array));
+    svc.appendRouteLegs.mockRejectedValue(new OverworldError('route_changed', 'This route was changed by someone else - try again.'));
+    const result: any = await run(route.actions.continueRoute, request({ routeId: ROUTE, points: pts }).request);
+    expect(result.status).toBe(409);
+    expect(result.data.error).toContain('changed by someone else');
+  });
+  it('updateRoute sends only posted fields; a DM-locked refusal is inline', async () => {
+    expect(await run(route.actions.updateRoute, request({ routeId: ROUTE, label: 'New' }).request)).toEqual({ done: 'route-updated' });
+    expect(svc.updateRoute).toHaveBeenCalledWith(ME, CAMPAIGN, MAP, ROUTE, { label: 'New' });
+    svc.updateRoute.mockRejectedValue(new OverworldError('forbidden', 'Only a DM can change this route.'));
+    const result: any = await run(route.actions.updateRoute, request({ routeId: ROUTE, label: 'x' }).request);
+    expect(result.status).toBe(403);
+    expect(result.data.error).toBe('Only a DM can change this route.');
+  });
+  it('deleteLeg reports whether the route went too; deleteRoute forwards the id', async () => {
+    svc.deleteRouteLeg.mockResolvedValue({ routeDeleted: true });
+    expect(await run(route.actions.deleteLeg, request({ routeId: ROUTE, legId: LEG }).request)).toEqual({ done: 'leg-deleted', routeDeleted: true });
+    expect(svc.deleteRouteLeg).toHaveBeenCalledWith(ME, CAMPAIGN, MAP, ROUTE, LEG);
+    expect(await run(route.actions.deleteRoute, request({ routeId: ROUTE }).request)).toEqual({ done: 'route-deleted' });
+    expect(svc.deleteRoute).toHaveBeenCalledWith(ME, CAMPAIGN, MAP, ROUTE);
+  });
+  it('every route action needs a content-length and caps it at 64 KB', async () => {
+    const actions = [route.actions.saveRoute, route.actions.continueRoute, route.actions.updateRoute, route.actions.deleteLeg, route.actions.deleteRoute];
+    for (const action of actions) {
+      const none = request({ routeId: ROUTE, points: pts }, { 'content-length': '' });
+      expect(((await run(action, none.request)) as any).status).toBe(411);
+      expect(none.formData).not.toHaveBeenCalled();
+      const big = request({ routeId: ROUTE, points: pts }, { 'content-length': String(70 * 1024) });
+      expect(((await run(action, big.request)) as any).status).toBe(413);
+      expect(big.formData).not.toHaveBeenCalled();
+    }
   });
 });

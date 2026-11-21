@@ -3309,6 +3309,32 @@ button.compact-button.active {
   border: 1px solid #000;
 }
 
+.ow-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.ow-svg-label {
+  fill: #fff;
+  font-size: 13px;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: #000;
+  stroke-width: 3px;
+}
+
+.ow-trace-banner {
+  flex-wrap: wrap;
+}
+
+.ow-miles {
+  width: 90px;
+}
+
 .ow-row-note {
   flex: 1 1 100%;
   margin: 0;

@@ -57,3 +57,39 @@ export function formatDistance(miles: number | null): string {
 function trimDecimal(n: number): string {
   return String(Number(n.toFixed(1)));
 }
+
+// Shortest distance from point p to the segment a-b, all in the same units.
+export function pointToSegmentDistance(p: Pt, a: Pt, b: Pt): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSquared));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+export type HitLeg = { routeId: string; legId: string; distance: number };
+
+// The leg closest to a tapped map point, if one is within `tolerancePx` image pixels. Everything is
+// measured in image pixels (not 0..1 fractions) so the tolerance is the same in both directions.
+// The caller turns a screen tolerance into image pixels by dividing by the zoom.
+export function nearestLeg(
+  routes: { id: string; legs: { id: string; x1: number; y1: number; x2: number; y2: number }[] }[],
+  point: Pt,
+  dims: Dims,
+  tolerancePx: number
+): HitLeg | null {
+  const p = { x: point.x * dims.width, y: point.y * dims.height };
+  let best: HitLeg | null = null;
+  for (const route of routes) {
+    for (const leg of route.legs) {
+      const distance = pointToSegmentDistance(
+        p,
+        { x: leg.x1 * dims.width, y: leg.y1 * dims.height },
+        { x: leg.x2 * dims.width, y: leg.y2 * dims.height }
+      );
+      if (distance <= tolerancePx && (!best || distance < best.distance)) best = { routeId: route.id, legId: leg.id, distance };
+    }
+  }
+  return best;
+}

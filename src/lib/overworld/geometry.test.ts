@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatDistance, legMiles, milesAcrossFromCalibration, routeMiles, travelDays } from './geometry';
+import { formatDistance, legMiles, milesAcrossFromCalibration, nearestLeg, pointToSegmentDistance, routeMiles, travelDays } from './geometry';
 
 const square = { width: 1000, height: 1000 };
 const wide = { width: 2000, height: 1000 };
@@ -89,5 +89,41 @@ describe('formatDistance', () => {
     expect(formatDistance(17)).toBe('17 mi');
     expect(formatDistance(24)).toBe('24 mi - about 1 day');
     expect(formatDistance(38)).toBe('38 mi - about 1.5 days');
+  });
+});
+
+describe('pointToSegmentDistance', () => {
+  const a = { x: 0, y: 0 };
+  const b = { x: 10, y: 0 };
+  it('measures to the segment, clamping at the ends', () => {
+    expect(pointToSegmentDistance({ x: 5, y: 3 }, a, b)).toBe(3);
+    expect(pointToSegmentDistance({ x: -4, y: 3 }, a, b)).toBe(5);
+    expect(pointToSegmentDistance({ x: 13, y: 4 }, a, b)).toBe(5);
+  });
+  it('handles a zero-length segment', () => {
+    expect(pointToSegmentDistance({ x: 3, y: 4 }, a, a)).toBe(5);
+  });
+});
+
+describe('nearestLeg', () => {
+  const routes = [
+    { id: 'r1', legs: [{ id: 'l1', x1: 0.1, y1: 0.5, x2: 0.5, y2: 0.5 }, { id: 'l2', x1: 0.5, y1: 0.5, x2: 0.5, y2: 0.9 }] },
+    { id: 'r2', legs: [{ id: 'l3', x1: 0.1, y1: 0.52, x2: 0.5, y2: 0.52 }] }
+  ];
+  const dims = { width: 1000, height: 1000 };
+  it('picks the closest leg inside the tolerance', () => {
+    expect(nearestLeg(routes, { x: 0.3, y: 0.505 }, dims, 12)).toMatchObject({ routeId: 'r1', legId: 'l1' });
+    expect(nearestLeg(routes, { x: 0.3, y: 0.518 }, dims, 12)).toMatchObject({ routeId: 'r2', legId: 'l3' });
+    expect(nearestLeg(routes, { x: 0.505, y: 0.7 }, dims, 12)).toMatchObject({ routeId: 'r1', legId: 'l2' });
+  });
+  it('returns null when nothing is close enough, or there are no routes', () => {
+    expect(nearestLeg(routes, { x: 0.3, y: 0.7 }, dims, 12)).toBeNull();
+    expect(nearestLeg([], { x: 0.3, y: 0.5 }, dims, 12)).toBeNull();
+  });
+  it('uses image pixels, so a wide image has the same tolerance both ways', () => {
+    const wideDims = { width: 4000, height: 1000 };
+    // 0.003 across is 12 px on a 4000 px wide image, but 0.003 down is only 3 px.
+    expect(nearestLeg(routes, { x: 0.5 + 0.003, y: 0.7 }, wideDims, 12)).not.toBeNull();
+    expect(nearestLeg(routes, { x: 0.5 + 0.004, y: 0.7 }, wideDims, 12)).toBeNull();
   });
 });

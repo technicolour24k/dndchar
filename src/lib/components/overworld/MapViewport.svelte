@@ -16,6 +16,8 @@
     mapId,
     armed = false,
     ontap,
+    onhover,
+    oncontext,
     overlay
   }: {
     imageUrl: string;
@@ -24,7 +26,13 @@
     // True while the page is waiting for a placement tap (crosshair cursor).
     armed?: boolean;
     // A tap on the map: the point as 0..1 fractions of the image (only when inside the image).
-    ontap?: (point: Pt) => void;
+    // The zoom is passed too, so the page can turn a screen tolerance into image pixels.
+    // pointerType ('mouse' | 'touch' | 'pen') lets the page use a bigger tolerance for fingers.
+    ontap?: (point: Pt, zoom: number, pointerType: string) => void;
+    // Mouse only: where the pointer is over the map (null when it leaves). Used for the route preview leg.
+    onhover?: (point: Pt | null) => void;
+    // Right-click on the map (the page decides whether to prevent the menu and what it does).
+    oncontext?: (event: MouseEvent) => void;
     overlay?: Snippet<[{ view: View; toScreen: (p: Pt) => Pt }]>;
   } = $props();
 
@@ -137,7 +145,11 @@
 
   function onpointermove(e: PointerEvent) {
     const prev = pointers.get(e.pointerId);
-    if (!prev) return;
+    if (!prev) {
+      // No button down: a mouse hovering. Touch never gets here, so a finger lifting cannot leave a ghost leg.
+      if (e.pointerType === 'mouse' && onhover) onhover(screenToMap(view, dims, localPoint(e)));
+      return;
+    }
     const now = localPoint(e);
     pointers.set(e.pointerId, now);
 
@@ -160,7 +172,7 @@
     if (pointers.size < 2) pinch = null;
     if (wasSingle && at && !moved) {
       const p = screenToMap(view, dims, at);
-      if (p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1) ontap?.(p);
+      if (p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1) ontap?.(p, view.zoom, e.pointerType);
     }
     if (pointers.size === 0) startPoint = null;
   }
@@ -187,6 +199,8 @@
   {onpointermove}
   {onpointerup}
   {onpointercancel}
+  onpointerleave={(e) => e.pointerType === 'mouse' && onhover?.(null)}
+  oncontextmenu={oncontext}
   onlostpointercapture={onpointercancel}
   onwheel={onwheel}
   role="application"
