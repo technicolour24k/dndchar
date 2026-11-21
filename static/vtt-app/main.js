@@ -2116,7 +2116,14 @@ function handleSpellResult(msg) {
       ? (msg.saveSuccess ? `Saved! ${msg.damageApplied} damage dealt` : `Failed save — ${msg.damageApplied} damage dealt`)
       : `${msg.damageApplied} damage dealt`;
   const cls = msg.resolution === 'heal' ? 'hit' : (msg.damageApplied > 0 ? 'hit' : 'miss');
-  setAttackVerdict(`<div class="attack-outcome ${cls}">${label}</div>`);
+  setAttackVerdict(`<div class="attack-outcome ${cls}">${label}${damageTakenNote(msg)}</div>`);
+}
+
+// The damage_taken audit trail the server adds when the target is a PC whose modifiers changed the
+// damage (armour reduction, Rage resistance...): "rolled 7; 7 - 2 (Half Cover) = 5". Empty otherwise.
+function damageTakenNote(msg) {
+  if (!msg.breakdown) return '';
+  return `<div class="damage-taken-note">Rolled ${escapeHtml(String(msg.damageRolled))}; ${escapeHtml(msg.breakdown)}</div>`;
 }
 
 // Server's verdict for the in-flight attack (it decided vs the hidden AC and
@@ -2136,7 +2143,7 @@ function handleAttackResult(msg) {
       : `Hit (no AC set) — ${msg.damage} damage dealt`;
   } else { cls = 'miss'; label = 'Miss'; }
 
-  setAttackVerdict(`<div class="attack-outcome ${cls}">${label}</div>`);
+  setAttackVerdict(`<div class="attack-outcome ${cls}">${label}${damageTakenNote(msg)}</div>`);
 }
 
 // Yellow highlight ring around every valid target while an action is armed (step 1's visible

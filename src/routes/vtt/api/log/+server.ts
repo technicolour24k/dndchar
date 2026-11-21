@@ -1,5 +1,5 @@
 import { json } from '@sveltejs/kit';
-import { env } from '$env/dynamic/private';
+import { internalSecretValid } from '$lib/server/internalSecret';
 import { logCombatEvent, listCombatLogEntries } from '$lib/server/services/combatLog';
 
 // vtt/server/handlers/token.js is plain @ts-nocheck JS living outside SvelteKit's
@@ -10,10 +10,10 @@ import { logCombatEvent, listCombatLogEntries } from '$lib/server/services/comba
 // with no browser session to authenticate against, hence the shared-secret header
 // rather than locals.user. Both sides fall back to the same default so this works
 // out of the box; set VTT_INTERNAL_SECRET in production to harden it.
-const INTERNAL_SECRET = env.VTT_INTERNAL_SECRET || 'vtt-internal-dev-secret';
+// (internalSecretValid does the constant-time compare and warns once if production has no secret.)
 
 export async function POST({ request }) {
-  if (request.headers.get('x-vtt-internal-secret') !== INTERNAL_SECRET) {
+  if (!internalSecretValid(request.headers.get('x-vtt-internal-secret'), { route: '/vtt/api/log' })) {
     return json({ error: 'unauthorized' }, { status: 401 });
   }
   const body = await request.json().catch(() => ({}));

@@ -140,7 +140,9 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:hidden:toggle':
         case 'attack:resolve':
         case 'spell:resolve':
-          handleTokenEvent(meta, msg, context);
+          // Async since damage-taken lookups (attack/spell resolve) await a loopback call; a
+          // failure there is logged, never an unhandled rejection.
+          Promise.resolve(handleTokenEvent(meta, msg, context)).catch((err) => console.error('[VTT] token event failed', msg.type, err));
           break;
         case 'map:set':
         case 'map:reveal':

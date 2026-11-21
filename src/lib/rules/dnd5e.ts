@@ -152,24 +152,38 @@ export function resolveModifierNumericValue(
   return Number.isFinite(numeric) ? numeric : 0;
 }
 
+// Every (effect, modifier) pair of the given types whose target and condition match, in source
+// order. The shared filter behind resolvedNumericModifiers; also used directly by rules that care
+// that a modifier applies but not what its number is (resistance, vulnerability, immunity).
+export function matchingModifiers(
+  effects: ActiveCharacterEffect[],
+  candidates: string[],
+  modifierTypes: string[],
+  context: ModifierContext = {}
+): Array<{ effect: ActiveCharacterEffect; modifier: EffectModifier }> {
+  const flagged = withStatusFlags(context, effects);
+  return effects.flatMap((effect) =>
+    effect.modifiers
+      .filter((modifier) => modifierTypes.includes(modifier.modifierType) && modifierTargetMatches(modifier.target, candidates)
+        && modifierConditionMatches(modifier.conditionExpression,flagged))
+      .map((modifier) => ({ effect, modifier }))
+  );
+}
+
 export function resolvedNumericModifiers(
   effects: ActiveCharacterEffect[],
   candidates: string[],
   modifierTypes: string[],
   context: ModifierContext = {}
 ): ResolvedBonus[] {
-  const flagged = withStatusFlags(context, effects);
-  return effects.flatMap((effect) =>
-    effect.modifiers
-      .filter((modifier) => modifierTypes.includes(modifier.modifierType) && modifierTargetMatches(modifier.target, candidates)
-        && modifierConditionMatches(modifier.conditionExpression,flagged))
-      .map((modifier) => ({
-        label: modifier.label?.trim() || effect.name,
-        value: resolveModifierNumericValue(modifier.valueExpression, context, effect.modifiers, modifier),
-        priority:modifier.priority
-      }))
-      .filter((bonus) => bonus.value !== 0 || modifierTypes.includes('set'))
-  ).sort((left,right)=>left.priority-right.priority).map(({label,value})=>({label,value}));
+  return matchingModifiers(effects, candidates, modifierTypes, context)
+    .map(({ effect, modifier }) => ({
+      label: modifier.label?.trim() || effect.name,
+      value: resolveModifierNumericValue(modifier.valueExpression, context, effect.modifiers, modifier),
+      priority:modifier.priority
+    }))
+    .filter((bonus) => bonus.value !== 0 || modifierTypes.includes('set'))
+    .sort((left,right)=>left.priority-right.priority).map(({label,value})=>({label,value}));
 }
 
 // Status flags for "flag:<name>" conditions: every active effect on the character (Raging, Hidden,
