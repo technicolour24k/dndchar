@@ -1,6 +1,7 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { WebSocketServer } from 'ws';
-import { sessions, socketsBySession, broadcast, setWatches, removeWatcher, releaseSocket, registerReleaseHook } from './store.js';
+import { sessions, socketsBySession, broadcast, setWatches, removeWatcher, releaseSocket, registerReleaseHook,
+  consumeOverworldLiveTicket, joinOverworldLive, leaveOverworldLive, clearOverworldPreview, relayOverworldPreview } from './store.js';
 import handleJoin from './handlers/join.js';
 import handleTokenEvent, { clearMovePreviewForSocket } from './handlers/token.js';
 import handleMapEvent from './handlers/map.js';
@@ -107,6 +108,9 @@ export function attachVttWebSocketServer(httpServer) {
       } catch {
         return;
       }
+      // A frame of JSON null / a number / a string parses fine but has no .type: ignore it, or
+      // msg.type would throw inside this callback and take down the whole shared server.
+      if (!msg || typeof msg !== 'object') return;
 
       switch (msg.type) {
         case 'join':
@@ -125,6 +129,23 @@ export function attachVttWebSocketServer(httpServer) {
           setWatches(meta, valid);
           break;
         }
+        // Overworld live route preview (Unit G): ticketed, per map. See store.js.
+        case 'overworld:live:join': {
+          const ticket = consumeOverworldLiveTicket(msg.ticket);
+          if (!ticket) {
+            ws.send(JSON.stringify({ type: 'overworld:live:error', reason: 'bad_ticket' }));
+            break;
+          }
+          joinOverworldLive(meta, ticket);
+          ws.send(JSON.stringify({ type: 'overworld:live:joined', mapId: ticket.mapId }));
+          break;
+        }
+        case 'overworld:preview':
+          relayOverworldPreview(meta, msg);
+          break;
+        case 'overworld:preview:clear':
+          clearOverworldPreview(meta);
+          break;
         case 'token:add':
         case 'token:remove':
         case 'token:remove:bulk':
@@ -173,6 +194,7 @@ export function attachVttWebSocketServer(httpServer) {
       // watch-only socket (sheet/Session Notes modal) has meta.sessionId ===
       // null and must still be cleaned out of watchersByTopic.
       removeWatcher(meta);
+      leaveOverworldLive(meta);
       releaseSocket(meta);
     });
   });
