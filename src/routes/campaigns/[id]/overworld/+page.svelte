@@ -2,7 +2,9 @@
   import { enhance } from '$app/forms';
   import { page } from '$app/state';
   import type { SubmitFunction } from '@sveltejs/kit';
+  import { invalidate } from '$app/navigation';
   import MapUploadForm from '$lib/components/overworld/MapUploadForm.svelte';
+  import { subscribeTopic } from '$lib/stores/liveUpdates';
 
   let { data, form } = $props();
 
@@ -20,6 +22,30 @@
     ungranted: 'Hidden from the party.',
     archived: 'Map hidden.'
   };
+
+  // Live refresh: a map shared, renamed or hidden by someone else shows up without a reload. The topic
+  // carries no content, it only says "re-fetch". Debounced; the first resync on connect is skipped.
+  $effect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let first = true;
+    const refresh = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => void invalidate('overworld:list'), 300);
+    };
+    const stop = subscribeTopic(`overworld:${data.campaignId}`, {
+      onMessage: (msg) => {
+        if (msg.type === 'overworld:changed') refresh();
+      },
+      onResync: () => {
+        if (first) first = false;
+        else refresh();
+      }
+    });
+    return () => {
+      clearTimeout(timer);
+      stop();
+    };
+  });
 
   function confirmFirst(message: string): SubmitFunction {
     return ({ cancel }) => {

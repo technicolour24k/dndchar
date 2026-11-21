@@ -58,6 +58,10 @@
       if (result.type === 'success') {
         prepared = null;
         pickerKey += 1;
+        notice = '';
+      } else if (result.type === 'failure') {
+        // When the action belongs to another page the page's own form data is not updated, so say it here.
+        notice = String(result.data?.error ?? 'That did not work.');
       }
       await update({ reset: result.type === 'success' });
     };

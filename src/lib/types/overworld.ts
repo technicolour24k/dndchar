@@ -123,6 +123,16 @@ export type MapListItem = {
   milesAcross: number | null;
 };
 
+// The values of the pin form (a new pin, or an existing one being edited).
+export type PinDraft = {
+  kind: PinKind;
+  label: string;
+  note: string;
+  colour: OverworldColour;
+  icon: OverworldIcon;
+  visibility: OverworldVisibility;
+};
+
 export type MapList = {
   viewer: { canManage: boolean };
   maps: MapListItem[];
