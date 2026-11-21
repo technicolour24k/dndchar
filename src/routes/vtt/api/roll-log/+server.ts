@@ -1,11 +1,11 @@
 import { json } from '@sveltejs/kit';
-import { env } from '$env/dynamic/private';
+import { internalSecretValid } from '$lib/server/internalSecret';
 import { listRollLogEntries, logRoll } from '$lib/server/services/rollLog';
 
 // Must match the fallback in vtt/server/handlers/dice.js - see that file's
 // comment for why this is a shared-secret header rather than a normal
 // authenticated request.
-const INTERNAL_SECRET = env.VTT_INTERNAL_SECRET || 'vtt-internal-dev-secret';
+// (internalSecretValid does the constant-time compare and warns once if production has no secret.)
 
 // POST side (Phase 9): the freeform dice roller's WS handler (dice.js) is
 // plain @ts-nocheck JS living outside SvelteKit's module graph, same
@@ -15,7 +15,7 @@ const INTERNAL_SECRET = env.VTT_INTERNAL_SECRET || 'vtt-internal-dev-secret';
 // ?/logRoll form action directly (same process, no HTTP hop needed), so
 // this is the freeform roller's only write path.
 export async function POST({ request }) {
-  if (request.headers.get('x-vtt-internal-secret') !== INTERNAL_SECRET) {
+  if (!internalSecretValid(request.headers.get('x-vtt-internal-secret'), { route: '/vtt/api/roll-log' })) {
     return json({ error: 'unauthorized' }, { status: 401 });
   }
   const body = await request.json().catch(() => ({}));

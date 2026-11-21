@@ -7,4 +7,6 @@ build/
 npm-debug.log*
 data/*.sqlite
 data/vtt-uploads/
+# Overworld map images uploaded through the app (see UPLOAD_DIR)
+data/overworld/
 *.local

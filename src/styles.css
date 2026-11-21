@@ -2961,3 +2961,387 @@ button.text-button.danger-text:hover {
 .creature-numbers label {
   font-size: 12px;
 }
+
+/* Overworld: embedded mode (no top bar) and the compact map rows on the list page. */
+.app-frame.embed .page-shell {
+  padding: 10px;
+}
+
+.ow-settings {
+  flex: 1 1 100%;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ow-settings > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.ow-settings form {
+  display: grid;
+  gap: 8px;
+  align-items: end;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.ow-settings form .full-row {
+  grid-column: 1 / -1;
+}
+
+.ow-settings h3 {
+  margin: 6px 0 0;
+  font-size: 13px;
+}
+
+/* Overworld viewer */
+.ow-page {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ow-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.ow-title {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ow-toolbar-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+button.compact-button.active {
+  background: var(--accent, #7c5cff);
+  color: #fff;
+}
+
+.ow-banner,
+.ow-message {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 14px;
+}
+
+.ow-stage {
+  position: relative;
+  height: calc(100dvh - 170px);
+  min-height: 320px;
+}
+
+.app-frame.embed .ow-stage {
+  height: calc(100dvh - 110px);
+}
+
+.ow-viewport {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  background: #111;
+  border-radius: 8px;
+  cursor: grab;
+}
+
+.ow-viewport.armed {
+  cursor: crosshair;
+}
+
+.ow-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.ow-layer img {
+  display: block;
+  max-width: none;
+  pointer-events: none;
+}
+
+.ow-missing {
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(45deg, #1a1a1a, #1a1a1a 20px, #222 20px, #222 40px);
+}
+
+.ow-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 12px;
+  text-align: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.ow-pin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  min-height: 0;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid #000;
+  background: var(--pin);
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.ow-pin.party {
+  width: 40px;
+  height: 40px;
+  font-size: 20px;
+  border-color: #f5d90a;
+}
+
+.ow-pin.private {
+  border-style: dashed;
+  border-color: #fff;
+}
+
+.ow-pin.selected {
+  outline: 3px solid #fff;
+}
+
+.ow-pin.moving {
+  opacity: 0.45;
+}
+
+.ow-draft {
+  pointer-events: none;
+  opacity: 0.8;
+}
+
+.ow-pin-label {
+  position: absolute;
+  top: 100%;
+  margin-top: 3px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.ow-tip {
+  display: none;
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  margin-bottom: 6px;
+  width: max-content;
+  max-width: 240px;
+  max-height: 160px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.9);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 400;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  z-index: 5;
+  pointer-events: none;
+}
+
+.ow-tip strong,
+.ow-tip em {
+  display: block;
+}
+
+@media (hover: hover) {
+  .ow-pin:hover .ow-tip {
+    display: block;
+  }
+}
+
+.ow-sheet {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  max-height: 60%;
+  overflow: auto;
+  z-index: 10;
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+}
+
+@media (min-width: 700px) {
+  .ow-sheet {
+    left: auto;
+    width: 320px;
+  }
+}
+
+.ow-panel {
+  padding: 10px;
+}
+
+.ow-pin-form {
+  display: grid;
+  gap: 8px;
+}
+
+.ow-pin-form textarea {
+  resize: vertical;
+}
+
+.ow-swatches,
+.ow-icons,
+.ow-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ow-swatch {
+  width: 28px;
+  height: 28px;
+  min-height: 0;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid #000;
+}
+
+.ow-swatch.on {
+  outline: 2px solid #fff;
+}
+
+.ow-icon {
+  width: 32px;
+  height: 32px;
+  min-height: 0;
+  padding: 0;
+  font-size: 16px;
+}
+
+.ow-icon.on {
+  outline: 2px solid #fff;
+}
+
+.ow-pin-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.ow-pin-title .compact-button {
+  margin-left: auto;
+}
+
+.ow-pin-dot {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid #000;
+  font-size: 13px;
+}
+
+.ow-note {
+  margin: 6px 0;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ow-list {
+  padding: 10px;
+}
+
+.ow-list h3 {
+  margin: 6px 0 4px;
+  font-size: 13px;
+}
+
+.ow-list-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.ow-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid #000;
+}
+
+.ow-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.ow-svg-label {
+  fill: #fff;
+  font-size: 13px;
+  font-weight: 800;
+  paint-order: stroke;
+  stroke: #000;
+  stroke-width: 3px;
+}
+
+.ow-trace-banner {
+  flex-wrap: wrap;
+}
+
+.ow-miles {
+  width: 90px;
+}
+
+.ow-row-note {
+  flex: 1 1 100%;
+  margin: 0;
+  font-size: 13px;
+}
+
+.ow-pick-info {
+  font-size: 13px;
+  color: var(--muted);
+}

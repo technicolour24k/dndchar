@@ -311,6 +311,8 @@ export function createCampaignClient(deps) {
   return {
     get active() { return !!params; },
     get campaignName() { return state.campaignName; },
+    // The campaign this tab is a table for (from the URL); null in a Quick room.
+    get campaignId() { return params ? params.campaignId : null; },
     start,
     onJoined,
     onJoinError,

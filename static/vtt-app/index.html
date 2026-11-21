@@ -53,6 +53,17 @@
   </div>
   <!-- A passing message that doesn't block play (e.g. "The DM has taken the GM seat."). -->
   <div id="campaignBanner" hidden></div>
+  <!-- "New map" banner when a DM shares an overworld map (campaign tables only). -->
+  <div id="overworldBanner" hidden></div>
+  <!-- Full-screen overworld (campaign tables only): an iframe is added on open and removed on close. -->
+  <div id="overworldOverlay" hidden>
+    <div id="overworldBar">
+      <strong>Overworld</strong>
+      <a id="overworldNewTab" href="#" target="_blank" rel="noopener">Open in new tab</a>
+      <button type="button" id="overworldClose">Close</button>
+    </div>
+    <div id="overworldFrameHost"></div>
+  </div>
 
   <div id="app">
     <div id="sidebar"></div>

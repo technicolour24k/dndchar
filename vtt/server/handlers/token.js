@@ -84,6 +84,61 @@ export function formatManualDamageText(delta) {
   return ` (manual ${delta > 0 ? '+' : ''}${delta} damage ${Math.abs(delta) === 1 ? 'die' : 'dice'})`;
 }
 
+// Damage taken (modifier-primacy: damage_taken.* modifiers on the DEFENDER). Only a PC token that
+// is linked to a character sheet has any; enemy/npc tokens are untouched, which also keeps their
+// resistances out of the table-wide log. The server can't load a character itself (plain JS outside
+// SvelteKit), so it asks POST /vtt/api/damage-taken, same loopback pattern as logCombatLine. Tests
+// (and anything else in-process) may supply context.resolveDamageTaken(characterId, amount, type)
+// instead. Never throws: on any failure the damage simply lands unreduced and an error is logged.
+const PHYSICAL_TYPES = new Set(['bludgeoning', 'piercing', 'slashing']);
+
+// The real damage type if the client knows one (a spell's SRD type, a GM action's typed damage),
+// else the physical type guessed from the weapon's name (msg.damageType, see inferDamageType in
+// main.js). The sound bucket 'magic' is not a real type, so it counts as untyped.
+export function damageTypeOfMessage(msg) {
+  const label = typeof msg.damageLabel === 'string' ? msg.damageLabel.trim().toLowerCase() : '';
+  if (label) return label;
+  return PHYSICAL_TYPES.has(msg.damageType) ? msg.damageType : null;
+}
+
+async function resolveDamageForTarget(context, session, target, amount, damageType) {
+  const unchanged = { final: amount, steps: [], breakdown: '' };
+  if (target.type !== 'pc' || !target.characterId || !(amount > 0)) return unchanged;
+  try {
+    let result;
+    if (context.resolveDamageTaken) {
+      result = await context.resolveDamageTaken(target.characterId, amount, damageType, { campaignId: session.campaignId || null, ownerId: target.ownerId || null });
+    } else {
+      const res = await fetch(`${context.internalApiBaseUrl()}/vtt/api/damage-taken`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-vtt-internal-secret': INTERNAL_API_SECRET },
+        // campaignId/ownerId let the route check the character really belongs at this table.
+        body: JSON.stringify({ characterId: target.characterId, amount, damageType, campaignId: session.campaignId || null, ownerId: target.ownerId || null }),
+        // A hung lookup falls back to unreduced damage exactly like an error does.
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      result = await res.json();
+    }
+    if (!result || !Number.isFinite(result.final)) return unchanged;
+    return { final: Math.max(0, result.final), steps: result.steps || [], breakdown: result.breakdown || '' };
+  } catch (err) {
+    console.error('[VTT] damage taken lookup failed, applying unreduced', err);
+    return unchanged;
+  }
+}
+
+// After an await: is this still the same room and the same token object?
+function stillThere(context, meta, session, target) {
+  return context.sessions.get(meta.sessionId) === session && session.tokens[target.id] === target;
+}
+
+// The " (rolled 7; 7 - 2 (Half Cover) = 5; halved (Rage: ...) = 2)" tail of a log line. Empty when
+// no damage_taken modifier did anything.
+export function formatDamageTakenText(rolled, breakdown) {
+  return breakdown ? ` (rolled ${rolled}; ${breakdown})` : '';
+}
+
 // Flavor-text pools for the combat log, picked at random each time so it
 // doesn't read as a flat, repetitive damage ticker. {attacker}/{target} are
 // always token names; {damage}/{damageType} only apply to the critical-hit
@@ -304,7 +359,7 @@ export function clearMovePreviewForSocket(meta, session, broadcast) {
     { type: 'token:move:preview:clear', tokenId }, meta, false);
 }
 
-function handleTokenEvent(meta, msg, context) {
+async function handleTokenEvent(meta, msg, context) {
   const session = context.sessions.get(meta.sessionId);
   if (!session) return;
 
@@ -729,11 +784,18 @@ function handleTokenEvent(meta, msg, context) {
       else if (ac == null) hit = true; // no AC configured -> can't determine a miss, treat as hit
       else hit = toHit >= ac;
 
+      // PC targets: run the rolled damage through their damage_taken modifiers first. Awaited
+      // BEFORE any state is read or written, so the HP update below stays one synchronous step.
+      const taken = hit ? await resolveDamageForTarget(context, session, target, damage, damageTypeOfMessage(msg)) : { final: damage, steps: [], breakdown: '' };
+      // The lookup awaited: the token (or the whole room) may have been removed meanwhile.
+      if (!stillThere(context, meta, session, target)) return;
+      const dealt = taken.final; // what the target actually takes (== damage for everyone but a PC)
+
       let damageApplied = 0;
       let knownAcChanged = false;
       if (hit) {
         const currentHp = Number(target.stats?.hp) || 0;
-        const newHp = Math.max(0, currentHp - damage);
+        const newHp = Math.max(0, currentHp - dealt);
         target.stats = target.stats || {};
         target.stats.hp = newHp;
         damageApplied = currentHp - newHp;
@@ -758,7 +820,10 @@ function handleTokenEvent(meta, msg, context) {
         critical: outcome === 'critical_hit',
         fumble: outcome === 'critical_miss',
         acKnown: ac != null,
-        damage: hit ? damage : 0,
+        // For a PC target this is the damage after their damage_taken modifiers, with the
+        // audit trail (a PC's HP is public, so nothing secret). Enemies: the rolled number as before.
+        damage: hit ? dealt : 0,
+        ...(taken.breakdown ? { damageRolled: damage, breakdown: taken.breakdown } : {}),
       }));
 
       // Broadcast the resulting HP (value stripped for players on enemy/npc, same
@@ -814,8 +879,8 @@ function handleTokenEvent(meta, msg, context) {
         const toHitTotal = typeof msg.toHit === 'number' && Number.isFinite(msg.toHit) ? msg.toHit : null;
         const pool = validatePool(msg.pool);
         const rollText = formatAttackRollText(outcome, toHitTotal, pool);
-        const manualText = formatManualDamageText(manualDamageDice);
-        const logDetails = { pool, manualDamageDice };
+        const manualText = formatManualDamageText(manualDamageDice) + formatDamageTakenText(damage, taken.breakdown);
+        const logDetails = { pool, manualDamageDice, ...(taken.breakdown ? { damageRolled: damage, damageTaken: taken.steps } : {}) };
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const targetName = target.name || 'something';
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
@@ -826,12 +891,12 @@ function handleTokenEvent(meta, msg, context) {
             { ...logDetails, kind: 'attack', outcome: 'miss', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, title: msg.title || null });
         } else if (outcome === 'critical_hit') {
           logCombatLine(context, session,
-            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage, damageType: damageTypeText, roll: rollText, manual: manualText }),
-            { ...logDetails, kind: 'attack', outcome: 'critical', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            pickLine(CRITICAL_HIT_PHRASES, { attacker: attackerName, target: targetName, damage: dealt, damageType: damageTypeText, roll: rollText, manual: manualText }),
+            { ...logDetails, kind: 'attack', outcome: 'critical', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: dealt, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         } else {
           logCombatLine(context, session,
-            `${attackerName} hits${rollText} ${targetName} for ${damage} ${damageTypeText}damage${manualText}.`,
-            { ...logDetails, kind: 'attack', outcome: 'hit', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+            `${attackerName} hits${rollText} ${targetName} for ${dealt} ${damageTypeText}damage${manualText}.`,
+            { ...logDetails, kind: 'attack', outcome: 'hit', toHit: toHitTotal, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: dealt, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
         }
       }
 
@@ -923,8 +988,13 @@ function handleTokenEvent(meta, msg, context) {
         ? (msg.saveEffect === 'negate' ? 0 : Math.floor(rolledDamage / 2))
         : rolledDamage;
 
+      // Save halving has already happened above (5e order: save, then resistance and the rest).
+      const taken = await resolveDamageForTarget(context, session, target, appliedDamage, damageTypeOfMessage(msg));
+      if (!stillThere(context, meta, session, target)) return;
+      const dealt = taken.final;
+
       const currentHp = Number(target.stats?.hp) || 0;
-      const newHp = Math.max(0, currentHp - appliedDamage);
+      const newHp = Math.max(0, currentHp - dealt);
       target.stats = target.stats || {};
       target.stats.hp = newHp;
 
@@ -938,7 +1008,10 @@ function handleTokenEvent(meta, msg, context) {
         targetTokenId: target.id,
         resolution: msg.resolution,
         saveSuccess: msg.saveSuccess ?? null,
-        damageApplied,
+        // Was a bare "damageApplied" with no such variable in this case (a ReferenceError after
+        // the HP write): now the damage dealt, after a PC target's damage_taken modifiers.
+        damageApplied: dealt,
+        ...(taken.breakdown ? { damageRolled: appliedDamage, breakdown: taken.breakdown } : {}),
       }));
 
       broadcastToken(context, session, meta.sessionId, 'token:stat:update', target, (recipient) => {
@@ -948,16 +1021,18 @@ function handleTokenEvent(meta, msg, context) {
       });
       // Same hit-sound cue as attack:resolve, gated on actual damage rather
       // than "resolved" - a negated save deals nothing, so nothing to hear.
-      if (appliedDamage > 0) {
+      if (dealt > 0) {
         context.broadcast(meta.sessionId, () => ({ type: 'fx:play', damageType: msg.damageType || 'magic' }));
+      }
+      if (appliedDamage > 0) {
 
         const attackerName = session.tokens[msg.sourceTokenId]?.name || 'Something';
         const spellTitle = msg.title || 'a spell';
         // damageLabel is the real type (fire, acid...); damageType is the sound-clip bucket.
         const damageTypeText = (msg.damageLabel || msg.damageType) ? `${msg.damageLabel || msg.damageType} ` : '';
         logCombatLine(context, session,
-          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${appliedDamage} ${damageTypeText}damage${formatManualDamageText(manualDamageDice)}.`,
-          { kind: 'spell', manualDamageDice, sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: appliedDamage, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
+          `${attackerName} uses ${spellTitle} — ${target.name || 'something'} takes ${dealt} ${damageTypeText}damage${formatManualDamageText(manualDamageDice)}${formatDamageTakenText(appliedDamage, taken.breakdown)}.`,
+          { kind: 'spell', manualDamageDice, ...(taken.breakdown ? { damageRolled: appliedDamage, damageTaken: taken.steps } : {}), sourceTokenId: msg.sourceTokenId, targetTokenId: target.id, damage: dealt, damageType: msg.damageLabel || msg.damageType || null, title: msg.title || null });
       }
       // Creature attack cue - casting the spell is the attack, so this fires
       // regardless of whether the save negated all damage (same rationale as

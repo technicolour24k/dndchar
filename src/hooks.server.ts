@@ -41,7 +41,7 @@ async function handleRequest({ event, resolve }: Parameters<Handle>[0]) {
   event.locals.user = session?.user ?? null;
   event.locals.sessionId = session?.sessionId ?? null;
 
-  // /vtt/api/log's and /vtt/api/roll-log's POST sides are called
+  // /vtt/api/log's, /vtt/api/roll-log's and /vtt/api/damage-taken's POST sides are called
   // server-to-server from vtt/server's ws process (see those routes' own
   // comments) - they carry no session cookie, so they can't go through the
   // normal locals.user gate. They authenticate themselves via a shared-secret
@@ -51,7 +51,8 @@ async function handleRequest({ event, resolve }: Parameters<Handle>[0]) {
   const bypassesUserAuth =
     event.url.pathname.startsWith('/api/websocket') ||
     event.url.pathname === '/vtt/api/log' ||
-    event.url.pathname === '/vtt/api/roll-log';
+    event.url.pathname === '/vtt/api/roll-log' ||
+    event.url.pathname === '/vtt/api/damage-taken';
   if (!event.locals.user && !publicRoutes.has(event.url.pathname) && !bypassesUserAuth) {
     // Remember where they were going (GET only, a POST can't be replayed) so login can send them
     // back, e.g. to an invite link. safeNext re-validates it on the way out of login.

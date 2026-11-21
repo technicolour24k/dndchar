@@ -16,7 +16,7 @@ const WS_PATH = '/vtt-ws';
 // topic shape is validated so a client can't subscribe to an unbounded or
 // malformed topic string. At most 10 per socket (also enforced defensively
 // in store.js's setWatches).
-const WATCH_TOPIC_PATTERN = /^(room|game-session):[A-Za-z0-9-]{1,64}$/;
+const WATCH_TOPIC_PATTERN = /^(room|game-session|overworld):[A-Za-z0-9-]{1,64}$/;
 const MAX_WATCH_TOPICS = 10;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 
@@ -140,7 +140,9 @@ export function attachVttWebSocketServer(httpServer) {
         case 'token:hidden:toggle':
         case 'attack:resolve':
         case 'spell:resolve':
-          handleTokenEvent(meta, msg, context);
+          // Async since damage-taken lookups (attack/spell resolve) await a loopback call; a
+          // failure there is logged, never an unhandled rejection.
+          Promise.resolve(handleTokenEvent(meta, msg, context)).catch((err) => console.error('[VTT] token event failed', msg.type, err));
           break;
         case 'map:set':
         case 'map:reveal':
