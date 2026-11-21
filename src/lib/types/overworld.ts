@@ -105,3 +105,30 @@ export type OverworldErrorCode =
   | 'archived'
   | 'bad_image'
   | 'too_large';
+
+// ---- What the overworld service hands to page loaders (Units C onwards) ----
+
+export type MapListItem = {
+  id: string;
+  name: string;
+  // False = DMs only ("Not shared yet").
+  granted: boolean;
+  imageUrl: string;
+  // Pins this viewer can see.
+  pinCount: number;
+};
+
+export type MapList = {
+  viewer: { canManage: boolean };
+  maps: MapListItem[];
+};
+
+export type PinView = OverworldPin & ItemViewFlags;
+export type RouteView = OverworldRoute & ItemViewFlags & { legs: OverworldRouteLeg[] };
+
+export type MapView = {
+  map: OverworldMap & { imageUrl: string };
+  viewer: { canManage: boolean; canCreatePin: boolean; canCreateParty: boolean };
+  pins: PinView[];
+  routes: RouteView[];
+};

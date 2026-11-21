@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseMapFields, parsePinInput, parseRoutePoints } from './input';
+import { parseMapFields, parsePinInput, parseRouteFields, parseRoutePoints } from './input';
 
 const form = (values: Record<string, string>) => new Map(Object.entries(values));
 const pts = (n: number) => Array.from({ length: n }, (_, i) => ({ x: i / 1000, y: 0.5 }));
@@ -147,5 +147,20 @@ describe('limits', () => {
     const r = parseRoutePoints(big);
     expect(r.ok).toBe(false);
     expect(r.ok === false && r.reason).toMatch(/too long/);
+  });
+});
+
+describe('parseRouteFields', () => {
+  it('returns only the fields that were sent', () => {
+    expect(parseRouteFields(form({}))).toEqual({ ok: true, fields: {} });
+    expect(parseRouteFields(form({ label: ' Road ', colour: 'teal', visibility: 'private' }))).toEqual({
+      ok: true, fields: { label: 'Road', colour: 'teal', visibility: 'private' }
+    });
+  });
+  it('rejects bad colour, visibility, long label and control characters', () => {
+    expect(parseRouteFields(form({ colour: 'pink' })).ok).toBe(false);
+    expect(parseRouteFields(form({ visibility: 'dm' })).ok).toBe(false);
+    expect(parseRouteFields(form({ label: 'x'.repeat(61) })).ok).toBe(false);
+    expect(parseRouteFields(form({ label: 'a\u0000b' })).ok).toBe(false);
   });
 });

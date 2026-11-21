@@ -176,3 +176,33 @@ export function parseMapFields(form: FormLike): Parsed<{ name: string; milesAcro
   }
   return { ok: true, name, milesAcross };
 }
+
+// What a route form can carry. Only the keys the form actually sent are returned, so on an update a
+// missing field is left unchanged and on create the database defaults apply.
+export type RouteFields = { label?: string; colour?: OverworldColour; visibility?: OverworldVisibility };
+
+export function parseRouteFields(form: FormLike): Parsed<{ fields: RouteFields }> {
+  const fields: RouteFields = {};
+
+  const label = text(form, 'label');
+  if (label !== null) {
+    const trimmed = label.trim();
+    if (CONTROL_ANY.test(trimmed)) return { ok: false, reason: 'Labels cannot contain control characters.' };
+    if (trimmed.length > MAX_LABEL) return { ok: false, reason: `Labels can be up to ${MAX_LABEL} characters.` };
+    fields.label = trimmed;
+  }
+
+  const colour = text(form, 'colour');
+  if (colour !== null && colour !== '') {
+    if (!(COLOUR_KEYS as readonly string[]).includes(colour)) return { ok: false, reason: 'Unknown colour.' };
+    fields.colour = colour as OverworldColour;
+  }
+
+  const visibility = text(form, 'visibility');
+  if (visibility !== null && visibility !== '') {
+    if (visibility !== 'everyone' && visibility !== 'private') return { ok: false, reason: 'Unknown visibility.' };
+    fields.visibility = visibility;
+  }
+
+  return { ok: true, fields };
+}
