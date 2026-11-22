@@ -276,7 +276,31 @@
   let playerModificationsOpen = $state(false);
   let activityLogOpen = $state(false);
   let sessionNotesModalId = $state<string | null>(null);
-  let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
+  let activityLogTab = $state<'combat' | 'rolls' | 'resources' | 'notes'>('combat');
+
+  // Resources tab (cost engine Unit 7): the newest ledger rows, fetched when the tab opens.
+  type LedgerRow = { id: string; createdAt: string; label: string; delta: number; before: number | null; after: number | null; shortfall: number;
+    reason: string; sourceLabel: string; badge: string | null; actorName: string | null; approvedByName: string | null };
+  let ledgerRows = $state<LedgerRow[]>([]);
+  let ledgerLoaded = $state(false);
+  $effect(() => {
+    if (!activityLogOpen || activityLogTab !== 'resources') return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/characters/${character.id}/resource-ledger`);
+        if (cancelled || !res.ok) return;
+        ledgerRows = (await res.json()).rows ?? [];
+        ledgerLoaded = true;
+      } catch {
+        // best-effort: the tab keeps whatever it last showed
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+  const ledgerAmount = (row: LedgerRow) => (row.delta > 0 ? `+${row.delta}` : String(row.delta));
 
   // db-traffic-reduction Phase 4: Past Encounters / Past Sessions used to arrive as props
   // from load(), fetched on every single sheet view even though this modal is rarely
@@ -3096,6 +3120,7 @@
         <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
           <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
           <button type="button" class:active={activityLogTab === 'rolls'} onclick={() => (activityLogTab = 'rolls')}>Rolls</button>
+          <button type="button" class:active={activityLogTab === 'resources'} onclick={() => (activityLogTab = 'resources')}>Resources</button>
           <button type="button" class:active={activityLogTab === 'notes'} onclick={() => (activityLogTab = 'notes')}>Session Notes</button>
         </div>
 
@@ -3129,6 +3154,23 @@
               {:else}
                 <p class="muted">No combat encounters yet.</p>
               {/each}
+            </div>
+          </section>
+        {:else if activityLogTab === 'resources'}
+          <section class="stack">
+            <div class="combat-log-panel">
+              <div class="combat-log-entries">
+                {#each ledgerRows as row (row.id)}
+                  <div class="combat-log-line">
+                    <strong>{row.label}</strong> {ledgerAmount(row)}{row.before !== null && row.after !== null ? ` (${row.before} -> ${row.after})` : ''}
+                    - {row.sourceLabel || row.reason}{row.shortfall ? `, short ${row.shortfall}` : ''}
+                    <span class="muted">{new Date(row.createdAt).toLocaleString()}{row.actorName ? `, ${row.actorName}` : ''}{row.approvedByName ? `, approved by ${row.approvedByName}` : ''}</span>
+                    {#if row.badge}<span class="badge badge-muted">{row.badge}</span>{/if}
+                  </div>
+                {:else}
+                  <span class="combat-log-empty">{ledgerLoaded ? 'Nothing spent or changed yet.' : 'Loading...'}</span>
+                {/each}
+              </div>
             </div>
           </section>
         {:else if activityLogTab === 'rolls'}

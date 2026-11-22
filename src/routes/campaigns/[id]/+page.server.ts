@@ -2,6 +2,8 @@ import { error, fail, redirect } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
+import { listUnreviewedOverrides, reviewOverride } from '$lib/server/services/resource-pools';
+import { announceCostUndo } from '$lib/server/vttCostGate';
 import { listMapsForViewer } from '$lib/server/services/overworld';
 import { dropCampaignPreviews, dropUserPreviews } from '$lib/server/overworldNotify';
 import { closeCampaignRoom, kickFromCampaignRoom, pruneDepartedCharacterTokens, syncGmSeats } from '$lib/server/services/campaignRooms';
@@ -39,6 +41,8 @@ export async function load({ params, locals }) {
     hasNoDm: !page.members.some((m) => m.role === 'dm'),
     // DMs and admins get a "Find tables: N active" line (foraging needs at least one table). Null for everyone else.
     findTableCount: page.access.canManage && !archived ? await countActiveFindTables(page.campaign.id) : null,
+    // Over-budget uses a player confirmed with "my DM OK'd it", waiting for a DM to mark OK or undo. canManage only.
+    overrideReviews: page.access.canManage && !archived ? await listUnreviewedOverrides(params.id) : [],
     // Maps this viewer may open (campaign role only, so null for a non-member, site admin or not).
     overworld: await listMapsForViewer(user.id, params.id),
     // The admin banner is for people who only have access through the override.
@@ -124,6 +128,24 @@ export const actions = {
     // The character left the campaign, so its token leaves the live map.
     if (result.ok) await pruneDepartedCharacterTokens();
     return result.ok ? { saved: 'character' } : result.failure;
+  },
+
+  // Over-budget review (cost engine). OK just marks it; Undo refunds what it spent. Both are idempotent.
+  reviewOk: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => reviewOverride(locals.user!.id, params.id, String(form.get('activationId') || ''), 'ok'));
+    return result.ok ? { reviewed: result.value.message } : result.failure;
+  },
+
+  reviewUndo: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => reviewOverride(locals.user!.id, params.id, String(form.get('activationId') || ''), 'undo'));
+    if (!result.ok) return result.failure;
+    const done = result.value;
+    if (done.status === 'undone' && done.characterId) {
+      await announceCostUndo({ characterId: done.characterId, characterName: done.characterName ?? 'Someone', label: done.sourceLabel ?? 'use', refunded: done.refunded ?? [], roomId: done.roomId ?? null });
+    }
+    return { reviewed: done.message };
   },
 
   setActive: async ({ request, params, locals }) => {

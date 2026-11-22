@@ -374,3 +374,33 @@ export function activationSignature(activation: Activation): string {
       return `content|${activation.instanceId}`;
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ledger views and override review (Unit 7)
+// ---------------------------------------------------------------------------------------------
+
+export type LedgerBadgeInput = { overrideKind: string | null; reviewOutcome: 'ok' | 'undone' | null; reason?: string };
+
+// The badge the Activity Log shows beside an override's rows. Null for a normal spend.
+export function ledgerBadge(row: LedgerBadgeInput): string | null {
+  if (row.reason === 'refund') return 'Refund';
+  if (row.overrideKind === 'dm_approved') return 'DM approved';
+  if (row.overrideKind === 'dm_self') return "DM's call";
+  if (row.overrideKind === 'self_override') {
+    if (row.reviewOutcome === 'undone') return 'Undone by DM';
+    if (row.reviewOutcome === 'ok') return "Player said DM OK'd it - DM marked OK";
+    return "Player said DM OK'd - not yet reviewed";
+  }
+  return null;
+}
+
+// What an undo did, as one note for the DM. `refunded` are "1 Level 2 Spell Slot" style phrases and
+// `problems` explain lines that couldn't be fully refunded (removed item, pool already full).
+export function undoMessage(refunded: string[], problems: string[]): string {
+  const head = refunded.length ? `Refunded ${refunded.join(', ')}.` : 'Nothing needed refunding.';
+  return [head, ...problems.map((p) => (p.endsWith('.') ? p : `${p}.`)), 'Anything it did (damage, conditions) needs fixing by hand.'].join(' ');
+}
+
+export function undoLogMessage(characterName: string, label: string, refunded: string[]): string {
+  return `The DM undid ${characterName}'s over-budget ${label} - ${refunded.length ? `refunded ${refunded.join(', ')}` : 'nothing to refund'}.`;
+}

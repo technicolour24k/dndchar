@@ -4,6 +4,7 @@ import { query } from '$lib/server/db';
 import { getCharacter } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { useInventoryCatalogueItem } from '$lib/server/services/catalogue';
+import { emitRealtimeEvent } from '$lib/server/realtime';
 import { CostShortfallError } from '$lib/server/services/cost-engine';
 import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { usableConsumableItems } from '$lib/rules/dnd5e';
@@ -47,6 +48,8 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
     return json({ error: error instanceof Error ? error.message : 'Could not use item.' }, { status: 400 });
   }
+
+  emitRealtimeEvent('resource:changed', { characterId });
 
   // INTERIM: manual damage-dice delta.
   const adjusted = adjustPrimaryDamageDice(item.damageRolls, options.manualDamageDice);

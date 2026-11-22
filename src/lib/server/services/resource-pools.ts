@@ -1,11 +1,12 @@
 import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
-import { assertCanEditCharacter, type Queryable } from '$lib/server/services/access';
+import { assertCanEditCharacter, getCampaignAccess, isUuid, type Queryable } from '$lib/server/services/access';
+import { CampaignError } from '$lib/server/campaignError';
 import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
 import { abilityMap, abilityModifier, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
-import { poolMaxima, type PoolMaxContext, type PoolMaximum } from '$lib/rules/cost';
+import { ledgerBadge, poolMaxima, undoMessage, type PoolMaxContext, type PoolMaximum } from '$lib/rules/cost';
 import type { ActiveCharacterEffect, CharacterAbility, CharacterClass, CharacterPool } from '$lib/types/character';
 
 // Character resource pools (Soulfire, Vowfire, any DM-defined pool). Definitions are global and
@@ -305,4 +306,172 @@ export async function togglePoolArchived(key: string): Promise<void> {
   const result = await query('UPDATE resource_pool_definitions SET is_archived = NOT is_archived, updated_at = now() WHERE pool_key = $1', [key]);
   if (!result.rowCount) throw new Error('Pool not found.');
   invalidateReferenceData('togglePoolArchived');
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ledger views and DM review of self overrides (cost engine Unit 7)
+// ---------------------------------------------------------------------------------------------
+
+export type LedgerView = {
+  id: string; createdAt: string; pool: string; label: string; delta: number; before: number | null; after: number | null; shortfall: number;
+  reason: 'cost' | 'manual' | 'rest' | 'refund'; sourceLabel: string; overrideKind: string | null; reviewOutcome: 'ok' | 'undone' | null;
+  badge: string | null; actorName: string | null; approvedByName: string | null; activationId: string | null;
+};
+
+// The newest ledger rows for one character (the sheet's Activity Log "Resources" tab). The caller
+// has already checked the viewer may see the character.
+export async function listLedger(characterId: string, limit = 50): Promise<LedgerView[]> {
+  const result = await query<any>(
+    `SELECT l.*, actor.display_name AS actor_name, approver.display_name AS approver_name
+     FROM character_resource_ledger l
+     LEFT JOIN users actor ON actor.id = l.actor_user_id
+     LEFT JOIN users approver ON approver.id = l.approved_by_user_id
+     WHERE l.character_id = $1 ORDER BY l.created_at DESC, l.id DESC LIMIT $2`,
+    [characterId, Math.max(1, Math.min(200, limit))]
+  );
+  return result.rows.map((row: any) => ({
+    id: row.id, createdAt: row.created_at, pool: row.pool, label: row.label, delta: row.delta, before: row.before_value, after: row.after_value,
+    shortfall: row.shortfall, reason: row.reason, sourceLabel: row.source_label, overrideKind: row.override_kind, reviewOutcome: row.review_outcome,
+    badge: ledgerBadge({ overrideKind: row.override_kind, reviewOutcome: row.review_outcome, reason: row.reason }),
+    actorName: row.actor_name ?? null, approvedByName: row.approver_name ?? null, activationId: row.activation_id
+  }));
+}
+
+export type OverrideReview = {
+  activationId: string; characterId: string; characterName: string; playerName: string; sourceLabel: string; createdAt: string;
+  lines: Array<{ label: string; delta: number; shortfall: number }>; shortText: string;
+};
+
+// Unreviewed "the DM OK'd it" overspends for a campaign's characters, one entry per activation.
+export async function listUnreviewedOverrides(campaignId: string): Promise<OverrideReview[]> {
+  const result = await query<any>(
+    `SELECT l.activation_id, l.character_id, l.label, l.delta, l.shortfall, l.source_label, l.created_at, c.name AS character_name, actor.display_name AS actor_name
+     FROM character_resource_ledger l
+     JOIN characters c ON c.id = l.character_id
+     LEFT JOIN users actor ON actor.id = l.actor_user_id
+     WHERE c.campaign_id = $1 AND l.override_kind = 'self_override' AND l.reviewed_at IS NULL AND l.activation_id IS NOT NULL
+     ORDER BY l.created_at, l.id`,
+    [campaignId]
+  );
+  const byActivation = new Map<string, OverrideReview>();
+  for (const row of result.rows) {
+    let review = byActivation.get(row.activation_id);
+    if (!review) {
+      review = {
+        activationId: row.activation_id, characterId: row.character_id, characterName: row.character_name, playerName: row.actor_name ?? 'A player',
+        sourceLabel: row.source_label, createdAt: row.created_at, lines: [], shortText: ''
+      };
+      byActivation.set(row.activation_id, review);
+    }
+    review.lines.push({ label: row.label, delta: row.delta, shortfall: row.shortfall });
+  }
+  return [...byActivation.values()].map((review) => ({
+    ...review,
+    shortText: review.lines.filter((line) => line.shortfall > 0).map((line) => `${line.shortfall} ${line.label}`).join(', ')
+  }));
+}
+
+export type ReviewResult = {
+  status: 'ok' | 'undone' | 'already_reviewed' | 'not_found';
+  message: string;
+  characterId?: string; characterName?: string; sourceLabel?: string; roomId?: string | null; refunded?: string[];
+};
+
+// Refund order follows the lock order in cost-engine.ts: slots, content counters, inventory counters, item, pools.
+const refundRank = (row: { pool: string; pool_detail: any }) =>
+  row.pool === 'spell_slot' ? 0 : row.pool === 'charges' ? (row.pool_detail?.scope === 'inventory' ? 2 : 1) : row.pool === 'item' ? 3 : 4;
+
+// OK or Undo for one self-override activation. Only for a campaign DM/co-DM (or the site admin
+// override, same as the rest of the campaign page). Idempotent: a second review changes nothing and
+// answers 'already_reviewed'. Undo refunds every line the activation actually paid (capped at the live
+// max for pools, the slot max for slots, no cap for item quantity), writes 'refund' rows pointing at
+// the rows they reverse, and notes anything it couldn't refund.
+export async function reviewOverride(
+  reviewerUserId: string, campaignId: string, activationId: string, outcome: 'ok' | 'undo'
+): Promise<ReviewResult> {
+  const access = await getCampaignAccess({ query }, reviewerUserId, campaignId);
+  if (!access?.canManage) throw new CampaignError("You can't manage this campaign.");
+  if (!isUuid(activationId)) return { status: 'not_found', message: 'That use was not found.' };
+
+  const owner = await query<{ character_id: string }>(
+    `SELECT DISTINCT l.character_id FROM character_resource_ledger l JOIN characters c ON c.id = l.character_id
+     WHERE l.activation_id = $1 AND l.override_kind = 'self_override' AND c.campaign_id = $2`,
+    [activationId, campaignId]
+  );
+  const characterId = owner.rows[0]?.character_id;
+  if (!characterId) return { status: 'not_found', message: 'That use was not found.' };
+  // Before the transaction: the rule engine reads on its own connection. Archived pools resolve too.
+  const loaded = outcome === 'undo' ? await loadPoolMaxima(characterId, true) : null;
+
+  return withTransaction(async (client) => {
+    const rows = (await client.query<any>(
+      `SELECT * FROM character_resource_ledger WHERE activation_id = $1 AND override_kind = 'self_override' AND character_id = $2 ORDER BY created_at, id FOR UPDATE`,
+      [activationId, characterId]
+    )).rows;
+    const first = rows[0];
+    const base = { characterId, sourceLabel: first.source_label as string, roomId: (first.room_id as string | null) ?? null };
+    const named = await client.query('SELECT name FROM characters WHERE id = $1', [characterId]);
+    const characterName: string = named.rows[0]?.name ?? 'Someone';
+    if (rows.some((row) => row.reviewed_at)) return { status: 'already_reviewed' as const, message: 'That use was already reviewed.', characterName, ...base };
+
+    const refunded: string[] = [];
+    const problems: string[] = [];
+    if (outcome === 'undo') {
+      const paid = rows.filter((row) => row.delta < 0).sort((a, b) => refundRank(a) - refundRank(b));
+      for (const row of paid) {
+        const n = -row.delta as number;
+        const detail = row.pool_detail ?? {};
+        let before: number | null = null;
+        let after: number | null = null;
+        if (row.pool === 'spell_slot') {
+          const slot = await client.query(
+            `SELECT current_slots, max_slots FROM character_spell_slots WHERE character_id = $1 AND slot_type = $2 AND slot_level = $3 FOR UPDATE`,
+            [characterId, detail.slotType, detail.slotLevel]);
+          if (slot.rows[0]) {
+            before = slot.rows[0].current_slots; after = Math.min(slot.rows[0].max_slots, before! + n);
+            await client.query(`UPDATE character_spell_slots SET current_slots = $4 WHERE character_id = $1 AND slot_type = $2 AND slot_level = $3`, [characterId, detail.slotType, detail.slotLevel, after]);
+          }
+        } else if (row.pool === 'charges') {
+          const table = detail.scope === 'inventory' ? 'character_inventory_resources' : 'character_content_resources';
+          const counter = await client.query(`SELECT current_value, max_value FROM ${table} WHERE id = $1 FOR UPDATE`, [detail.resourceId]);
+          if (counter.rows[0]) {
+            before = counter.rows[0].current_value; after = Math.min(counter.rows[0].max_value, before! + n);
+            await client.query(`UPDATE ${table} SET current_value = $2 WHERE id = $1`, [detail.resourceId, after]);
+          }
+        } else if (row.pool === 'item') {
+          const item = await client.query(`SELECT quantity FROM character_inventory_items WHERE id = $1 AND character_id = $2 FOR UPDATE`, [detail.inventoryId, characterId]);
+          if (item.rows[0]) {
+            before = item.rows[0].quantity; after = before! + n;
+            await client.query(`UPDATE character_inventory_items SET quantity = $2 WHERE id = $1`, [detail.inventoryId, after]);
+          }
+        } else if (row.pool.startsWith(POOL_ROW_PREFIX)) {
+          const key = row.pool.slice(POOL_ROW_PREFIX.length);
+          const max = loaded?.maxima[key]?.max;
+          const pool = await client.query(`SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = $2 FOR UPDATE`, [characterId, row.pool]);
+          if (pool.rows[0] && max !== undefined) {
+            before = Math.max(0, Math.min(max, pool.rows[0].current_value)); after = Math.min(max, before + n);
+            await client.query(`UPDATE character_resources SET current_value = $3, max_value = $4 WHERE character_id = $1 AND resource_key = $2`, [characterId, row.pool, after, max]);
+          }
+        }
+        if (before === null || after === null) {
+          problems.push(`Couldn't refund ${n} ${row.label} (it's gone)`);
+          continue;
+        }
+        const actual = after - before;
+        if (actual < n) problems.push(`Refunded ${actual} of ${n} ${row.label} (it was already at its maximum)`);
+        if (actual > 0) refunded.push(`${actual} ${row.label}`);
+        await writeLedger(client, {
+          characterId, pool: row.pool, poolDetail: detail, label: row.label, delta: actual, before, after, reason: 'refund',
+          sourceContentId: row.source_content_id, sourceLabel: row.source_label, activationId, actorUserId: reviewerUserId, roomId: row.room_id, refundOf: row.id
+        });
+      }
+    }
+    await client.query(
+      `UPDATE character_resource_ledger SET reviewed_at = now(), reviewed_by_user_id = $2, review_outcome = $3
+       WHERE activation_id = $1 AND override_kind = 'self_override' AND character_id = $4`,
+      [activationId, reviewerUserId, outcome === 'ok' ? 'ok' : 'undone', characterId]
+    );
+    if (outcome === 'ok') return { status: 'ok' as const, message: 'Marked as OK.', characterName, ...base };
+    return { status: 'undone' as const, message: undoMessage(refunded, problems), characterName, refunded, ...base };
+  });
 }

@@ -31,6 +31,8 @@ vi.mock('$lib/server/services/access', async (importOriginal) => ({
 vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: vi.fn() }));
 // The campaign page's "Find tables: N active" line (DMs and admins only) reads the forage service.
 const countActiveFindTables = vi.fn();
+vi.mock('$lib/server/services/resource-pools', () => ({ listUnreviewedOverrides: async () => [], reviewOverride: vi.fn() }));
+vi.mock('$lib/server/vttCostGate', () => ({ announceCostUndo: vi.fn() }));
 vi.mock('$lib/server/services/forage', () => ({ countActiveFindTables: (...args: unknown[]) => countActiveFindTables(...args) }));
 
 const { CampaignError } = await import('$lib/server/campaignError');

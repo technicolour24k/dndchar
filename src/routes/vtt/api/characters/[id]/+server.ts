@@ -66,6 +66,9 @@ export const GET: RequestHandler = async ({ locals, params }) => {
       }
     ],
     spellSlots: character.spellSlots,
+    // Character resource pools (Soulfire, Vowfire, ...), visible ones only. Unlike spellSlots these follow the
+    // database: the client re-syncs them on every character:changed, and they are never edited on the token.
+    pools: character.pools.map(({ key, label, current, max, rechargePeriod }) => ({ key, label, current, max, rechargePeriod })),
     preparedSpells: character.content
       .filter((entry) => entry.type === 'spell' && entry.isPrepared)
       .map((entry) => ({ id: entry.id, name: entry.name, spellLevel: entry.spellLevel, costText: entry.cost?.summary ?? '' })),

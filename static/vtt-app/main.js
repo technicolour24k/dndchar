@@ -36,6 +36,7 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
+  'pools',
   // Last sheet vision values the token took (see token:vision:sync). Client-side list only, so
   // the generic token:stat:update path on the server can't write it.
   'sheetVision',
@@ -2874,6 +2875,7 @@ characterPickerList.addEventListener('click', async (e) => {
       actions: snapshot.actions,
       spellSlots: snapshot.spellSlots,
       preparedSpells: snapshot.preparedSpells,
+      pools: snapshot.pools || [],
       stats: { hp: snapshot.hp, maxHp: snapshot.maxHp },
     },
   });
@@ -2952,6 +2954,8 @@ function applyCharacterSyncFields(token, snapshot) {
     saves: snapshot.saves,
     actions: snapshot.actions,
     preparedSpells: snapshot.preparedSpells,
+    // Resource pools follow the database (server-authoritative), unlike spellSlots which are session-tracked.
+    pools: snapshot.pools || [],
   };
   for (const [stat, value] of Object.entries(updates)) {
     if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
@@ -5019,7 +5023,7 @@ function renderCombatActionsBody() {
           (a) => `
         <div class="mini-sheet-action" data-action-name="${escapeHtml(a.name)}">
           <span>${escapeHtml(a.name)}</span>
-          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${a.damageRolls || ''}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
+          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${escapeHtml(a.damageRolls || '')}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
           <span class="row-chevron">›</span>
         </div>
       `
@@ -5037,8 +5041,10 @@ function renderCombatActionsBody() {
   // plain label sitting next to Use/Reset buttons was easy to miss entirely.
   const slotsHtml = (token.spellSlots || []).length
     ? (token.spellSlots || [])
-        .map(
-          (s) => `
+        .map((slot) => {
+          // Token fields are client-written, so numbers are coerced (never interpolated raw).
+          const s = { type: slot.type, level: Number(slot.level) || 0, current: Number(slot.current) || 0, max: Number(slot.max) || 0 };
+          return `
         <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
           <span class="mini-sheet-slot-label">${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
           <div class="mini-sheet-slot-actions">
@@ -5047,8 +5053,8 @@ function renderCombatActionsBody() {
             <button type="button" class="secondary slotResetBtn">Reset</button>
           </div>
         </div>
-      `
-        )
+      `;
+        })
         .join('')
     : '';
 
@@ -5064,12 +5070,30 @@ function renderCombatActionsBody() {
     `
     : '';
 
+  // Resource pools (Soulfire, Vowfire...). Always the database value: -/+ post to the pool route, which
+  // clamps and logs it, and the answer replaces the token's display copy. The token cannot be edited by hand.
+  const poolsHtml = (token.pools || [])
+    .map((pool) => {
+      // The numbers are coerced and the disabled flags come from the coerced numbers, never the raw fields.
+      const current = Number(pool.current) || 0;
+      const max = Number(pool.max) || 0;
+      return `
+        <div class="mini-sheet-slot mini-sheet-pool" data-pool-key="${escapeHtml(pool.key)}">
+          <span class="mini-sheet-slot-label">${escapeHtml(pool.label)}: ${current}/${max}</span>
+          <div class="mini-sheet-slot-actions">
+            <button type="button" class="secondary poolMinusBtn" ${current <= 0 ? 'disabled' : ''} aria-label="Spend one ${escapeHtml(pool.label)}">-</button>
+            <button type="button" class="secondary poolPlusBtn" ${current >= max ? 'disabled' : ''} aria-label="Regain one ${escapeHtml(pool.label)}">+</button>
+          </div>
+        </div>`;
+    })
+    .join('');
+
   const itemsHtml = (token.items || []).length
     ? (token.items || [])
         .map(
           (item) => `
         <div class="mini-sheet-action" data-item-id="${escapeHtml(item.id)}" data-item-name="${escapeHtml(item.name)}">
-          <span>${escapeHtml(item.name)} <span style="color:#666;">×${item.quantity}</span></span>
+          <span>${escapeHtml(item.name)} <span style="color:#666;">×${Number(item.quantity) || 0}</span></span>
           <span style="color:#aaa;">${escapeHtml(item.damageRolls || '')}</span>
           <span class="row-chevron">›</span>
         </div>
@@ -5082,8 +5106,26 @@ function renderCombatActionsBody() {
     <label class="combat-actions-heading">Weapons</label>
     ${actionsHtml}
     ${(cantripsHtml || slotsHtml) ? `<label class="combat-actions-heading">Spells</label>${cantripsHtml}${slotsHtml}` : ''}
+    ${poolsHtml ? `<label class="combat-actions-heading">Resources</label>${poolsHtml}` : ''}
     ${itemsHtml ? `<label class="combat-actions-heading">Items</label>${itemsHtml}` : ''}
   `;
+
+  combatActionsBody.querySelectorAll('.poolMinusBtn, .poolPlusBtn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const key = btn.closest('.mini-sheet-pool')?.dataset.poolKey;
+      if (!key || !token.characterId) return;
+      combatActionsBody.querySelectorAll('.poolMinusBtn, .poolPlusBtn').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await fetch('/vtt/api/characters/' + token.characterId + '/pool', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, delta: btn.classList.contains('poolMinusBtn') ? -1 : 1 }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok && Array.isArray(body.pools)) { token.pools = body.pools; send({ type: 'token:stat:update', tokenId, stat: 'pools', value: body.pools }); }
+      } catch { /* the buttons come back on the next render */ }
+      if (combatActionsState && combatActionsModal.classList.contains('visible')) renderCombatActionsBody();
+    });
+  });
 
   combatActionsBody.querySelectorAll('.mini-sheet-action[data-action-name]').forEach((row) => {
     row.addEventListener('click', () => {

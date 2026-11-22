@@ -2,8 +2,9 @@ import { dmPresent, sessions } from '$vtt/store.js';
 import { query } from '$lib/server/db';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { logRoll } from '$lib/server/services/rollLog';
+import { emitRealtimeEvent } from '$lib/server/realtime';
 import { CostShortfallError, type CostOverride } from '$lib/server/services/cost-engine';
-import { activationSignature, overrideDecision, shortfallMode } from '$lib/rules/cost';
+import { activationSignature, overrideDecision, shortfallMode, undoLogMessage } from '$lib/rules/cost';
 import type { Activation, ShortfallMode } from '$lib/types/cost';
 import {
   approvalVerdict, claimApproval, closeCostRequest, costMap, findCostRequest, isActorDm, overrideLogMessage, releaseApproval,
@@ -148,4 +149,18 @@ export async function runWithGate<T>(gate: Extract<CostGate, { ok: true }>, run:
   }
   await gate.settle(true);
   return result;
+}
+
+/**
+ * After a DM undoes a player's self override: tell open sheets and VTT tokens to re-sync (the refund
+ * changed their resources) and post the public roll-log line if the character's room is still live.
+ */
+export async function announceCostUndo(input: { characterId: string; characterName: string; label: string; refunded: string[]; roomId: string | null }): Promise<void> {
+  emitRealtimeEvent('resource:changed', { characterId: input.characterId });
+  if (!input.roomId || !sessions.has(input.roomId)) return;
+  try {
+    await logRoll(input.roomId, undoLogMessage(input.characterName, input.label, input.refunded), { kind: 'cost_undo', characterId: input.characterId }, 'public');
+  } catch (error) {
+    console.error('[cost] could not write the roll-log line', error);
+  }
 }

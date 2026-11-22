@@ -362,6 +362,8 @@ describe.skipIf(!enabled)('character resource pools', () => {
       expect(await slot('standard', 1)).toBe(0);
     } finally {
       await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      // The access rows first: spell_content_id is RESTRICT, so deleting a spell before its owner item can fail.
+      await query(`DELETE FROM content_spell_access WHERE spell_content_id = ANY($1::uuid[]) OR owner_content_id = ANY($1::uuid[])`, [contentIds]);
       await query(`DELETE FROM content_definitions WHERE id = ANY($1::uuid[])`, [contentIds]);
       await query(`DELETE FROM content_definitions WHERE content_type='action' AND content_key = ANY($1::text[])`, [actionKeys]);
     }
@@ -471,6 +473,137 @@ describe.skipIf(!enabled)('character resource pools', () => {
       expect(await slot(2)).toBe(2);
     } finally {
       await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE id = ANY($1::uuid[])`, [contentIds]);
+    }
+  });
+  it('reviews self overrides: scoped to the campaign DM, OK marks, Undo refunds (capped, with notes) once', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (target.searchParams.has('host')) throw new Error('Refusing to run: DATABASE_URL has a "host" query parameter.');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, ''))) {
+      throw new Error(`Refusing to run: database host "${target.hostname}" is not local.`);
+    }
+    const { query } = await import('$lib/server/db');
+    const { createCampaign } = await import('./services/campaigns');
+    const { castCharacterSpell, useInventoryCatalogueItem } = await import('./services/catalogue');
+    const { listLedger, listUnreviewedOverrides, reviewOverride } = await import('./services/resource-pools');
+    const tag = `zzrev${crypto.randomBytes(4).toString('hex')}`;
+    const mkUser = async (name: string) => (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, $2, 'x') RETURNING id`, [`${tag}${name}@example.invalid`, `IT ${name}`])).rows[0].id;
+    const dmId = await mkUser('dm');
+    const playerId = await mkUser('player');
+    const otherDmId = await mkUser('otherdm');
+    const contentIds: string[] = [];
+    const campaignIds: string[] = [];
+    try {
+      const campaignId = await createCampaign(dmId, `${tag} A`);
+      const otherCampaignId = await createCampaign(otherDmId, `${tag} B`);
+      campaignIds.push(campaignId, otherCampaignId);
+      await query(`INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1,$2,'player')`, [campaignId, playerId]);
+      const characterId = (await query<{ id: string }>(
+        `INSERT INTO characters (owner_user_id, name, campaign_id) VALUES ($1, 'Reviewed', $2) RETURNING id`, [playerId, campaignId])).rows[0].id;
+      const content = async (type: string, suffix: string, cost: unknown) => {
+        const id = (await query<{ id: string }>(
+          `INSERT INTO content_definitions (content_key, content_type, name, cost_json) VALUES ($1,$2,$3,$4::jsonb) RETURNING id`,
+          [`${type}:${tag}${suffix}`, type, `IT ${suffix}`, JSON.stringify(cost)])).rows[0].id;
+        contentIds.push(id);
+        return id;
+      };
+      const modifierId = (await query<{ id: string }>(
+        `SELECT id FROM modifier_definitions WHERE target='resource.vowfire.max' AND modifier_type='bonus' AND NOT is_archived LIMIT 1`)).rows[0].id;
+      const feat = await content('feat', 'feat', []);
+      await query(`INSERT INTO content_modifier_links (content_id, modifier_id, activation_type, value_override_expression) VALUES ($1,$2,'known','1')`, [feat, modifierId]);
+      await query(`INSERT INTO character_content_instances (character_id, content_id) VALUES ($1,$2)`, [characterId, feat]);
+      const spellId = await content('spell', 'smite', [{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 2 }]);
+      await query(`INSERT INTO spell_definitions (content_id, spell_level, casting_time, resolution_type) VALUES ($1,1,'1 action','auto')`, [spellId]);
+      const instance = (await query<{ id: string }>(
+        `INSERT INTO character_content_instances (character_id, content_id, is_known, is_prepared) VALUES ($1,$2,true,true) RETURNING id`, [characterId, spellId])).rows[0].id;
+      const setSlot = async (n: number) => {
+        await query(`DELETE FROM character_spell_slots WHERE character_id=$1`, [characterId]);
+        await query(`INSERT INTO character_spell_slots (character_id, slot_type, slot_level, current_slots, max_slots) VALUES ($1,'standard',2,$2,3)`, [characterId, n]);
+      };
+      const slot = async () => (await query<any>(`SELECT current_slots FROM character_spell_slots WHERE character_id=$1`, [characterId])).rows[0].current_slots;
+      const vowfire = async () => (await query<any>(`SELECT current_value FROM character_resources WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId])).rows[0].current_value;
+      const cast = async () => {
+        const form = new FormData();
+        form.set('instanceId', instance);
+        await castCharacterSpell(playerId, characterId, form, { kind: 'self_override', roomId: null });
+      };
+
+      // Two unreviewed overspends. Activation A: slot 1 -> 0 and Vowfire 1 -> 0 (short 1).
+      await setSlot(1);
+      await cast();
+      expect(await slot()).toBe(0);
+      expect(await vowfire()).toBe(0);
+      let pending = await listUnreviewedOverrides(campaignId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]).toMatchObject({ characterName: 'Reviewed', sourceLabel: 'IT smite', shortText: '1 Vowfire' });
+      expect(await listUnreviewedOverrides(otherCampaignId)).toHaveLength(0);
+      const first = pending[0].activationId;
+
+      // Scoping: another campaign's DM, a plain player and a stranger can't review it. Nothing changes.
+      await expect(reviewOverride(otherDmId, campaignId, first, 'undo')).rejects.toThrow();
+      await expect(reviewOverride(playerId, campaignId, first, 'undo')).rejects.toThrow();
+      expect((await reviewOverride(otherDmId, otherCampaignId, first, 'undo')).status).toBe('not_found');
+      expect(await slot()).toBe(0);
+
+      // Undo: slot and Vowfire come back, as 'refund' rows pointing at what they reverse; the row is reviewed.
+      const undone = await reviewOverride(dmId, campaignId, first, 'undo');
+      expect(undone).toMatchObject({ status: 'undone', characterName: 'Reviewed', sourceLabel: 'IT smite' });
+      expect(undone.refunded).toEqual(['1 Level 2 Spell Slot', '1 Vowfire']);
+      expect(undone.message).toContain('needs fixing by hand');
+      expect(await slot()).toBe(1);
+      expect(await vowfire()).toBe(1);
+      const rows = await query<any>(`SELECT * FROM character_resource_ledger WHERE character_id=$1 AND activation_id=$2 ORDER BY created_at, id`, [characterId, first]);
+      const refunds = rows.rows.filter((r: any) => r.reason === 'refund');
+      expect(refunds).toHaveLength(2);
+      expect(refunds.every((r: any) => r.refund_of && r.delta === 1 && r.override_kind === null)).toBe(true);
+      expect(rows.rows.filter((r: any) => r.reason === 'cost').every((r: any) => r.review_outcome === 'undone' && r.reviewed_by_user_id === dmId)).toBe(true);
+      expect(await listUnreviewedOverrides(campaignId)).toHaveLength(0);
+      const view = await listLedger(characterId);
+      expect(view.some((r) => r.badge === 'Undone by DM')).toBe(true);
+      expect(view.some((r) => r.badge === 'Refund')).toBe(true);
+
+      // A second undo does nothing.
+      expect((await reviewOverride(dmId, campaignId, first, 'undo')).status).toBe('already_reviewed');
+      expect(await slot()).toBe(1);
+      expect(await vowfire()).toBe(1);
+
+      // Activation B, then the pool is topped up before the undo: the refund is capped at the live max.
+      await setSlot(1);
+      await query(`UPDATE character_resources SET current_value=1, max_value=1 WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId]);
+      await cast();
+      pending = await listUnreviewedOverrides(campaignId);
+      const second = pending[0].activationId;
+      await query(`UPDATE character_resources SET current_value=1 WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId]);
+      const capped = await reviewOverride(dmId, campaignId, second, 'undo');
+      expect(capped.refunded).toEqual(['1 Level 2 Spell Slot']);
+      expect(capped.message).toContain('Refunded 0 of 1 Vowfire');
+      expect(await vowfire()).toBe(1);
+
+      // OK just marks it: no refund, and it leaves the list.
+      await setSlot(1);
+      await query(`UPDATE character_resources SET current_value=1 WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId]);
+      await cast();
+      const third = (await listUnreviewedOverrides(campaignId))[0].activationId;
+      expect((await reviewOverride(dmId, campaignId, third, 'ok')).status).toBe('ok');
+      expect(await slot()).toBe(0);
+      expect(await listUnreviewedOverrides(campaignId)).toHaveLength(0);
+      expect((await reviewOverride(dmId, campaignId, third, 'undo')).status).toBe('already_reviewed');
+      expect((await listLedger(characterId)).some((r) => r.badge === "Player said DM OK'd it - DM marked OK")).toBe(true);
+
+      // A removed item is noted, not an error.
+      const potion = await content('item', 'potion', [{ pool: 'item', amount: 2 }]);
+      const invId = (await query<{ id: string }>(
+        `INSERT INTO character_inventory_items (character_id, name, source_content_id, quantity) VALUES ($1,'IT Potion',$2,1) RETURNING id`, [characterId, potion])).rows[0].id;
+      await useInventoryCatalogueItem(playerId, characterId, invId, { kind: 'self_override', roomId: null });
+      const fourth = (await listUnreviewedOverrides(campaignId))[0].activationId;
+      await query(`DELETE FROM character_inventory_items WHERE id=$1`, [invId]);
+      const gone = await reviewOverride(dmId, campaignId, fourth, 'undo');
+      expect(gone.status).toBe('undone');
+      expect(gone.message).toContain("Couldn't refund 1 Item quantity (it's gone)");
+    } finally {
+      await query(`DELETE FROM campaigns WHERE id = ANY($1::uuid[])`, [campaignIds]);
+      await query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [[dmId, playerId, otherDmId]]);
       await query(`DELETE FROM content_definitions WHERE id = ANY($1::uuid[])`, [contentIds]);
     }
   });

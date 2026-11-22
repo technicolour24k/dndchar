@@ -336,6 +336,34 @@
       </section>
     {/if}
 
+    {#if data.overrideReviews.length}
+      <section class="panel campaign-box">
+        <h2>Over-budget uses to review</h2>
+        <p class="muted">A player said you OK'd these. Mark OK, or Undo to refund what they spent.</p>
+        <ul class="member-list">
+          {#each data.overrideReviews as review (review.activationId)}
+            <li>
+              <div class="member-name">
+                <strong>{review.characterName}</strong> - {review.sourceLabel}
+                <span class="muted">{review.playerName}, {new Date(review.createdAt).toLocaleString()}{review.shortText ? `, short ${review.shortText}` : ''}</span>
+              </div>
+              <span class="campaign-box-foot">
+                <form method="POST" action="?/reviewOk" use:enhance>
+                  <input type="hidden" name="activationId" value={review.activationId} />
+                  <button type="submit" class="compact-button">OK</button>
+                </form>
+                <form method="POST" action="?/reviewUndo" use:enhance={confirmFirst(`Undo ${review.characterName}'s ${review.sourceLabel}? What it spent is given back. Anything it did needs fixing by hand.`)}>
+                  <input type="hidden" name="activationId" value={review.activationId} />
+                  <button type="submit" class="compact-button danger">Undo</button>
+                </form>
+              </span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
+    {#if form?.reviewed}<p class="muted">{form.reviewed}</p>{/if}
+
     {#if access.canManage && !archived}
       <section class="panel campaign-box">
         <h2>Settings</h2>
