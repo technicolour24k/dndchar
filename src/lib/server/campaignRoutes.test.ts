@@ -29,6 +29,13 @@ vi.mock('$lib/server/services/access', async (importOriginal) => ({
   getCampaignAccess: (...args: unknown[]) => getCampaignAccess(...args)
 }));
 vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: vi.fn() }));
+// Voice eject is fire-and-forget; the routes only need to call it (voiceEject itself is tested in voiceEject.test.ts).
+const ejectFromCampaignVoice = vi.fn(async () => {});
+const ejectAllFromCampaignVoice = vi.fn(async () => {});
+vi.mock('$lib/server/voice/voiceEject', () => ({
+  ejectFromCampaignVoice: (...a: unknown[]) => (ejectFromCampaignVoice as any)(...a),
+  ejectAllFromCampaignVoice: (...a: unknown[]) => (ejectAllFromCampaignVoice as any)(...a)
+}));
 // The campaign page's "Find tables: N active" line (DMs and admins only) reads the forage service.
 const countActiveFindTables = vi.fn();
 vi.mock('$lib/server/services/resource-pools', () => ({ listUnreviewedOverrides: async () => [], reviewOverride: vi.fn() }));
@@ -211,6 +218,24 @@ describe('/campaigns/[id] actions', () => {
     svc.removeMember.mockRejectedValue(new CampaignError("A co-DM can't remove the DM."));
     const removed: any = await call(detail.actions.removeMember, user, { userId: 'dm' });
     expect(removed.data.error).toBe("A co-DM can't remove the DM.");
+  });
+
+  it('ejects from voice on removal, leave and archive, and never for a role change', async () => {
+    svc.setMemberRole.mockResolvedValueOnce({ roomCode: 'R', demotedToPlayer: ['someone'] });
+    await call(detail.actions.setRole, user, { userId: 'someone', role: 'player' });
+    expect(ejectFromCampaignVoice).not.toHaveBeenCalled();
+
+    svc.removeMember.mockResolvedValueOnce({ roomCode: 'R', targetUserId: 'target' });
+    expect(await call(detail.actions.removeMember, user, { userId: 'target' })).toEqual({ saved: 'removed' });
+    expect(ejectFromCampaignVoice).toHaveBeenCalledWith(CAMPAIGN, 'target');
+
+    svc.leaveCampaign.mockResolvedValueOnce({ roomCode: 'R' });
+    await redirected(call(detail.actions.leave, user, {}));
+    expect(ejectFromCampaignVoice).toHaveBeenCalledWith(CAMPAIGN, ME);
+
+    svc.archiveCampaign.mockResolvedValueOnce({ roomCode: 'R' });
+    await redirected(call(detail.actions.archive, user, {}));
+    expect(ejectAllFromCampaignVoice).toHaveBeenCalledWith(CAMPAIGN);
   });
 
   it('rejects an unknown role without calling the service', async () => {

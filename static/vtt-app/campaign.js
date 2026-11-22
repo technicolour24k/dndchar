@@ -125,6 +125,8 @@ export function createCampaignClient(deps) {
     hideBanner();
     setJoiningText(message);
     showNotice(title, message, actions);
+    // Removed / dead end (not a mere connection drop, which keeps the table and any voice call).
+    if (forgetTable && deps.onTableGone) deps.onTableGone();
   }
 
   // --- Connecting -----------------------------------------------------------------------------

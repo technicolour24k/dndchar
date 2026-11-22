@@ -65,6 +65,41 @@
     <div id="overworldFrameHost"></div>
   </div>
 
+  <!-- Voice controls (daily-voice plan, campaign tables only; shown by voice.js). ONE persistent node:
+       it waits here in a hidden holder and voice.mount() moves it into #voiceSlot at the top of the
+       sidebar's room info box after every sidebar render (renderSidebar's innerHTML detaches it, it is
+       never re-created). The call and its audio elements don't live in it, so they are unaffected. -->
+  <div id="voiceHold" hidden>
+  <div id="voiceDock" hidden>
+    <div id="voiceBar">
+      <span id="voiceStatus">Voice</span>
+      <button type="button" id="voiceJoin">Join voice</button>
+      <button type="button" id="voiceMute" hidden>Mute</button>
+      <button type="button" id="voiceLeave" hidden>Leave</button>
+      <button type="button" id="voiceListToggle" hidden aria-expanded="false">Who's in</button>
+      <button type="button" id="voiceDevicesToggle" hidden aria-expanded="false">Devices</button>
+      <button type="button" id="voiceRecord" hidden>Record</button>
+    </div>
+    <div id="voiceBadge" hidden></div>
+    <button type="button" id="voiceListen" hidden>Join to listen only</button>
+    <div id="voiceNote" hidden></div>
+    <div id="voicePrompt" hidden>
+      <span id="voicePromptText"></span>
+      <button type="button" id="voiceStay">Stay</button>
+      <button type="button" id="voicePromptLeave">Leave</button>
+    </div>
+    <div id="voiceDevices" hidden>
+      <label>Mic <select id="voiceInputSel"></select></label>
+      <label id="voiceOutputRow" hidden>Speaker <select id="voiceOutputSel"></select></label>
+    </div>
+    <button type="button" id="voiceSound" hidden>Tap to enable sound</button>
+    <ul id="voiceList" hidden></ul>
+  </div>
+  </div>
+  <!-- Remote audio lives here, NOT in the dock: the dock is moved in and out of the sidebar, and
+       audio elements must never be detached by that. display:none audio still plays. -->
+  <div id="voiceAudioHost" hidden></div>
+
   <div id="app">
     <div id="sidebar"></div>
     <div id="mapWrap">
