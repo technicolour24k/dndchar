@@ -20,7 +20,7 @@ import {
 // The gate only grants the right to overspend: an activation that is affordable pays normally.
 
 export type CostGate =
-  | { ok: true; mode: ShortfallMode; override: CostOverride | null; settle: (success: boolean) => Promise<void> }
+  | { ok: true; mode: ShortfallMode; activation: Activation; override: CostOverride | null; settle: (success: boolean) => Promise<void> }
   | { ok: false; status: number; body: Record<string, unknown> };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -41,7 +41,7 @@ export async function openCostGate(input: {
   const approvalId = typeof input.approvalId === 'string' ? input.approvalId : '';
   const requested = input.override === 'dm' || input.override === 'self' ? input.override : null;
   // Nothing asked for and nothing else to learn: the plain path still needs a mode for a shortfall.
-  const plain = (mode: ShortfallMode): CostGate => ({ ok: true, mode, override: null, settle: NOOP });
+  const plain = (mode: ShortfallMode): CostGate => ({ ok: true, mode, activation: input.activation, override: null, settle: NOOP });
   if (!UUID.test(input.characterId)) return plain('no_dm');
 
   const access = await getCharacterAccess({ query }, input.userId, input.characterId);
@@ -125,12 +125,13 @@ export async function openCostGate(input: {
     }
   };
 
-  return { ok: true, mode, override, settle };
+  return { ok: true, mode, activation: input.activation, override, settle };
 }
 
 /** The 409 body for a shortfall, with the prompt mode the client should show. */
 export function costShortfallBody(gate: Extract<CostGate, { ok: true }>, error: CostShortfallError) {
-  return { error: 'insufficient', message: error.message, shortfalls: error.shortfalls, mode: gate.mode };
+  // `activation` is exactly what the server will check an approval against, so a client asks with it as it is.
+  return { error: 'insufficient', message: error.message, shortfalls: error.shortfalls, mode: gate.mode, activation: gate.activation };
 }
 
 /**

@@ -11,6 +11,8 @@
   import { readOnlyLock } from '$lib/ui/readOnlyLock';
   import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
   import type { ForageMine } from '$lib/types/forage';
+  import CostRequestPrompt from './CostRequestPrompt.svelte';
+  import { promptSpec, approvalErrorText, closedMessage, formForActivation, mineStep } from '../../../../static/vtt-app/shared/costApproval.js';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
     adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
@@ -1144,6 +1146,7 @@
       onResync: () => {
         refreshActivityStatus();
         void refreshForage();
+        void refreshCost();
         fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
         if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
       },
@@ -1154,6 +1157,10 @@
           combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
         } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
           refreshActivityStatus();
+        } else if (msg.type === 'cost:ping') {
+          // Detail-free nudge (it carries no user id): fetch our own cost-request state, which only ever
+          // holds this user's request for this character.
+          untrack(() => void refreshCost());
         } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
           // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
           // nothing read in here can become a dependency of this effect (Review 3).
@@ -1726,12 +1733,134 @@
   // pools etc. are all plain $derived off the `character` prop (or resynced-on-change local
   // $state - see statOverrides/hitDicePools above), so a narrow invalidate() refreshes every
   // visible value exactly as well as a full reload did, without the round-trip cost.
+  // ---- Over-budget prompt and DM approval (cost engine Unit 6). The held click is kept in memory as
+  // plain entries, so it can be re-sent with an approval or an override. The server decides who may
+  // do what (src/lib/server/vttCostGate.ts); this only shows the right prompt and resends.
+  type Held={action:string;entries:Array<[string,string]>;heading:string};
+  type CostPromptState={stage:'prompt'|'waiting'|'banner';mode:string;shortfalls:Array<{label:string;needed:number;available:number}>;label:string;
+    busy:boolean;error:string;held:Held|null;activation:any;requestId:string|null;banner:any};
+  let costPrompt=$state<CostPromptState|null>(null);
+  let costSeq=0;
+  let costResuming=false;
+  const costOwner=$derived(!readOnly&&!!currentUserId);
+
+  function heldForm(held:Held,extra:Record<string,string>){
+    const form=new FormData();
+    for(const [key,value] of held.entries)form.set(key,value);
+    for(const [key,value] of Object.entries(extra))form.set(key,value);
+    return form;
+  }
+
+  function openCostPrompt(held:Held,shortfalls:CostPromptState['shortfalls'],mode:string,activation:any){
+    const label=held.heading.replace(/ (cast|used)\..*$/,'');
+    costPrompt={stage:'prompt',mode,shortfalls,label,busy:false,error:'',held,activation,requestId:null,banner:null};
+  }
+
+  // Runs the held click again with an approval or an override. The dialog closes first; a fresh
+  // shortfall or refusal opens a new prompt or message from runResourceAction.
+  async function resendHeld(extra:Record<string,string>){
+    const held=costPrompt?.held;
+    if(!held)return;
+    costPrompt=null;
+    await runResourceAction(held.action,heldForm(held,extra),held.heading);
+  }
+
+  async function costApi(url:string,init?:RequestInit):Promise<{ok:boolean;status:number;data:any}>{
+    try{
+      const response=await fetch(url,init);
+      return{ok:response.ok,status:response.status,data:await response.json().catch(()=>({}))};
+    }catch{return{ok:false,status:0,data:{error:'network'}};}
+  }
+  const costPost=(body:Record<string,unknown>)=>costApi('/vtt/api/cost-requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+
+  async function askDm(){
+    const prompt=costPrompt;
+    if(!prompt||!prompt.activation)return;
+    prompt.busy=true;prompt.error='';
+    const result=await costPost({action:'ask',characterId:character.id,activation:prompt.activation});
+    if(costPrompt!==prompt)return;
+    prompt.busy=false;
+    if(result.ok&&result.data.notNeeded){await resendHeld({});return;} // it is affordable now: just run it
+    if(result.ok&&result.data.request){prompt.stage='waiting';prompt.requestId=result.data.request.id;return;}
+    if(result.status===409&&result.data.error==='pending'&&result.data.request){prompt.stage='waiting';prompt.requestId=result.data.request.id;return;}
+    if(result.status===409&&(result.data.error==='no_dm'||result.data.error==='dm_self')){prompt.mode=result.data.error;return;}
+    prompt.error='Could not ask the DM. Try again.';
+  }
+
+  async function chooseCost(id:string){
+    const prompt=costPrompt;
+    if(!prompt||prompt.busy)return;
+    if(id==='ask')return askDm();
+    if(id==='go_ahead')return resendHeld({override:'dm'});
+    if(id==='self')return resendHeld({override:'self'}); // the server also closes a request still waiting
+    if(id==='use_now'){
+      const form=formForActivation(prompt.banner?.activation);
+      if(!form||!prompt.requestId){costPrompt=null;return;}
+      const label=prompt.label;
+      costPrompt={...prompt,held:{action:form.action,entries:form.entries as Array<[string,string]>,heading:`${label} used.`}};
+      return resendHeld({approvalId:prompt.requestId});
+    }
+    if(id==='withdraw'||id==='dismiss'){
+      const requestId=prompt.requestId;
+      costPrompt=null;
+      if(requestId)await costPost({action:'withdraw',requestId});
+      return;
+    }
+    costPrompt=null; // cancel: nothing was spent
+  }
+
+  // The latest of our own request for this character (fetched, never pushed): decides what to show.
+  async function refreshCost(){
+    if(!costOwner)return;
+    const characterId=character.id;
+    const seq=++costSeq;
+    const result=await costApi(`/vtt/api/cost-requests/mine?characterId=${encodeURIComponent(characterId)}`);
+    if(!result.ok||seq!==costSeq||characterId!==character.id)return;
+    const mine=result.data;
+    const prompt=costPrompt;
+    const step=mineStep(mine,prompt?.requestId??null);
+    if(step==='resume'&&prompt?.held&&!costResuming){
+      costResuming=true;
+      try{await resendHeld({approvalId:mine.request.id});}finally{costResuming=false;}
+    }else if(step==='banner'){
+      // A resume is already spending this approval: don't flash a "Use now" banner for it.
+      if(costResuming)return;
+      if(prompt&&prompt.stage==='prompt')return; // don't replace a prompt the player is answering
+      costPrompt={stage:'banner',mode:'ask_dm',shortfalls:[],label:mine.request.activationLabel||'That',busy:false,error:'',held:null,activation:null,
+        requestId:mine.request.id,banner:{...mine.request}};
+    }else if(step==='waiting'){
+      if(prompt&&prompt.stage==='waiting'){prompt.mode='ask_dm';}
+    }else if(step==='no_dm_pending'){
+      if(prompt&&prompt.stage==='waiting')costPrompt={...prompt,stage:'prompt',mode:'no_dm_pending',requestId:mine.request.id,busy:false,error:''};
+    }else if(step==='none'&&prompt&&prompt.stage==='waiting'){
+      // Our request is gone and we didn't use it: the DM said no (or it ran out). Nothing was spent.
+      costPrompt=null;
+      inventoryMessage=closedMessage('denied');
+    }else if(step==='none'&&prompt&&prompt.stage==='banner'){
+      costPrompt=null;
+    }
+  }
+
+  // While a request waits, look again every few seconds: a DM leaving sends no ping.
+  $effect(()=>{
+    if(costPrompt?.stage!=='waiting')return;
+    const timer=setInterval(()=>untrack(()=>void refreshCost()),8000);
+    return()=>clearInterval(timer);
+  });
+
   async function runResourceAction(action:string,body:FormData,heading:string){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
-    if(actionResult.type==='failure'&&(actionResult.data as {costShortfall?:Array<{label:string;needed:number;available:number}>})?.costShortfall){
-      const short=(actionResult.data as {costShortfall:Array<{label:string;needed:number;available:number}>}).costShortfall;
-      inventoryMessage=["It doesn't look like you've got the capacity to do that.",...short.map((line)=>`Needs ${line.needed} ${line.label}, you have ${line.available}`)].join('\n');
+    const failed=actionResult.type==='failure'?(actionResult.data as {costShortfall?:Array<{label:string;needed:number;available:number}>;costMode?:string;costActivation?:any;costError?:any}|undefined):undefined;
+    if(failed?.costShortfall){
+      // Can't afford it: offer the way past that fits who is acting and whether a DM is connected.
+      openCostPrompt({action,entries:[...body.entries()].filter(([key])=>key!=='approvalId'&&key!=='override').map(([key,value])=>[key,String(value)] as [string,string]),heading},
+        failed.costShortfall,failed.costMode||'no_dm',failed.costActivation);
+      return;
+    }
+    if(failed?.costError){
+      costPrompt=null;
+      inventoryMessage=approvalErrorText(failed.costError);
       return;
     }
     if(actionResult.type!=='success'){
@@ -1783,6 +1912,8 @@
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
   function closeOpenModal() {
+    // The safe choice (cancel / withdraw) is what Escape picks on the cost prompt.
+    if (costPrompt && costPrompt.stage === 'prompt') { void chooseCost(promptSpec(costPrompt.mode).escape); return; }
     if (forageOpen) { forageOpen = false; return; }
     if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
@@ -2817,6 +2948,9 @@
     </div>
   {/if}
 
+  {#if costPrompt}
+    <CostRequestPrompt prompt={costPrompt} onChoose={(id) => void chooseCost(id)} />
+  {/if}
   {#if castDialog}
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (castDialog = null))}>
       <div class="panel compact-modal cast-dialog" role="dialog" aria-modal="true" aria-labelledby="cast-dialog-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>

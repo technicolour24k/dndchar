@@ -279,7 +279,7 @@ describe('the cost gate', () => {
     accessMock.mockResolvedValue({ canAct: true, isCampaignDm: true });
     expect(((await gate()) as any).mode).toBe('dm_self');
     const body = costShortfallBody(g, new (CostShortfallError as any)(SHORT));
-    expect(body).toMatchObject({ error: 'insufficient', mode: 'ask_dm', shortfalls: SHORT });
+    expect(body).toMatchObject({ error: 'insufficient', mode: 'ask_dm', shortfalls: SHORT, activation: spell });
   });
 
   it('override self is refused (left to fail as ask_dm) while a DM is present, and granted with none', async () => {

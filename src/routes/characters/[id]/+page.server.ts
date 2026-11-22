@@ -249,7 +249,7 @@ export const actions = {
     const inventoryId = String(form.get('inventoryId') || '');
     const gate = await openCostGate({ userId: locals.user!.id, characterId: params.id, activation: { kind: 'item', inventoryId }, approvalId: form.get('approvalId'), override: form.get('override') });
     if (!gate.ok) return fail(gate.status, { costError: gate.body });
-    try { itemResult=await runWithGate(gate, (override) => useInventoryCatalogueItem(locals.user!.id, params.id, inventoryId, override)); } catch (error) { if (error instanceof CostShortfallError) return fail(409, { costShortfall: error.shortfalls, costMode: gate.mode }); throw error; }
+    try { itemResult=await runWithGate(gate, (override) => useInventoryCatalogueItem(locals.user!.id, params.id, inventoryId, override)); } catch (error) { if (error instanceof CostShortfallError) return fail(409, { costShortfall: error.shortfalls, costMode: gate.mode, costActivation: gate.activation }); throw error; }
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true, itemResult };
   },
@@ -259,7 +259,7 @@ export const actions = {
     const instanceId=String(form.get('instanceId')||'');
     const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:{kind:'content',instanceId},approvalId:form.get('approvalId'),override:form.get('override')});
     if(!gate.ok)return fail(gate.status,{costError:gate.body});
-    try{itemResult=await runWithGate(gate,(override)=>triggerCharacterContentActions(locals.user!.id,params.id,instanceId,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode});throw error;}
+    try{itemResult=await runWithGate(gate,(override)=>triggerCharacterContentActions(locals.user!.id,params.id,instanceId,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});
     return{contentUpdated:true,itemResult};
   },
@@ -268,7 +268,7 @@ export const actions = {
     const form=await request.formData();
     const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:activationFromCastForm(form),approvalId:form.get('approvalId'),override:form.get('override')});
     if(!gate.ok)return fail(gate.status,{costError:gate.body});
-    try{itemResult=await runWithGate(gate,(override)=>castCharacterSpell(locals.user!.id,params.id,form,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode});throw error;}
+    try{itemResult=await runWithGate(gate,(override)=>castCharacterSpell(locals.user!.id,params.id,form,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
   },
   // The one join a player needs, covering combat, rolls, and session notes at

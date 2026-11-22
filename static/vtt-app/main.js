@@ -8,6 +8,8 @@ import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/move
 import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
+import { createCostApproval } from './costApproval.js';
+import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
 import { drawTargetRings } from './render/targeting.js';
@@ -113,10 +115,12 @@ function getImage(url) {
   return media;
 }
 
+// Escapes for HTML text AND attribute values: textContent -> innerHTML covers & < >, and the
+// quotes are replaced too, so the result is also safe inside data-*="..." / title="...".
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str ?? '';
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // Every .modal-overlay shares the same CSS z-index, so when one modal opens
@@ -678,6 +682,7 @@ function handleMessage(msg) {
       // Forage: the GM's pending requests (or the player's own view and result) arrive in
       // session.forage / session.forageResults. Targeted updates only, no extra sidebar rebuild.
       forage.onStateFull();
+      costApproval.onStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
       // 'character:changed' below instead. See that case and
@@ -966,6 +971,19 @@ function handleMessage(msg) {
 
     case 'forage:closed':
       forage.onClosed(msg);
+      break;
+
+    // Cost-engine DM approval (cost-engine unit 6): the GM's queue, and a player's own request.
+    case 'cost:update':
+      costApproval.onUpdate(msg);
+      break;
+
+    case 'cost:closed':
+      costApproval.onClosed(msg);
+      break;
+
+    case 'cost:ping':
+      costApproval.onPing();
       break;
 
     // A DM shared an overworld map (campaign tables only).
@@ -1610,6 +1628,8 @@ function closeAttackModal() {
     clearTimeout(awaitingSpellResult.timeoutId);
     awaitingSpellResult = null;
   }
+  // A cost request still waiting on the DM goes with the modal (nothing was spent).
+  costApproval.onAttackClosed();
   if (pendingAttack) {
     send({ type: 'target:clear' });
     currentTargetTokenIds = [];
@@ -1886,6 +1906,15 @@ async function rollManualAction(action, extraBody = {}) {
 // extraBody carries the advantage choices (and `preview: true` for a preview) into whichever
 // endpoint applies; the item_not_found fallback covers previews too.
 // A 409 'insufficient' from roll-spell/roll-item: the clear sentence plus what's short.
+// The Error a roll route's non-OK answer becomes. A 409 'insufficient' keeps the whole body on
+// err.insufficient so resolveAttack can offer the ask-the-DM prompt instead of a dead end.
+function rollError(body, res) {
+  const refused = body?.error === 'approval_invalid' || body?.error === 'forbidden' || body?.error === 'wrong_room' || body?.error === 'not_in_room';
+  const err = new Error(costShortfallText(body) || (refused ? costApprovalErrorText(body) : '') || body.error || ('roll request failed (' + res.status + ')'));
+  if (isCostInsufficient(body)) err.insufficient = body;
+  return err;
+}
+
 function costShortfallText(body) {
   if (body?.error !== 'insufficient') return '';
   const lines = (body.shortfalls || []).map((l) => `Needs ${l.needed} ${l.label}, you have ${l.available}`);
@@ -1902,7 +1931,7 @@ async function rollPendingAction(action, source, extraBody = {}) {
       body: JSON.stringify({ ...extraBody, instanceId: action.instanceId, slotLevel: action.slotLevel }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(costShortfallText(body) || body.error || ('roll request failed (' + res.status + ')'));
+    if (!res.ok) throw rollError(body, res);
     return body;
   }
 
@@ -1912,7 +1941,7 @@ async function rollPendingAction(action, source, extraBody = {}) {
       body: JSON.stringify({ ...extraBody, inventoryId: action.inventoryId }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(costShortfallText(body) || body.error || ('roll request failed (' + res.status + ')'));
+    if (!res.ok) throw rollError(body, res);
     return body;
   }
 
@@ -1962,8 +1991,10 @@ function deductLocalSpellSlot(tokenId, level, type) {
 // target's HP (attack:resolve for weapons and attack-resolution spells alike -
 // a spell attack roll vs. AC is mechanically identical once you have a to-hit
 // total; spell:resolve for save/auto spells, see renderSpellResolutionControls).
-async function resolveAttack() {
+// costExtra is { approvalId } or { override } when re-running after the cost prompt (same target and options).
+async function resolveAttack(costExtra = {}) {
   if (!pendingAttack) return;
+  const pending = pendingAttack;
   const { sourceTokenId, action, intent, targetId, targetName, options } = pendingAttack;
   pendingAttack.stage = 'rolling'; // the panel's listeners ignore clicks from here on
   const source = session.tokens[sourceTokenId];
@@ -1973,8 +2004,17 @@ async function resolveAttack() {
   attackModalBody.innerHTML = `<h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isHeal ? 'Healing with' : isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
   let result;
   try {
-    result = await rollPendingAction(action, source, attackRollExtras(sourceTokenId, targetId, options, false));
+    result = await rollPendingAction(action, source, { ...attackRollExtras(sourceTokenId, targetId, options, false), ...costExtra, roomId: sessionId });
   } catch (err) {
+    if (err.insufficient && pendingAttack === pending) {
+      // Can't afford it: offer the way past that fits (ask the DM, the DM's own go-ahead, or the no-DM confirm).
+      pending.stage = 'cost';
+      costApproval.promptPlayer({
+        body: err.insufficient, label: action.name, characterId: source.characterId,
+        retry: (extra) => { if (pendingAttack === pending) resolveAttack(extra); }
+      });
+      return;
+    }
     console.error('[VTT] roll failed', err);
     attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
     return;
@@ -3393,6 +3433,7 @@ function roomInfoHtml(roleLabel) {
     ${overworld.buttonHtml()}
     ${combatControlHtml()}
     ${forage.forageControlHtml()}
+    ${costApproval.queueHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
     ${sessionNotesControlHtml()}
@@ -5184,6 +5225,15 @@ const campaignClient = createCampaignClient({
   },
 });
 campaignClient.start();
+
+const costApproval = createCostApproval({
+  getSession: () => session,
+  getRole: () => role,
+  getSessionId: () => sessionId,
+  attackModalBody,
+  closeAttackModal,
+  escapeHtml,
+});
 
 const forage = createForage({
   getSession: () => session,
