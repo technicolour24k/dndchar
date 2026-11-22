@@ -54,7 +54,9 @@ function loadDailyScript() {
 const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
 
-export function createVoice({ getCampaignId }) {
+// getCharacterId (optional): the character the player is controlling on the table right now, or null.
+// It is only a hint for the display name; the server checks ownership and builds the name itself.
+export function createVoice({ getCampaignId, getCharacterId = () => null }) {
   const dock = document.getElementById('voiceDock');
   const statusEl = document.getElementById('voiceStatus');
   const joinBtn = document.getElementById('voiceJoin');
@@ -431,7 +433,13 @@ export function createVoice({ getCampaignId }) {
   async function fetchToken() {
     let res;
     try {
-      res = await fetch(`/vtt/api/campaigns/${encodeURIComponent(getCampaignId())}/voice-token`, { method: 'POST' });
+      const characterId = getCharacterId();
+      const init = { method: 'POST' };
+      if (typeof characterId === 'string' && characterId) {
+        init.headers = { 'Content-Type': 'application/json' };
+        init.body = JSON.stringify({ characterId });
+      }
+      res = await fetch(`/vtt/api/campaigns/${encodeURIComponent(getCampaignId())}/voice-token`, init);
     } catch {
       throw new Error('network');
     }

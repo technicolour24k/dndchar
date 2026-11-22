@@ -5548,7 +5548,16 @@ function wirePlayerSidebar() {
 // Overworld maps (overworld-map plan, Unit F): a button and full-screen overlay at campaign tables only.
 const overworld = createOverworld({ getCampaignId: () => campaignClient.campaignId });
 // Voice chat dock (daily-voice plan): campaign tables only, never reset by reconnects or re-renders.
-const voice = createVoice({ getCampaignId: () => campaignClient.campaignId });
+const voice = createVoice({
+  getCampaignId: () => campaignClient.campaignId,
+  // The character this player is controlling: their first owned character token on the table. Only a
+  // hint for the voice name; the server verifies ownership and the campaign.
+  getCharacterId: () => {
+    if (role !== 'player' || !session || !playerId) return null;
+    const token = Object.values(session.tokens || {}).find((t) => t.ownerId === playerId && t.characterId);
+    return token ? token.characterId : null;
+  }
+});
 
 const campaignClient = createCampaignClient({
   connect,

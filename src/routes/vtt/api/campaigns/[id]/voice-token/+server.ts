@@ -5,8 +5,16 @@ import { query } from '$lib/server/db';
 import { getCampaignAccess, isUuid } from '$lib/server/services/access';
 import { readDailyConfig, tokenProperties, voiceRoomName, voiceRoomUrl } from '$lib/server/voice/dailyConfig';
 import { createDailyClient, DailyError } from '$lib/server/voice/dailyClient';
+import { voiceDisplayName } from '$lib/server/voice/voiceName';
 
-// POST /vtt/api/campaigns/<id>/voice-token   (body ignored)
+// POST /vtt/api/campaigns/<id>/voice-token   (optional JSON body: { characterId })
+//
+// The name shown in voice is built HERE and baked into the token (never taken from the client):
+// "Character (Player)", "DM (Player)" for the primary DM, "Co-DM (Player)" for the co-DM, or just
+// the player's name with no character. characterId is a hint for WHICH character (the one whose
+// token the player is controlling); it is only honoured if that user owns it and it is in THIS
+// campaign, otherwise their first party-active character in the campaign (by name) is used. The
+// name is fixed at join, so changing token mid-call doesn't rename until the next join.
 //
 // Hands a real campaign member a short-lived Daily meeting token for the campaign's voice room
 // (creating the room on first use). The Daily API key never leaves the server.
@@ -29,7 +37,7 @@ const lastRequest = new Map<string, number>();
 const noStore = { 'Cache-Control': 'no-store' };
 const fail = (error: string, status: number) => json({ error }, { status, headers: noStore });
 
-export const POST: RequestHandler = async ({ params, locals }) => {
+export const POST: RequestHandler = async ({ params, locals, request }) => {
   const user = locals.user!;
   const campaignId = params.id;
   if (!isUuid(campaignId)) return fail('campaign_not_found', 404);
@@ -51,15 +59,35 @@ export const POST: RequestHandler = async ({ params, locals }) => {
     for (const [id, t] of lastRequest) if (now - t >= THROTTLE_MS) lastRequest.delete(id);
   }
 
+  const body = await request.json().catch(() => null);
+  const hint = typeof body?.characterId === 'string' && isUuid(body.characterId) ? body.characterId : null;
+  let characterName: string | null = null;
+  if (access.role === 'player') {
+    try {
+      // The hinted character first (only if owned and in this campaign), else the first party-active one.
+      const found = await query<{ name: string }>(
+        `SELECT name FROM characters
+         WHERE owner_user_id = $1 AND campaign_id = $2 AND (id = $3::uuid OR party_active)
+         ORDER BY (id = $3::uuid) DESC NULLS LAST, lower(name), id
+         LIMIT 1`,
+        [user.id, campaignId, hint]
+      );
+      characterName = found.rows[0]?.name ?? null;
+    } catch {
+      characterName = null; // a name lookup must never stop someone joining voice
+    }
+  }
+  const userName = voiceDisplayName({ role: access.role, playerName: user.displayName, characterName });
+
   const roomName = voiceRoomName(config.roomPrefix, campaignId);
   try {
     const daily = createDailyClient(config);
     await daily.ensureRoom(roomName);
     const token = await daily.createToken(
-      tokenProperties(config, { roomName, userId: user.id, displayName: user.displayName, nowSeconds: Math.floor(now / 1000) })
+      tokenProperties(config, { roomName, userId: user.id, displayName: userName, nowSeconds: Math.floor(now / 1000) })
     );
     return json(
-      { url: voiceRoomUrl(config.domain, roomName), token, roomName, userName: user.displayName },
+      { url: voiceRoomUrl(config.domain, roomName), token, roomName, userName },
       { headers: noStore }
     );
   } catch (e) {
