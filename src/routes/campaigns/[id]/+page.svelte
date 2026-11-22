@@ -5,6 +5,7 @@
   import { formatInviteCode, roleLabel } from '$lib/campaigns/listParams';
   import { canOpenAsGm, tableHref } from '$lib/campaigns/vttLinks';
   import { totalLevel } from '$lib/rules/dnd5e';
+  import { PROFILES } from '$lib/rules/actionEconomy';
 
   let { data, form } = $props();
 
@@ -363,6 +364,28 @@
       </section>
     {/if}
     {#if form?.reviewed}<p class="muted">{form.reviewed}</p>{/if}
+
+    {#if !archived}
+      <section class="panel campaign-box">
+        <h2>Rules</h2>
+        {#if access.canManage}
+          <form method="POST" action="?/setActionEconomy" use:enhance class="stack">
+            <label>
+              Action economy
+              <select name="actionEconomy" value={campaign.actionEconomy}>
+                <option value="dnd5e">D&amp;D 5e (Action, Bonus action, Reaction per turn)</option>
+                <option value="attack_utility">Attack &amp; Utility (2 Attack + 2 Utility per turn, homebrew)</option>
+              </select>
+            </label>
+            <p class="muted">{PROFILES[campaign.actionEconomy]?.description} Characters in this campaign track their actions per turn this way.</p>
+            <button type="submit" class="compact-button stack-button">Save rules</button>
+          </form>
+          {#if form?.saved === 'actionEconomy'}<p class="muted">Saved.</p>{/if}
+        {:else}
+          <p class="muted">Action economy: {PROFILES[campaign.actionEconomy]?.label}. {PROFILES[campaign.actionEconomy]?.description}</p>
+        {/if}
+      </section>
+    {/if}
 
     {#if access.canManage && !archived}
       <section class="panel campaign-box">

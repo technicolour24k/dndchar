@@ -333,6 +333,7 @@
   let selectedSkillProficiencies = $state<string[]>([]);
   let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
   let contentBusy = $state(false);
+  let turnOpen = $state(false); // the "Actions this turn" panel
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
   let newItemOpen = $state(false);
@@ -2042,6 +2043,26 @@
     <div class="actions sheet-header-actions">
       <div class="combat-clock">
         <span class="save-state combat-clock-status">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
+        <!-- Actions this turn (action economy). Display and bookkeeping only for now: nothing charges it yet. Next Turn resets it. -->
+        <div class="turn-strip">
+          <button type="button" class="turn-strip-chips" aria-expanded={turnOpen} title="Actions this turn" onclick={() => (turnOpen = !turnOpen)}>
+            {#each character.turn.pools as pool (pool.key)}<span class="cost-chip" class:spent={pool.current === 0}>{pool.label} {pool.current}/{pool.max}</span>{/each}
+            {#each character.turn.followups as followup (followup.cls)}<span class="cost-chip">{followup.label}: {followup.remaining} left</span>{/each}
+          </button>
+          {#if turnOpen}
+            <div class="turn-panel">
+              <strong>Actions this turn <span class="muted">({character.turn.profileLabel})</span></strong>
+              {#each character.turn.pools as pool (pool.key)}
+                <div class="turn-panel-row">
+                  <span>{pool.label} {pool.current}/{pool.max}</span>
+                  {#if !readOnly}<button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('turnAdjust', { key: pool.key, delta: -1 })}>-</button><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('turnAdjust', { key: pool.key, delta: 1 })}>+</button>{/if}
+                  <span class="muted">{pool.breakdown.map((line) => `${line.label} ${line.value >= 0 && line.label !== 'Base' ? '+' : ''}${line.value}`).join(', ')}</span>
+                </div>
+              {/each}
+              {#if character.turn.log.length}<ul class="turn-log">{#each character.turn.log as entry}<li>{entry.label}{entry.amount ? ` (${entry.amount})` : ''}</li>{/each}</ul>{:else}<span class="muted">Nothing spent yet. Next Turn resets this.</span>{/if}
+            </div>
+          {/if}
+        </div>
         <button type="button" class="compact-button combat-clock-full" disabled={contentBusy || readOnly} onclick={() => runContentAction('newBattle')}>New Battle</button>
         <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
         <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceRound')}>Next Round</button>

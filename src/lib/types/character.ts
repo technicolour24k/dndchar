@@ -153,6 +153,9 @@ export type CharacterDetail = {
   combatClock: { roundNumber: number; turnNumber: number };
   /** Character resource pools (Soulfire, Vowfire, ...) with live maxima. Only the visible ones. */
   pools: CharacterPool[];
+  /** This turn's action economy under the campaign's profile (spent pools, follow-ups waiting, log). */
+  turn: import('$lib/types/actionEconomy').TurnView;
+  actionEconomy: import('$lib/types/actionEconomy').ProfileKey;
   updatedAt: string;
   /** Bumped by every whole-sheet write; the sheet posts it back with Save (stale-save guard). */
   sheetVersion: number;

@@ -99,8 +99,16 @@ export async function getCharacterPools(
 // With `db` (a transaction client) it reads sequentially on that client and never takes another
 // pool connection.
 export async function loadPoolMaxima(characterId: string, includeArchived = false, db?: Queryable): Promise<{ definitions: PoolDefinition[]; maxima: Record<string, PoolMaximum> }> {
-  const q = db ?? { query };
   const definitions = db ? await loadDefinitions(db, includeArchived) : await listPoolDefinitions({ includeArchived });
+  const { sources, ctx } = await loadModifierContext(characterId, db);
+  return { definitions, maxima: poolMaxima(definitions.map((d) => ({ key: d.key, baseMaxExpression: d.baseMaxExpression })), sources, ctx) };
+}
+
+// The modifier sources and pool-maximum context of one character, read sequentially on `db` when
+// given (so a transaction never takes a second pool connection). Shared by resource pools and the
+// per-turn action pools (turn-state.ts).
+export async function loadModifierContext(characterId: string, db?: Queryable): Promise<{ sources: ActiveCharacterEffect[]; ctx: PoolMaxContext }> {
+  const q = db ?? { query };
   const sources = await resolveCharacterModifierSources(characterId, q);
   const classes = await q.query('SELECT class_name, level FROM character_classes WHERE character_id = $1', [characterId]);
   const abilities = await q.query('SELECT ability_key, score FROM character_abilities WHERE character_id = $1', [characterId]);
@@ -110,7 +118,7 @@ export async function loadPoolMaxima(characterId: string, includeArchived = fals
     abilities.rows.map((row: { ability_key: CharacterAbility['key']; score: number }) => ({ key: row.ability_key, score: row.score })),
     character.rows[0]?.metadata_json
   );
-  return { definitions, maxima: poolMaxima(definitions.map((d) => ({ key: d.key, baseMaxExpression: d.baseMaxExpression })), sources.sources, ctx) };
+  return { sources: sources.sources, ctx };
 }
 
 // ---------------------------------------------------------------------------------------------

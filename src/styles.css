@@ -1801,6 +1801,52 @@ button.death-save-icon.failure.active {
   grid-column: 1 / -1;
 }
 
+/* Actions this turn: a chip strip under the round counter that opens a small -/+ panel. */
+.turn-strip {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 4px;
+}
+
+.turn-strip-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: center;
+  background: none;
+  border: 0;
+  padding: 2px;
+}
+
+.turn-strip-chips .spent {
+  opacity: 0.55;
+}
+
+.turn-panel {
+  display: grid;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border, #444);
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.turn-panel-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.turn-panel-row .compact-button {
+  width: auto;
+}
+
+.turn-log {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
 .combat-clock button {
   width: 100%;
 }

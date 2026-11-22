@@ -1,5 +1,6 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
+import { emitRealtimeEvent } from '$lib/server/realtime';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
 import { listUnreviewedOverrides, reviewOverride } from '$lib/server/services/resource-pools';
@@ -16,6 +17,7 @@ import {
   removeCharacterFromCampaign,
   removeMember,
   setCharacterPartyActive,
+  setCampaignActionEconomy,
   setMemberRole,
   updateCampaignDetails
 } from '$lib/server/services/campaigns';
@@ -59,6 +61,15 @@ export const actions = {
       updateCampaignDetails(locals.user!.id, params.id, String(form.get('name') || ''), String(form.get('description') || ''))
     );
     return result.ok ? { saved: 'details' } : result.failure;
+  },
+
+  // DM-only: which action-economy profile the campaign plays by. Open sheets and VTT tokens re-sync.
+  setActionEconomy: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => setCampaignActionEconomy(locals.user!.id, params.id, String(form.get('actionEconomy') || '')));
+    if (!result.ok) return result.failure;
+    for (const characterId of result.value) emitRealtimeEvent('resource:changed', { characterId });
+    return { saved: 'actionEconomy' };
   },
 
   regenerate: async ({ params, locals }) => {

@@ -11,6 +11,7 @@ import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from
 import { cachedReference } from '$lib/server/cache/referenceData';
 import { costSummary, parseCostJson } from '$lib/rules/cost';
 import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
+import { characterProfile, getTurnView } from '$lib/server/services/turn-state';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -241,12 +242,17 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   const abilities = await getAbilities(characterId);
   const poolDefinitions = await listPoolDefinitions({ includeArchived: true });
   const poolLabels = Object.fromEntries(poolDefinitions.map((pool) => [pool.key, pool.label]));
-  const pools = await getCharacterPools({ query }, characterId, poolDefinitions, resolvedModifiers.sources, poolContextFor(classes, abilities, row.metadata_json));
+  const poolCtx = poolContextFor(classes, abilities, row.metadata_json);
+  const pools = await getCharacterPools({ query }, characterId, poolDefinitions, resolvedModifiers.sources, poolCtx);
+  // Reuses the sources and context already loaded above, so the turn view costs the profile and turn-row queries only.
+  const turn = await getTurnView({ query }, characterId, { profile: await characterProfile({ query }, characterId), sources: resolvedModifiers.sources, ctx: poolCtx });
 
   return mapCharacterRow(row, {
     classes,
     abilities,
     pools,
+    turn,
+    actionEconomy: turn.profileKey,
     resources: await getResources(characterId),
     inventory: await getInventory(characterId, poolLabels),
     attacks: await getAttacks(characterId),

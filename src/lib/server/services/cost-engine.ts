@@ -6,8 +6,9 @@ import { loadPoolMaxima, POOL_ROW_PREFIX, writeLedger } from '$lib/server/servic
 
 // LOCK ORDER. Every writer that touches several of a character's resource rows takes them in this
 // one order, so two of them can never deadlock:
-//   spell slots -> content counters -> inventory counters -> inventory item (quantity) -> character_resources
-// (character_resources holds pools, hp and hit dice). payActivationCost below, restCharacter and
+//   spell slots -> content counters -> inventory counters -> inventory item (quantity) -> character_resources -> character_turn_state
+// (character_resources holds pools, hp and hit dice; character_turn_state holds per-turn action
+// spending and is ALWAYS last: turn-state.ts, and every reset in catalogue.ts). payActivationCost below, restCharacter and
 // newBattle (catalogue.ts) and refillCharacterPools (resource-pools.ts) all follow it. A new
 // multi-source writer must too.
 //

@@ -8,6 +8,8 @@ import { CostShortfallError } from '$lib/server/services/cost-engine';
 import { openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { activationFromCastForm } from '$lib/server/vttCostApproval';
 import { adjustCharacterPool } from '$lib/server/services/resource-pools';
+import { adjustTurnPool } from '$lib/server/services/turn-state';
+import { resetLiveTokenMovement } from '$lib/server/vttTurn';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
 import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
@@ -220,6 +222,13 @@ export const actions = {
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true };
   },
+  // +/- on a per-turn action pool (bookkeeping, like poolAdjust). Delta changes what is left.
+  turnAdjust: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    await adjustTurnPool(locals.user!.id, params.id, String(form.get('key') || ''), Number(form.get('delta')) || 0);
+    emitRealtimeEvent('resource:changed', { characterId: params.id });
+    return { contentUpdated: true };
+  },
   rest: async ({ request, params, locals }) => {
     const form = await request.formData();
     await restCharacter(locals.user!.id, params.id, String(form.get('restType')) as 'short_rest' | 'long_rest');
@@ -228,16 +237,19 @@ export const actions = {
   },
   advanceRound: async ({ params, locals }) => {
     await advanceCharacterRound(locals.user!.id, params.id);
+    resetLiveTokenMovement(params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },
   advanceTurn: async ({ params, locals }) => {
     await advanceCharacterTurn(locals.user!.id, params.id);
+    resetLiveTokenMovement(params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },
   newBattle: async ({ params, locals }) => {
     await newBattle(locals.user!.id, params.id);
+    resetLiveTokenMovement(params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },

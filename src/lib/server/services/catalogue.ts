@@ -7,6 +7,7 @@ import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzyS
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { listPoolDefinitions, loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
+import { resetTurnState } from '$lib/server/services/turn-state';
 import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson } from '$lib/rules/cost';
 import type { CostEntry } from '$lib/types/cost';
 import { payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
@@ -570,6 +571,7 @@ export async function restCharacter(userId: string, characterId: string, rest: '
         });
       }
     }
+    await resetTurnState(client, characterId); // a rest starts a fresh turn; the turn row is always last (lock order)
   });
 }
 
@@ -592,6 +594,7 @@ export async function advanceCharacterRound(userId: string, characterId: string)
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
       FROM content_resource_definitions d, character_content_instances i WHERE r.resource_definition_id = d.id
       AND r.character_content_id = i.id AND i.character_id = $1 AND d.recharge_period = 'round'`, [characterId]);
+    await resetTurnState(client, characterId);
   });
 }
 
@@ -603,6 +606,7 @@ export async function advanceCharacterTurn(userId: string, characterId: string):
     await client.query(`UPDATE active_character_effects SET remaining_rounds=GREATEST(0,remaining_rounds-1)
       WHERE character_id=$1 AND remaining_rounds IS NOT NULL AND expiry_boundary IN ('turn_start','turn_end')`, [characterId]);
     await client.query('DELETE FROM active_character_effects WHERE character_id=$1 AND remaining_rounds=0', [characterId]);
+    await resetTurnState(client, characterId); // Next Turn is the reset for the character's per-turn actions
   });
 }
 
@@ -631,6 +635,7 @@ export async function newBattle(userId: string, characterId: string): Promise<vo
       WHERE resource.resource_definition_id=definition.id AND resource.inventory_item_id=inventory.id
         AND inventory.character_id=$1 AND definition.recharge_period='encounter'`, [characterId]);
     await refillCharacterPools(client, characterId, ['encounter'], userId, loadedPools);
+    await resetTurnState(client, characterId);
   });
 }
 
