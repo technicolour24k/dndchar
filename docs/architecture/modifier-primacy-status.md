@@ -143,43 +143,60 @@ This is a significant migration (removing a dedicated table, replacing with gene
 
 ## 6. Container Unification - Current Progress and Remaining Work
 
+*§6 re-audited 2026-11-21 against `vttpoc` (`7de8dea6`). Only this section was regenerated - the rest of the document is still dated 2026-11-19. The migration plan lives at `~/.claude/plans/dndchar/container-migration/container-migration.md`.*
+
 ### 6.1 What migration 019 accomplished
 
 - `content_definitions` now carries all Container-level fields: `activation_type`, `cost_json`, `duration_type`, `duration_rounds`, `requires_concentration`, `expiry_boundary`, `stack_behavior`, `is_system`.
 - `content_type` now accepts `'condition'` and `'action'` in addition to the original four.
-- All rows from `effect_definitions` were inserted into `content_definitions` with `content_type = 'condition'` (key prefix `condition:`).
-- All rows from `effect_modifier_links` were migrated into `content_modifier_links` for the new condition Containers.
-- `active_character_effects` now has a `container_id` column referencing `content_definitions`. Existing rows were back-filled. New active effects should set `container_id` in addition to (or instead of) `effect_id`.
-- All rows from `action_definitions` were inserted into `content_definitions` with `content_type = 'action'` (key prefix `action:`).
-- `action_steps` and `content_action_links` now each have a `container_id` column referencing the new action Containers.
-- `content_effect_links` rows were migrated into `content_grants` (effect grants become Container grants).
-- The rule engine (`resolveCharacterModifierSources`) branch 1 now queries via `container_id → content_definitions → content_modifier_links`, with a legacy fallback for any remaining rows where `container_id IS NULL`.
+- `effect_definitions` rows were copied into `content_definitions` as `content_type = 'condition'` (key `condition:<effect_key>`). Not copied: `source_type`, `source_ref`, `is_condition`, `is_selectable`, `is_homebrew`, `sort_order`, `metadata_json`, `owner_user_id`. The legacy `duration_type` was mapped lossily into the new vocabulary.
+- `effect_modifier_links` were copied into `content_modifier_links`. `content_effect_links` were copied into `content_grants`.
+- `action_definitions` were copied into `content_definitions` as `content_type = 'action'` (key `action:<action_key>`).
+- Added `container_id` to `active_character_effects` and `action_steps`, and `action_container_id` to `content_action_links` (not `container_id`). All three were back-filled. `action_steps.effect_id` (a legacy effect reference) got **no** container equivalent.
+- The rule engine's branch 1 reads via `container_id`, with a legacy fallback (`rule-engine.ts:52-64`) for `container_id IS NULL`.
+- Since 019, some condition mechanics exist **only** on the container side: migration 032 added 15 `content_modifier_links` on condition Containers with no `effect_modifier_links` twin. So the legacy tables are no longer a complete picture.
 
-### 6.2 Remaining service-layer work
+### 6.2 Remaining legacy reads/writes (audit 2026-11-21)
 
-The following service functions still write to the old tables and need updating to write to `content_definitions` directly:
+Schema blockers: `active_character_effects.effect_id`, `action_steps.action_id` and `content_action_links.action_id` are still `NOT NULL`, so no write path can go container-only yet.
 
-| Function | File | Old write target | New target |
-|---|---|---|---|
-| `applyCharacterEffect` | `effects.ts` | `active_character_effects.effect_id` | `active_character_effects.container_id` |
-| `removeCharacterEffect` | `effects.ts` | looks up by `effect_id` | look up by `container_id` |
-| `listEffectDefinitions` | `characters.ts` | `effect_definitions` query | `content_definitions WHERE content_type = 'condition'` |
-| `getActiveEffects` | `characters.ts` | UNION through `effect_definitions` | UNION through `content_definitions` via `container_id` |
-| `createHomebrewContent` | `catalogue.ts` | routes on old `ContentType` | add 'condition' and 'action' routing |
-| `executeActionStep` | `catalogue.ts` | `action_steps.action_id` | `action_steps.container_id` |
-| `triggerCharacterContentActions` | `catalogue.ts` | `content_action_links.action_id` | `content_action_links.action_container_id` |
+| File:line (`src/lib/server/services/`) | R/W | Legacy touch |
+|---|---|---|
+| action-engine.ts:17-22 | R | Legacy action branch via `content_action_links.action_id` -> `action_definitions` -> `action_steps.action_id` |
+| action-engine.ts:44-49 | R | `step.effect_id` (legacy id) -> apply/removeCharacterEffect |
+| catalogue.ts:39-43 | R | listCatalogue effects: `content_effect_links` ⋈ `effect_definitions` |
+| catalogue.ts:179-189 | W | attachEffectToContent dual-writes `content_effect_links` + `content_grants` |
+| catalogue.ts:204-224 | W | attachEffectToOwnedContent on_use: `action_definitions`, `content_action_links.action_id`, `action_steps(action_id, effect_id)`. Bug: a repeat attach nulls `action_container_id` |
+| catalogue.ts:268 | R | listEffectsForLinking -> `effect_definitions` |
+| catalogue.ts:490 | R | Spend-step check via `action_steps.action_id` |
+| catalogue.ts:640-651 | R | syncSpellSlots via `active_character_effects.effect_id`, `content_effect_links`, `effect_modifier_links` |
+| characters.ts:520-529 | R | buildSnapshot JOIN `effect_definitions` on `effect_id` |
+| characters.ts:694-700 | W | Snapshot restore writes `effect_id` (+ `container_id`) via `effect_definitions` |
+| characters.ts:897-899 | R | loadEffectDefinitions LEFT JOIN `effect_definitions` for `is_condition` |
+| characters.ts:1286-1293 | W/R | replaceActiveEffects via `effect_definitions`/`effect_id` |
+| content-admin.ts:28-37 | R | Effect picker, attached effects (`content_effect_links`), actions/steps via `action_id`, actionCandidates (`action_definitions`) |
+| content-admin.ts:93 | W | attachEffectToAdminContent writes **only** `content_effect_links`. The rule engine never sees it (live bug) |
+| content-admin.ts:95-100, 111-118, 122-123 | W | Action authoring writes `action_definitions`, `content_action_links.action_id` and `action_steps(action_id, effect_id)` with **no** containers. Steps added to a container-linked action are skipped by the engine (live bug) |
+| content-admin.ts:102 | W | detachEffectFromAdminContent deletes only `content_effect_links`, so the `content_grants` copy keeps applying (live bug) |
+| content-admin.ts:135 | R | groupActions maps `step.effect_id` |
+| effects.ts:15-58 | R/W | apply/removeCharacterEffect read `effect_definitions` and write/look up `active_character_effects.effect_id` (+ `container_id`) |
+| modifier-admin.ts:145-611 | R/W | Dead code (imported nowhere). Legacy tables throughout |
+| rule-engine.ts:52-64 | R | Branch 1b legacy fallback |
+| rules-admin.ts:40, 49-50 | R | Modifier reference counts/lists over `effect_modifier_links`. Double-counts condition links |
+| rules-admin.ts:66-88 | R | loadEffects from `effect_definitions`/`effect_modifier_links`/`content_effect_links`. Misses the 032 container-only links |
+| rules-admin.ts:163-238 | W | saveEffect, attach/detachEffectModifier, archiveEffect: legacy-first dual writes |
+| scripts/seed-core-effects.ts, import-srd-effects.ts, import-srd-content.ts, trim-effect-catalog.ts | W | Legacy-only writes (`effect_definitions`, `effect_modifier_links`, `effect_sources`, `content_effect_links`). Intended for the pre-019 `migrate --to 018` flow |
 
-### 6.3 Tables that can be dropped after service-layer migration is complete
+No direct legacy SQL in `src/routes`, `vtt/`, `server.js` or `vttConditions.ts` (already container-keyed).
 
-- `effect_definitions` (superseded by `content_definitions WHERE content_type = 'condition'`)
-- `effect_modifier_links` (superseded by `content_modifier_links` on condition Containers)
-- `active_character_effects.effect_id` column (superseded by `container_id`)
-- `content_effect_links` (superseded by `content_grants`)
-- `action_definitions` (superseded by `content_definitions WHERE content_type = 'action'`)
-- `action_steps.action_id` column (superseded by `container_id`)
-- `content_action_links.action_id` column (superseded by `action_container_id`)
+Drift risk: the legacy-only write paths above (content-admin actions and effect attach, scripts) can have created rows since 019 that have no container twin or have NULL container columns. On the local dev DB (2026-11-21) every drift count is 0. Prod is unchecked - the plan's read-only check query covers it.
 
-Do not drop these until all write paths above are confirmed updated and tested.
+### 6.3 Tables/columns to drop once 6.2 is empty
+
+- `effect_definitions`, `effect_modifier_links`, `effect_sources`, `content_effect_links`, `action_definitions`
+- `active_character_effects.effect_id`, `action_steps.effect_id` (needs a new `effect_container_id` first), `action_steps.action_id`, `content_action_links.action_id`
+
+Don't drop these until every 6.2 row is gone, a re-run backfill has passed its guards, and the app has been through at least one real session on the container-only code.
 
 ---
 
