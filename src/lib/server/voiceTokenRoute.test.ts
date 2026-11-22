@@ -113,7 +113,8 @@ describe('voice-token route', () => {
       url: 'https://tonyj.daily.co/dev-22222222222242228222222222222222',
       token: 'tok-123',
       roomName: 'dev-22222222222242228222222222222222',
-      userName: 'Tester'
+      userName: 'Tester',
+      canRecord: false
     });
     expect(JSON.stringify(body)).not.toContain('sk-secret');
     expect(ensureRoom).toHaveBeenCalledWith('dev-22222222222242228222222222222222');
@@ -122,6 +123,12 @@ describe('voice-token route', () => {
   it('lets a DM in too', async () => {
     getCampaignAccess.mockResolvedValue({ role: 'dm', archived: false, isAdmin: false });
     expect((await post(nextUser())).status).toBe(200);
+  });
+  it('canRecord comes from the campaign role: DM and co-DM yes, player no, and a client claim is ignored', async () => {
+    for (const [role, expected] of [['dm', true], ['co_dm', true], ['player', false]] as const) {
+      getCampaignAccess.mockResolvedValue({ role, archived: false, isAdmin: false });
+      expect((await (await post(nextUser(), CAMPAIGN, { canRecord: true, role: 'dm' })).json()).canRecord).toBe(expected);
+    }
   });
   it('403s a non-member', async () => {
     getCampaignAccess.mockResolvedValue({ role: null, archived: false, isAdmin: false });

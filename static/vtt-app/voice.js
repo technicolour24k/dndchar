@@ -17,6 +17,8 @@ import {
   SPEECH_LEVEL, dockLabel, describeEject, describeVoiceError, isMicError, participantRows, pickDevices, rememberedDevice, speakingIds
 } from './shared/voiceView.js';
 import { createIdleTracker, idleTimings } from './shared/voiceIdle.js';
+import { applyRecordingMessage, badgeText, formatElapsed, pruneRecorders, recordingFileName, recordingMessage } from './shared/voiceRecord.js';
+import { createRecorder, downloadBlob } from './voiceRecorder.js';
 
 // Daily retires old daily-js versions, so this needs bumping now and then (npm view
 // @daily-co/daily-js version). dist/daily.js is the UMD build and sets window.Daily. The integrity
@@ -58,7 +60,8 @@ const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private
 
 // getCharacterId (optional): the character the player is controlling on the table right now, or null.
 // It is only a hint for the display name; the server checks ownership and builds the name itself.
-export function createVoice({ getCampaignId, getCharacterId = () => null }) {
+// getCampaignName (optional): only used to name a recording file.
+export function createVoice({ getCampaignId, getCharacterId = () => null, getCampaignName = () => '' }) {
   const dock = document.getElementById('voiceDock');
   const statusEl = document.getElementById('voiceStatus');
   const joinBtn = document.getElementById('voiceJoin');
@@ -70,6 +73,8 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
   const audioHost = document.getElementById('voiceAudioHost');
   const listenBtn = document.getElementById('voiceListen');
   const noteEl = document.getElementById('voiceNote');
+  const recordBtn = document.getElementById('voiceRecord');
+  const badgeEl = document.getElementById('voiceBadge');
   const promptEl = document.getElementById('voicePrompt');
   const promptText = document.getElementById('voicePromptText');
   const stayBtn = document.getElementById('voiceStay');
@@ -106,6 +111,14 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
   let joinSeq = 0;
   // Set by pagehide so the Daily leave that follows doesn't clear the "Rejoin voice" hint.
   let leavingForUnload = false;
+  // Recording (Rev 4). canRecord comes from the SERVER in the voice-token response (campaign DM or
+  // co-DM); the client never decides it. recorders is who is recording right now (session_id -> name),
+  // from our own recorder plus Daily app messages from others.
+  let canRecord = false;
+  let recorders = {};
+  let finishing = null;
+  const recorder = createRecorder();
+  const warnBeforeUnload = (e) => { e.preventDefault(); e.returnValue = ''; };
   const TITLE_CUE = '(!) Still in voice? ';
 
   const participantList = () => (call ? Object.values(call.participants()) : []);
@@ -153,6 +166,12 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
     devicesBtn.hidden = state !== 'joined';
     devicesEl.hidden = state !== 'joined' || !devicesOpen;
     devicesBtn.setAttribute('aria-expanded', String(devicesOpen));
+    recordBtn.hidden = !(state === 'joined' && canRecord);
+    recordBtn.textContent = recorder.active ? `Stop ${formatElapsed(Date.now() - recorder.startedAt)}` : 'Record';
+    recordBtn.classList.toggle('voice-recording', recorder.active);
+    const badge = state === 'joined' ? badgeText(recorders) : null;
+    badgeEl.textContent = badge || '';
+    badgeEl.hidden = !badge;
     // A mid-call problem (e.g. the mic failing) stays visible while joined.
     noteEl.textContent = state === 'joined' ? message : '';
     noteEl.hidden = !(state === 'joined' && message);
@@ -233,7 +252,67 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
       }
     }
     for (const id of [...audioEls.keys()]) if (!seen.has(id)) dropAudio(id);
+    if (recorder.active) recorder.sync(buildSources());
   }
+
+  // ---- recording (DM / co-DM only, in this browser) ------------------------------------------
+
+  // Everything audible to us: each remote participant's stream (the one already playing in its
+  // <audio> element, which Chromium needs before Web Audio will hear it) plus our own mic.
+  function buildSources() {
+    const m = new Map();
+    for (const [id, a] of audioEls) if (a.el.srcObject) m.set(id, { key: a.trackId, stream: a.el.srcObject });
+    const me = participantList().find((p) => p.local);
+    const t = me && me.tracks && me.tracks.audio && me.tracks.audio.persistentTrack;
+    if (t) m.set('local', { key: t.id, stream: new MediaStream([t]) });
+    return m;
+  }
+
+  const myName = () => {
+    const me = participantList().find((p) => p.local);
+    return (me && me.user_name) || 'DM';
+  };
+
+  function announceRecording(on, to) {
+    if (!call) return;
+    try { call.sendAppMessage(recordingMessage(on, myName()), to || '*'); } catch { /* never break the call */ }
+  }
+
+  function startRecording() {
+    // Not while a stop is still finishing: a quick re-Record would otherwise be killed by it.
+    if (!canRecord || state !== 'joined' || recorder.active || finishing) return;
+    try {
+      recorder.start(buildSources());
+    } catch {
+      message = "Recording isn't supported in this browser.";
+      render();
+      return;
+    }
+    if (localId) recorders = { ...recorders, [localId]: myName() };
+    announceRecording(true);
+    window.addEventListener('beforeunload', warnBeforeUnload);
+    render();
+  }
+
+  // Stop and download what was captured. Used by the Stop button AND every way of leaving the call
+  // (leave, kick, auto-leave, eject), so a recording is never silently lost. Never throws.
+  function finishRecording() {
+    if (!recorder.active) return finishing || Promise.resolve();
+    if (finishing) return finishing;
+    const myId = localId;
+    const startedAt = recorder.startedAt;
+    announceRecording(false);
+    window.removeEventListener('beforeunload', warnBeforeUnload);
+    finishing = recorder.stop().then(({ blob, ext }) => {
+      if (myId) { const { [myId]: _gone, ...rest } = recorders; recorders = rest; }
+      if (blob) {
+        try { downloadBlob(blob, recordingFileName(getCampaignName(), new Date(startedAt), ext)); } catch (e) { console.error('[voice] download failed', e); }
+      }
+    }).catch(() => {}).finally(() => { finishing = null; render(); });
+    return finishing;
+  }
+
+  recordBtn.addEventListener('click', () => { if (recorder.active) finishRecording(); else startRecording(); });
 
   soundBtn.addEventListener('click', () => {
     soundBtn.hidden = true;
@@ -350,7 +429,20 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
   // ---- call lifecycle ----------------------------------------------------------------------
 
   function resetAfterCall() {
-    clearAudio();
+    // Start stopping the recorder first: it flushes what it has right away. Only tear the audio
+    // elements down once it has finished (bounded by the recorder's stop timeout), so the last
+    // seconds aren't cut. The rest of the reset doesn't wait.
+    const recording = recorder.active || !!finishing;
+    const stopped = finishRecording();
+    recorders = {};
+    if (recording) {
+      stopped.then(() => {
+        // A new call may have started meanwhile and owns the audio elements now.
+        if (state !== 'joined' && state !== 'joining') clearAudio();
+      });
+    } else {
+      clearAudio();
+    }
     stopTimers();
     localId = null;
   }
@@ -388,8 +480,18 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
       render();
     });
     c.on('participant-joined', refresh);
+    // App messages are not stored for late joiners, so a recorder tells each newcomer again.
+    c.on('participant-joined', onCall((ev) => { if (recorder.active && ev && ev.participant) announceRecording(true, ev.participant.session_id); }));
+    c.on('app-message', onCall((ev) => {
+      recorders = applyRecordingMessage(recorders, ev && ev.data, ev && ev.fromId);
+      render();
+    }));
     c.on('participant-updated', refresh);
     c.on('participant-left', refresh);
+    c.on('participant-left', onCall(() => {
+      // A recorder who dropped out can't clear their own badge.
+      recorders = pruneRecorders(recorders, new Set(participantList().map((p) => p.session_id)));
+    }));
     c.on('active-speaker-change', onCall(() => { if (idle) idle.noteSpeech(); }));
     c.on('local-audio-level', onCall((ev) => noteLevel(localId, ev.audioLevel)));
     c.on('remote-participants-audio-level', onCall((ev) => {
@@ -457,7 +559,8 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
     rejoinHint = false;
     setState('loading');
     try {
-      const { url, token } = await fetchToken();
+      const { url, token, canRecord: serverSaysCanRecord } = await fetchToken();
+      canRecord = serverSaysCanRecord === true;
       if (seq !== joinSeq) return;
       const Daily = await loadDailyScript();
       if (seq !== joinSeq) return;
@@ -489,6 +592,7 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
     if (state === 'loading') { setState('idle'); return; }
     if (!call || state === 'idle' || state === 'leaving') return;
     setState('leaving');
+    await finishRecording(); // announces "stopped" and downloads, while we are still in the call
     try {
       await call.leave();
     } catch { /* fall through to the reset */ }

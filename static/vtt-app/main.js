@@ -5556,6 +5556,7 @@ const overworld = createOverworld({ getCampaignId: () => campaignClient.campaign
 // Voice chat dock (daily-voice plan): campaign tables only, never reset by reconnects or re-renders.
 const voice = createVoice({
   getCampaignId: () => campaignClient.campaignId,
+  getCampaignName: () => campaignClient.campaignName,
   // The character this player is controlling: their first owned character token on the table. Only a
   // hint for the voice name; the server verifies ownership and the campaign.
   getCharacterId: () => {

@@ -87,7 +87,15 @@ export const POST: RequestHandler = async ({ params, locals, request }) => {
       tokenProperties(config, { roomName, userId: user.id, displayName: userName, nowSeconds: Math.floor(now / 1000) })
     );
     return json(
-      { url: voiceRoomUrl(config.domain, roomName), token, roomName, userName },
+      {
+        url: voiceRoomUrl(config.domain, roomName),
+        token,
+        roomName,
+        userName,
+        // Whether this user may record the session in their browser: decided HERE from the campaign
+        // role (DM or co-DM; site admin alone doesn't count), never by the client.
+        canRecord: access.role === 'dm' || access.role === 'co_dm'
+      },
       { headers: noStore }
     );
   } catch (e) {
