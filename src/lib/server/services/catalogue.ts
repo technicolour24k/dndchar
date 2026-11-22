@@ -6,7 +6,9 @@ import { cachedReference, invalidateReferenceData } from '$lib/server/cache/refe
 import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
-import { loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
+import { listPoolDefinitions, loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
+import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson } from '$lib/rules/cost';
+import type { CostEntry } from '$lib/types/cost';
 import { payActivationCost, type PaidLine } from '$lib/server/services/cost-engine';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { Activation } from '$lib/types/cost';
@@ -354,8 +356,10 @@ function paidToResults(paid:PaidLine[]):ActionResult[]{
   return paid.map((line)=>({label:'Cost',target:line.label,expression:String(-line.delta),rolled:-line.delta,before:line.before,after:line.after}));
 }
 
-export async function listCharacterContent(characterId: string): Promise<CharacterContentInstance[]> {
-  const result = await query<any>(`SELECT i.*, c.content_type, c.name, c.description, s.spell_level,
+// `poolLabels` (pool key -> label) can be passed by a caller that already loaded the definitions.
+export async function listCharacterContent(characterId: string, knownPoolLabels?: Record<string, string>): Promise<CharacterContentInstance[]> {
+  const poolLabels = knownPoolLabels ?? Object.fromEntries((await listPoolDefinitions({ includeArchived: true })).map((pool) => [pool.key, pool.label]));
+  const result = await query<any>(`SELECT i.*, c.content_type, c.name, c.description, c.cost_json, s.spell_level, s.casting_time,
     s.resolution_type, s.damage_type, s.base_dice, s.save_ability, s.save_effect, s.scaling_json,
     EXISTS(SELECT 1 FROM content_action_links action WHERE action.content_id=c.id) AS has_resource_actions
     FROM character_content_instances i JOIN content_definitions c ON c.id = i.content_id
@@ -368,6 +372,9 @@ export async function listCharacterContent(characterId: string): Promise<Charact
     id: row.id, contentId: row.content_id, type: row.content_type, name: row.custom_name || row.name,
     description: row.description, isKnown: row.is_known, isPrepared: row.is_prepared, isActive: row.is_active,
     notes: row.notes, spellLevel: row.spell_level, hasResourceActions: row.has_resource_actions,
+    // "Use Actions" on a spell is free unless a DM set a cost (see cost-engine's 'content' kind), so a
+    // spell's slot cost belongs to Cast only; feats and features show their explicit cost.
+    cost: costView(row.cost_json, row.content_type === 'spell' ? defaultCostFor({ contentType: 'spell', spellLevel: row.spell_level, castingTime: row.casting_time }) : [], poolLabels),
     spellDamage: row.content_type === 'spell' ? {
       resolutionType: row.resolution_type, damageType: row.damage_type, baseDice: row.base_dice,
       saveAbility: row.save_ability, saveEffect: row.save_effect, scaling: row.scaling_json || {}
@@ -377,7 +384,7 @@ export async function listCharacterContent(characterId: string): Promise<Charact
       rechargePeriod: resource.recharge_period, currentValue: resource.current_value, maxValue: resource.max_value
     }))
   }));
-  const grants = await query<any>(`SELECT g.id, granted.id AS content_id, granted.content_type, granted.name,
+  const grants = await query<any>(`SELECT g.id, granted.id AS content_id, granted.content_type, granted.name, granted.cost_json,
       granted.description, source.name AS source_name
     FROM character_inventory_items inventory
     JOIN content_grants g ON g.source_content_id = inventory.source_content_id
@@ -386,9 +393,11 @@ export async function listCharacterContent(characterId: string): Promise<Charact
     WHERE inventory.character_id = $1 AND (g.activation_type='carried'
       OR (g.activation_type='equipped' AND inventory.equipped)
       OR (g.activation_type='attuned' AND inventory.attuned))`, [characterId]);
-  const spellAccess=await query<any>(`SELECT access.id,access.spell_content_id,spell.name,spell.description,spell_detail.spell_level,
+  const spellAccess=await query<any>(`SELECT access.id,access.spell_content_id,spell.name,spell.description,spell.cost_json,spell_detail.spell_level,spell_detail.casting_time,
+      access.access_type,access.resource_cost_expression,counter.resource_key,
       inventory.id AS inventory_id,inventory.name AS source_name FROM character_inventory_items inventory
     JOIN content_spell_access access ON access.owner_content_id=inventory.source_content_id
+    LEFT JOIN content_resource_definitions counter ON counter.id=access.resource_definition_id
     JOIN content_definitions spell ON spell.id=access.spell_content_id
     JOIN spell_definitions spell_detail ON spell_detail.content_id=spell.id
     WHERE inventory.character_id=$1 AND (access.availability_type='carried'
@@ -397,10 +406,21 @@ export async function listCharacterContent(characterId: string): Promise<Charact
   return [...instances, ...grants.rows.map((row: any): CharacterContentInstance => ({
     id: `grant:${row.id}`, contentId: row.content_id, type: row.content_type, name: row.name,
     description: row.description, isKnown: true, isPrepared: true, isActive: true, notes: '',
-    spellLevel: null, grantedBy: row.source_name, resources: []
+    spellLevel: null, grantedBy: row.source_name, resources: [], cost: costView(row.cost_json, [], poolLabels)
   })),...spellAccess.rows.map((row:any):CharacterContentInstance=>({id:`spell-access:${row.id}:${row.inventory_id}`,
     contentId:row.spell_content_id,type:'spell',name:row.name,description:row.description,isKnown:true,isPrepared:true,isActive:true,
-    notes:'',spellLevel:row.spell_level,grantedBy:row.source_name,spellAccessId:row.id,inventoryItemId:row.inventory_id,resources:[]}))];
+    notes:'',spellLevel:row.spell_level,grantedBy:row.source_name,spellAccessId:row.id,inventoryItemId:row.inventory_id,resources:[],
+    cost:costView(row.cost_json,defaultCostFor({contentType:'spell',spellLevel:row.spell_level,castingTime:row.casting_time}),poolLabels,
+      {accessType:row.access_type,resourceKey:row.resource_key,resourceCostExpression:row.resource_cost_expression})}))];
+}
+
+// The cost shown on the sheet: explicit cost_json when a DM set one, else the type's default. A spell
+// access replaces the spell's slot line with its own rule (same maths as the cost engine).
+function costView(costJson: unknown, defaults: CostEntry[], labels: Record<string, string>, access?: Parameters<typeof applySpellAccessCost>[1]): { entries: CostEntry[]; summary: string } {
+  const parsed = parseCostJson(costJson);
+  let entries = effectiveCost(parsed.errors.length ? null : parsed.entries, defaults);
+  if (access) entries = applySpellAccessCost(entries, access);
+  return { entries, summary: entries.length ? costSummary(entries, labels) : '' };
 }
 
 export async function castCharacterSpell(userId:string,characterId:string,form:FormData):Promise<ActionResult[]>{

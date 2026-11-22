@@ -9,6 +9,7 @@ import { getActiveEncounterForCharacter } from '$lib/server/services/encounters'
 import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
+import { costSummary, parseCostJson } from '$lib/rules/cost';
 import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
 import type {
   AbilityKey,
@@ -238,14 +239,16 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   const resolvedModifiers = await resolveCharacterModifierSources(characterId);
   const classes = await getClasses(characterId);
   const abilities = await getAbilities(characterId);
-  const pools = await getCharacterPools({ query }, characterId, await listPoolDefinitions({ includeArchived: true }), resolvedModifiers.sources, poolContextFor(classes, abilities, row.metadata_json));
+  const poolDefinitions = await listPoolDefinitions({ includeArchived: true });
+  const poolLabels = Object.fromEntries(poolDefinitions.map((pool) => [pool.key, pool.label]));
+  const pools = await getCharacterPools({ query }, characterId, poolDefinitions, resolvedModifiers.sources, poolContextFor(classes, abilities, row.metadata_json));
 
   return mapCharacterRow(row, {
     classes,
     abilities,
     pools,
     resources: await getResources(characterId),
-    inventory: await getInventory(characterId),
+    inventory: await getInventory(characterId, poolLabels),
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId),
     proficiencies: await getProficiencies(characterId),
@@ -254,7 +257,7 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
     modifierAudit: resolvedModifiers.audit,
     availableEffects: await listEffectDefinitions(),
     exhaustionLevel: await getExhaustionLevel(characterId),
-    content: await listCharacterContent(characterId),
+    content: await listCharacterContent(characterId, poolLabels),
     spellSlots: await listSpellSlots(characterId),
     combatClock: await getCombatClock(characterId)
   });
@@ -769,7 +772,7 @@ async function getResources(characterId: string): Promise<CharacterResource[]> {
   }));
 }
 
-async function getInventory(characterId: string): Promise<InventoryItem[]> {
+async function getInventory(characterId: string, knownPoolLabels?: Record<string, string>): Promise<InventoryItem[]> {
   const result = await query<{
     id: string;
     name: string;
@@ -794,7 +797,9 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     effects: string;
     source_content_id: string | null;
     attuned: boolean;
-  }>('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order ASC', [characterId]);
+    source_cost_json: unknown;
+  }>('SELECT i.*, c.cost_json AS source_cost_json FROM character_inventory_items i LEFT JOIN content_definitions c ON c.id = i.source_content_id WHERE i.character_id = $1 ORDER BY i.sort_order ASC', [characterId]);
+  const poolLabels = knownPoolLabels ?? Object.fromEntries((await listPoolDefinitions({ includeArchived: true })).map((pool) => [pool.key, pool.label]));
   const resources=await query<any>(`SELECT resource.id,resource.inventory_item_id,definition.resource_key,definition.label,
     definition.recharge_period,resource.current_value,resource.max_value FROM character_inventory_resources resource
     JOIN content_resource_definitions definition ON definition.id=resource.resource_definition_id
@@ -814,6 +819,8 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     proficient: row.proficient ?? true,
     sourceContentId: row.source_content_id,
     attuned: row.attuned,
+    // Only an explicit cost shows (the default item cost, one of itself, would be noise).
+    costSummary: (() => { const parsed = parseCostJson(row.source_cost_json); return parsed.entries?.length ? costSummary(parsed.entries, poolLabels) : undefined; })(),
     damageRolls: row.damage_rolls,
     effects: row.effects,
     abilityBonuses: {

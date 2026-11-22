@@ -130,6 +130,61 @@ describe.skipIf(!enabled)('character resource pools', () => {
     }
   });
 
+  it('authors costs through the admin editor: refuses bad lines, saves, and goes back to the default', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, ''))) throw new Error('Refusing to run: database host is not local.');
+    const { query } = await import('$lib/server/db');
+    const { updateAdminContent } = await import('./services/content-admin');
+    const { listCharacterContent } = await import('./services/catalogue');
+    const { createCharacter } = await import('./services/characters');
+    const tag = `zzadm${crypto.randomBytes(4).toString('hex')}`;
+    const userId = (await query<{ id: string }>(`INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Adm', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    let spellId = '';
+    try {
+      spellId = (await query<{ id: string }>(`INSERT INTO content_definitions (content_key, content_type, name) VALUES ($1,'spell','IT Misty') RETURNING id`, [`spell:${tag}`])).rows[0].id;
+      await query(`INSERT INTO spell_definitions (content_id, spell_level, casting_time) VALUES ($1,2,'1 action')`, [spellId]);
+      const save = (costJson: string) => {
+        const form = new FormData();
+        form.set('contentId', spellId); form.set('name', 'IT Misty'); form.set('description', ''); form.set('spellLevel', '2'); form.set('castingTime', '1 action');
+        form.set('costJson', costJson);
+        return updateAdminContent(form);
+      };
+      const stored = async () => (await query<any>(`SELECT cost_json FROM content_definitions WHERE id=$1`, [spellId])).rows[0].cost_json;
+      await expect(save('not json')).rejects.toThrow();
+      await expect(save(JSON.stringify([{ pool: 'vowfyre', amount: 1 }]))).rejects.toThrow(/isn't an active resource pool/);
+      await expect(save(JSON.stringify([{ pool: 'charges', amount: 1 }]))).rejects.toThrow(/counter/);
+      await expect(save(JSON.stringify([{ pool: 'spell_slot', amount: 1 }]))).rejects.toThrow(/level/);
+      expect(await stored()).toBeNull();
+      await save(JSON.stringify([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }]));
+      expect(await stored()).toEqual([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }]);
+      // The sheet shows it as a chip, with the pool's label.
+      const characterId = await createCharacter(userId, 'Chips');
+      await query(`INSERT INTO character_content_instances (character_id, content_id) VALUES ($1,$2)`, [characterId, spellId]);
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 Vowfire');
+      // Caps, and a since-archived pool already in the stored cost can still be saved.
+      await expect(save(JSON.stringify(Array.from({ length: 21 }, () => ({ pool: 'action', amount: 1 }))))).rejects.toThrow(/at most 20/);
+      await expect(save(JSON.stringify([{ pool: 'action', amount: 1, pad: 'x'.repeat(4100) }]))).rejects.toThrow(/too long/);
+      await query(`UPDATE resource_pool_definitions SET is_archived=true WHERE pool_key='vowfire'`);
+      try {
+        await save(JSON.stringify([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }])); // unchanged: no re-validation
+        await save(JSON.stringify([{ pool: 'spell_slot', amount: 1, level: 3 }, { pool: 'vowfire', amount: 1 }])); // edited, archived pool kept
+        await expect(save(JSON.stringify([{ pool: 'vowfire', amount: 1 }, { pool: 'soulfire', amount: 1 }, { pool: 'nope', amount: 1 }]))).rejects.toThrow(/nope/);
+      } finally {
+        await query(`UPDATE resource_pool_definitions SET is_archived=false WHERE pool_key='vowfire'`);
+      }
+      await save(JSON.stringify([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }]));
+      await save('[]');
+      expect(await stored()).toEqual([]);
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('');
+      await save('');
+      expect(await stored()).toBeNull();
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 action');
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      if (spellId) await query(`DELETE FROM content_definitions WHERE id = $1`, [spellId]);
+    }
+  });
+
   it('pays activation costs through the engine: defaults, explicit costs, upcast, access charges, shortfalls and races', async () => {
     const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
     if (target.searchParams.has('host')) throw new Error('Refusing to run: DATABASE_URL has a "host" query parameter.');

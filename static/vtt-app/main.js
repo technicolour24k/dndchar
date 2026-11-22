@@ -4900,7 +4900,7 @@ function openSpellPicker(tokenId, clickedLevel, intent = 'attack') {
           return `
         <div class="mini-sheet-action spell-picker-row" data-spell-id="${escapeHtml(s.id)}" data-spell-name="${escapeHtml(s.name)}">
           <span>${escapeHtml(s.name)}</span>
-          <span style="color:#aaa;">${levelHtml}</span>
+          <span style="color:#aaa;">${levelHtml}${s.costText ? ` · <span class="spell-picker-cost">${escapeHtml(s.costText)}</span>` : ''}</span>
         </div>
       `;
         })

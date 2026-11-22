@@ -44,6 +44,8 @@ export type InventoryItem = {
   proficient: boolean;
   sourceContentId?: string | null;
   attuned?: boolean;
+  /** Muted cost chip for an item with an explicit cost (display only; never posted back). */
+  costSummary?: string;
   damageRolls: string;
   effects: string;
   abilityBonuses: Partial<Record<AbilityKey, number>>;

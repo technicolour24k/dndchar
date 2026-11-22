@@ -3356,3 +3356,10 @@ button.compact-button.active {
   font-size: 13px;
   color: var(--muted);
 }
+
+/* Cost engine: muted cost chip and the Cast dialog lines */
+.cost-chip { display: inline-block; margin: 0 0.35rem; padding: 0 0.4rem; border: 1px solid var(--border, #555); border-radius: 999px; font-size: 0.72rem; font-weight: 400; color: var(--muted, #999); white-space: nowrap; }
+.cast-dialog label { display: grid; gap: 0.2rem; }
+.cast-lines { list-style: none; margin: 0.4rem 0; padding: 0; display: grid; gap: 0.15rem; }
+.cast-lines .short { color: var(--danger, #e06c6c); }
+.spell-picker-cost { font-size: 0.75em; color: #8a8; }

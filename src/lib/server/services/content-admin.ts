@@ -1,13 +1,15 @@
 import { query, withTransaction } from '$lib/server/db';
 import { invalidateReferenceData } from '$lib/server/cache/referenceData';
 import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/services/action-containers';
+import { parseCostJson, validateCostEntries } from '$lib/rules/cost';
+import type { CostEntry } from '$lib/types/cost';
 import type { ContentType } from '$lib/types/content';
 
 export type AdminContentRecord={id:string;type:ContentType;name:string;description:string;key:string;sourceKind:string;
   isArchived:boolean;spellLevel:number|null;school:string;castingTime:string;range:string;components:string;duration:string;
   ritual:boolean;concentration:boolean;classes:string[];category:string;equipmentType:string;requiresAttunement:boolean;
   acBonus:number;toHitBonus:number;damageBonus:number;attackAbility:string;damageRolls:string;
-  resolutionType:string;damageType:string;baseDice:string;saveAbility:string;saveEffect:string;scaling:any};
+  resolutionType:string;damageType:string;baseDice:string;saveAbility:string;saveEffect:string;scaling:any;costJson:CostEntry[]|null};
 
 export async function loadContentAdmin(types:ContentType[],selectedId=''){
   const content=await query<any>(`SELECT c.*,s.spell_level,s.school,s.casting_time,s.spell_range,s.components,s.duration,
@@ -44,6 +46,10 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     JOIN content_definitions c ON c.id=g.granted_content_id WHERE g.source_content_id=$1 AND c.content_type<>'condition' ORDER BY c.name`,[selectedContentId]):{rows:[]};
   const grantCandidates=await query<any>(`SELECT id,name,content_type FROM content_definitions WHERE content_type IN('feat','class_feature') AND is_archived=false ORDER BY name`);
   const spellCandidates=await query<any>(`SELECT id,name FROM content_definitions WHERE content_type='spell' AND is_archived=false ORDER BY name`);
+  // Active pools, plus any archived one the selected entry's stored cost still uses (shown as "(archived)").
+  const pools=await query<any>(`SELECT pool_key,label||CASE WHEN is_archived THEN ' (archived)' ELSE '' END AS label FROM resource_pool_definitions
+    WHERE NOT is_archived OR pool_key IN (SELECT line->>'pool' FROM content_definitions c, jsonb_array_elements(COALESCE(c.cost_json,'[]'::jsonb)) AS line WHERE c.id=NULLIF($1,'')::uuid)
+    ORDER BY is_archived,sort_order,label`,[selectedContentId]);
   const spellAccess=selectedContentId?await query<any>(`SELECT access.*,spell.name AS spell_name FROM content_spell_access access
     JOIN content_definitions spell ON spell.id=access.spell_content_id WHERE access.owner_content_id=$1 ORDER BY access.sort_order,spell.name`,[selectedContentId]):{rows:[]};
   return{content:records,selectedContentId,modifiers:modifiers.rows.map((row:any)=>({id:row.id,target:row.target,targetLabel:row.target_label,
@@ -55,6 +61,7 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     actions:groupActions(actions.rows),actionCandidates:actionCandidates.rows,resources:resources.rows.map((row:any)=>({id:row.id,key:row.resource_key,label:row.label,maxValueExpression:row.max_value_expression,rechargePeriod:row.recharge_period})),
     grants:grants.rows.map((row:any)=>({id:row.id,name:row.name,type:row.content_type,activationType:row.activation_type})),
     grantCandidates:grantCandidates.rows.map((row:any)=>({id:row.id,name:row.name,type:row.content_type})),
+    pools:pools.rows.map((row:any)=>({key:row.pool_key,label:row.label})),
     spellCandidates:spellCandidates.rows,spellAccess:spellAccess.rows.map(mapSpellAccess)};
 }
 
@@ -68,6 +75,9 @@ export async function createAdminContent(userId:string,type:ContentType,form:For
 export async function updateAdminContent(form:FormData){const id=String(form.get('contentId')||'');const result=await withTransaction(async(client)=>{
   const current=await client.query<{content_type:ContentType}>('SELECT content_type FROM content_definitions WHERE id=$1',[id]);if(!current.rowCount)throw new Error('Catalogue entry not found.');
   await client.query('UPDATE content_definitions SET name=$2,description=$3,updated_at=now() WHERE id=$1',[id,String(form.get('name')||'').trim(),String(form.get('description')||'')]);
+  // The Cost block posts costJson: '' means "use the default" (NULL), anything else is the explicit list.
+  if(form.has('costJson')){const cost=await readAdminCost(client,id,current.rows[0].content_type,String(form.get('costJson')||''));
+    if(cost!==undefined)await client.query('UPDATE content_definitions SET cost_json=$2::jsonb WHERE id=$1',[id,cost===null?null:JSON.stringify(cost)]);}
   if(current.rows[0].content_type==='spell')await client.query(`INSERT INTO spell_definitions(content_id,spell_level,school,casting_time,spell_range,components,duration,ritual,concentration,classes,
     resolution_type,damage_type,base_dice,save_ability,save_effect,scaling_json)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb) ON CONFLICT(content_id) DO UPDATE SET spell_level=EXCLUDED.spell_level,school=EXCLUDED.school,
@@ -144,7 +154,7 @@ export async function removeSpellAccess(form:FormData){const id=String(form.get(
 function groupActions(rows:any[]){const map=new Map<string,any>();for(const row of rows){const action=map.get(row.id)||{id:row.id,linkId:row.link_id,name:row.name,description:row.description,triggerType:row.trigger_type,steps:[]};if(row.step_id)action.steps.push({id:row.step_id,type:row.step_type,operation:row.operation,targetType:row.target_type,targetKey:row.target_key,valueExpression:row.value_expression,effectId:row.effect_id,targetMode:row.target_mode,label:row.label,sortOrder:row.sort_order});map.set(row.id,action);}return[...map.values()];}
 function mapSpellAccess(row:any){return{id:row.id,spellContentId:row.spell_content_id,spellName:row.spell_name,accessType:row.access_type,availabilityType:row.availability_type,resourceDefinitionId:row.resource_definition_id,resourceCostExpression:row.resource_cost_expression,castLevelMode:row.cast_level_mode,fixedCastLevel:row.fixed_cast_level,saveDcMode:row.save_dc_mode,fixedSaveDc:row.fixed_save_dc,spellAttackMode:row.spell_attack_mode,fixedSpellAttackBonus:row.fixed_spell_attack_bonus};}
 function mapContent(row:any):AdminContentRecord{return{id:row.id,type:row.content_type,name:row.name,description:row.description,key:row.content_key,sourceKind:row.source_kind,isArchived:row.is_archived,spellLevel:row.spell_level,school:row.school||'',castingTime:row.casting_time||'',range:row.spell_range||'',components:row.components||'',duration:row.duration||'',ritual:Boolean(row.ritual),concentration:Boolean(row.concentration),classes:row.classes||[],category:row.category||'gear',equipmentType:row.equipment_type||'item',requiresAttunement:Boolean(row.requires_attunement),acBonus:row.ac_bonus||0,toHitBonus:row.to_hit_bonus||0,damageBonus:row.damage_bonus||0,attackAbility:row.attack_ability||'str',damageRolls:row.damage_rolls||'',
-  resolutionType:row.resolution_type||'attack',damageType:row.damage_type||'',baseDice:row.base_dice||'',saveAbility:row.save_ability||'dex',saveEffect:row.save_effect||'half',scaling:row.scaling_json||{}};}
+  resolutionType:row.resolution_type||'attack',damageType:row.damage_type||'',baseDice:row.base_dice||'',saveAbility:row.save_ability||'dex',saveEffect:row.save_effect||'half',scaling:row.scaling_json||{},costJson:Array.isArray(row.cost_json)?row.cost_json:null};}
 // Builds spell_definitions.scaling_json from the admin form's plain inputs - a
 // "Scales?" kind select gates which pair of fields is read, so authoring a
 // non-scaling spell (most saves/debuffs) just leaves both blank -> {}.
@@ -154,6 +164,28 @@ function parseSpellScaling(form:FormData):Record<string,unknown>{
     tiers:String(form.get('scalingTiers')||'').split(',').map((value)=>Number(value.trim())).filter((value)=>Number.isFinite(value)&&value>0)};
   if(kind==='leveled')return{kind,extraDicePerSlotLevel:String(form.get('scalingExtraDicePerSlotLevel')||'')||null};
   return{};
+}
+// Parses and validates the admin Cost block. Refuses with a clear message; the item-line-plus-spend_item
+// overlap is only a warning (shown live in the editor), not a refusal.
+// Returns undefined when the posted cost equals what is stored (nothing to re-validate or write, so an
+// entry whose cost uses a since-archived pool can still be saved), null for "use the default".
+const MAX_COST_JSON_LENGTH=4000,MAX_COST_LINES=20;
+async function readAdminCost(client:{query:(text:string,params?:any[])=>Promise<{rows:any[]}>},contentId:string,contentType:string,raw:string):Promise<CostEntry[]|null|undefined>{
+  const stored=(await client.query('SELECT cost_json FROM content_definitions WHERE id=$1',[contentId])).rows[0]?.cost_json??null;
+  if(!raw.trim())return stored===null?undefined:null;
+  if(raw.length>MAX_COST_JSON_LENGTH)throw new Error('That cost is too long.');
+  let value:unknown;try{value=JSON.parse(raw);}catch{throw new Error('The cost could not be read.');}
+  if(Array.isArray(value)&&value.length>MAX_COST_LINES)throw new Error(`A cost can have at most ${MAX_COST_LINES} lines.`);
+  const parsed=parseCostJson(value);if(parsed.errors.length)throw new Error(parsed.errors.join(' '));
+  const entries=parsed.entries??[];
+  if(stored!==null&&JSON.stringify(stored)===JSON.stringify(entries))return undefined;
+  // A pool already in the stored cost stays acceptable even if it has since been archived.
+  const keptKeys=Array.isArray(stored)?stored.map((line:any)=>String(line?.pool)):[];
+  const pools=await client.query('SELECT pool_key FROM resource_pool_definitions WHERE NOT is_archived');
+  const counters=await client.query('SELECT resource_key FROM content_resource_definitions WHERE content_id=$1',[contentId]);
+  const errors=validateCostEntries(entries,{contentType,poolKeys:[...pools.rows.map((r:any)=>r.pool_key),...keptKeys],counterKeys:counters.rows.map((r:any)=>r.resource_key)});
+  if(errors.length)throw new Error(errors.join(' '));
+  return entries;
 }
 function validateDice(value:string){const result=value.replace(/\s+/g,'');if(!/^(?:\d*d\d+|\d+)(?:[+-](?:\d*d\d+|\d+))*$/i.test(result))throw new Error('Amount must contain only numbers, dice, +, and -.');return result;}
 function slug(value:string){return value.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'content';}

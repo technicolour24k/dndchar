@@ -9,10 +9,12 @@ import {
   defaultCostFor,
   effectiveCost,
   overrideDecision,
+  itemCostConflictsWithStep,
   parseCostJson,
   planCost,
   poolMaxima,
-  shortfallMode
+  shortfallMode,
+  validateCostEntries
 } from './cost';
 
 function mod(target: string, modifierType: string, valueExpression: string, conditionExpression = ''): EffectModifier {
@@ -71,6 +73,34 @@ describe('parseCostJson', () => {
   it('rejects a non-text charges key and reports every bad line', () => {
     expect(parseCostJson([{ pool: 'charges', amount: 1, key: 4 }]).errors).toHaveLength(1);
     expect(parseCostJson([{ pool: 'x', amount: 0 }, { pool: 'y', amount: 100 }]).errors).toHaveLength(2);
+  });
+});
+
+describe('validateCostEntries', () => {
+  const ctx = { contentType: 'item', poolKeys: ['vowfire'], counterKeys: ['charge'] };
+  it('accepts known pools, a single unkeyed counter, slots and display lines', () => {
+    expect(validateCostEntries([{ pool: 'vowfire', amount: 1 }, { pool: 'charges', amount: 1 }, { pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'action', amount: 1 }, { pool: 'item', amount: 1 }], ctx)).toEqual([]);
+  });
+  it('refuses unknown pools', () => {
+    expect(validateCostEntries([{ pool: 'vowfyre', amount: 1 }], ctx)).toHaveLength(1);
+  });
+  it('checks counters: unknown key, none, and ambiguous', () => {
+    expect(validateCostEntries([{ pool: 'charges', amount: 1, key: 'nope' }], ctx)).toHaveLength(1);
+    expect(validateCostEntries([{ pool: 'charges', amount: 1 }], { ...ctx, counterKeys: [] })).toHaveLength(1);
+    expect(validateCostEntries([{ pool: 'charges', amount: 1 }], { ...ctx, counterKeys: ['a', 'b'] })).toHaveLength(1);
+    expect(validateCostEntries([{ pool: 'charges', amount: 1, key: 'b' }], { ...ctx, counterKeys: ['a', 'b'] })).toEqual([]);
+  });
+  it('item quantity is for items only', () => {
+    expect(validateCostEntries([{ pool: 'item', amount: 1 }], { ...ctx, contentType: 'feat' })).toHaveLength(1);
+  });
+});
+
+describe('itemCostConflictsWithStep', () => {
+  it('flags an explicit item line alongside a spend_item step only', () => {
+    expect(itemCostConflictsWithStep([{ pool: 'item', amount: 1 }], true)).toBe(true);
+    expect(itemCostConflictsWithStep([{ pool: 'item', amount: 1 }], false)).toBe(false);
+    expect(itemCostConflictsWithStep([{ pool: 'vowfire', amount: 1 }], true)).toBe(false);
+    expect(itemCostConflictsWithStep(null, true)).toBe(false);
   });
 });
 

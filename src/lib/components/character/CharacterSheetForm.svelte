@@ -1658,11 +1658,66 @@
     await runResourceAction('triggerContent',body,`${name} used.`);
   }
 
-  async function castSpell(spell:any){
+  async function castSpell(spell:any,slot?:{type:string;level:number}){
     const body=new FormData();
+    if(slot){body.set('slotType',slot.type);body.set('slotLevel',String(slot.level));}
     if(spell.spellAccessId){body.set('spellAccessId',spell.spellAccessId);body.set('inventoryItemId',spell.inventoryItemId||'');}
     else body.set('instanceId',spell.id);
     await runResourceAction('castSpell',body,`${spell.name} cast.`);
+  }
+
+  // ---- Cast dialog (cost engine Unit 4). A spell whose cost has a slot line or any non-display line
+  // opens a small dialog: pick the slot (upcast), see the other costs against what's available.
+  // Cantrips and free spells (action lines only) cast directly. The server stays authoritative.
+  const DISPLAY_ONLY_COSTS = ['action', 'bonus_action', 'reaction'];
+  let castDialog = $state<{ spell: any; slotKey: string } | null>(null);
+  const castCostEntries = $derived((castDialog?.spell.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; key?: string }>);
+  const castSlotLine = $derived(castCostEntries.find((entry) => entry.pool === 'spell_slot'));
+  const castEligibleSlots = $derived(castSlotLine
+    ? character.spellSlots.filter((slot) => slot.level >= (castSlotLine.level ?? 1))
+        .sort((a, b) => a.level - b.level || (a.type === b.type ? 0 : a.type === 'standard' ? -1 : 1))
+    : []);
+  // Availability of every non-slot, non-display line, plus the chosen slot.
+  const castLines = $derived.by(() => {
+    if (!castDialog) return [] as Array<{ label: string; needed: number; available: number }>;
+    const lines: Array<{ label: string; needed: number; available: number }> = [];
+    const chosen = castEligibleSlots.find((slot) => `${slot.type}:${slot.level}` === castDialog!.slotKey);
+    const counters = castDialog.spell.spellAccessId
+      ? (character.inventory.find((item) => item.id === castDialog!.spell.inventoryItemId)?.resources ?? [])
+      : castDialog.spell.resources.map((r: any) => ({ key: r.key, label: r.label, currentValue: r.currentValue }));
+    for (const entry of castCostEntries) {
+      if (DISPLAY_ONLY_COSTS.includes(entry.pool)) continue;
+      if (entry.pool === 'spell_slot') lines.push({ label: chosen ? `Level ${chosen.level} Spell Slot` : `Level ${entry.level}+ Spell Slot`, needed: entry.amount, available: chosen?.current ?? 0 });
+      else if (entry.pool === 'charges') {
+        const counter = entry.key ? counters.find((c: any) => c.key === entry.key) : counters.length === 1 ? counters[0] : undefined;
+        lines.push({ label: counter?.label ?? 'Counter', needed: entry.amount, available: counter?.currentValue ?? 0 });
+      } else {
+        const pool = character.pools.find((p) => p.key === entry.pool);
+        lines.push({ label: pool?.label ?? entry.pool, needed: entry.amount, available: pool?.current ?? 0 });
+      }
+    }
+    return lines;
+  });
+  const castShort = $derived(castLines.filter((line) => line.available < line.needed));
+
+  function openCast(spell: any) {
+    const entries = (spell.cost?.entries ?? []) as Array<{ pool: string; level?: number; amount: number }>;
+    if (!entries.some((entry) => !DISPLAY_ONLY_COSTS.includes(entry.pool))) { void castSpell(spell); return; }
+    const slotLine = entries.find((entry) => entry.pool === 'spell_slot');
+    const eligible = slotLine
+      ? character.spellSlots.filter((slot) => slot.level >= (slotLine.level ?? 1))
+          .sort((a, b) => a.level - b.level || (a.type === b.type ? 0 : a.type === 'standard' ? -1 : 1))
+      : [];
+    const pick = eligible.find((slot) => slot.current >= (slotLine?.amount ?? 1)) ?? eligible[0];
+    castDialog = { spell, slotKey: pick ? `${pick.type}:${pick.level}` : '' };
+  }
+
+  async function confirmCast() {
+    if (!castDialog) return;
+    const { spell, slotKey } = castDialog;
+    const [type, level] = slotKey.split(':');
+    castDialog = null;
+    await castSpell(spell, castSlotLine && slotKey ? { type, level: Number(level) } : undefined);
   }
 
   // db-traffic-reduction Phase 4: this used to stash its message in sessionStorage and do a
@@ -1735,6 +1790,7 @@
     if (inventoryMessage) { inventoryMessage = null; return; }
     if (simpleItemOpen) { simpleItemOpen = false; return; }
     if (newItemOpen) { newItemOpen = false; return; }
+    if (castDialog) { castDialog = null; return; }
     if (formulaHelp) { formulaHelp = null; return; }
     if (playerModificationsOpen) { playerModificationsOpen = false; return; }
     if (activityLogOpen) { activityLogOpen = false; return; }
@@ -2164,7 +2220,7 @@
             <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
-                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
+                <article class="content-instance-row"><div><strong>{spell.name}</strong>{#if spell.cost?.summary}<span class="cost-chip" title="Cost to cast">{spell.cost.summary}</span>{/if}<span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => openCast(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
               {/each}
             </div>
           </div>
@@ -2210,7 +2266,7 @@
       <div class="content-instance-list">
         {#each [...characterFeatures, ...characterFeats] as entry}
           <article class="content-instance-card">
-            <div class="panel-head compact-head"><div><span class="eyebrow">{entry.type.replace('_', ' ')}{entry.grantedBy ? ` / granted by ${entry.grantedBy}` : ''}</span><h3>{entry.name}</h3></div>{#if !entry.grantedBy}<button type="button" class="danger compact-button" onclick={() => runContentAction('removeContent', { instanceId: entry.id })}>Remove</button>{/if}</div>
+            <div class="panel-head compact-head"><div><span class="eyebrow">{entry.type.replace('_', ' ')}{entry.grantedBy ? ` / granted by ${entry.grantedBy}` : ''}</span><h3>{entry.name}{#if entry.cost?.summary} <span class="cost-chip" title="Cost to use">{entry.cost.summary}</span>{/if}</h3></div>{#if !entry.grantedBy}<button type="button" class="danger compact-button" onclick={() => runContentAction('removeContent', { instanceId: entry.id })}>Remove</button>{/if}</div>
             <p>{entry.description}</p>
             {#if entry.hasResourceActions}<button type="button" class="compact-button" onclick={() => triggerContentResourceAction(entry.id,entry.name)}>Use Actions</button>{/if}
             {#each entry.resources as resource}
@@ -2332,6 +2388,7 @@
               </label>
               <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
               <div class="row-actions">
+                {#if item.costSummary}<span class="cost-chip" title="Cost to use">{item.costSummary}</span>{/if}
                 <button type="button" class="compact-button" onclick={useInventoryItem}>Use</button>
                 <button type="button" class="compact-button danger" onclick={removeInventoryItem}>Remove</button>
               </div>
@@ -2760,6 +2817,23 @@
     </div>
   {/if}
 
+  {#if castDialog}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (castDialog = null))}>
+      <div class="panel compact-modal cast-dialog" role="dialog" aria-modal="true" aria-labelledby="cast-dialog-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head"><h2 id="cast-dialog-title">Cast {castDialog.spell.name}</h2><span class="cost-chip">{castDialog.spell.cost.summary}</span></div>
+        {#if castSlotLine}
+          <label>Slot
+            <select bind:value={castDialog.slotKey}>
+              {#each castEligibleSlots as slot}<option value={`${slot.type}:${slot.level}`}>{slot.type === 'pact' ? `Pact (level ${slot.level})` : `Level ${slot.level}`} - {slot.current} left{slot.level > (castSlotLine.level ?? 1) ? ' (upcast)' : ''}</option>{:else}<option value="">No suitable slot</option>{/each}
+            </select>
+          </label>
+        {/if}
+        <ul class="cast-lines">{#each castLines as line}<li class:short={line.available < line.needed}>{line.needed} {line.label} <span class="muted">(have {line.available})</span></li>{/each}</ul>
+        {#if castShort.length}<p class="form-error">It doesn't look like you've got the capacity to do that. {castShort.map((line) => `Needs ${line.needed} ${line.label}, you have ${line.available}.`).join(' ')}</p>{/if}
+        <div class="actions"><button type="button" onclick={confirmCast}>Cast</button><button type="button" class="text-button" onclick={() => (castDialog = null)}>Cancel</button></div>
+      </div>
+    </div>
+  {/if}
   {#if formulaHelp}
     {@const statKey = formulaHelp.statKey}
     {@const stat = statKey ? stats[statKey] : null}

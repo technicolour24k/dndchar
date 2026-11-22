@@ -1,12 +1,15 @@
 <script lang="ts">
   import type { ContentType } from '$lib/types/content';
   import type { AdminContentRecord } from '$lib/server/services/content-admin';
+  import CostEditor from './CostEditor.svelte';
 
   let { data, form, title, description, createType, allowedTypes }:{
     data:any; form:any; title:string; description:string; createType:ContentType;
     allowedTypes:ContentType[];
   }=$props();
   const selected=$derived(data.content.find((entry:AdminContentRecord)=>entry.id===data.selectedContentId) as AdminContentRecord|undefined);
+  // An on_use Spend Item step already pays the item's quantity (see CostEditor's warning).
+  const hasSpendItemStep=$derived(data.actions.some((action:any)=>action.triggerType==='on_use'&&action.steps.some((step:any)=>step.type==='spend_item')));
   let actionTarget=$state('hp');
   let actionStepType=$state('resource_change');
   let librarySearch=$state('');
@@ -93,6 +96,7 @@
           </div>
           <label>Extra Dice per Slot Level Above Minimum (leveled/upcast)<input name="scalingExtraDicePerSlotLevel" value={selected.scaling?.extraDicePerSlotLevel||''} placeholder="1d6"/></label>
         {/if}
+        {#key selected.id}<CostEditor initial={selected.costJson} contentType={selected.type} spellLevel={selected.spellLevel} castingTime={selected.castingTime} {hasSpendItemStep} pools={data.pools} counters={data.resources.map((resource:any)=>({key:resource.key,label:resource.label}))}/>{/key}
         <p class="muted">Key: {selected.key}</p>
         <div class="button-row"><button type="submit">Save Entry</button><button type="submit" formaction="?/archive" class="danger">{selected.isArchived?'Restore':'Archive'}</button></div>
       </form>

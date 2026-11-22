@@ -136,6 +136,42 @@ export function applySpellAccessCost(entries: CostEntry[], access: SpellAccessCo
 }
 
 // ---------------------------------------------------------------------------------------------
+// Authoring validation
+// ---------------------------------------------------------------------------------------------
+
+// Checks a parsed cost against the world it will be saved into: every character pool key must be an
+// active definition, a charges line must name one of THIS entry's counters (or be unambiguous),
+// and item quantity only makes sense on an item. Returns human messages; empty means fine.
+export function validateCostEntries(
+  entries: CostEntry[],
+  ctx: { contentType: string; poolKeys: string[]; counterKeys: string[] }
+): string[] {
+  const errors: string[] = [];
+  for (const entry of entries) {
+    if (ACTION_ECONOMY_POOLS.includes(entry.pool) || entry.pool === 'spell_slot') continue;
+    if (entry.pool === 'item') {
+      if (ctx.contentType !== 'item') errors.push('Item quantity can only be a cost on an item.');
+      continue;
+    }
+    if (entry.pool === 'charges') {
+      const key = (entry as { key?: string }).key;
+      if (key && !ctx.counterKeys.includes(key)) errors.push(`This entry has no counter "${key}". Add it under Resources first.`);
+      else if (!key && ctx.counterKeys.length === 0) errors.push('A counter cost needs a counter. Add one under Resources first.');
+      else if (!key && ctx.counterKeys.length > 1) errors.push('This entry has several counters, so choose which one the cost uses.');
+      continue;
+    }
+    if (!ctx.poolKeys.includes(entry.pool)) errors.push(`"${entry.pool}" isn't an active resource pool.`);
+  }
+  return errors;
+}
+
+// True when an item would pay its quantity twice: an explicit item line AND an on_use spend_item step.
+// The engine drops the item line (the step keeps paying), so this is only a heads-up for authors.
+export function itemCostConflictsWithStep(entries: CostEntry[] | null, hasSpendItemStep: boolean): boolean {
+  return hasSpendItemStep && Boolean(entries?.some((entry) => entry.pool === 'item'));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pool maxima
 // ---------------------------------------------------------------------------------------------
 
