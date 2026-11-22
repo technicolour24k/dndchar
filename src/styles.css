@@ -3023,9 +3023,20 @@ button.text-button.danger-text:hover {
   gap: 6px;
 }
 
+/* Overworld: the mode you're in (Draw route, Add pin, ...) and the main action (Save) are gold with
+   dark text, so they stand out; disabled buttons are dimmed outlines, so it's clear they can't be
+   pressed yet. (--accent is the app's text colour, which made these white-on-white.) */
 button.compact-button.active {
-  background: var(--accent, #7c5cff);
-  color: #fff;
+  background: #d4a928;
+  color: #111;
+}
+
+.ow-page button.compact-button:disabled {
+  background: transparent;
+  color: var(--muted);
+  box-shadow: inset 0 0 0 1px var(--line);
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .ow-banner,
