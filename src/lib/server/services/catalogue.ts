@@ -7,8 +7,9 @@ import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzyS
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { listPoolDefinitions, loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
-import { resetTurnState } from '$lib/server/services/turn-state';
-import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson } from '$lib/rules/cost';
+import { characterProfile, lockTurnState, resetTurnState } from '$lib/server/services/turn-state';
+import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson, withCategory } from '$lib/rules/cost';
+import { inferCategory } from '$lib/rules/actionEconomy';
 import type { CostEntry } from '$lib/types/cost';
 import { payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
@@ -357,9 +358,11 @@ function paidToResults(paid:PaidLine[]):ActionResult[]{
   return paid.map((line)=>({label:'Cost',target:line.label,expression:String(-line.delta),rolled:-line.delta,before:line.before,after:line.after}));
 }
 
-// `poolLabels` (pool key -> label) can be passed by a caller that already loaded the definitions.
-export async function listCharacterContent(characterId: string, knownPoolLabels?: Record<string, string>): Promise<CharacterContentInstance[]> {
+// `poolLabels` (pool key -> label) and `profileKey` (the action-economy profile, which words the turn
+// line: "1 Action" vs "1 Attack action") can be passed by a caller that already has them.
+export async function listCharacterContent(characterId: string, knownPoolLabels?: Record<string, string>, knownProfileKey?: string): Promise<CharacterContentInstance[]> {
   const poolLabels = knownPoolLabels ?? Object.fromEntries((await listPoolDefinitions({ includeArchived: true })).map((pool) => [pool.key, pool.label]));
+  const profileKey = knownProfileKey ?? (await characterProfile({ query }, characterId)).key;
   const result = await query<any>(`SELECT i.*, c.content_type, c.name, c.description, c.cost_json, s.spell_level, s.casting_time,
     s.resolution_type, s.damage_type, s.base_dice, s.save_ability, s.save_effect, s.scaling_json,
     EXISTS(SELECT 1 FROM content_action_links action WHERE action.content_id=c.id) AS has_resource_actions
@@ -375,7 +378,7 @@ export async function listCharacterContent(characterId: string, knownPoolLabels?
     notes: row.notes, spellLevel: row.spell_level, hasResourceActions: row.has_resource_actions,
     // "Use Actions" on a spell is free unless a DM set a cost (see cost-engine's 'content' kind), so a
     // spell's slot cost belongs to Cast only; feats and features show their explicit cost.
-    cost: costView(row.cost_json, row.content_type === 'spell' ? defaultCostFor({ contentType: 'spell', spellLevel: row.spell_level, castingTime: row.casting_time }) : [], poolLabels),
+    cost: costView(row.cost_json, row.content_type === 'spell' ? defaultCostFor({ contentType: 'spell', spellLevel: row.spell_level, castingTime: row.casting_time }) : [], poolLabels, profileKey, inferCategory(row.content_type)),
     spellDamage: row.content_type === 'spell' ? {
       resolutionType: row.resolution_type, damageType: row.damage_type, baseDice: row.base_dice,
       saveAbility: row.save_ability, saveEffect: row.save_effect, scaling: row.scaling_json || {}
@@ -407,21 +410,21 @@ export async function listCharacterContent(characterId: string, knownPoolLabels?
   return [...instances, ...grants.rows.map((row: any): CharacterContentInstance => ({
     id: `grant:${row.id}`, contentId: row.content_id, type: row.content_type, name: row.name,
     description: row.description, isKnown: true, isPrepared: true, isActive: true, notes: '',
-    spellLevel: null, grantedBy: row.source_name, resources: [], cost: costView(row.cost_json, [], poolLabels)
+    spellLevel: null, grantedBy: row.source_name, resources: [], cost: costView(row.cost_json, [], poolLabels, profileKey, inferCategory(row.content_type))
   })),...spellAccess.rows.map((row:any):CharacterContentInstance=>({id:`spell-access:${row.id}:${row.inventory_id}`,
     contentId:row.spell_content_id,type:'spell',name:row.name,description:row.description,isKnown:true,isPrepared:true,isActive:true,
     notes:'',spellLevel:row.spell_level,grantedBy:row.source_name,spellAccessId:row.id,inventoryItemId:row.inventory_id,resources:[],
-    cost:costView(row.cost_json,defaultCostFor({contentType:'spell',spellLevel:row.spell_level,castingTime:row.casting_time}),poolLabels,
+    cost:costView(row.cost_json,defaultCostFor({contentType:'spell',spellLevel:row.spell_level,castingTime:row.casting_time}),poolLabels,profileKey,'spell',
       {accessType:row.access_type,resourceKey:row.resource_key,resourceCostExpression:row.resource_cost_expression})}))];
 }
 
 // The cost shown on the sheet: explicit cost_json when a DM set one, else the type's default. A spell
 // access replaces the spell's slot line with its own rule (same maths as the cost engine).
-function costView(costJson: unknown, defaults: CostEntry[], labels: Record<string, string>, access?: Parameters<typeof applySpellAccessCost>[1]): { entries: CostEntry[]; summary: string } {
+function costView(costJson: unknown, defaults: CostEntry[], labels: Record<string, string>, profileKey: string, category: Parameters<typeof withCategory>[1], access?: Parameters<typeof applySpellAccessCost>[1]): { entries: CostEntry[]; summary: string } {
   const parsed = parseCostJson(costJson, { stored: true });
-  let entries = effectiveCost(parsed.errors.length ? null : parsed.entries, defaults);
+  let entries = withCategory(effectiveCost(parsed.errors.length ? null : parsed.entries, defaults), category);
   if (access) entries = applySpellAccessCost(entries, access);
-  return { entries, summary: entries.length ? costSummary(entries, labels) : '' };
+  return { entries, summary: entries.length ? costSummary(entries, labels, profileKey) : '' };
 }
 
 export async function castCharacterSpell(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<ActionResult[]>{
@@ -429,10 +432,13 @@ export async function castCharacterSpell(userId:string,characterId:string,form:F
 }
 
 // Same cast, but also says which slot was spent (the VTT mirrors it onto the token).
-export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null}>{
+export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null;castAtLevel?:number}>{
   const requestedType=String(form.get('slotType')||'');
-  const slotChoice={slotType:requestedType==='standard'||requestedType==='pact'?requestedType:undefined,slotLevel:Number(form.get('slotLevel'))||undefined} as const;
+  const slotChoice={slotType:requestedType==='standard'||requestedType==='pact'?requestedType:undefined,slotLevel:Number(form.get('slotLevel'))||undefined,
+    // An echo (a free repeat of a waiting follow-up) is chosen explicitly; a plain cast never spends one.
+    ...(form.get('followup')==='use'||form.get('followup')==='skip'?{followup:form.get('followup') as 'use'|'skip'}:{})} as const;
   return withTransaction(async(client)=>{await assertCanAct(client,userId,characterId);
+    await lockTurnState(client,characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     const accessId=String(form.get('spellAccessId')||'');let spellId='';let activation:Activation;let context:{inventoryId?:string;instanceId?:string};
     if(accessId){
       const inventoryId=String(form.get('inventoryItemId')||'');
@@ -453,7 +459,9 @@ export async function castCharacterSpellDetailed(userId:string,characterId:strin
     const paid=await payActivationCost(client,characterId,activation,{actorUserId:userId,override:costOverride});
     const effects=await executeContentActions(client,characterId,spellId,['on_cast','on_use'],context);
     const slot=paid.find((line)=>line.slot);
-    return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null};
+    // A spell echo (free follow-up) spends no slot; castAtLevel says which level it resolves at.
+    const echo=paid.find((line)=>line.castAtLevel!==undefined);
+    return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null,...(echo?{castAtLevel:echo.castAtLevel}:{})};
   });
 }
 
@@ -505,6 +513,7 @@ export type ResourceActionResult=ActionResult;
 export async function useInventoryCatalogueItem(userId: string, characterId: string, inventoryId: string, costOverride?: CostOverride | null): Promise<ResourceActionResult[]> {
   return withTransaction(async (client) => {
     await assertCanAct(client, userId, characterId);
+    await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     const item = await client.query<any>(`SELECT source_content_id,quantity FROM character_inventory_items
       WHERE id=$1 AND character_id=$2 AND quantity>0 FOR UPDATE`, [inventoryId, characterId]);
     if (!item.rowCount) throw new Error('Inventory item is unavailable.');
@@ -539,6 +548,7 @@ export async function restCharacter(userId: string, characterId: string, rest: '
   const loadedPools = await loadPoolMaxima(characterId); // before the transaction: it reads on its own connection
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
+    await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     const periods = rest === 'long_rest' ? ['short_rest', 'long_rest', 'dawn'] : ['short_rest'];
     // Lock order (see cost-engine.ts): slots -> content counters -> inventory counters -> character_resources.
     await client.query(`UPDATE character_spell_slots SET current_slots = max_slots
@@ -571,7 +581,7 @@ export async function restCharacter(userId: string, characterId: string, rest: '
         });
       }
     }
-    await resetTurnState(client, characterId); // a rest starts a fresh turn; the turn row is always last (lock order)
+    await resetTurnState(client, characterId); // a rest starts a fresh turn (the row was locked first)
   });
 }
 
@@ -585,6 +595,7 @@ export async function getCombatClock(characterId: string): Promise<{ roundNumber
 export async function advanceCharacterRound(userId: string, characterId: string): Promise<void> {
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
+    await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 2, 1)
       ON CONFLICT (character_id) DO UPDATE SET round_number = character_combat_clocks.round_number + 1,
         turn_number = 1, updated_at = now()`, [characterId]);
@@ -601,6 +612,7 @@ export async function advanceCharacterRound(userId: string, characterId: string)
 export async function advanceCharacterTurn(userId: string, characterId: string): Promise<void> {
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
+    await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1,1,2)
       ON CONFLICT (character_id) DO UPDATE SET turn_number=character_combat_clocks.turn_number+1, updated_at=now()`, [characterId]);
     await client.query(`UPDATE active_character_effects SET remaining_rounds=GREATEST(0,remaining_rounds-1)
@@ -624,6 +636,7 @@ export async function newBattle(userId: string, characterId: string): Promise<vo
   const loadedPools = await loadPoolMaxima(characterId);
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
+    await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 1, 1)
       ON CONFLICT (character_id) DO UPDATE SET round_number = 1, turn_number = 1, updated_at = now()`, [characterId]);
     // Lock order (see cost-engine.ts): content counters -> inventory counters -> character_resources.

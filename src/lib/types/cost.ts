@@ -15,12 +15,17 @@ export const ACTION_ECONOMY_POOLS: readonly string[] = ['action', 'bonus_action'
 
 export type SlotType = 'standard' | 'pact';
 
+// Whether an activation spends a waiting follow-up ('use': Extra Attack, a spell echo) or pays
+// normally ('skip'). Weapon attacks default to 'use'. Spells default to 'skip': an echo must be
+// chosen, or a normal L5 Fireball would silently become a free L3 echo.
+export type FollowupChoice = 'use' | 'skip';
+
 export type Activation =
-  | { kind: 'spell'; instanceId: string; slotType?: SlotType; slotLevel?: number }
-  | { kind: 'spell_access'; spellAccessId: string; inventoryItemId: string; slotType?: SlotType; slotLevel?: number }
+  | { kind: 'spell'; instanceId: string; slotType?: SlotType; slotLevel?: number; followup?: FollowupChoice }
+  | { kind: 'spell_access'; spellAccessId: string; inventoryItemId: string; slotType?: SlotType; slotLevel?: number; followup?: FollowupChoice }
   | { kind: 'item'; inventoryId: string }
   | { kind: 'content'; instanceId: string }
-  | { kind: 'weapon_attack'; inventoryId: string | null; label?: string; timing?: 'action' | 'bonus_action' | 'reaction' }
+  | { kind: 'weapon_attack'; inventoryId: string | null; label?: string; timing?: 'action' | 'bonus_action' | 'reaction'; followup?: FollowupChoice }
   | { kind: 'dash'; count: number };
 
 export type CostShortfall = { label: string; needed: number; available: number };

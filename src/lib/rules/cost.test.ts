@@ -423,15 +423,25 @@ describe('activationSignature', () => {
   });
   it('weapon_attack: stable, an id names the weapon, a label names an id-less attack, timing counts', () => {
     const sig = (a: Activation) => activationSignature(a);
-    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).toBe('weapon_attack|w1||action');
+    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).toBe('weapon_attack|w1||action|use');
     expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).toBe(sig({ kind: 'weapon_attack', inventoryId: 'w1', timing: 'action' }));
     expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).not.toBe(sig({ kind: 'weapon_attack', inventoryId: 'w1', timing: 'reaction' }));
     expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).not.toBe(sig({ kind: 'weapon_attack', inventoryId: 'w2' }));
     // The label is ignored once there is an id, and matters when there isn't.
     expect(sig({ kind: 'weapon_attack', inventoryId: 'w1', label: 'x' })).toBe(sig({ kind: 'weapon_attack', inventoryId: 'w1', label: 'y' }));
-    expect(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike' })).toBe('weapon_attack|none|Unarmed Strike|action');
+    expect(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike' })).toBe('weapon_attack|none|Unarmed Strike|action|use');
     expect(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike' })).not.toBe(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Bite' }));
-    expect(sig({ kind: 'weapon_attack', inventoryId: null })).toBe('weapon_attack|none||action');
+    expect(sig({ kind: 'weapon_attack', inventoryId: null })).toBe('weapon_attack|none||action|use');
+  });
+  it('the follow-up choice is part of the signature: weapons default to use, spells to skip', () => {
+    const w = (followup?: 'use' | 'skip') => activationSignature({ kind: 'weapon_attack', inventoryId: 'w1', ...(followup ? { followup } : {}) });
+    expect(w()).toBe(w('use'));
+    expect(w('skip')).not.toBe(w('use'));
+    const s = (followup?: 'use' | 'skip') => activationSignature({ kind: 'spell', instanceId: 'i1', slotType: 'standard', slotLevel: 3, ...(followup ? { followup } : {}) });
+    expect(s()).toBe(s('skip'));
+    expect(s('use')).not.toBe(s('skip'));
+    const a = (followup?: 'use' | 'skip') => activationSignature({ kind: 'spell_access', spellAccessId: 'a', inventoryItemId: 'b', ...(followup ? { followup } : {}) });
+    expect(a('use')).not.toBe(a());
   });
   it('dash: stable per count and distinct from everything else', () => {
     expect(activationSignature({ kind: 'dash', count: 1 })).toBe('dash|1');
@@ -575,6 +585,16 @@ describe('turn lines: planCost', () => {
     expect(planCost([line('action', 'spell')], a, { followupClass: 'spell' }).shortfalls).toEqual([{ label: 'Attack', needed: 1, available: 0 }]);
     expect(planCost([line('action', 'attack')], a, { followupClass: 'ranged' }).lines[0].payFrom).toEqual({ pool: 'followup', cls: 'ranged' });
     expect(planCost([line('action', 'spell')], turn('dnd5e', {}, { cantrip: 2 }), { followupClass: 'cantrip' }).lines[0].payFrom).toEqual({ pool: 'followup', cls: 'cantrip' });
+  });
+  it('a follow-up only covers a one-action line', () => {
+    const two: CostEntry = { pool: 'turn', amount: 2, timing: 'action', category: 'attack' };
+    const a = turn('attack_utility', { attack: 2 }, { melee: 3 });
+    const plan = planCost([two], a, { followupClass: 'melee' });
+    expect(plan.lines[0].payFrom).toEqual({ pool: 'turn', key: 'attack' });
+    const spellTwo: CostEntry[] = [{ pool: 'spell_slot', amount: 1, level: 3 }, { pool: 'turn', amount: 2, timing: 'action', category: 'spell' }];
+    const echo = planCost(spellTwo, { ...turn('attack_utility', { attack: 2 }, { spell: 2 }), slots: slots3 }, { followupClass: 'spell' });
+    expect(echo.castAtLevel).toBeUndefined();
+    expect(echo.lines).toHaveLength(2);
   });
   it('with no follow-ups left the pool pays', () => {
     const a = turn('attack_utility', { attack: 1 }, { melee: 0 });

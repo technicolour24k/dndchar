@@ -254,7 +254,7 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
     turn,
     actionEconomy: turn.profileKey,
     resources: await getResources(characterId),
-    inventory: await getInventory(characterId, poolLabels),
+    inventory: await getInventory(characterId, poolLabels, turn.profileKey),
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId),
     proficiencies: await getProficiencies(characterId),
@@ -263,7 +263,7 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
     modifierAudit: resolvedModifiers.audit,
     availableEffects: await listEffectDefinitions(),
     exhaustionLevel: await getExhaustionLevel(characterId),
-    content: await listCharacterContent(characterId, poolLabels),
+    content: await listCharacterContent(characterId, poolLabels, turn.profileKey),
     spellSlots: await listSpellSlots(characterId),
     combatClock: await getCombatClock(characterId)
   });
@@ -778,7 +778,7 @@ async function getResources(characterId: string): Promise<CharacterResource[]> {
   }));
 }
 
-async function getInventory(characterId: string, knownPoolLabels?: Record<string, string>): Promise<InventoryItem[]> {
+async function getInventory(characterId: string, knownPoolLabels?: Record<string, string>, profileKey?: string): Promise<InventoryItem[]> {
   const result = await query<{
     id: string;
     name: string;
@@ -826,7 +826,7 @@ async function getInventory(characterId: string, knownPoolLabels?: Record<string
     sourceContentId: row.source_content_id,
     attuned: row.attuned,
     // Only an explicit cost shows (the default item cost, one of itself, would be noise).
-    costSummary: (() => { const parsed = parseCostJson(row.source_cost_json, { stored: true }); return parsed.entries?.length ? costSummary(parsed.entries, poolLabels) : undefined; })(),
+    costSummary: (() => { const parsed = parseCostJson(row.source_cost_json, { stored: true }); return parsed.entries?.length ? costSummary(parsed.entries, poolLabels, profileKey) : undefined; })(),
     damageRolls: row.damage_rolls,
     effects: row.effects,
     abilityBonuses: {

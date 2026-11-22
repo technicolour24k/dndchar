@@ -5,6 +5,7 @@ import { assertCanEditCharacter, getCampaignAccess, isUuid, type Queryable } fro
 import { CampaignError } from '$lib/server/campaignError';
 import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
 import { abilityMap, abilityModifier, totalLevel } from '$lib/rules/dnd5e';
+import { profileFor, turnCostLabel } from '$lib/rules/actionEconomy';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { ledgerBadge, poolMaxima, undoMessage, type PoolMaxContext, type PoolMaximum } from '$lib/rules/cost';
 import type { ActiveCharacterEffect, CharacterAbility, CharacterClass, CharacterPool } from '$lib/types/character';
@@ -385,9 +386,9 @@ export type ReviewResult = {
   characterId?: string; characterName?: string; sourceLabel?: string; roomId?: string | null; refunded?: string[];
 };
 
-// Refund order follows the lock order in cost-engine.ts: slots, content counters, inventory counters, item, pools.
+// Refund order follows the lock order in cost-engine.ts: (turn row, taken first above), slots, content counters, inventory counters, item, pools.
 const refundRank = (row: { pool: string; pool_detail: any }) =>
-  row.pool === 'spell_slot' ? 0 : row.pool === 'charges' ? (row.pool_detail?.scope === 'inventory' ? 2 : 1) : row.pool === 'item' ? 3 : 4;
+  row.pool === 'spell_slot' ? 0 : row.pool === 'charges' ? (row.pool_detail?.scope === 'inventory' ? 2 : 1) : row.pool === 'item' ? 3 : row.pool.startsWith('turn:') ? 5 : 4; // the turn row is already locked (first); 5 only keeps the refund list reading slot, pools, action
 
 // OK or Undo for one self-override activation. Only for a campaign DM/co-DM (or the site admin
 // override, same as the rest of the campaign page). Idempotent: a second review changes nothing and
@@ -425,12 +426,61 @@ export async function reviewOverride(
     const refunded: string[] = [];
     const problems: string[] = [];
     if (outcome === 'undo') {
+      // The turn row is the FIRST lock (see cost-engine.ts), so it is taken before any slot, counter
+      // or pool below. Its follow-ups are unwound here too: an action that earned Extra Attack
+      // repeats takes them back (clamped at 0), but only while it is still the same turn and profile.
+      const turnRows = rows.filter((row) => row.pool.startsWith('turn:'));
+      let turnState: { profile: string; spent: Record<string, number>; followups: Record<string, any>; seq: number; current: string } | null = null;
+      if (turnRows.length) {
+        const current = await client.query(
+          `SELECT cp.action_economy FROM characters c LEFT JOIN campaigns cp ON cp.id = c.campaign_id AND NOT cp.is_archived WHERE c.id = $1`, [characterId]);
+        const locked = (await client.query('SELECT profile_key, turn_seq, spent_json, followups_json FROM character_turn_state WHERE character_id = $1 FOR UPDATE', [characterId])).rows[0];
+        if (locked) {
+          turnState = { profile: locked.profile_key, spent: { ...(locked.spent_json ?? {}) }, followups: structuredClone(locked.followups_json ?? {}), seq: locked.turn_seq, current: profileFor(current.rows[0]?.action_economy).key };
+        }
+      }
+      const sameTurn = (detail: any) => Boolean(turnState && turnState.profile === detail.profile && turnState.current === detail.profile && turnState.seq === detail.turnSeq);
+      if (turnState) {
+        let unwound = false;
+        for (const row of turnRows) {
+          const detail = row.pool_detail ?? {};
+          const cls = detail.grantedCls as string | undefined;
+          const count = Number(detail.grantedCount) || 0;
+          if (!cls || count <= 0 || !sameTurn(detail) || !turnState.followups[cls]) continue;
+          turnState.followups[cls].remaining = Math.max(0, (Number(turnState.followups[cls].remaining) || 0) - count);
+          unwound = true;
+        }
+        if (unwound) await client.query('UPDATE character_turn_state SET followups_json = $2::jsonb, updated_at = now() WHERE character_id = $1', [characterId, JSON.stringify(turnState.followups)]);
+      }
       const paid = rows.filter((row) => row.delta < 0).sort((a, b) => refundRank(a) - refundRank(b));
       for (const row of paid) {
         const n = -row.delta as number;
         const detail = row.pool_detail ?? {};
         let before: number | null = null;
         let after: number | null = null;
+        if (row.pool.startsWith('turn:')) {
+          // A per-turn action spend (override rows only; normal ones aren't ledgered). Refunded only
+          // while it is still the same turn under the same profile, else the turn has moved on.
+          const key = row.pool.slice('turn:'.length);
+          const label = turnCostLabel(profileFor(detail.profile), key, n);
+          if (!turnState || !sameTurn(detail)) {
+            problems.push(`${label} not refunded - the turn has been reset since`);
+            continue;
+          }
+          const spentNow = Number(turnState.spent[key]) || 0;
+          const actual = Math.min(n, spentNow);
+          if (actual > 0) {
+            turnState.spent[key] = spentNow - actual;
+            await client.query('UPDATE character_turn_state SET spent_json = $2::jsonb, updated_at = now() WHERE character_id = $1', [characterId, JSON.stringify(turnState.spent)]);
+            refunded.push(turnCostLabel(profileFor(detail.profile), key, actual));
+            await writeLedger(client, {
+              characterId, pool: row.pool, poolDetail: detail, label: row.label, delta: actual, before: null, after: null, reason: 'refund',
+              sourceContentId: row.source_content_id, sourceLabel: row.source_label, activationId, actorUserId: reviewerUserId, roomId: row.room_id, refundOf: row.id
+            });
+          }
+          if (actual < n) problems.push(`Refunded ${actual} of ${n} ${row.label} (it was already refunded or adjusted by hand)`);
+          continue;
+        }
         if (row.pool === 'spell_slot') {
           const slot = await client.query(
             `SELECT current_slots, max_slots FROM character_spell_slots WHERE character_id = $1 AND slot_type = $2 AND slot_level = $3 FOR UPDATE`,

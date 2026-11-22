@@ -10,10 +10,18 @@ import type { ActiveCharacterEffect } from '$lib/types/character';
 // Per-turn action pools (action economy, plans/dndchar/action-economy). What a character has SPENT
 // this turn lives in character_turn_state, one lazy row per character (no row = nothing spent).
 // It is not in character_resources on purpose: the whole-sheet Save wipes non-pool rows there and
-// snapshots copy that table. LOCK ORDER: the turn row is always taken LAST, after every resource
+// snapshots copy that table. LOCK ORDER: the turn row is always taken FIRST, before every resource
 // row (see cost-engine.ts).
 
 export const TURN_LOG_CAP = 30;
+
+// Locks the turn row without reading anything from it. Every multi-resource writer that also resets
+// the turn (rests, New Battle, Next Turn, Next Round) calls this FIRST in its transaction: the turn
+// row is the first lock in the global order (see cost-engine.ts), because a cast holds it while its
+// on_cast steps lock slots, counters and pools.
+export async function lockTurnState(client: pg.PoolClient, characterId: string): Promise<void> {
+  await lockTurnRow(client, characterId, (await characterProfile(client, characterId)).key);
+}
 
 // The profile a character plays by: its live campaign's, else 5e.
 export async function characterProfile(db: Queryable, characterId: string): Promise<ActionEconomyProfile> {

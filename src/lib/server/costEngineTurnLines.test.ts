@@ -13,38 +13,38 @@ function fakeClient(costJson: unknown) {
     query: async (text: string) => {
       sql.push(text);
       if (/FROM character_content_instances/.test(text)) return { rows: [{ id: 'c1', name: 'Second Wind', cost_json: costJson }], rowCount: 1 };
-      return { rows: [], rowCount: 0 };
+      return { rows: [], rowCount: 0 }; // no campaign: the character plays 5e
     }
   };
   return { client: client as never, sql };
 }
 const activation = { kind: 'content', instanceId: 'i1' } as const;
+const touchesState = (text: string) => /FOR UPDATE|character_resources|resource_pool_definitions|character_turn_state/.test(text);
 
-describe('turn-only costs take no locks and load no pool maxima', () => {
+// A Free or movement turn line costs nothing, so it takes no locks and loads no pool maxima.
+describe('turn-only costs that cost nothing take no locks and load no pool maxima', () => {
   for (const [name, cost] of [
-    ['a turn line', [{ pool: 'turn', amount: 1, timing: 'bonus_action', category: 'general' }]],
-    ['a legacy action line', [{ pool: 'action', amount: 1 }]],
-    ['a free turn line', [{ pool: 'turn', amount: 1, timing: 'free' }]]
+    ['a free turn line', [{ pool: 'turn', amount: 1, timing: 'free' }]],
+    ['a movement turn line', [{ pool: 'turn', amount: 1, timing: 'movement', category: 'general' }]]
   ] as const) {
-    it(`paying ${name} returns at once after reading the content row`, async () => {
+    it(`paying ${name} spends nothing and locks nothing`, async () => {
       const { client, sql } = fakeClient(cost);
       expect(await payActivationCost(client, 'char', activation, { actorUserId: 'u' })).toEqual([]);
-      expect(sql).toHaveLength(1);
+      expect(sql.some(touchesState)).toBe(false);
     });
-    it(`previewing ${name} reads no pools, slots or counters`, async () => {
+    it(`previewing ${name} shows Free and reads no pools, slots or counters`, async () => {
       const { client, sql } = fakeClient(cost);
       const plan = await previewActivationCost(client, 'char', activation);
       expect(plan.shortfalls).toEqual([]);
       expect(plan.lines.every((line) => line.displayOnly)).toBe(true);
-      expect(sql).toHaveLength(1);
-      expect(sql.some((text) => /FOR UPDATE|character_resources|resource_pool_definitions/.test(text))).toBe(false);
+      expect(sql.some(touchesState)).toBe(false);
     });
   }
   it('a stored cost with several turn lines still plays, using the first', async () => {
-    const { client } = fakeClient([{ pool: 'action', amount: 1 }, { pool: 'turn', amount: 1, timing: 'reaction' }]);
+    const { client } = fakeClient([{ pool: 'turn', amount: 1, timing: 'free' }, { pool: 'action', amount: 1 }]);
     const plan = await previewActivationCost(client, 'char', activation);
     expect(plan.lines).toHaveLength(1);
-    expect(plan.lines[0].label).toBe('Action');
+    expect(plan.lines[0].label).toBe('Free');
   });
 });
 

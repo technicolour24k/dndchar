@@ -331,7 +331,7 @@ function planSpellEcho(entries: CostEntry[], availability: CostAvailability, cho
   const line = entry && asTurnLine(entry);
   if (!entry || !line || resolveTurnPool(profileFor(turn.profile), line) === null) return null;
   const waiting = turn.followups[cls] ?? 0;
-  if (waiting < line.amount) return null;
+  if (line.amount !== 1 || waiting < 1) return null; // a follow-up only covers a 1-action line
   const levels = entries.flatMap((e) => (e.pool === 'spell_slot' ? [(e as { level: number }).level] : []));
   return {
     lines: [{ entry, label: 'Extra Attack', needed: line.amount, available: waiting, payFrom: { pool: 'followup', cls }, displayOnly: false }],
@@ -376,7 +376,7 @@ export function planCost(entries: CostEntry[], availability: CostAvailability, c
       }
       // Extra Attack and friends: a waiting follow-up covers the whole turn line, and only that.
       const waiting = choices.followupClass ? turn.followups[choices.followupClass] ?? 0 : 0;
-      if (choices.followupClass && waiting >= needed) {
+      if (choices.followupClass && needed === 1 && waiting >= 1) {
         lines.push({ entry, label: 'Extra Attack', needed, available: waiting, payFrom: { pool: 'followup', cls: choices.followupClass }, displayOnly: false });
         continue;
       }
@@ -495,15 +495,15 @@ export function shortfallMode(input: { actorIsDm: boolean; dmPresent: boolean })
 export function activationSignature(activation: Activation): string {
   if (activation.kind === 'weapon_attack') {
     // An id names the weapon; without one (Unarmed Strike, a GM-added action) the label does.
-    return `weapon_attack|${activation.inventoryId ?? 'none'}|${activation.inventoryId ? '' : activation.label ?? ''}|${activation.timing ?? 'action'}`;
+    return `weapon_attack|${activation.inventoryId ?? 'none'}|${activation.inventoryId ? '' : activation.label ?? ''}|${activation.timing ?? 'action'}|${activation.followup ?? 'use'}`;
   }
   if (activation.kind === 'dash') return `dash|${activation.count}`;
   const slot = `${activation.kind === 'item' || activation.kind === 'content' ? '' : `${activation.slotType ?? ''}:${activation.slotLevel ?? ''}`}`;
   switch (activation.kind) {
     case 'spell':
-      return `spell|${activation.instanceId}|${slot}`;
+      return `spell|${activation.instanceId}|${slot}|${activation.followup ?? 'skip'}`;
     case 'spell_access':
-      return `spell_access|${activation.spellAccessId}|${activation.inventoryItemId}|${slot}`;
+      return `spell_access|${activation.spellAccessId}|${activation.inventoryItemId}|${slot}|${activation.followup ?? 'skip'}`;
     case 'item':
       return `item|${activation.inventoryId}`;
     case 'content':

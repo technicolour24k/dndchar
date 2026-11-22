@@ -10,6 +10,17 @@ import { env } from '$env/dynamic/private';
 //   COST_DB_TEST=1 npx vitest run src/lib/server/costEngine.integration.test.ts
 const enabled = process.env.COST_DB_TEST === '1';
 
+// Casting and using things now costs an action (action economy Unit 3). These tests are about
+// resources, so the character gets a feat granting 99 extra Actions per turn; the turn charging
+// itself is covered in actionEconomyCharging.integration.test.ts.
+async function giveActions(query: any, characterId: string, tag: string, contentIds: string[]) {
+  const modifierId = (await query(`SELECT id FROM modifier_definitions WHERE target='action_pool.action.max' AND modifier_type='bonus' AND NOT is_archived LIMIT 1`)).rows[0].id;
+  const feat = (await query(`INSERT INTO content_definitions (content_key, content_type, name) VALUES ($1,'feat','IT many actions') RETURNING id`, [`feat:${tag}actions`])).rows[0].id;
+  contentIds.push(feat);
+  await query(`INSERT INTO content_modifier_links (content_id, modifier_id, activation_type, value_override_expression) VALUES ($1,$2,'known','99')`, [feat, modifierId]);
+  await query(`INSERT INTO character_content_instances (character_id, content_id) VALUES ($1,$2)`, [characterId, feat]);
+}
+
 describe.skipIf(!enabled)('character resource pools', () => {
   it('sums maxima, ledgers adjustments, survives Save, refills on rest and round-trips snapshots', async () => {
     // Guard FIRST, before any query: local database only, and no ?host= override.
@@ -160,7 +171,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
       // The sheet shows it as a chip, with the pool's label.
       const characterId = await createCharacter(userId, 'Chips');
       await query(`INSERT INTO character_content_instances (character_id, content_id) VALUES ($1,$2)`, [characterId, spellId]);
-      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 Vowfire + 1 action'); // an explicit cost inherits the default turn line (action economy Unit 1)
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 Vowfire + 1 Action'); // an explicit cost inherits the default turn line (action economy Unit 1)
       // Caps, and a since-archived pool already in the stored cost can still be saved.
       await expect(save(JSON.stringify(Array.from({ length: 21 }, () => ({ pool: 'action', amount: 1 }))))).rejects.toThrow(/at most 20/);
       await expect(save(JSON.stringify([{ pool: 'action', amount: 1, pad: 'x'.repeat(4100) }]))).rejects.toThrow(/too long/);
@@ -175,10 +186,10 @@ describe.skipIf(!enabled)('character resource pools', () => {
       await save(JSON.stringify([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }]));
       await save('[]');
       expect(await stored()).toEqual([]);
-      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('1 action'); // [] = no resources, the spell still uses its action
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('1 Action'); // [] = no resources, the spell still uses its action
       await save('');
       expect(await stored()).toBeNull();
-      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 action');
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 Action');
     } finally {
       await query(`DELETE FROM users WHERE id = $1`, [userId]);
       if (spellId) await query(`DELETE FROM content_definitions WHERE id = $1`, [spellId]);
@@ -203,6 +214,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
     const actionKeys: string[] = [];
     try {
       const characterId = await createCharacter(userId, 'Acting');
+      await giveActions(query, characterId, tag, contentIds);
       const content = async (type: string, suffix: string, cost: unknown = null) => {
         const id = (await query<{ id: string }>(
           `INSERT INTO content_definitions (content_key, content_type, name, cost_json) VALUES ($1,$2,$3,$4::jsonb) RETURNING id`,
@@ -260,7 +272,8 @@ describe.skipIf(!enabled)('character resource pools', () => {
       // Cantrip: free.
       const cantrip = await spell('cantrip', 0);
       await setSlots([]);
-      expect(await cast(cantrip.instance)).toEqual([]);
+      // (A cantrip costs no resources, but still takes its Action.)
+      expect(await cast(cantrip.instance)).toMatchObject([{ label: 'Cost', target: 'Action' }]);
 
       // Explicit [L2 slot + Vowfire]: with no Vowfire, nothing is spent and the error says so.
       const hard = await spell('hard', 1, [{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }]);
@@ -384,6 +397,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
     const contentIds: string[] = [];
     try {
       const characterId = await createCharacter(userId, 'Overspender');
+      await giveActions(query, characterId, tag, contentIds);
       const content = async (type: string, suffix: string, cost: unknown = null) => {
         const id = (await query<{ id: string }>(
           `INSERT INTO content_definitions (content_key, content_type, name, cost_json) VALUES ($1,$2,$3,$4::jsonb) RETURNING id`,
@@ -434,7 +448,9 @@ describe.skipIf(!enabled)('character resource pools', () => {
       expect(used).toHaveLength(1);
       expect(used[0]).toMatchObject({ kind: 'dm_approved', label: 'IT smite', waived: false, shortfalls: [{ label: 'Vowfire', needed: 2, available: 1 }] });
       let rows = await rowsFor();
-      expect(rows).toHaveLength(2);
+      // Under an override the action line is ledgered too (a normal turn spend is not), so a review sees the whole activation.
+      expect(rows).toHaveLength(3);
+      expect(rows.find((r: any) => r.pool === 'turn:action')).toMatchObject({ delta: -1, shortfall: 0, pool_detail: { profile: 'dnd5e' } });
       expect(rows.every((r: any) => r.override_kind === 'dm_approved' && r.approved_by_user_id === userId && r.approval_request_id === requestId && r.room_id === 'ROOM')).toBe(true);
       expect(new Set(rows.map((r: any) => r.activation_id)).size).toBe(1);
       expect(rows.find((r: any) => r.pool === 'spell_slot')).toMatchObject({ delta: -1, shortfall: 0 });
@@ -447,7 +463,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
       await cast(smite, { kind: 'dm_approved', approvedByUserId: userId, approvalRequestId: crypto.randomUUID(), waive: true });
       expect(await slot(2)).toBe(1);
       rows = await rowsFor();
-      expect(rows).toHaveLength(2);
+      expect(rows).toHaveLength(3);
       expect(rows.every((r: any) => r.delta === 0 && r.pool_detail.waived === true)).toBe(true);
       expect(rows.find((r: any) => r.pool === 'pool:vowfire').shortfall).toBe(2);
 
@@ -501,6 +517,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
       await query(`INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1,$2,'player')`, [campaignId, playerId]);
       const characterId = (await query<{ id: string }>(
         `INSERT INTO characters (owner_user_id, name, campaign_id) VALUES ($1, 'Reviewed', $2) RETURNING id`, [playerId, campaignId])).rows[0].id;
+      await giveActions(query, characterId, tag, contentIds);
       const content = async (type: string, suffix: string, cost: unknown) => {
         const id = (await query<{ id: string }>(
           `INSERT INTO content_definitions (content_key, content_type, name, cost_json) VALUES ($1,$2,$3,$4::jsonb) RETURNING id`,
@@ -549,13 +566,13 @@ describe.skipIf(!enabled)('character resource pools', () => {
       // Undo: slot and Vowfire come back, as 'refund' rows pointing at what they reverse; the row is reviewed.
       const undone = await reviewOverride(dmId, campaignId, first, 'undo');
       expect(undone).toMatchObject({ status: 'undone', characterName: 'Reviewed', sourceLabel: 'IT smite' });
-      expect(undone.refunded).toEqual(['1 Level 2 Spell Slot', '1 Vowfire']);
+      expect(undone.refunded).toEqual(['1 Level 2 Spell Slot', '1 Vowfire', '1 Action']);
       expect(undone.message).toContain('needs fixing by hand');
       expect(await slot()).toBe(1);
       expect(await vowfire()).toBe(1);
       const rows = await query<any>(`SELECT * FROM character_resource_ledger WHERE character_id=$1 AND activation_id=$2 ORDER BY created_at, id`, [characterId, first]);
       const refunds = rows.rows.filter((r: any) => r.reason === 'refund');
-      expect(refunds).toHaveLength(2);
+      expect(refunds).toHaveLength(3); // slot, Vowfire and the Action (still the same turn)
       expect(refunds.every((r: any) => r.refund_of && r.delta === 1 && r.override_kind === null)).toBe(true);
       expect(rows.rows.filter((r: any) => r.reason === 'cost').every((r: any) => r.review_outcome === 'undone' && r.reviewed_by_user_id === dmId)).toBe(true);
       expect(await listUnreviewedOverrides(campaignId)).toHaveLength(0);
@@ -576,7 +593,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
       const second = pending[0].activationId;
       await query(`UPDATE character_resources SET current_value=1 WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId]);
       const capped = await reviewOverride(dmId, campaignId, second, 'undo');
-      expect(capped.refunded).toEqual(['1 Level 2 Spell Slot']);
+      expect(capped.refunded).toEqual(['1 Level 2 Spell Slot', '1 Action']);
       expect(capped.message).toContain('Refunded 0 of 1 Vowfire');
       expect(await vowfire()).toBe(1);
 

@@ -19,6 +19,7 @@
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
   import { isDisplayOnlyCost } from '$lib/rules/cost';
+  import { profileFor, resolveTurnPool } from '$lib/rules/actionEconomy';
   import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -1702,7 +1703,8 @@
   // ---- Cast dialog (cost engine Unit 4). A spell whose cost has a slot line or any non-display line
   // opens a small dialog: pick the slot (upcast), see the other costs against what's available.
   // Cantrips and free spells (action lines only) cast directly. The server stays authoritative.
-  // Turn lines (and legacy action lines) are display-only until the engine charges them.
+  // A turn line never forces the dialog on its own (a cantrip casts directly), but when the dialog is
+  // open it is listed against this turn's live pools. The server charges it either way.
   let castDialog = $state<{ spell: any; slotKey: string } | null>(null);
   const castCostEntries = $derived((castDialog?.spell.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; key?: string }>);
   const castSlotLine = $derived(castCostEntries.find((entry) => entry.pool === 'spell_slot'));
@@ -1719,6 +1721,12 @@
       ? (character.inventory.find((item) => item.id === castDialog!.spell.inventoryItemId)?.resources ?? [])
       : castDialog.spell.resources.map((r: any) => ({ key: r.key, label: r.label, currentValue: r.currentValue }));
     for (const entry of castCostEntries) {
+      if (entry.pool === 'turn') {
+        const key = resolveTurnPool(profileFor(character.actionEconomy), entry as unknown as { timing: any; category?: any; actionPool?: string });
+        const turnPool = key ? character.turn.pools.find((p) => p.key === key) : undefined;
+        if (turnPool) lines.push({ label: turnPool.label, needed: entry.amount, available: turnPool.current });
+        continue;
+      }
       if (isDisplayOnlyCost(entry)) continue;
       if (entry.pool === 'spell_slot') lines.push({ label: chosen ? `Level ${chosen.level} Spell Slot` : `Level ${entry.level}+ Spell Slot`, needed: entry.amount, available: chosen?.current ?? 0 });
       else if (entry.pool === 'charges') {

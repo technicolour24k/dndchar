@@ -76,3 +76,20 @@ BEGIN
     );
   END IF;
 END $$;
+
+-- Belt and braces: the constraint must now refuse the two new reserved keys. A CHECK violation is
+-- the expected outcome (caught); if the INSERT is accepted we raise, which fails the migration and
+-- rolls the INSERT back with it.
+DO $$
+DECLARE
+  reserved text;
+BEGIN
+  FOREACH reserved IN ARRAY ARRAY['turn', 'followup'] LOOP
+    BEGIN
+      INSERT INTO resource_pool_definitions (pool_key, label) VALUES (reserved, 'migration 045 check');
+      RAISE EXCEPTION 'resource_pool_definitions still accepts the reserved pool key %', reserved;
+    EXCEPTION WHEN check_violation THEN
+      NULL;
+    END;
+  END LOOP;
+END $$;

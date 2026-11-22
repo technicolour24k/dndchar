@@ -463,6 +463,29 @@ describe('helpers', () => {
     expect(state.parseActivation({ kind: 'spell', instanceId: INSTANCE, slotType: 'junk', slotLevel: 12 })).toEqual({ kind: 'spell', instanceId: INSTANCE });
     expect(state.parseActivation({ kind: 'item', inventoryId: 'x' })).toBeNull();
     expect(state.parseActivation(null)).toBeNull();
+    // Weapon attacks (a real weapon, or an id-less one named by a label) and dashes.
+    expect(state.parseActivation({ kind: 'weapon_attack', inventoryId: INSTANCE })).toEqual({ kind: 'weapon_attack', inventoryId: INSTANCE });
+    expect(state.parseActivation({ kind: 'weapon_attack', inventoryId: INSTANCE, timing: 'reaction', label: 'ignored' })).toEqual({ kind: 'weapon_attack', inventoryId: INSTANCE, timing: 'reaction' });
+    expect(state.parseActivation({ kind: 'weapon_attack', inventoryId: null, label: ' Unarmed Strike ', timing: 'bonus_action' })).toEqual({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike', timing: 'bonus_action' });
+    for (const bad of [
+      { kind: 'weapon_attack', inventoryId: 'nope' }, { kind: 'weapon_attack', inventoryId: null }, { kind: 'weapon_attack', inventoryId: null, label: '   ' },
+      { kind: 'weapon_attack', inventoryId: null, label: 'x'.repeat(81) }, { kind: 'weapon_attack', inventoryId: null, label: 5 },
+      { kind: 'weapon_attack', inventoryId: INSTANCE, timing: 'free' }, { kind: 'weapon_attack', inventoryId: INSTANCE, timing: 'movement' }
+    ]) expect(state.parseActivation(bad), JSON.stringify(bad)).toBeNull();
+    expect(state.parseActivation({ kind: 'dash', count: 3 })).toEqual({ kind: 'dash', count: 3 });
+    // The explicit follow-up choice (Extra Attack repeat / spell echo), on weapons, spells and granted spells.
+    expect(state.parseActivation({ kind: 'weapon_attack', inventoryId: INSTANCE, followup: 'skip' })).toEqual({ kind: 'weapon_attack', inventoryId: INSTANCE, followup: 'skip' });
+    expect(state.parseActivation({ kind: 'spell', instanceId: INSTANCE, followup: 'use' })).toEqual({ kind: 'spell', instanceId: INSTANCE, followup: 'use' });
+    expect(state.parseActivation({ kind: 'spell_access', spellAccessId: INSTANCE, inventoryItemId: INSTANCE, followup: 'use' })).toMatchObject({ followup: 'use' });
+    expect(state.parseActivation({ kind: 'spell', instanceId: INSTANCE })).toEqual({ kind: 'spell', instanceId: INSTANCE });
+    for (const followup of ['maybe', 1, null, true]) expect(state.parseActivation({ kind: 'spell', instanceId: INSTANCE, followup })).toBeNull();
+    const echoForm = new FormData();
+    echoForm.set('instanceId', INSTANCE);
+    echoForm.set('followup', 'use');
+    expect(state.activationFromCastForm(echoForm)).toEqual({ kind: 'spell', instanceId: INSTANCE, followup: 'use' });
+    echoForm.set('followup', 'whatever');
+    expect(state.activationFromCastForm(echoForm)).toEqual({ kind: 'spell', instanceId: INSTANCE });
+    for (const count of [0, 10, 1.5, '2', null, undefined]) expect(state.parseActivation({ kind: 'dash', count })).toBeNull();
     const form = new FormData();
     form.set('instanceId', INSTANCE);
     form.set('slotType', 'standard');
@@ -476,5 +499,7 @@ describe('helpers', () => {
     expect(state.overrideLogMessage({ ...common, kind: 'dm_self' })).toBe("Aria cast Fireball over budget (short 1 Vowfire) - the DM's call.");
     expect(state.overrideLogMessage({ ...common, kind: 'dm_approved', approvedByName: 'Tony', waived: true })).toContain('approved by Tony, spending nothing');
     expect(state.overrideLogMessage({ ...common, kind: 'self_override', activation: { kind: 'item', inventoryId: 'i' } })).toContain('Aria used Fireball');
+    expect(state.overrideLogMessage({ ...common, label: 'Longsword attack', kind: 'dm_self', activation: { kind: 'weapon_attack', inventoryId: null, label: 'Longsword' } })).toContain('Aria attacked with Longsword over budget');
+    expect(state.overrideLogMessage({ ...common, label: 'Dash', kind: 'dm_self', activation: { kind: 'dash', count: 1 } })).toContain('Aria dashed over budget');
   });
 });

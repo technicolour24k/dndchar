@@ -210,21 +210,41 @@ function slotChoiceOf(raw: any): { slotType?: SlotType; slotLevel?: number } {
 /** An activation descriptor from a request body, or null if it isn't well formed. */
 export function parseActivation(raw: any): Activation | null {
   if (!raw || typeof raw !== 'object') return null;
-  if (raw.kind === 'spell' && isId(raw.instanceId)) return { kind: 'spell', instanceId: raw.instanceId, ...slotChoiceOf(raw) };
+  // An explicit follow-up choice ('use' | 'skip'); anything else is not a valid activation.
+  if (raw.followup !== undefined && raw.followup !== 'use' && raw.followup !== 'skip') return null;
+  const followup = raw.followup ? { followup: raw.followup as 'use' | 'skip' } : {};
+  if (raw.kind === 'spell' && isId(raw.instanceId)) return { kind: 'spell', instanceId: raw.instanceId, ...slotChoiceOf(raw), ...followup };
   if (raw.kind === 'spell_access' && isId(raw.spellAccessId) && isId(raw.inventoryItemId)) {
-    return { kind: 'spell_access', spellAccessId: raw.spellAccessId, inventoryItemId: raw.inventoryItemId, ...slotChoiceOf(raw) };
+    return { kind: 'spell_access', spellAccessId: raw.spellAccessId, inventoryItemId: raw.inventoryItemId, ...slotChoiceOf(raw), ...followup };
   }
   if (raw.kind === 'item' && isId(raw.inventoryId)) return { kind: 'item', inventoryId: raw.inventoryId };
   if (raw.kind === 'content' && isId(raw.instanceId)) return { kind: 'content', instanceId: raw.instanceId };
+  if (raw.kind === 'weapon_attack') {
+    // A real weapon (uuid) or an id-less attack named by a label (Unarmed Strike, a GM-added action).
+    const hasId = raw.inventoryId !== null && raw.inventoryId !== undefined;
+    if (hasId && !isId(raw.inventoryId)) return null;
+    if (raw.label !== undefined && raw.label !== null && (typeof raw.label !== 'string' || raw.label.length > 80)) return null;
+    if (!hasId && !(typeof raw.label === 'string' && raw.label.trim())) return null;
+    if (raw.timing !== undefined && !ATTACK_TIMINGS.includes(raw.timing)) return null;
+    return {
+      kind: 'weapon_attack', inventoryId: hasId ? raw.inventoryId : null,
+      ...(!hasId ? { label: raw.label.trim() } : {}), ...(raw.timing ? { timing: raw.timing } : {}), ...followup
+    };
+  }
+  if (raw.kind === 'dash' && Number.isInteger(raw.count) && raw.count >= 1 && raw.count <= 9) return { kind: 'dash', count: raw.count };
   return null;
 }
+
+const ATTACK_TIMINGS = ['action', 'bonus_action', 'reaction'];
 
 /** The activation castCharacterSpell derives from its form (same fields, same slot normalising). */
 export function activationFromCastForm(form: FormData): Activation {
   const slot = slotChoiceOf({ slotType: String(form.get('slotType') || ''), slotLevel: form.get('slotLevel') });
+  const choice = String(form.get('followup') || '');
+  const followup = choice === 'use' || choice === 'skip' ? { followup: choice as 'use' | 'skip' } : {};
   const accessId = String(form.get('spellAccessId') || '');
-  if (accessId) return { kind: 'spell_access', spellAccessId: accessId, inventoryItemId: String(form.get('inventoryItemId') || ''), ...slot };
-  return { kind: 'spell', instanceId: String(form.get('instanceId') || ''), ...slot };
+  if (accessId) return { kind: 'spell_access', spellAccessId: accessId, inventoryItemId: String(form.get('inventoryItemId') || ''), ...slot, ...followup };
+  return { kind: 'spell', instanceId: String(form.get('instanceId') || ''), ...slot, ...followup };
 }
 
 // --- Roll-log wording -------------------------------------------------------------------------
@@ -236,12 +256,20 @@ export function shortfallText(shortfalls: CostShortfall[]): string {
 
 const verbFor = (activation: Activation) => (activation.kind === 'spell' || activation.kind === 'spell_access' ? 'cast' : 'used');
 
+// "Aria cast Fireball", "Aria attacked with Longsword", "Aria dashed". The engine labels a weapon
+// attack "<weapon> attack" and a dash "Dash", so those read naturally here.
+function whatDid(activation: Activation, label: string): string {
+  if (activation.kind === 'dash') return 'dashed';
+  if (activation.kind === 'weapon_attack') return `attacked with ${label.replace(/ attack$/, '')}`;
+  return `${verbFor(activation)} ${label}`;
+}
+
 /** The public roll-log line for an override that let a short activation through. */
 export function overrideLogMessage(input: {
   characterName: string; label: string; activation: Activation; kind: CostOverride['kind']; shortfalls: CostShortfall[];
   waived: boolean; approvedByName?: string;
 }): string {
-  const head = `${input.characterName} ${verbFor(input.activation)} ${input.label} over budget (short ${shortfallText(input.shortfalls)})`;
+  const head = `${input.characterName} ${whatDid(input.activation, input.label)} over budget (short ${shortfallText(input.shortfalls)})`;
   if (input.kind === 'dm_approved') return `${head} - approved by ${input.approvedByName || 'the DM'}${input.waived ? ', spending nothing' : ''}.`;
   if (input.kind === 'dm_self') return `${head} - the DM's call${input.waived ? ', spending nothing' : ''}.`;
   return `${head} - the player says the DM OK'd it (not yet reviewed).`;
