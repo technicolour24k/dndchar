@@ -25,19 +25,23 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     COALESCE(link.condition_expression,'') AS condition_expression,link.priority
     FROM content_modifier_links link JOIN modifier_definitions m ON m.id=link.modifier_id
     LEFT JOIN modifier_targets t ON t.target_key=m.target WHERE link.content_id=$1 ORDER BY link.sort_order,link.priority,target_label`,[selectedContentId]):{rows:[]};
-  const effects=await query<any>(`SELECT id,name,source_type FROM effect_definitions WHERE is_archived=false ORDER BY name`);
-  const attachedEffects=selectedContentId?await query<any>(`SELECT link.id,link.effect_id,link.activation_type,effect.name,effect.duration_type
-    FROM content_effect_links link JOIN effect_definitions effect ON effect.id=link.effect_id WHERE link.content_id=$1
-    ORDER BY link.sort_order,effect.name`,[selectedContentId]):{rows:[]};
+  const effects=await query<any>(`SELECT id,name,COALESCE(metadata_json->>'sourceType',source_kind) AS source_type FROM content_definitions
+    WHERE content_type='condition' AND is_archived=false ORDER BY name`);
+  const attachedEffects=selectedContentId?await query<any>(`SELECT link.id,link.granted_content_id AS effect_id,link.activation_type,effect.name,
+      COALESCE(effect.metadata_json->>'legacyDurationType',effect.duration_type) AS duration_type
+    FROM content_grants link JOIN content_definitions effect ON effect.id=link.granted_content_id AND effect.content_type='condition'
+    WHERE link.source_content_id=$1 ORDER BY effect.name`,[selectedContentId]):{rows:[]};
   const actions=selectedContentId?await query<any>(`SELECT link.id AS link_id,link.trigger_type,action.id,action.name,action.description,
     step.id AS step_id,step.step_type,step.operation,step.target_type,step.target_key,step.value_expression,
-    step.effect_id,step.target_mode,step.label,step.sort_order FROM content_action_links link
+    COALESCE(step.effect_container_id,(SELECT cd.id FROM effect_definitions ed JOIN content_definitions cd
+      ON cd.content_type='condition' AND cd.content_key='condition:'||ed.effect_key WHERE ed.id=step.effect_id)) AS effect_id,
+    step.target_mode,step.label,step.sort_order FROM content_action_links link
     JOIN action_definitions action ON action.id=link.action_id LEFT JOIN action_steps step ON step.action_id=action.id
     WHERE link.content_id=$1 ORDER BY link.sort_order,action.name,step.sort_order`,[selectedContentId]):{rows:[]};
   const actionCandidates=await query<any>('SELECT id,name FROM action_definitions WHERE is_archived=false ORDER BY name');
   const resources=selectedContentId?await query<any>('SELECT id,resource_key,label,max_value_expression,recharge_period FROM content_resource_definitions WHERE content_id=$1 ORDER BY label',[selectedContentId]):{rows:[]};
   const grants=selectedContentId?await query<any>(`SELECT g.id,g.activation_type,c.name,c.content_type FROM content_grants g
-    JOIN content_definitions c ON c.id=g.granted_content_id WHERE g.source_content_id=$1 ORDER BY c.name`,[selectedContentId]):{rows:[]};
+    JOIN content_definitions c ON c.id=g.granted_content_id WHERE g.source_content_id=$1 AND c.content_type<>'condition' ORDER BY c.name`,[selectedContentId]):{rows:[]};
   const grantCandidates=await query<any>(`SELECT id,name,content_type FROM content_definitions WHERE content_type IN('feat','class_feature') AND is_archived=false ORDER BY name`);
   const spellCandidates=await query<any>(`SELECT id,name FROM content_definitions WHERE content_type='spell' AND is_archived=false ORDER BY name`);
   const spellAccess=selectedContentId?await query<any>(`SELECT access.*,spell.name AS spell_name FROM content_spell_access access
@@ -90,16 +94,18 @@ export async function attachModifierToContent(form:FormData){const contentId=Str
 export async function detachContentModifier(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_modifier_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachContentModifier');return id;}
 
 export async function attachEffectToAdminContent(form:FormData){const id=String(form.get('contentId')||''),effectId=String(form.get('effectId')||''),activation=String(form.get('activationType')||'manual');
-  const result=await withTransaction(async client=>{if(activation!=='on_use'){await client.query(`INSERT INTO content_effect_links(content_id,effect_id,activation_type) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,[id,effectId,activation]);return id;}
+  const result=await withTransaction(async client=>{if(activation!=='on_use'){await client.query(`INSERT INTO content_grants(source_content_id,granted_content_id,activation_type)
+      SELECT $1,cd.id,$3 FROM content_definitions cd WHERE cd.id=$2 AND cd.content_type='condition' ON CONFLICT DO NOTHING`,[id,effectId,activation]);return id;}
     const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[id]);if(!content.rowCount)throw new Error('Content not found.');
     const action=await client.query<{id:string}>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id) VALUES($1,$2,$3,$4)
       ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,[`content:${id}:on_use`,`Use ${content.rows[0].name}`,`Actions for ${content.rows[0].name}`,content.rows[0].owner_user_id]);
     await client.query("INSERT INTO content_action_links(content_id,action_id,trigger_type) VALUES($1,$2,'on_use') ON CONFLICT DO NOTHING",[id,action.rows[0].id]);
-    await client.query(`INSERT INTO action_steps(action_id,step_type,operation,effect_id,label,sort_order)
-      SELECT $1,'apply_effect','apply',$2,effect.name,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
-      FROM effect_definitions effect WHERE effect.id=$2 AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,[action.rows[0].id,effectId]);return id;});
+    await client.query(`INSERT INTO action_steps(action_id,step_type,operation,effect_container_id,label,sort_order)
+      SELECT $1,'apply_effect','apply',effect.id,effect.name,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
+      FROM content_definitions effect WHERE effect.id=$2 AND effect.content_type='condition'
+        AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_container_id=$2)`,[action.rows[0].id,effectId]);return id;});
   invalidateReferenceData('attachEffectToAdminContent');return result;}
-export async function detachEffectFromAdminContent(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_effect_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachEffectFromAdminContent');return id;}
+export async function detachEffectFromAdminContent(form:FormData){const id=String(form.get('contentId')||'');await query(`DELETE FROM content_grants WHERE id=$1 AND source_content_id=$2 AND granted_content_id IN (SELECT id FROM content_definitions WHERE content_type='condition')`,[String(form.get('linkId')||''),id]);invalidateReferenceData('detachEffectFromAdminContent');return id;}
 
 export async function addContentResourceAction(form:FormData){const contentId=String(form.get('contentId')||''),trigger=String(form.get('activationType')||'on_use')==='on_use'?'on_use':'manual';
   const stepType=String(form.get('stepType')||'resource_change'),operation=String(form.get('actionOperation')||'add'),target=String(form.get('targetType')||''),key=String(form.get('targetKey')||''),rawExpression=String(form.get('valueExpression')||'');
@@ -113,7 +119,7 @@ export async function addContentResourceAction(form:FormData){const contentId=St
         VALUES($1,$2,$3,$4) ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,[`content:${contentId}:${trigger}`,`${trigger==='on_use'?'Use':'Activate'} ${content.rows[0].name}`,`Actions for ${content.rows[0].name}`,content.rows[0].owner_user_id]);
     if(!action.rowCount)throw new Error('Attach the Action before adding steps.');
     await client.query('INSERT INTO content_action_links(content_id,action_id,trigger_type) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[contentId,action.rows[0].id,trigger]);
-    await client.query(`INSERT INTO action_steps(action_id,step_type,operation,target_type,target_key,value_expression,effect_id,target_mode,label,sort_order)
+    await client.query(`INSERT INTO action_steps(action_id,step_type,operation,target_type,target_key,value_expression,effect_container_id,target_mode,label,sort_order)
       VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,'')::uuid,$8,$9,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0))`,
       [action.rows[0].id,stepType,operation,target,key,expression,String(form.get('effectId')||''),String(form.get('targetMode')||'self'),String(form.get('actionLabel')||'').trim()]);return contentId;});
   invalidateReferenceData('addContentResourceAction');return result;}

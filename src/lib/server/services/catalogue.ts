@@ -37,9 +37,9 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
 
   const ids = result.rows.map((row: any) => row.id);
   const effects = ids.length ? await query<any>(
-    `SELECT l.content_id, l.effect_id, e.name, l.activation_type
-     FROM content_effect_links l JOIN effect_definitions e ON e.id = l.effect_id
-     WHERE l.content_id = ANY($1::uuid[]) ORDER BY l.sort_order, e.name`, [ids]
+    `SELECT g.source_content_id AS content_id, g.granted_content_id AS effect_id, e.name, g.activation_type
+     FROM content_grants g JOIN content_definitions e ON e.id = g.granted_content_id AND e.content_type = 'condition'
+     WHERE g.source_content_id = ANY($1::uuid[]) ORDER BY e.name`, [ids]
   ) : { rows: [] };
   const resources = ids.length ? await query<any>(
     `SELECT id, content_id, resource_key, label, max_value_expression, recharge_period
@@ -175,16 +175,9 @@ export async function attachEffectToContent(form: FormData): Promise<void> {
   const contentId = String(form.get('contentId') || '');
   const effectId = String(form.get('effectId') || '');
   const activationType = String(form.get('activationType') || 'manual');
-  // Legacy write: keep content_effect_links for backward compat during transition.
-  await query(`INSERT INTO content_effect_links (content_id, effect_id, activation_type)
-    VALUES ($1,$2,$3) ON CONFLICT (content_id, effect_id, activation_type) DO NOTHING`,
-    [contentId, effectId, activationType]);
-  // Unified Container write: insert into content_grants pointing at the condition Container.
+  // effectId is the condition container id. content_grants is the only write.
   await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
-    SELECT $1, cd.id, $3
-    FROM content_definitions cd
-    JOIN effect_definitions ed ON cd.content_key='condition:'||ed.effect_key
-    WHERE ed.id=$2 AND cd.content_type='condition'
+    SELECT $1, cd.id, $3 FROM content_definitions cd WHERE cd.id=$2 AND cd.content_type='condition'
     ON CONFLICT DO NOTHING`,
     [contentId, effectId, activationType]);
   invalidateReferenceData('attachEffectToContent');
@@ -215,13 +208,13 @@ export async function attachEffectToOwnedContent(userId: string, form: FormData)
         VALUES($1,$2,$3,'on_use') ON CONFLICT(content_id,action_id,trigger_type) DO UPDATE SET action_container_id=EXCLUDED.action_container_id`,
         [contentId, action.rows[0].id, actionContainerId]);
       const effectId = String(form.get('effectId') || '');
-      // Legacy action_steps write.
-      await client.query(`INSERT INTO action_steps(action_id,container_id,step_type,operation,effect_id,label,sort_order)
-        SELECT $1,$5,'apply_effect','apply',$2,effect.name,
+      // effectId is the condition container id; the step carries it as effect_container_id (effect_id stays NULL).
+      await client.query(`INSERT INTO action_steps(action_id,container_id,step_type,operation,effect_container_id,label,sort_order)
+        SELECT $1,$3,'apply_effect','apply',effect.id,effect.name,
           COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
-        FROM effect_definitions effect WHERE effect.id=$2
-          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_id=$2)`,
-        [action.rows[0].id, effectId, null, null, actionContainerId]);
+        FROM content_definitions effect WHERE effect.id=$2 AND effect.content_type='condition'
+          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_container_id=$2)`,
+        [action.rows[0].id, effectId, actionContainerId]);
     });
     invalidateReferenceData('attachEffectToOwnedContent');
     return;
@@ -265,8 +258,8 @@ export async function addOwnedContentResourceDefinition(userId: string, form: Fo
 }
 
 export async function listEffectsForLinking(userId?: string): Promise<Array<{ id: string; name: string }>> {
-  const result = await query<{ id: string; name: string }>(`SELECT id, name FROM effect_definitions
-    WHERE is_archived=false ORDER BY name`);
+  const result = await query<{ id: string; name: string }>(`SELECT id, name FROM content_definitions
+    WHERE content_type='condition' AND is_archived=false ORDER BY name`);
   return result.rows;
 }
 
@@ -636,28 +629,21 @@ async function initializeInventoryResources(client:pg.PoolClient,inventoryId:str
 async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: string): Promise<void> {
   const classes = await getClasses(client, characterId);
   const standard = standardSpellSlotMaximums(classes);
-  const bonusResult = await client.query<{ bonus: string }>(`WITH effect_ids AS (
-      SELECT l.effect_id FROM character_content_instances i
-        JOIN content_effect_links l ON l.content_id=i.content_id
-        WHERE i.character_id=$1 AND i.is_active AND l.activation_type IN ('manual','carried','equipped','attuned')
-      UNION SELECT l.effect_id FROM character_inventory_items inventory
-        JOIN content_effect_links l ON l.content_id=inventory.source_content_id
-        WHERE inventory.character_id=$1 AND (l.activation_type='carried'
-          OR (l.activation_type='equipped' AND inventory.equipped)
-          OR (l.activation_type='attuned' AND inventory.attuned))
+  const bonusResult = await client.query<{ bonus: string }>(`WITH condition_ids AS (
+      SELECT DISTINCT container_id AS id FROM active_character_effects WHERE character_id=$1 AND container_id IS NOT NULL
+      UNION SELECT g.granted_content_id FROM character_content_instances i
+        JOIN content_grants g ON g.source_content_id=i.content_id
+        WHERE i.character_id=$1 AND i.is_active AND g.activation_type IN ('manual','carried','equipped','attuned')
+      UNION SELECT g.granted_content_id FROM character_inventory_items inventory
+        JOIN content_grants g ON g.source_content_id=inventory.source_content_id
+        WHERE inventory.character_id=$1 AND (g.activation_type='carried'
+          OR (g.activation_type='equipped' AND inventory.equipped)
+          OR (g.activation_type='attuned' AND inventory.attuned))
     ), modifier_values AS (
       SELECT COALESCE(l.value_override_expression,m.default_value_expression,'') AS value_expression,m.target,m.modifier_type
-      FROM effect_ids active JOIN effect_modifier_links l ON l.effect_id=active.effect_id
+      FROM condition_ids c JOIN content_definitions cd ON cd.id=c.id AND cd.content_type='condition'
+      JOIN content_modifier_links l ON l.content_id=c.id
       JOIN modifier_definitions m ON m.id=l.modifier_id
-      UNION ALL
-      SELECT COALESCE(l.value_override_expression,m.default_value_expression,''),m.target,m.modifier_type
-      FROM (SELECT DISTINCT container_id FROM active_character_effects WHERE character_id=$1 AND container_id IS NOT NULL) ace
-      JOIN content_modifier_links l ON l.content_id=ace.container_id
-      JOIN modifier_definitions m ON m.id=l.modifier_id
-      WHERE NOT EXISTS ( -- already counted through effect_ids (granted by active content / equipped items)
-        SELECT 1 FROM effect_ids e JOIN effect_definitions ed ON ed.id=e.effect_id
-        JOIN content_definitions cd ON cd.content_type='condition' AND cd.content_key='condition:'||ed.effect_key
-        WHERE cd.id=ace.container_id)
       UNION ALL
       SELECT COALESCE(l.value_override_expression,m.default_value_expression,''),m.target,m.modifier_type
       FROM character_content_instances instance JOIN content_modifier_links l ON l.content_id=instance.content_id
