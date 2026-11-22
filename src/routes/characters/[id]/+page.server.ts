@@ -5,6 +5,8 @@ import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/se
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
 import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { openCostGate, runWithGate } from '$lib/server/vttCostGate';
+import { activationFromCastForm } from '$lib/server/vttCostApproval';
 import { adjustCharacterPool } from '$lib/server/services/resource-pools';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
@@ -242,20 +244,31 @@ export const actions = {
   useItem: async ({ request, params, locals }) => {
     const form = await request.formData();
     let itemResult;
-    try { itemResult=await useInventoryCatalogueItem(locals.user!.id, params.id, String(form.get('inventoryId') || '')); } catch (error) { if (error instanceof CostShortfallError) return fail(409, { costShortfall: error.shortfalls }); throw error; }
+    // The cost gate decides, before the transaction, whether this may go over budget (DM approval, the DM's own
+    // go-ahead, or the no-DM "Did your DM OK this?"). Form fields: approvalId, override ('dm' | 'self').
+    const inventoryId = String(form.get('inventoryId') || '');
+    const gate = await openCostGate({ userId: locals.user!.id, characterId: params.id, activation: { kind: 'item', inventoryId }, approvalId: form.get('approvalId'), override: form.get('override') });
+    if (!gate.ok) return fail(gate.status, { costError: gate.body });
+    try { itemResult=await runWithGate(gate, (override) => useInventoryCatalogueItem(locals.user!.id, params.id, inventoryId, override)); } catch (error) { if (error instanceof CostShortfallError) return fail(409, { costShortfall: error.shortfalls, costMode: gate.mode }); throw error; }
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true, itemResult };
   },
   triggerContent:async({request,params,locals})=>{
     const form=await request.formData();
     let itemResult;
-    try{itemResult=await triggerCharacterContentActions(locals.user!.id,params.id,String(form.get('instanceId')||''));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls});throw error;}
+    const instanceId=String(form.get('instanceId')||'');
+    const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:{kind:'content',instanceId},approvalId:form.get('approvalId'),override:form.get('override')});
+    if(!gate.ok)return fail(gate.status,{costError:gate.body});
+    try{itemResult=await runWithGate(gate,(override)=>triggerCharacterContentActions(locals.user!.id,params.id,instanceId,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});
     return{contentUpdated:true,itemResult};
   },
   castSpell:async({request,params,locals})=>{
     let itemResult;
-    try{itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls});throw error;}
+    const form=await request.formData();
+    const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:activationFromCastForm(form),approvalId:form.get('approvalId'),override:form.get('override')});
+    if(!gate.ok)return fail(gate.status,{costError:gate.body});
+    try{itemResult=await runWithGate(gate,(override)=>castCharacterSpell(locals.user!.id,params.id,form,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
   },
   // The one join a player needs, covering combat, rolls, and session notes at

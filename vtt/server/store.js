@@ -104,6 +104,7 @@ export function publish(topic, payload) {
 // NEVER add forage:update, forage:closed or forage:ping here. Watch subscriptions are
 // unauthenticated, and forage payloads carry a player's private view (the DM's loot preview, the
 // finder's check). forage:ping is sent with publish() directly because it carries no details.
+// The same goes for cost:update, cost:closed and cost:ping (cost-engine DM approval requests).
 const WATCHABLE_BROADCAST_TYPES = new Set(['combat:state', 'combat:log', 'roll:log', 'game_session:state']);
 
 export function generateRoomCode(existingSessions) {
@@ -145,6 +146,11 @@ export function createSession(id, options = {}) {
     // result, so a finder who wasn't watching still sees it). Self-serve finds live in the DB.
     forage: {},
     forageResults: {},
+    // Cost-engine DM approval requests (unaffordable activations), keyed by CHARACTER id. In memory by
+    // design, like forage: a restart drops pending requests and unused approvals (the player asks
+    // again). Written only by the cost-request endpoints. The GM sees all of it, a player only their own
+    // requests (costViewForPlayer). See src/lib/server/vttCostApproval.ts.
+    costRequests: {},
   };
 }
 
@@ -334,6 +340,26 @@ export function forageViewForPlayer(request) {
   return { id: request.id, stage: request.stage, source: request.source, check: request.check };
 }
 
+// What a player may see of their own cost request (never anything about other characters).
+export function costViewForPlayer(request) {
+  return {
+    id: request.id, characterId: request.characterId, status: request.status, source: request.source,
+    activation: request.activation, activationLabel: request.activationLabel, shortfalls: request.shortfalls,
+    approvedAt: request.approvedAt ?? null, waive: request.status === 'approved' ? !!request.waive : false,
+  };
+}
+
+// For a non-GM recipient: only the cost requests THEY made, as the player view.
+function ownCost(session, playerId) {
+  const own = {};
+  if (playerId) {
+    for (const [characterId, request] of Object.entries(session.costRequests ?? {})) {
+      if (request.playerId === playerId) own[characterId] = costViewForPlayer(request);
+    }
+  }
+  return { costRequests: own };
+}
+
 // For a non-GM recipient: only their own forage entries survive.
 function ownForage(session, playerId) {
   const request = playerId ? session.forage?.[playerId] : undefined;
@@ -379,7 +405,7 @@ export function filterSessionForRole(session, role, playerId) {
   // client can distinguish "no map set yet" from "map set but not revealed"
   // and show an accurate waiting message (see render() in main.js).
   if (session.map && !session.map.revealed) {
-    return { ...session, map: { revealed: false }, tokens: {}, markers: {}, ...ownForage(session, playerId) };
+    return { ...session, map: { revealed: false }, tokens: {}, markers: {}, ...ownForage(session, playerId), ...ownCost(session, playerId) };
   }
 
   const tokens = {};
@@ -393,7 +419,7 @@ export function filterSessionForRole(session, role, playerId) {
     if (shouldPlayerSeeMarker(marker, playerId)) markers[id] = marker;
   }
 
-  return { ...session, tokens, markers, ...ownForage(session, playerId) };
+  return { ...session, tokens, markers, ...ownForage(session, playerId), ...ownCost(session, playerId) };
 }
 
 // Sends a per-recipient payload to every socket in a session. buildPayload

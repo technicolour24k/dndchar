@@ -9,7 +9,7 @@ import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/charact
 import { listPoolDefinitions, loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
 import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson } from '$lib/rules/cost';
 import type { CostEntry } from '$lib/types/cost';
-import { payActivationCost, type PaidLine } from '$lib/server/services/cost-engine';
+import { payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { Activation } from '$lib/types/cost';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
@@ -423,12 +423,12 @@ function costView(costJson: unknown, defaults: CostEntry[], labels: Record<strin
   return { entries, summary: entries.length ? costSummary(entries, labels) : '' };
 }
 
-export async function castCharacterSpell(userId:string,characterId:string,form:FormData):Promise<ActionResult[]>{
-  return (await castCharacterSpellDetailed(userId,characterId,form)).results;
+export async function castCharacterSpell(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<ActionResult[]>{
+  return (await castCharacterSpellDetailed(userId,characterId,form,costOverride)).results;
 }
 
 // Same cast, but also says which slot was spent (the VTT mirrors it onto the token).
-export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null}>{
+export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null}>{
   const requestedType=String(form.get('slotType')||'');
   const slotChoice={slotType:requestedType==='standard'||requestedType==='pact'?requestedType:undefined,slotLevel:Number(form.get('slotLevel'))||undefined} as const;
   return withTransaction(async(client)=>{await assertCanAct(client,userId,characterId);
@@ -449,7 +449,7 @@ export async function castCharacterSpellDetailed(userId:string,characterId:strin
       if(!spell.rowCount||!spell.rows[0].is_known||!spell.rows[0].is_prepared)throw new Error('Spell must be known and prepared before casting.');
       spellId=spell.rows[0].content_id;activation={kind:'spell',instanceId,...slotChoice};context={instanceId};
     }
-    const paid=await payActivationCost(client,characterId,activation,{actorUserId:userId});
+    const paid=await payActivationCost(client,characterId,activation,{actorUserId:userId,override:costOverride});
     const effects=await executeContentActions(client,characterId,spellId,['on_cast','on_use'],context);
     const slot=paid.find((line)=>line.slot);
     return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null};
@@ -501,7 +501,7 @@ export async function spendSpellSlot(userId: string, characterId: string, type: 
 
 export type ResourceActionResult=ActionResult;
 
-export async function useInventoryCatalogueItem(userId: string, characterId: string, inventoryId: string): Promise<ResourceActionResult[]> {
+export async function useInventoryCatalogueItem(userId: string, characterId: string, inventoryId: string, costOverride?: CostOverride | null): Promise<ResourceActionResult[]> {
   return withTransaction(async (client) => {
     await assertCanAct(client, userId, characterId);
     const item = await client.query<any>(`SELECT source_content_id,quantity FROM character_inventory_items
@@ -510,20 +510,20 @@ export async function useInventoryCatalogueItem(userId: string, characterId: str
     // The item's cost (default: one of itself, unless an on_use spend_item step already pays). A
     // freeform item (no catalogue link, e.g. a player-authored potion) has no actions to run but
     // still consumes one, through the same cost line.
-    const paid=await payActivationCost(client,characterId,{kind:'item',inventoryId},{actorUserId:userId});
+    const paid=await payActivationCost(client,characterId,{kind:'item',inventoryId},{actorUserId:userId,override:costOverride});
     if(!item.rows[0].source_content_id)return paidToResults(paid);
     const results=await executeContentActions(client,characterId,item.rows[0].source_content_id,['on_use'],{inventoryId});
     return [...paidToResults(paid),...results];
   });
 }
 
-export async function triggerCharacterContentActions(userId:string,characterId:string,instanceId:string):Promise<ResourceActionResult[]>{
+export async function triggerCharacterContentActions(userId:string,characterId:string,instanceId:string,costOverride?:CostOverride|null):Promise<ResourceActionResult[]>{
   return withTransaction(async(client)=>{
     await assertCanAct(client,userId,characterId);
     const instance=await client.query<{content_id:string}>(`SELECT content_id FROM character_content_instances
       WHERE id=$1 AND character_id=$2`,[instanceId,characterId]);
     if(!instance.rowCount)throw new Error('Character content not found.');
-    const paid=await payActivationCost(client,characterId,{kind:'content',instanceId},{actorUserId:userId});
+    const paid=await payActivationCost(client,characterId,{kind:'content',instanceId},{actorUserId:userId,override:costOverride});
     const results=await executeContentActions(client,characterId,instance.rows[0].content_id,['manual','on_use'],{instanceId});
     return [...paidToResults(paid),...results];
   });

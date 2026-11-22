@@ -366,4 +366,112 @@ describe.skipIf(!enabled)('character resource pools', () => {
       await query(`DELETE FROM content_definitions WHERE content_type='action' AND content_key = ANY($1::text[])`, [actionKeys]);
     }
   });
+  it('overrides pay what they can, record the shortfall and who allowed it, and a waiver spends nothing', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (target.searchParams.has('host')) throw new Error('Refusing to run: DATABASE_URL has a "host" query parameter.');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, ''))) {
+      throw new Error(`Refusing to run: database host "${target.hostname}" is not local.`);
+    }
+    const { query } = await import('$lib/server/db');
+    const { createCharacter } = await import('./services/characters');
+    const { castCharacterSpell } = await import('./services/catalogue');
+    const { CostShortfallError } = await import('./services/cost-engine');
+    const tag = `zzovr${crypto.randomBytes(4).toString('hex')}`;
+    const userId = (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Override', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    const contentIds: string[] = [];
+    try {
+      const characterId = await createCharacter(userId, 'Overspender');
+      const content = async (type: string, suffix: string, cost: unknown = null) => {
+        const id = (await query<{ id: string }>(
+          `INSERT INTO content_definitions (content_key, content_type, name, cost_json) VALUES ($1,$2,$3,$4::jsonb) RETURNING id`,
+          [`${type}:${tag}${suffix}`, type, `IT ${suffix}`, cost === null ? null : JSON.stringify(cost)])).rows[0].id;
+        contentIds.push(id);
+        return id;
+      };
+      const spell = async (suffix: string, level: number, cost: unknown) => {
+        const id = await content('spell', suffix, cost);
+        await query(`INSERT INTO spell_definitions (content_id, spell_level, casting_time, resolution_type) VALUES ($1,$2,'1 action','auto')`, [id, level]);
+        return (await query<{ id: string }>(
+          `INSERT INTO character_content_instances (character_id, content_id, is_known, is_prepared) VALUES ($1,$2,true,true) RETURNING id`, [characterId, id])).rows[0].id;
+      };
+      const setSlots = async (rows: Array<[string, number, number]>) => {
+        await query(`DELETE FROM character_spell_slots WHERE character_id=$1`, [characterId]);
+        for (const [type, level, n] of rows) {
+          await query(`INSERT INTO character_spell_slots (character_id, slot_type, slot_level, current_slots, max_slots) VALUES ($1,$2,$3,$4,5)`, [characterId, type, level, n]);
+        }
+      };
+      const slot = async (level: number) => (await query<any>(
+        `SELECT current_slots FROM character_spell_slots WHERE character_id=$1 AND slot_type='standard' AND slot_level=$2`, [characterId, level])).rows[0].current_slots;
+      const rowsFor = async () => (await query<any>(
+        `SELECT * FROM character_resource_ledger WHERE character_id=$1 AND reason='cost' ORDER BY created_at, id`, [characterId])).rows;
+      const cast = (instanceId: string, override?: any) => {
+        const form = new FormData();
+        form.set('instanceId', instanceId);
+        return castCharacterSpell(userId, characterId, form, override);
+      };
+
+      // The character holds 1 Vowfire (a feat granting 1); the spell costs a level 2 slot + 2 Vowfire.
+      const modifierId = (await query<{ id: string }>(
+        `SELECT id FROM modifier_definitions WHERE target='resource.vowfire.max' AND modifier_type='bonus' AND NOT is_archived LIMIT 1`)).rows[0].id;
+      const feat = await content('feat', 'feat');
+      await query(`INSERT INTO content_modifier_links (content_id, modifier_id, activation_type, value_override_expression) VALUES ($1,$2,'known','1')`, [feat, modifierId]);
+      await query(`INSERT INTO character_content_instances (character_id, content_id) VALUES ($1,$2)`, [characterId, feat]);
+      const smite = await spell('smite', 1, [{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 2 }]);
+      await setSlots([['standard', 2, 1]]);
+
+      // No override: shortfall, nothing spent.
+      await expect(cast(smite)).rejects.toBeInstanceOf(CostShortfallError);
+      expect(await slot(2)).toBe(1);
+
+      // An approval pays what it can: the slot and the 1 Vowfire it has; the shortfall is recorded per line.
+      const requestId = crypto.randomUUID();
+      const used: any[] = [];
+      await cast(smite, { kind: 'dm_approved', approvedByUserId: userId, approvalRequestId: requestId, roomId: 'ROOM', onUsed: (u: any) => used.push(u) });
+      expect(await slot(2)).toBe(0);
+      expect(used).toHaveLength(1);
+      expect(used[0]).toMatchObject({ kind: 'dm_approved', label: 'IT smite', waived: false, shortfalls: [{ label: 'Vowfire', needed: 2, available: 1 }] });
+      let rows = await rowsFor();
+      expect(rows).toHaveLength(2);
+      expect(rows.every((r: any) => r.override_kind === 'dm_approved' && r.approved_by_user_id === userId && r.approval_request_id === requestId && r.room_id === 'ROOM')).toBe(true);
+      expect(new Set(rows.map((r: any) => r.activation_id)).size).toBe(1);
+      expect(rows.find((r: any) => r.pool === 'spell_slot')).toMatchObject({ delta: -1, shortfall: 0 });
+      expect(rows.find((r: any) => r.pool === 'pool:vowfire')).toMatchObject({ delta: -1, before_value: 1, after_value: 0, shortfall: 1 });
+      expect((await query<any>(`SELECT current_value FROM character_resources WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId])).rows[0].current_value).toBe(0);
+
+      // "Spend nothing": rows with delta 0 and waived, the slot untouched.
+      await setSlots([['standard', 2, 1]]);
+      await query(`DELETE FROM character_resource_ledger WHERE character_id=$1`, [characterId]);
+      await cast(smite, { kind: 'dm_approved', approvedByUserId: userId, approvalRequestId: crypto.randomUUID(), waive: true });
+      expect(await slot(2)).toBe(1);
+      rows = await rowsFor();
+      expect(rows).toHaveLength(2);
+      expect(rows.every((r: any) => r.delta === 0 && r.pool_detail.waived === true)).toBe(true);
+      expect(rows.find((r: any) => r.pool === 'pool:vowfire').shortfall).toBe(2);
+
+      // A line with no source at all (no slot of that level) still gets a row, and pays nothing.
+      await setSlots([]);
+      await query(`DELETE FROM character_resource_ledger WHERE character_id=$1`, [characterId]);
+      await cast(smite, { kind: 'self_override', roomId: null });
+      rows = await rowsFor();
+      expect(rows.find((r: any) => r.pool === 'spell_slot')).toMatchObject({ delta: 0, shortfall: 1, override_kind: 'self_override', before_value: null });
+      expect(rows.every((r: any) => r.reviewed_at === null)).toBe(true);
+
+      // An override that isn't needed (affordable) pays normally: no override kind, onUsed never fires.
+      await setSlots([['standard', 2, 3]]);
+      await query(`UPDATE character_resources SET current_value=1, max_value=1 WHERE character_id=$1 AND resource_key='pool:vowfire'`, [characterId]);
+      const easy = await spell('easy', 1, [{ pool: 'spell_slot', amount: 1, level: 2 }]);
+      await query(`DELETE FROM character_resource_ledger WHERE character_id=$1`, [characterId]);
+      let fired = false;
+      await cast(easy, { kind: 'dm_self', onUsed: () => { fired = true; } });
+      expect(fired).toBe(false);
+      rows = await rowsFor();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].override_kind).toBeNull();
+      expect(await slot(2)).toBe(2);
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE id = ANY($1::uuid[])`, [contentIds]);
+    }
+  });
 });

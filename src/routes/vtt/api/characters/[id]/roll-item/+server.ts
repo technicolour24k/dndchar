@@ -5,6 +5,7 @@ import { getCharacter } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { useInventoryCatalogueItem } from '$lib/server/services/catalogue';
 import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { usableConsumableItems } from '$lib/rules/dnd5e';
 import { adjustPrimaryDamageDice, rollDamage } from '$lib/rules/attackRoll';
 import { parseAttackOptions } from '$lib/server/vttAttackAdvantage';
@@ -37,10 +38,13 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   const options = parseAttackOptions(body);
   if (options.preview) return json({ usesAttackRoll: false, primaryDamageDice: item.damageRolls });
 
+  // Over-budget use: body.approvalId (the DM approved) or body.override ('dm' | 'self'), checked server-side.
+  const gate = await openCostGate({ userId: locals.user!.id, characterId, activation: { kind: 'item', inventoryId }, approvalId: body.approvalId, override: body.override, roomId: body.roomId });
+  if (!gate.ok) return json(gate.body, { status: gate.status });
   try {
-    await useInventoryCatalogueItem(locals.user!.id, characterId, inventoryId);
+    await runWithGate(gate, (override) => useInventoryCatalogueItem(locals.user!.id, characterId, inventoryId, override));
   } catch (error) {
-    if (error instanceof CostShortfallError) return json({ error: 'insufficient', message: error.message, shortfalls: error.shortfalls }, { status: 409 });
+    if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
     return json({ error: error instanceof Error ? error.message : 'Could not use item.' }, { status: 400 });
   }
 

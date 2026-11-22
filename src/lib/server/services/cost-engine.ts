@@ -14,7 +14,10 @@ import { loadPoolMaxima, POOL_ROW_PREFIX, writeLedger } from '$lib/server/servic
 // The one way anything is paid at activation (sheet and VTT). Reads the activated Container's
 // cost_json (or the content type's default, which copies the old procedural behaviour exactly),
 // plans it against what the character has, and either pays it with a ledger row per line or throws
-// CostShortfallError with nothing spent. Unit 5 adds the DM-approval override on top.
+// CostShortfallError with nothing spent. With a CostOverride (DM approval, the DM's own go-ahead, or a
+// no-DM self override) a short activation pays what it can instead (each line min(available, amount),
+// nothing below 0) and every ledger row records the override. Who may use an override is decided
+// BEFORE the transaction, in vttCostApproval.ts.
 
 export class CostShortfallError extends Error {
   shortfalls: CostShortfall[];
@@ -24,6 +27,18 @@ export class CostShortfallError extends Error {
     this.shortfalls = shortfalls;
   }
 }
+
+// How a short activation is let through. Built by vttCostApproval.ts after it has checked who is allowed.
+export type CostOverride = {
+  kind: 'dm_approved' | 'dm_self' | 'self_override';
+  approvedByUserId?: string | null;
+  approvalRequestId?: string | null;
+  roomId?: string | null;
+  // "Spend nothing": let it through and pay no line (rows are still written, delta 0).
+  waive?: boolean;
+  // Called once if the override actually let a short activation through (not when it was affordable).
+  onUsed?: (used: { kind: CostOverride['kind']; label: string; shortfalls: CostShortfall[]; waived: boolean }) => void;
+};
 
 export type PaidLine = {
   label: string;
@@ -104,6 +119,9 @@ export async function loadActivationCost(client: pg.PoolClient, characterId: str
   return { entries: effectiveCost(parseExplicit(row.cost_json), []), contentId: row.id, label: row.name, counters: { scope: 'instance', id: activation.instanceId }, inventoryId: null };
 }
 
+// Pool names that are already ledger pool values; anything else is a character pool key ('pool:<key>').
+const OVERRIDE_UNPAID_POOLS = new Set(['spell_slot', 'charges', 'item']);
+
 function slotChoice(activation: Activation) {
   return activation.kind === 'spell' || activation.kind === 'spell_access' ? { slotType: activation.slotType, slotLevel: activation.slotLevel } : {};
 }
@@ -176,35 +194,48 @@ export async function previewActivationCost(client: pg.PoolClient, characterId: 
 // Pays the activation's cost, or throws CostShortfallError with nothing spent (the caller's
 // transaction rolls back). One ledger row per paid line, sharing an activation_id.
 export async function payActivationCost(
-  client: pg.PoolClient, characterId: string, activation: Activation, options: { actorUserId: string }
+  client: pg.PoolClient, characterId: string, activation: Activation, options: { actorUserId: string; override?: CostOverride | null }
 ): Promise<PaidLine[]> {
   const loaded = await loadActivationCost(client, characterId, activation);
   if (!loaded.entries.some((e) => !['action', 'bonus_action', 'reaction'].includes(e.pool))) return [];
   const { availability, counterRows, poolMax } = await lockSources(client, characterId, loaded, true);
   const choices = slotChoice(activation);
   const plan = planCost(loaded.entries, availability, choices);
-  if (plan.shortfalls.length) throw new CostShortfallError(plan.shortfalls);
+  const override = plan.shortfalls.length ? options.override ?? null : null;
+  if (plan.shortfalls.length && !override) throw new CostShortfallError(plan.shortfalls);
+  const waived = Boolean(override?.waive);
 
   const activationId = crypto.randomUUID();
   const paid: PaidLine[] = [];
   const running = new Map<string, number>(); // value left per source, so repeated lines chain
-  const ledger = (pool: string, poolDetail: Record<string, unknown>, label: string, n: number, before: number) => writeLedger(client, {
-    characterId, pool, poolDetail, label, delta: -n, before, after: before - n, reason: 'cost', sourceContentId: loaded.contentId,
-    sourceLabel: loaded.label, activationId, actorUserId: options.actorUserId
+  // short = how much of this line couldn't be paid (0 on a normal spend). Under an override every row
+  // carries the override kind, so a review sees the whole activation.
+  const ledger = (pool: string, poolDetail: Record<string, unknown>, label: string, n: number, before: number | null, short = 0) => writeLedger(client, {
+    characterId, pool, poolDetail: waived ? { ...poolDetail, waived: true } : poolDetail, label, delta: n === 0 ? 0 : -n, before,
+    after: before === null ? null : before - n, shortfall: short, reason: 'cost', sourceContentId: loaded.contentId,
+    sourceLabel: loaded.label, activationId, actorUserId: options.actorUserId,
+    ...(override ? { overrideKind: override.kind, approvedByUserId: override.approvedByUserId ?? null, approvalRequestId: override.approvalRequestId ?? null, roomId: override.roomId ?? null } : {})
   });
 
   for (const line of plan.lines) {
+    if (line.displayOnly) continue;
     const from = line.payFrom;
-    if (!from) continue;
-    const n = line.needed;
+    // What this line actually pays: all of it normally; under an override the part it can afford.
+    const n = waived ? 0 : override ? Math.min(line.needed, line.available) : line.needed;
+    const short = override ? Math.max(0, line.needed - (waived ? line.available : n)) : 0;
+    if (!from) {
+      // A line with no source at all (no slot of that level, unknown counter or pool): nothing to pay.
+      if (override) await ledger(OVERRIDE_UNPAID_POOLS.has(line.entry.pool) ? line.entry.pool : `pool:${line.entry.pool}`, { unpaid: true }, line.label, 0, null, short);
+      continue;
+    }
     if (from.pool === 'spell_slot') {
       const id = `slot:${from.slotType}:${from.slotLevel}`;
       const before = running.get(id) ?? availability.slots.find((s) => s.type === from.slotType && s.level === from.slotLevel)!.current;
       await client.query(`UPDATE character_spell_slots SET current_slots = current_slots - $4 WHERE character_id = $1 AND slot_type = $2 AND slot_level = $3`,
         [characterId, from.slotType, from.slotLevel, n]);
       running.set(id, before - n);
-      await ledger('spell_slot', { slotType: from.slotType, slotLevel: from.slotLevel }, line.label, n, before);
-      paid.push({ label: line.label, pool: 'spell_slot', delta: -n, before, after: before - n, slot: { slotType: from.slotType, slotLevel: from.slotLevel } });
+      await ledger('spell_slot', { slotType: from.slotType, slotLevel: from.slotLevel }, line.label, n, before, short);
+      if (n > 0) paid.push({ label: line.label, pool: 'spell_slot', delta: -n, before, after: before - n, slot: { slotType: from.slotType, slotLevel: from.slotLevel } });
     } else if (from.pool === 'charges') {
       const row = counterRows.get(from.key)!;
       const id = `charges:${from.key}`;
@@ -212,14 +243,14 @@ export async function payActivationCost(
       const table = loaded.counters!.scope === 'instance' ? 'character_content_resources' : 'character_inventory_resources';
       await client.query(`UPDATE ${table} SET current_value = current_value - $2 WHERE id = $1`, [row.id, n]);
       running.set(id, before - n);
-      await ledger('charges', { resourceId: row.id, resourceKey: from.key, scope: loaded.counters!.scope }, line.label, n, before);
-      paid.push({ label: line.label, pool: 'charges', delta: -n, before, after: before - n });
+      await ledger('charges', { resourceId: row.id, resourceKey: from.key, scope: loaded.counters!.scope }, line.label, n, before, short);
+      if (n > 0) paid.push({ label: line.label, pool: 'charges', delta: -n, before, after: before - n });
     } else if (from.pool === 'item') {
       const before = running.get('item') ?? availability.itemQuantity ?? 0;
       await client.query(`UPDATE character_inventory_items SET quantity = quantity - $2 WHERE id = $1`, [loaded.inventoryId, n]);
       running.set('item', before - n);
-      await ledger('item', { inventoryId: loaded.inventoryId }, line.label, n, before);
-      paid.push({ label: line.label, pool: 'item', delta: -n, before, after: before - n });
+      await ledger('item', { inventoryId: loaded.inventoryId }, line.label, n, before, short);
+      if (n > 0) paid.push({ label: line.label, pool: 'item', delta: -n, before, after: before - n });
     } else {
       const id = `pool:${from.key}`;
       const before = running.get(id) ?? availability.pools[from.key].current;
@@ -227,9 +258,10 @@ export async function payActivationCost(
         `UPDATE character_resources SET current_value = $3, max_value = $4, label = $5 WHERE character_id = $1 AND resource_key = $2`,
         [characterId, `${POOL_ROW_PREFIX}${from.key}`, before - n, poolMax.get(from.key) ?? 0, line.label]);
       running.set(id, before - n);
-      await ledger(id, {}, line.label, n, before);
-      paid.push({ label: line.label, pool: id, delta: -n, before, after: before - n });
+      await ledger(id, {}, line.label, n, before, short);
+      if (n > 0) paid.push({ label: line.label, pool: id, delta: -n, before, after: before - n });
     }
   }
+  override?.onUsed?.({ kind: override.kind, label: loaded.label, shortfalls: plan.shortfalls, waived });
   return paid;
 }
