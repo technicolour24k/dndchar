@@ -80,13 +80,15 @@ export async function writeTurnRow(client: pg.PoolClient, characterId: string, p
 
 // A fresh turn: spent, follow-ups and log cleared, turn_seq + 1, current profile. Call it LAST in a
 // transaction (lock order). Used by Next Turn, Next Round, New Battle and rests.
-export async function resetTurnState(client: pg.PoolClient, characterId: string): Promise<void> {
+// `note` (the VTT's manual Reset buttons) leaves one line in the fresh turn's log saying who reset it.
+export async function resetTurnState(client: pg.PoolClient, characterId: string, note?: string): Promise<void> {
   const profile = await characterProfile(client, characterId);
+  const log: TurnLogEntry[] = note ? [{ pool: 'turn', label: note.slice(0, 80), amount: 0, via: 'manual', source: 'Manual', at: new Date().toISOString() }] : [];
   await client.query(
-    `INSERT INTO character_turn_state (character_id, profile_key, turn_seq) VALUES ($1, $2, 1)
+    `INSERT INTO character_turn_state (character_id, profile_key, turn_seq, log_json) VALUES ($1, $2, 1, $3::jsonb)
      ON CONFLICT (character_id) DO UPDATE SET profile_key = EXCLUDED.profile_key, turn_seq = character_turn_state.turn_seq + 1,
-       spent_json = '{}'::jsonb, followups_json = '{}'::jsonb, log_json = '[]'::jsonb, updated_at = now()`,
-    [characterId, profile.key]);
+       spent_json = '{}'::jsonb, followups_json = '{}'::jsonb, log_json = EXCLUDED.log_json, updated_at = now()`,
+    [characterId, profile.key, JSON.stringify(log)]);
 }
 
 // Manual +/- on a pool (bookkeeping, like the resource pools' own +/-): delta changes what is LEFT,

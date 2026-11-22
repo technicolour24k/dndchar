@@ -70,3 +70,75 @@ export function paidText(turn) {
   const spent = (turn.paid || []).filter((/** @type {any} */ line) => line.delta < 0).map((/** @type {any} */ line) => `${-line.delta} ${line.label}`);
   return spent.length ? `Paid: ${spent.join(', ')}` : '';
 }
+
+// ---------------------------------------------------------------------------
+// Turn display on the token (action economy Unit 5). token.turn is a DISPLAY copy of the character's
+// turn view; every change goes through the /turn routes. The VTT server rebuilds it (sanitizeTurn),
+// so this trim and that one must produce the same shape and key order or the resync would resend.
+// ---------------------------------------------------------------------------
+
+const clampInt = (/** @type {any} */ n, /** @type {number} */ max) => Math.min(max, Math.max(0, Math.round(Number(n) || 0)));
+
+/**
+ * The small, display-only copy kept on a token, or null when there is nothing to show.
+ * @param {any} view a TurnView (full or already trimmed)
+ */
+export function trimTurnView(view) {
+  if (!view || typeof view !== 'object' || typeof view.profileKey !== 'string' || !Array.isArray(view.pools)) return null;
+  return {
+    profileKey: String(view.profileKey).slice(0, 40),
+    turnSeq: Math.min(1e9, Math.max(0, Math.round(Number(view.turnSeq) || 0))),
+    pools: view.pools.slice(0, 6).map((/** @type {any} */ p) => ({ key: String(p.key).slice(0, 40), label: String(p.label || p.key).slice(0, 80), current: clampInt(p.current, 99), max: clampInt(p.max, 99) })),
+    followups: (Array.isArray(view.followups) ? view.followups : []).slice(0, 4).map((/** @type {any} */ f) => ({ cls: String(f.cls).slice(0, 20), label: String(f.label || 'Extra Attack').slice(0, 80), remaining: clampInt(f.remaining, 99) }))
+  };
+}
+
+/**
+ * Chip texts for the token card: "Attack 1/2", "Extra Attack: 1 left" (only while some are waiting).
+ * @param {any} turn
+ */
+export function turnChips(turn) {
+  if (!turn) return [];
+  const pools = (turn.pools || []).map((/** @type {any} */ p) => `${p.label} ${p.current}/${p.max}`);
+  const followups = (turn.followups || []).filter((/** @type {any} */ f) => f.remaining > 0).map((/** @type {any} */ f) => `${f.label}: ${f.remaining} left`);
+  return [...pools, ...followups];
+}
+
+/**
+ * How many extra feet a move needs and how many dashes cover it (each dash adds one full speed).
+ * No speed means no dash is on offer (count 0), though `over` is still reported.
+ * @param {number} distanceFt @param {number | null | undefined} remainingFt @param {number | null | undefined} speedFt
+ */
+export function dashNeeded(distanceFt, remainingFt, speedFt) {
+  const over = Math.max(0, (Number(distanceFt) || 0) - (Number(remainingFt) || 0));
+  const speed = Number(speedFt) || 0;
+  return { over, count: over > 0 && speed > 0 ? Math.ceil(over / speed) : 0 };
+}
+
+/** The pool a dash draws from: a general action, so Utility in homebrew and Action in 5e. @param {any} view */
+export function dashPoolKey(view) {
+  return view?.profileKey === 'attack_utility' ? 'utility' : 'action';
+}
+
+/**
+ * The dash prompt sentence. `over` is null for the Dash button (no held move).
+ * @param {any} view @param {number} count @param {number | null} over @param {number} speedFt
+ */
+export function dashPromptText(view, count, over, speedFt) {
+  const key = dashPoolKey(view);
+  const pool = (view?.pools || []).find((/** @type {any} */ p) => p.key === key);
+  const cost = `${poolCostText(view, key, count)}${pool ? ` (you have ${pool.current})` : ''}`;
+  const gain = `Adds ${count * speedFt} ft of movement.`;
+  return over === null ? `Dash? Costs ${cost}. ${gain}` : `That move is ${over} ft past your movement. Dash? Costs ${cost}. ${gain}`;
+}
+
+/**
+ * The note shown after a GM "Reset all", only when some characters were not theirs to reset.
+ * @param {{ reset?: number, skipped?: number }} result
+ */
+export function resetAllNote(result) {
+  const reset = Number(result?.reset) || 0;
+  const skipped = Number(result?.skipped) || 0;
+  if (!skipped) return '';
+  return `Actions reset for ${reset} ${reset === 1 ? 'character' : 'characters'} (${skipped} skipped)`;
+}

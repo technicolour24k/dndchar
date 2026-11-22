@@ -9,7 +9,7 @@ import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.j
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
 import { createCostApproval } from './costApproval.js';
-import { ATTACK_TIMINGS, attackCostText, attackFollowup, paidText } from './shared/actionEconomy.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, paidText, resetAllNote, turnChips } from './shared/actionEconomy.js';
 import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
@@ -38,6 +38,7 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'spellSlots',
   'preparedSpells',
   'pools',
+  'turn', // display copy of the character's turn view (see shared/actionEconomy.js trimTurnView)
   // Last sheet vision values the token took (see token:vision:sync). Client-side list only, so
   // the generic token:stat:update path on the server can't write it.
   'sheetVision',
@@ -630,13 +631,13 @@ function dropMovePreview(tokenId) {
 
 // Brief message after our plan is aborted by someone else's change (there is no toast system).
 let movePlanNoticeTimer = null;
-function showMovePlanNotice(text) {
+function showMovePlanNotice(text, ms = 2500) {
   const notice = document.getElementById('movePlanNotice');
   if (!notice) return;
   notice.textContent = text;
   notice.classList.add('visible');
   clearTimeout(movePlanNoticeTimer);
-  movePlanNoticeTimer = setTimeout(() => notice.classList.remove('visible'), 2500);
+  movePlanNoticeTimer = setTimeout(() => notice.classList.remove('visible'), ms);
 }
 
 function clearAllMovePreviews() {
@@ -1492,14 +1493,16 @@ function sendMovePreview() {
 function commitMovePlan() {
   if (!movePlan || !movePlan.points.length) return;
   const final = movePlan.points[movePlan.points.length - 1];
-  send({
+  const sent = sendTokenMove({
     type: 'token:move',
     tokenId: movePlan.tokenId,
     x: final.x,
     y: final.y,
     waypoints: movePlan.points.slice(0, -1),
   });
-  // No clear message needed: every client drops the preview on the token:move broadcast.
+  // A sent move needs no clear message: every client drops the preview on the token:move broadcast.
+  // A move held for a dash never reaches the server, so the preview is cleared by hand.
+  if (!sent && movePlan.broadcast) send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
   endMovePlan();
 }
 
@@ -1620,6 +1623,7 @@ const attackModalBody = document.getElementById('attackModalBody');
 let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName, options, stage }
 
 function closeAttackModal() {
+  if (dashHold?.stage === 'paying') return; // a dash is being paid: closing now would look like cancelling it
   attackModal.classList.remove('visible');
   attackModalBody.innerHTML = '';
   if (awaitingAttackResult) {
@@ -1638,6 +1642,7 @@ function closeAttackModal() {
     render();
   }
   pendingAttack = null;
+  dashHold = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2472,7 +2477,7 @@ window.addEventListener('mouseup', (e) => {
       if (fromPlan) cancelMovePlan(); // dragging the planned token abandons the plan
       const raw = canvasCoords(e);
       const { x, y } = clampToMapBounds(raw.x, raw.y);
-      send({ type: 'token:move', tokenId, x, y });
+      sendTokenMove({ type: 'token:move', tokenId, x, y });
       // dragState itself is cleared once the server echoes the move back (see
       // handleMessage's token:move case) - the token doesn't actually move on
       // screen until then, per the "server is the only writer" rule.
@@ -2593,7 +2598,7 @@ function endTouchDrag(e, commit) {
       if (fromPlan) cancelMovePlan();
       const raw = canvasCoords(touch);
       const { x, y } = clampToMapBounds(raw.x, raw.y);
-      send({ type: 'token:move', tokenId, x, y });
+      sendTokenMove({ type: 'token:move', tokenId, x, y });
       // dragState itself clears once the server echoes the move back (see
       // handleMessage's token:move case), same as the mouse path above.
     }
@@ -2951,6 +2956,7 @@ characterPickerList.addEventListener('click', async (e) => {
       spellSlots: snapshot.spellSlots,
       preparedSpells: snapshot.preparedSpells,
       pools: snapshot.pools || [],
+      ...(snapshot.turn ? { turn: snapshot.turn } : {}),
       stats: { hp: snapshot.hp, maxHp: snapshot.maxHp },
     },
   });
@@ -3031,6 +3037,8 @@ function applyCharacterSyncFields(token, snapshot) {
     preparedSpells: snapshot.preparedSpells,
     // Resource pools follow the database (server-authoritative), unlike spellSlots which are session-tracked.
     pools: snapshot.pools || [],
+    // This turn's actions follow the database too (a display copy: changes go through the turn routes).
+    ...(snapshot.turn ? { turn: snapshot.turn } : {}),
   };
   for (const [stat, value] of Object.entries(updates)) {
     if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
@@ -3373,6 +3381,166 @@ function resetTokenSpeedRemaining(tokenId) {
   const token = session.tokens[tokenId];
   if (!token) return;
   send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: token.speedFt || 0 });
+  void resetTokenTurn(token);
+}
+
+// ---------------------------------------------------------------------------
+// Dash (action economy Unit 5). A character token moved by its OWNING PLAYER past its remaining
+// movement is held, and a dash is offered: a general action (1 Utility in homebrew, 1 Action in 5e)
+// that adds one full speed per dash. Paid through the turn route, so a shortfall goes through the same
+// ask-the-DM prompt as everything else. Movement within speed is free; the GM never gets this prompt
+// (the server still clamps the budget at 0). Server-side the move is not blocked: this is a prompt.
+// ---------------------------------------------------------------------------
+let dashHold = null; // { tokenId, count, over, move (a held token:move message, or null), stage }
+
+// The same distance the server deducts: the path total, never less than the straight line.
+function moveDistanceFt(token, waypoints, x, y) {
+  const grid = session?.map?.gridSizePx;
+  if (!grid) return null;
+  const path = pathFt([{ x: token.x, y: token.y }, ...waypoints, { x, y }], grid);
+  const straight = chebyshevFt(token.x, token.y, x, y, grid);
+  return path === null || straight === null ? null : Math.max(path, straight);
+}
+
+function dashForMove(token, msg) {
+  if (role !== 'player' || token.ownerId !== playerId) return null;
+  if (!token.characterId || !token.turn || !(token.speedFt > 0) || typeof token.speedRemainingFt !== 'number') return null;
+  if (!dashHold && attackModal.classList.contains('visible')) return null; // another prompt is open: leave it alone
+  const distance = moveDistanceFt(token, msg.waypoints || [], msg.x, msg.y);
+  if (distance === null) return null;
+  const need = dashNeeded(distance, token.speedRemainingFt, token.speedFt);
+  return need.count > 0 ? need : null;
+}
+
+// Sends a token:move, or holds it and offers a dash. Returns true when the move was sent.
+function sendTokenMove(msg) {
+  const token = session?.tokens[msg.tokenId];
+  // A dash prompt is already open. While it is being paid the new drop is refused (the ghost snaps back);
+  // while it waits for an answer the newest move REPLACES the held one (never sent unpaid).
+  if (dashHold && token && dashHold.tokenId === msg.tokenId) {
+    dragState = null;
+    render();
+    if (dashHold.stage !== 'ask') return false;
+    const again = dashForMove(token, msg);
+    if (again) { openDashPrompt(token, again.count, again.over, msg); return false; }
+    closeAttackModal(); // the new move is within movement after all: no dash needed
+    send(msg);
+    return true;
+  }
+  const need = token ? dashForMove(token, msg) : null;
+  if (!need) { send(msg); return true; }
+  dragState = null; // the ghost snaps back: nothing has moved
+  render();
+  openDashPrompt(token, need.count, need.over, msg);
+  return false;
+}
+
+function openDashPrompt(token, count, over, move) {
+  const hold = { tokenId: token.id, count, over, move, stage: 'ask' };
+  dashHold = hold;
+  attackModalBody.innerHTML = `<h2>Dash?</h2><p class="attack-subtext">${escapeHtml(dashPromptText(token.turn, count, over, token.speedFt))}</p>
+    <div class="actions">
+      <button type="button" class="secondary" data-dash="cancel">Cancel</button>
+      <button type="button" data-dash="go">${move ? 'Dash and move' : 'Dash'}</button>
+    </div>`;
+  attackModal.classList.add('visible');
+  attackModalBody.querySelector('[data-dash="go"]')?.focus();
+}
+
+// Pays the dash. On success: the turn copy, the extra movement, then the held move (same socket, so the
+// order holds). A 409 shortfall becomes the usual prompt, and approving it re-runs this with the approval.
+async function payDash(hold, extra = {}) {
+  const token = session?.tokens[hold.tokenId];
+  if (!token?.characterId) { closeAttackModal(); return; }
+  hold.stage = 'paying';
+  attackModalBody.innerHTML = '<h2>Dash</h2><p class="attack-subtext">Dashing…</p>';
+  let res;
+  let body;
+  try {
+    res = await fetch('/vtt/api/characters/' + token.characterId + '/turn', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...extra, action: 'pay', roomId: sessionId, activation: { kind: 'dash', count: hold.count } }),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch {
+    res = { ok: false, status: 0 };
+    body = { error: 'network' };
+  }
+  if (res.ok) {
+    const current = session?.tokens[hold.tokenId];
+    if (current) {
+      if (body.turn) send({ type: 'token:stat:update', tokenId: current.id, stat: 'turn', value: body.turn });
+      send({ type: 'token:stat:update', tokenId: current.id, stat: 'speedRemainingFt', value: (current.speedRemainingFt ?? 0) + hold.count * (current.speedFt || 0) });
+      if (hold.move) send(hold.move);
+    }
+    if (dashHold === hold) { hold.stage = 'done'; closeAttackModal(); }
+    return;
+  }
+  if (dashHold !== hold) return; // closed meanwhile
+  if (isCostInsufficient(body)) {
+    hold.stage = 'cost';
+    costApproval.promptPlayer({
+      body, label: 'Dash', characterId: token.characterId,
+      retry: (again) => { if (dashHold === hold) payDash(hold, again); },
+    });
+    return;
+  }
+  hold.stage = 'error';
+  const message = body.error === 'not_found' ? "You can't spend actions for this character." : rollError(body, res).message;
+  attackModalBody.innerHTML = `<h2>Dash</h2><p style="color:#e57373;font-size:13px;">${escapeHtml(message)}</p><div class="actions"><button type="button" data-dash="cancel">Close</button></div>`;
+}
+
+attackModalBody.addEventListener('click', (e) => {
+  const button = e.target.closest?.('[data-dash]');
+  if (!button || !dashHold || dashHold.stage === 'paying') return;
+  if (button.dataset.dash === 'cancel') closeAttackModal();
+  else if (dashHold.stage === 'ask') payDash(dashHold);
+});
+
+// Per-token Reset also gives the character a fresh turn (the VTT server has no database, so it is an
+// HTTP call). Only the character's owner or DM may; anyone else just gets the movement reset.
+async function resetTokenTurn(token) {
+  if (!token?.characterId) return;
+  try {
+    const res = await fetch('/vtt/api/characters/' + token.characterId + '/turn', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'reset' }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok) { if (body.turn) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: body.turn }); return; }
+    if (res.status === 404 || res.status === 403) showMovePlanNotice("Movement reset; actions need the character's owner or DM", 4000);
+  } catch { /* the movement reset already happened; the next character sync fixes the display */ }
+}
+
+// GM "Reset all": the HTTP half of token:move:resetAll. Pushes each reset character's fresh turn copy onto
+// its tokens, so the GM's display is right even when an owner is not connected.
+async function resetAllTurns() {
+  if (!sessionId) return;
+  try {
+    const res = await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/turn-reset', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) return;
+    for (const token of Object.values(session.tokens)) {
+      const view = token.characterId && body.views?.[token.characterId];
+      if (view) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: view });
+    }
+    const note = resetAllNote(body);
+    if (note) showMovePlanNotice(note, 4000);
+  } catch { /* movement was reset over the socket; actions follow on the next sync */ }
+}
+
+// Sidebar Dash button: a dash with no move behind it (just adds speed to this turn's movement).
+function dashButtonClicked(tokenId) {
+  const token = session?.tokens[tokenId];
+  if (token?.turn && token.characterId && token.speedFt > 0) openDashPrompt(token, 1, null, null);
+}
+
+// The "Actions" chips on the token cards: labels come from the profile, display only.
+function turnChipsHtml(t) {
+  const chips = turnChips(t.turn);
+  return chips.length ? `<div class="field turn-chips">${chips.map((chip) => `<span class="tag">${escapeHtml(chip)}</span>`).join(' ')}</div>` : '';
+}
+function dashButtonHtml(t) {
+  return t.characterId && t.turn && t.speedFt > 0 ? '<button class="secondary speedDashBtn" title="Spend a general action to add your speed to this turn\'s movement">Dash</button>' : '';
 }
 
 // Rescue for a token dragged somewhere unreachable (see clampToMapBounds's
@@ -3979,8 +4147,10 @@ function tokenManagerRowsHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            ${dashButtonHtml(t)}
             <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
+          ${turnChipsHtml(t)}
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
           <div class="actions">
@@ -4071,7 +4241,7 @@ function wireGmSidebar() {
   // Bulk counterpart to each token's own per-token Reset button - there's no
   // turn tracker in the VTT to hang an automatic reset on, so this is a
   // deliberate manual "everyone's back to full movement" GM action.
-  document.getElementById('resetAllMovementBtn').addEventListener('click', () => send({ type: 'token:move:resetAll' }));
+  document.getElementById('resetAllMovementBtn').addEventListener('click', () => { send({ type: 'token:move:resetAll' }); void resetAllTurns(); });
 
   wireMarkerForm();
 
@@ -4805,6 +4975,8 @@ tokenManagerList.addEventListener('click', (e) => {
     adjustTokenSpeedRemaining(tokenId, 5);
   } else if (e.target.classList.contains('speedResetBtn')) {
     resetTokenSpeedRemaining(tokenId);
+  } else if (e.target.classList.contains('speedDashBtn')) {
+    dashButtonClicked(tokenId);
   }
 });
 
@@ -4899,8 +5071,10 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            ${dashButtonHtml(t)}
             <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
+          ${turnChipsHtml(t)}
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
           <div class="actions">
@@ -5163,6 +5337,27 @@ function renderCombatActionsBody() {
     })
     .join('');
 
+  // This turn's actions (action economy). Always the database value: -/+ post to the turn route and the answer
+  // replaces the token's display copy. Labels come from the campaign's profile. Numbers are coerced, never raw.
+  const turnRowsHtml = (token.turn?.pools || [])
+    .map((pool) => {
+      const current = Number(pool.current) || 0;
+      const max = Number(pool.max) || 0;
+      return `
+        <div class="mini-sheet-slot mini-sheet-turn" data-turn-key="${escapeHtml(pool.key)}">
+          <span class="mini-sheet-slot-label">${escapeHtml(pool.label)}: ${current}/${max}</span>
+          <div class="mini-sheet-slot-actions">
+            <button type="button" class="secondary turnMinusBtn" ${current <= 0 ? 'disabled' : ''} aria-label="Spend one ${escapeHtml(pool.label)}">-</button>
+            <button type="button" class="secondary turnPlusBtn" ${current >= max ? 'disabled' : ''} aria-label="Regain one ${escapeHtml(pool.label)}">+</button>
+          </div>
+        </div>`;
+    })
+    .join('');
+  const turnFollowupsHtml = (token.turn?.followups || [])
+    .filter((entry) => Number(entry.remaining) > 0)
+    .map((entry) => `<div class="mini-sheet-slot"><span class="mini-sheet-slot-label">${escapeHtml(entry.label)}: ${Number(entry.remaining) || 0} left</span></div>`)
+    .join('');
+
   const itemsHtml = (token.items || []).length
     ? (token.items || [])
         .map(
@@ -5178,12 +5373,30 @@ function renderCombatActionsBody() {
     : '';
 
   combatActionsBody.innerHTML = `
+    ${turnRowsHtml ? `<label class="combat-actions-heading">Actions this turn</label>${turnRowsHtml}${turnFollowupsHtml}` : ''}
     <label class="combat-actions-heading">Weapons</label>
     ${actionsHtml}
     ${(cantripsHtml || slotsHtml) ? `<label class="combat-actions-heading">Spells</label>${cantripsHtml}${slotsHtml}` : ''}
     ${poolsHtml ? `<label class="combat-actions-heading">Resources</label>${poolsHtml}` : ''}
     ${itemsHtml ? `<label class="combat-actions-heading">Items</label>${itemsHtml}` : ''}
   `;
+
+  combatActionsBody.querySelectorAll('.turnMinusBtn, .turnPlusBtn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const key = btn.closest('.mini-sheet-turn')?.dataset.turnKey;
+      if (!key || !token.characterId) return;
+      combatActionsBody.querySelectorAll('.turnMinusBtn, .turnPlusBtn').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await fetch('/vtt/api/characters/' + token.characterId + '/turn', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'adjust', key, delta: btn.classList.contains('turnMinusBtn') ? -1 : 1 }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok && body.turn) { token.turn = body.turn; send({ type: 'token:stat:update', tokenId, stat: 'turn', value: body.turn }); }
+      } catch { /* the buttons come back on the next render */ }
+      if (combatActionsState && combatActionsModal.classList.contains('visible')) renderCombatActionsBody();
+    });
+  });
 
   combatActionsBody.querySelectorAll('.poolMinusBtn, .poolPlusBtn').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -5299,6 +5512,8 @@ function wirePlayerSidebar() {
       adjustTokenSpeedRemaining(tokenId, 5);
     } else if (e.target.classList.contains('speedResetBtn')) {
       resetTokenSpeedRemaining(tokenId);
+    } else if (e.target.classList.contains('speedDashBtn')) {
+      dashButtonClicked(tokenId);
     } else if (e.target.classList.contains('combatActionsBtn')) {
       openCombatActionsModal(tokenId);
     }

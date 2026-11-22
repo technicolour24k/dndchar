@@ -209,6 +209,9 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   // through the token. The vtt server has no database access, so the owner's client has to be the one
   // to write the copy (see PLAYER_EDITABLE_FIELDS).
   'pools',
+  // This turn's actions (Attack 1/2, Extra Attack...): a DISPLAY copy, like pools. Every change goes through
+  // the /vtt/api/characters/[id]/turn routes; the owner's client pushes it after character:changed.
+  'turn',
   // The lowest attack roll that has actually hit this token. Set by
   // attack:resolve, or manually via the dedicated token:knownAc:set event (any
   // role, any visible token - deliberately not in PLAYER_EDITABLE_FIELDS, so
@@ -262,6 +265,7 @@ const PLAYER_EDITABLE_FIELDS = new Set([
   'actions',
   'preparedSpells',
   'pools',
+  'turn',
   'conditions',
   'x',
   'y',
@@ -286,6 +290,35 @@ export function sanitizePools(value) {
     clean.push(rebuilt);
   }
   return clean;
+}
+
+// token.turn is a client-written DISPLAY copy of a character's turn view (the truth is character_turn_state).
+// Rebuilt here, never stored raw: { profileKey, turnSeq, pools (max 6), followups (max 4) } with capped
+// strings and integers clamped to 0..99 (turnSeq to 0..1e9). Anything malformed rejects the update (null).
+export const MAX_TURN_POOLS = 6;
+export const MAX_TURN_FOLLOWUPS = 4;
+export function sanitizeTurn(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const { profileKey, turnSeq, pools, followups } = value;
+  if (typeof profileKey !== 'string' || profileKey.length === 0 || profileKey.length > 40 || !Number.isInteger(turnSeq)) return null;
+  if (!Array.isArray(pools) || pools.length > MAX_TURN_POOLS || !Array.isArray(followups) || followups.length > MAX_TURN_FOLLOWUPS) return null;
+  const cleanPools = [];
+  for (const entry of pools) {
+    if (!entry || typeof entry !== 'object') return null;
+    const { key, label, current, max } = entry;
+    if (typeof key !== 'string' || typeof label !== 'string' || key.length === 0 || key.length > 40 || label.length > 80) return null;
+    if (!Number.isInteger(current) || !Number.isInteger(max)) return null;
+    cleanPools.push({ key, label, current: Math.min(99, Math.max(0, current)), max: Math.min(99, Math.max(0, max)) });
+  }
+  const cleanFollowups = [];
+  for (const entry of followups) {
+    if (!entry || typeof entry !== 'object') return null;
+    const { cls, label, remaining } = entry;
+    if (typeof cls !== 'string' || typeof label !== 'string' || cls.length === 0 || cls.length > 20 || label.length > 80) return null;
+    if (!Number.isInteger(remaining)) return null;
+    cleanFollowups.push({ cls, label, remaining: Math.min(99, Math.max(0, remaining)) });
+  }
+  return { profileKey, turnSeq: Math.min(1e9, Math.max(0, turnSeq)), pools: cleanPools, followups: cleanFollowups };
 }
 
 function isFieldEditAllowed(role, isOwner, field) {
@@ -397,6 +430,11 @@ async function handleTokenEvent(meta, msg, context) {
       // token) - never an NPC/enemy, never on another player's behalf.
       const isSelfPcToken = meta.role === 'player' && token.type === 'pc' && token.ownerId === meta.playerId;
       if (meta.role !== 'gm' && !isSelfPcToken) return;
+      // token.turn is display-only and rebuilt server-side; a bad or missing copy is dropped, the owner re-pushes it.
+      if (token.turn !== undefined) {
+        const cleanTurn = sanitizeTurn(token.turn);
+        if (cleanTurn) token.turn = cleanTurn; else delete token.turn;
+      }
       session.tokens[token.id] = token;
       broadcastToken(context, session, meta.sessionId, 'token:add', token);
       break;
@@ -570,6 +608,11 @@ async function handleTokenEvent(meta, msg, context) {
       // still works exactly as before for every other case, including the
       // GM editing an enemy directly or a player editing their own HP.
       let appliedValue = msg.value;
+      if (msg.stat === 'turn') {
+        const clean = sanitizeTurn(msg.value);
+        if (!clean) return;
+        appliedValue = clean;
+      }
       if (msg.stat === 'pools') {
         // Rebuilt from validated parts, never msg.value itself. A malformed array is ignored.
         const clean = sanitizePools(msg.value);

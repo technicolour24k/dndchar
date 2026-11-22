@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ATTACK_TIMINGS, attackCostText, attackFollowup, attackPoolKey, paidText, poolCostText } from '../../../static/vtt-app/shared/actionEconomy.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, attackPoolKey, dashNeeded, dashPoolKey, dashPromptText, paidText, poolCostText, resetAllNote, trimTurnView, turnChips } from '../../../static/vtt-app/shared/actionEconomy.js';
 import { formForActivation } from '../../../static/vtt-app/shared/costApproval.js';
 import { activationFromCastForm, parseActivation } from './vttCostApproval';
 
@@ -66,5 +66,44 @@ describe('re-running an approved attack or echo from the sheet banner', () => {
     const form = new FormData();
     for (const [key, value] of built.entries) form.set(key, value);
     expect(activationFromCastForm(form)).toEqual(activation);
+  });
+});
+
+describe('dash and token turn display (Unit 5)', () => {
+  it('dashNeeded: one dash per speed beyond what is left', () => {
+    expect(dashNeeded(25, 10, 30)).toEqual({ over: 15, count: 1 });
+    expect(dashNeeded(55, 10, 30)).toEqual({ over: 45, count: 2 });
+    expect(dashNeeded(40, 40, 30)).toEqual({ over: 0, count: 0 }); // exactly within movement is free
+    expect(dashNeeded(10, 30, 30)).toEqual({ over: 0, count: 0 });
+    expect(dashNeeded(60, 30, 30)).toEqual({ over: 30, count: 1 });
+    expect(dashNeeded(60, 30, 0)).toEqual({ over: 30, count: 0 }); // speed 0: no dash on offer
+    expect(dashNeeded(35, 0, 30)).toEqual({ over: 35, count: 2 });
+  });
+  it('a dash draws from the general pool of the profile, worded by its labels', () => {
+    expect(dashPoolKey(homebrew)).toBe('utility');
+    expect(dashPoolKey(fiveE)).toBe('action');
+    expect(dashPromptText(homebrew, 1, 15, 30)).toBe('That move is 15 ft past your movement. Dash? Costs 1 Utility action (you have 2). Adds 30 ft of movement.');
+    expect(dashPromptText(fiveE, 2, null, 30)).toBe('Dash? Costs 2 Actions (you have 1). Adds 60 ft of movement.');
+  });
+  it('trims a full view to the small copy tokens carry, and refuses junk', () => {
+    const full = { ...withExtra(homebrew), profileLabel: 'x', turnSeq: 3, log: [{}], pools: homebrew.pools.map((p) => ({ ...p, spent: 1, breakdown: [] })) };
+    expect(trimTurnView(full)).toEqual({
+      profileKey: 'attack_utility', turnSeq: 3,
+      pools: [{ key: 'attack', label: 'Attack', current: 1, max: 2 }, { key: 'utility', label: 'Utility', current: 2, max: 2 }],
+      followups: [{ cls: 'melee', label: 'Extra Attack', remaining: 1 }]
+    });
+    expect(trimTurnView(null)).toBeNull();
+    expect(trimTurnView({ profileKey: 5, pools: [] })).toBeNull();
+    expect(trimTurnView({ profileKey: 'dnd5e', pools: [{ key: 'a', label: 'A', current: 500, max: -2 }] })!.pools[0]).toEqual({ key: 'a', label: 'A', current: 99, max: 0 });
+  });
+  it('chips use the profile labels and only show follow-ups that are waiting', () => {
+    expect(turnChips(withExtra(homebrew))).toEqual(['Attack 1/2', 'Utility 2/2', 'Extra Attack: 1 left']);
+    expect(turnChips(withExtra(fiveE, 0))).toEqual(['Action 1/1', 'Bonus action 0/1', 'Reaction 1/1']);
+    expect(turnChips(null)).toEqual([]);
+  });
+  it('the Reset all note only appears when some characters were skipped', () => {
+    expect(resetAllNote({ reset: 3, skipped: 1 })).toBe('Actions reset for 3 characters (1 skipped)');
+    expect(resetAllNote({ reset: 1, skipped: 2 })).toBe('Actions reset for 1 character (2 skipped)');
+    expect(resetAllNote({ reset: 3, skipped: 0 })).toBe('');
   });
 });

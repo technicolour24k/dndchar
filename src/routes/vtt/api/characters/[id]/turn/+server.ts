@@ -5,6 +5,7 @@ import { withTransaction } from '$lib/server/db';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { payTurnActivation } from '$lib/server/services/catalogue';
 import { adjustTurnPool, getTurnView, resetTurnState, lockTurnState } from '$lib/server/services/turn-state';
+import { trimTurnView } from '$lib/server/vttTurn';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { CostShortfallError } from '$lib/server/services/cost-engine';
 import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
@@ -35,7 +36,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     try {
       const paid = await runWithGate(gate, (override) => payTurnActivation(locals.user!.id, characterId, activation, override));
       emitRealtimeEvent('resource:changed', { characterId });
-      return json({ paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), view: paid.turn });
+      return json({ paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), view: paid.turn, turn: trimTurnView(paid.turn) });
     } catch (error) {
       if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
       return json({ error: error instanceof Error ? error.message : 'Could not pay for that.' }, { status: 400 });
@@ -47,17 +48,18 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   if (body?.action === 'reset') {
     await withTransaction(async (client) => {
       await lockTurnState(client, characterId); // the turn row is the first lock
-      await resetTurnState(client, characterId);
+      await resetTurnState(client, characterId, 'Turn reset from the VTT');
     });
     emitRealtimeEvent('resource:changed', { characterId });
-    return json({ view: await getTurnView({ query }, characterId) });
+    const view = await getTurnView({ query }, characterId);
+    return json({ view, turn: trimTurnView(view) });
   }
 
   if (body?.action === 'adjust') {
     try {
       const view = await adjustTurnPool(locals.user!.id, characterId, typeof body.key === 'string' ? body.key : '', Number(body.delta));
       emitRealtimeEvent('resource:changed', { characterId });
-      return json({ view });
+      return json({ view, turn: trimTurnView(view) });
     } catch (error) {
       return json({ error: error instanceof Error ? error.message : 'Could not change that.' }, { status: 400 });
     }

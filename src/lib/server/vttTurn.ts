@@ -30,3 +30,7 @@ export function resetLiveTokenMovement(characterId: string, deps: Deps = live): 
   }
   return total;
 }
+
+// The trimmed display copy of a turn view that tokens carry (token.turn). One implementation, shared
+// with the browser, so the character route, the VTT client and the token handler's sanitizer agree.
+export { trimTurnView } from '../../../static/vtt-app/shared/actionEconomy.js';

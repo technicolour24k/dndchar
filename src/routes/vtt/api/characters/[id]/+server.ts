@@ -9,6 +9,7 @@ import {
   visionRadii
 } from '$lib/rules/dnd5e';
 import { characterStatsFor } from '$lib/rules/characterStats';
+import { trimTurnView } from '$lib/server/vttTurn';
 
 // Full computed combat snapshot for a single character, ownership-scoped
 // exactly like getCharacter() itself (a player can only pull their own
@@ -69,6 +70,8 @@ export const GET: RequestHandler = async ({ locals, params }) => {
     // Character resource pools (Soulfire, Vowfire, ...), visible ones only. Unlike spellSlots these follow the
     // database: the client re-syncs them on every character:changed, and they are never edited on the token.
     pools: character.pools.map(({ key, label, current, max, rechargePeriod }) => ({ key, label, current, max, rechargePeriod })),
+    // This turn's actions (Attack 1/2, Extra Attack...), trimmed to the display copy tokens carry (token.turn).
+    turn: trimTurnView(character.turn),
     preparedSpells: character.content
       .filter((entry) => entry.type === 'spell' && entry.isPrepared)
       .map((entry) => ({ id: entry.id, name: entry.name, spellLevel: entry.spellLevel, costText: entry.cost?.summary ?? '' })),

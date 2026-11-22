@@ -116,6 +116,13 @@ describe.skipIf(!enabled)('action economy turn state', () => {
 
       // The log keeps what was done by hand.
       expect((await view()).turn.log.at(-1)).toMatchObject({ pool: 'attack', via: 'manual' });
+
+      // The VTT's manual Reset leaves one line in the fresh turn's log (sheet resets leave it empty, above).
+      const { withTransaction } = await import('$lib/server/db');
+      const { resetTurnState } = await import('./services/turn-state');
+      await withTransaction((client) => resetTurnState(client, characterId, 'Turn reset from the VTT'));
+      expect((await view()).turn.log).toEqual([expect.objectContaining({ label: 'Turn reset from the VTT', via: 'manual', amount: 0 })]);
+      expect((await pools()).attack).toBe('2/2');
     } finally {
       if (campaignId) await query('DELETE FROM campaigns WHERE id=$1', [campaignId]);
       await query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [[dmId, strangerId, adminId]]); // cascades the character and its turn row

@@ -92,6 +92,7 @@ describe('turn route: reset and adjust are bookkeeping', () => {
   it('work for an editor, and an unknown action is a 400', async () => {
     expect((await post({ action: 'reset' })).status).toBe(200);
     expect(reset).toHaveBeenCalledTimes(1);
+    expect(reset.mock.calls[0][2]).toBe('Turn reset from the VTT'); // the new turn's log says who reset it
     expect((await post({ action: 'adjust', key: 'attack', delta: -1 })).status).toBe(200);
     expect(adjust).toHaveBeenCalledWith('u1', ID, 'attack', -1);
     expect((await post({ action: 'bogus' })).status).toBe(400);
