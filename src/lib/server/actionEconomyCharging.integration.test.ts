@@ -329,6 +329,26 @@ describe.skipIf(!enabled)('the cost engine charges the turn', () => {
       await reviewOverride(dmId, campaignId, staleEarned, 'undo');
       expect(await followupsLeft(duelist)).toEqual([['melee', 1]]);
 
+      // payTurnActivation (what the sheet's payTurn action and the VTT roll-attack call) returns what was paid and the fresh view.
+      const { payTurnActivation } = await import('./services/catalogue');
+      await advanceCharacterTurn(userId, duelist);
+      const payOne = await payTurnActivation(userId, duelist, { kind: 'weapon_attack', inventoryId: null, label: 'Longsword' });
+      expect(payOne.paid.map((l) => l.pool)).toEqual(['turn:attack']);
+      expect(payOne.turn.followups).toMatchObject([{ cls: 'melee', label: 'Extra Attack', remaining: 1 }]);
+      const payTwo = await payTurnActivation(userId, duelist, { kind: 'weapon_attack', inventoryId: null, label: 'Longsword' }); // default: use the follow-up
+      expect(payTwo.paid.map((l) => l.pool)).toEqual(['followup']);
+      expect(payTwo.turn.followups).toEqual([]);
+      expect(payTwo.results[0]).toMatchObject({ label: 'Cost', target: 'Extra Attack', before: 1, after: 0 });
+      // A cantrip echo needs the explicit choice and resolves with no cost lines at all (cantrip class).
+      await grant(duelist, 'followup.cantrip.count', '1', 'Cantrip echo');
+      const cantrip = await spell(duelist, 'Echo bolt', 0);
+      await advanceCharacterTurn(userId, duelist);
+      await cast(duelist, cantrip);
+      expect(await followupsLeft(duelist)).toEqual([['cantrip', 1]]);
+      await cast(duelist, cantrip, { followup: 'use' });
+      expect(await followupsLeft(duelist)).toEqual([]);
+      expect((await left(duelist)).attack).toBe(1); // only the first cast paid
+
       // The turn row is the first lock: casts racing long rests never deadlock.
       const racer = await mkCharacter('Racer');
       await addCharacterToCampaign(userId, racer, campaignId);

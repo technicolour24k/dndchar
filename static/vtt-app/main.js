@@ -9,6 +9,7 @@ import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.j
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
 import { createCostApproval } from './costApproval.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, paidText } from './shared/actionEconomy.js';
 import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
@@ -1650,7 +1651,7 @@ function closeAttackModal() {
 // INTERIM: the "Damage dice" control is a manual per-roll stopgap until proper modifiers handle
 // extra damage dice. It is not part of the modifier model (see the vtt-combat-mechanics plan).
 // ---------------------------------------------------------------------------
-function newAttackOptions(action, intent) {
+function newAttackOptions(action, intent, hasTurn = false) {
   const isSpell = action.kind === 'spell';
   const skipsPreview = intent === 'heal' || action.kind === 'item';
   // Whether the advantage panel is shown: never for heals/items; manual spells only when they
@@ -1668,6 +1669,12 @@ function newAttackOptions(action, intent) {
     dis: 0,               // situational disadvantage counter, 0-5
     damageDelta: 0,       // INTERIM: manual damage-dice delta, -5..+5
     primaryDamageDice: '',
+    // Action economy: a character's weapon attack also pays its action. The preview supplies the live
+    // turn view; the player picks when it is taken and whether to spend an Extra Attack follow-up.
+    showTurn: hasTurn,
+    turn: null,           // the turn view from the preview
+    timing: 'action',
+    followup: 'use',      // Extra Attack is the highlighted default while follow-ups wait
   };
 }
 
@@ -1746,6 +1753,16 @@ function advancedOptionsHtml(options) {
       <div class="attack-subtext">Each point counts as one source. Advantage and disadvantage cancel one for one.</div>
       <div class="adv-readout" id="advReadout"></div>
     </div>` : '';
+  const turnPanel = options.showTurn ? `
+    <div class="adv-panel" id="turnPanel">
+      <h4>Action</h4>
+      <div class="adv-row">
+        <span class="adv-row-label">Taken as</span>
+        <select id="turnTiming" aria-label="When the attack is taken">${ATTACK_TIMINGS.map((t) => `<option value="${t.value}">${t.label}</option>`).join('')}</select>
+      </div>
+      <div id="turnFollowup"></div>
+      <div class="adv-readout" id="turnCost"></div>
+    </div>` : '';
   const dmgPanel = `
     <div class="adv-panel" id="dmgPanel">
       <h4>Damage dice <span class="adv-manual">manual</span></h4>
@@ -1757,7 +1774,7 @@ function advancedOptionsHtml(options) {
       </div>
       <div class="attack-subtext" id="dmgPreview"></div>
     </div>`;
-  return advPanel + dmgPanel;
+  return advPanel + turnPanel + dmgPanel;
 }
 
 // Repaints the parts of the panel that depend on state (not the whole card, so focus is kept).
@@ -1790,6 +1807,29 @@ function refreshAdvantagePanel() {
   if (dmgPreview) dmgPreview.textContent = previewPrimaryDice(options.primaryDamageDice, options.damageDelta);
   const advPanel = document.getElementById('advPanel');
   if (advPanel && !options.showAdvantage) advPanel.remove();
+  refreshTurnPanel(options);
+}
+
+// The Action part of the confirm card: when the attack is taken, the explicit Extra Attack choice while
+// follow-ups wait, and what it will cost. Display only; the server pays and decides.
+function refreshTurnPanel(options) {
+  const panel = document.getElementById('turnPanel');
+  if (!panel) return;
+  const timing = document.getElementById('turnTiming');
+  if (timing && timing.value !== options.timing) timing.value = options.timing;
+  const offered = attackFollowup(options.turn, options.timing);
+  const followupEl = document.getElementById('turnFollowup');
+  if (followupEl) {
+    const key = offered ? `${offered.label}|${offered.remaining}` : '';
+    if (followupEl.dataset.renderedKey !== key) {
+      followupEl.dataset.renderedKey = key;
+      followupEl.innerHTML = offered ? `
+        <label class="adv-source"><input type="radio" name="turnFollowup" value="use" class="turnFollowupRadio" ${options.followup === 'use' ? 'checked' : ''} /> <strong>${escapeHtml(offered.label)} (${offered.remaining} left)</strong>: free repeat, spends no action</label>
+        <label class="adv-source"><input type="radio" name="turnFollowup" value="skip" class="turnFollowupRadio" ${options.followup === 'skip' ? 'checked' : ''} /> Normal attack: spends the action</label>` : '';
+    }
+  }
+  const cost = document.getElementById('turnCost');
+  if (cost) cost.textContent = options.turn ? `Cost: ${attackCostText(options.turn, options.timing, options.followup)}` : '';
 }
 
 // One delegated listener for the whole panel (the modal body is rebuilt as the flow moves on).
@@ -1804,6 +1844,11 @@ attackModalBody.addEventListener('click', (event) => {
   refreshAdvantagePanel();
 });
 attackModalBody.addEventListener('change', (event) => {
+  const turnOptions = pendingAttack?.options;
+  if (turnOptions && pendingAttack.stage === 'confirm') {
+    if (event.target.id === 'turnTiming') { turnOptions.timing = event.target.value; refreshTurnPanel(turnOptions); return; }
+    if (event.target.classList?.contains('turnFollowupRadio')) { turnOptions.followup = event.target.value; refreshTurnPanel(turnOptions); return; }
+  }
   const box = event.target.closest('.advSourceCheckbox');
   const options = pendingAttack?.options;
   if (!box || !options || pendingAttack.stage !== 'confirm') return;
@@ -1820,6 +1865,13 @@ function attackRollExtras(sourceTokenId, targetId, options, preview) {
     vtt: { sessionId, sourceTokenId, targetTokenId: targetId },
     advantage: { disabled: [...options.disabled], situationalAdvantage: options.adv, situationalDisadvantage: options.dis },
     manualDamageDice: options.damageDelta, // INTERIM
+    // The action economy choices for a character's weapon attack (the server defaults match).
+    // A follow-up is only used when the card actually offered it (and it's still the choice);
+    // otherwise send 'skip', so a hidden/unknown follow-up is never spent silently.
+    ...(options.showTurn ? {
+      timing: options.timing,
+      followup: attackFollowup(options.turn, options.timing) && options.followup === 'use' ? 'use' : 'skip'
+    } : {}),
   };
 }
 
@@ -1834,6 +1886,7 @@ async function loadAttackPreview(pending) {
     options.primaryDamageDice = preview.primaryDamageDice || '';
     if (preview.usesAttackRoll === false) options.showAdvantage = false;
     options.sources = (preview.sources || []).filter((src) => src.origin !== 'situational');
+    if (preview.turn) options.turn = preview.turn;
   } catch (err) {
     if (pendingAttack !== pending) return;
     console.warn('[VTT] advantage preview failed', err);
@@ -1847,7 +1900,7 @@ async function loadAttackPreview(pending) {
 function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   const isSpell = action.kind === 'spell';
   const isHeal = intent === 'heal';
-  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name, options: newAttackOptions(action, intent), stage: 'confirm' };
+  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name, options: newAttackOptions(action, intent, !isSpell && !isHeal && action.kind !== 'item' && Boolean(session.tokens[sourceTokenId]?.characterId)), stage: 'confirm' };
   const pending = pendingAttack;
   send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
   currentTargetTokenIds = [target.id];
@@ -1963,7 +2016,23 @@ async function rollPendingAction(action, source, extraBody = {}) {
   // stored on the action itself (same as an enemy/npc attack) - loses the
   // sheet's rich advantage/disadvantage-aware roll, but a homebrew extra
   // attack was never going to have that anyway.
-  if (body.error === 'item_not_found') return rollManualAction(action, extraBody);
+  if (body.error === 'item_not_found') {
+    // The attack isn't on the sheet (Unarmed Strike, a GM-added action), so its action is paid through
+    // the turn route instead. A 409 becomes the usual cost prompt (rollError keeps the body).
+    if (!extraBody.preview) {
+      const paid = await fetch('/vtt/api/characters/' + source.characterId + '/turn', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'pay', approvalId: extraBody.approvalId, override: extraBody.override, roomId: extraBody.roomId,
+          activation: { kind: 'weapon_attack', inventoryId: null, label: action.name, timing: extraBody.timing || 'action', followup: extraBody.followup === 'use' ? 'use' : 'skip' },
+        }),
+      });
+      const paidBody = await paid.json().catch(() => ({}));
+      if (paid.status === 404) return rollManualAction(action, extraBody); // can't act for this character: rolls unpaid, as before
+      if (!paid.ok) throw rollError(paidBody, paid);
+    }
+    return rollManualAction(action, extraBody);
+  }
 
   // Any other reason (not_found, missing_item) is a real failure - surface
   // the server's actual reason rather than just a bare status code.
@@ -2035,6 +2104,12 @@ async function resolveAttack(costExtra = {}) {
   renderAttackBreakdown(targetName, result, usesAttackRoll
     ? '<span class="attack-subtext">Resolving hit/miss…</span>'
     : '<span class="attack-subtext">Loading…</span>');
+  if (result.turn && paidText(result.turn)) {
+    const paidEl = document.createElement('div');
+    paidEl.className = 'attack-subtext';
+    paidEl.textContent = paidText(result.turn);
+    attackModalBody.querySelector('.attack-target-name')?.after(paidEl);
+  }
 
   if (usesAttackRoll) {
     const outcome = (result.outcomes || []).includes('critical_hit') ? 'critical_hit'

@@ -157,9 +157,15 @@ export function readTurnRow(row: TurnRow | null | undefined, profileKey: Profile
   return { turnSeq, spent, followups, log };
 }
 
-// The button label. The granting feature can name it later; "Extra Attack" is the default.
+// The button label when no granting feature names it.
 export function followupLabel(_cls: FollowupClass): string {
   return 'Extra Attack';
+}
+
+// The follow-up class a spell earns and spends: levelled spells are 'spell', cantrips 'cantrip', and
+// only an Action-timed spell takes part at all (matching weapon attacks). Null otherwise.
+export function spellFollowupClass(spellLevel: number | null | undefined, timing: string | null | undefined): FollowupClass | null {
+  return timing === 'action' ? ((spellLevel ?? 0) >= 1 ? 'spell' : 'cantrip') : null;
 }
 
 // What the sheet and the VTT show: remaining = max(0, liveMax - spent) per pool, plus the follow-ups
@@ -185,7 +191,7 @@ export function buildTurnView(
     followups: FOLLOWUP_CLASSES.flatMap((cls) => {
       const state = read.followups[cls];
       if (!state || state.remaining <= 0) return [];
-      return [{ cls, label: followupLabel(cls), remaining: state.remaining, perAction: followupInfo[cls]?.count ?? state.perAction }];
+      return [{ cls, label: state.sources[0] || followupLabel(cls), remaining: state.remaining, perAction: followupInfo[cls]?.count ?? state.perAction }];
     }),
     log: read.log.map(({ label, pool, amount, via, at }) => ({ label, pool, amount, via, at }))
   };

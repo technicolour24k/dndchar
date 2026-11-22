@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import type pg from 'pg';
 import { applySpellAccessCost, asTurnLine, defaultCostFor, effectiveCost, parseCostJson, planCost, withCategory } from '$lib/rules/cost';
-import { actionPoolMaxima, followupCount, readTurnRow, resolveTurnPool, type TurnRead } from '$lib/rules/actionEconomy';
+import { actionPoolMaxima, followupCount, readTurnRow, resolveTurnPool, spellFollowupClass, type TurnRead } from '$lib/rules/actionEconomy';
 import type { ActionEconomyProfile, FollowupClass, TurnLogEntry } from '$lib/types/actionEconomy';
 import type { Activation, CostAvailability, CostEntry, CostShortfall, PlannedCost } from '$lib/types/cost';
 import { loadPoolMaxima, POOL_ROW_PREFIX, writeLedger } from '$lib/server/services/resource-pools';
@@ -152,8 +152,8 @@ export async function loadActivationCost(client: pg.PoolClient, characterId: str
 // Only an Action-timed spell earns or spends an echo (matching weapon attacks: a bonus-action or
 // reaction spell neither earns nor burns one).
 function spellFollowup(spellLevel: number | null | undefined, entries: CostEntry[]): { cls: FollowupClass; grants: boolean } | null {
-  const timing = entries.map((e) => asTurnLine(e)).find((line) => line !== null)?.timing;
-  return timing === 'action' ? { cls: (spellLevel ?? 0) >= 1 ? 'spell' : 'cantrip', grants: true } : null;
+  const cls = spellFollowupClass(spellLevel, entries.map((e) => asTurnLine(e)).find((line) => line !== null)?.timing);
+  return cls ? { cls, grants: true } : null;
 }
 
 // Pool names that are already ledger pool values; anything else is a character pool key ('pool:<key>').

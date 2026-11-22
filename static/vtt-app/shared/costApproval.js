@@ -116,13 +116,23 @@ export function formForActivation(activation) {
     const entries = [['instanceId', activation.instanceId]];
     if (activation.slotType) entries.push(['slotType', activation.slotType]);
     if (activation.slotLevel) entries.push(['slotLevel', String(activation.slotLevel)]);
+    if (activation.followup) entries.push(['followup', activation.followup]);
     return { action: 'castSpell', entries };
   }
   if (activation.kind === 'spell_access') {
     const entries = [['spellAccessId', activation.spellAccessId], ['inventoryItemId', activation.inventoryItemId]];
     if (activation.slotType) entries.push(['slotType', activation.slotType]);
     if (activation.slotLevel) entries.push(['slotLevel', String(activation.slotLevel)]);
+    if (activation.followup) entries.push(['followup', activation.followup]);
     return { action: 'castSpell', entries };
+  }
+  if (activation.kind === 'weapon_attack') {
+    // Only a real weapon can be re-run from the sheet (an id-less attack has no sheet row), and a dash never.
+    if (!activation.inventoryId) return null;
+    const entries = [['kind', 'weapon_attack'], ['inventoryId', activation.inventoryId]];
+    if (activation.timing) entries.push(['timing', activation.timing]);
+    if (activation.followup) entries.push(['followup', activation.followup]);
+    return { action: 'payTurn', entries };
   }
   if (activation.kind === 'item') return { action: 'useItem', entries: [['inventoryId', activation.inventoryId]] };
   if (activation.kind === 'content') return { action: 'triggerContent', entries: [['instanceId', activation.instanceId]] };

@@ -7,7 +7,7 @@ import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzyS
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
 import { listPoolDefinitions, loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
-import { characterProfile, lockTurnState, resetTurnState } from '$lib/server/services/turn-state';
+import { characterProfile, getTurnView, lockTurnState, resetTurnState } from '$lib/server/services/turn-state';
 import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson, withCategory } from '$lib/rules/cost';
 import { inferCategory } from '$lib/rules/actionEconomy';
 import type { CostEntry } from '$lib/types/cost';
@@ -509,6 +509,17 @@ export async function spendSpellSlot(userId: string, characterId: string, type: 
 }
 
 export type ResourceActionResult=ActionResult;
+
+// Pays an activation that is nothing but its action (a weapon attack, a dash), through the one cost
+// engine. The roll itself happens in the caller (the sheet rolls locally; the VTT route rolls on the
+// server). Returns what was paid and the fresh turn view. Needs act access, like casting.
+export async function payTurnActivation(userId:string,characterId:string,activation:Activation,costOverride?:CostOverride|null):Promise<{results:ActionResult[];paid:PaidLine[];turn:Awaited<ReturnType<typeof getTurnView>>}>{
+  return withTransaction(async(client)=>{
+    await assertCanAct(client,userId,characterId);
+    const paid=await payActivationCost(client,characterId,activation,{actorUserId:userId,override:costOverride});
+    return {results:paidToResults(paid),paid,turn:await getTurnView(client,characterId)};
+  });
+}
 
 export async function useInventoryCatalogueItem(userId: string, characterId: string, inventoryId: string, costOverride?: CostOverride | null): Promise<ResourceActionResult[]> {
   return withTransaction(async (client) => {

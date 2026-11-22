@@ -6,7 +6,7 @@
   import { tick, untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
-  import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
+  import RollOptionsModal, { type AttackChoice } from '$lib/components/character/RollOptionsModal.svelte';
   import ForageModal from '$lib/components/character/ForageModal.svelte';
   import { readOnlyLock } from '$lib/ui/readOnlyLock';
   import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
@@ -19,7 +19,7 @@
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
   import { isDisplayOnlyCost } from '$lib/rules/cost';
-  import { profileFor, resolveTurnPool } from '$lib/rules/actionEconomy';
+  import { profileFor, resolveTurnPool, spellFollowupClass } from '$lib/rules/actionEconomy';
   import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -907,7 +907,9 @@
     title: string;
     advantage: { effects: typeof character.modifierSources; candidates: string[]; context: ModifierContext; batch?: boolean } | null;
     damageDice: { baseExpression: string } | null;
-    run: (choices: RollChoices) => void;
+    // Set on a weapon attack: the panel then also asks when it is taken and whether to use a follow-up.
+    attack?: { followup: { label: string; remaining: number } | null } | null;
+    run: (choices: RollChoices, attack?: AttackChoice) => void;
   };
   let rollOptions = $state<RollOptionsSpec | null>(null);
 
@@ -925,10 +927,10 @@
     void tick().then(() => { if (trigger.isConnected) trigger.focus(); });
   });
 
-  function submitRollOptions(choices: RollChoices) {
+  function submitRollOptions(choices: RollChoices, attack?: AttackChoice) {
     const spec = rollOptions;
     rollOptions = null;
-    spec?.run(choices);
+    spec?.run(choices, attack);
   }
 
   // A plain d20 roll (save, skill, ability check, initiative, death save).
@@ -1514,7 +1516,19 @@
         context: { classes: classRows, ability: item.attackAbility, attackType: 'melee_weapon' }
       },
       damageDice: { baseExpression: item.damageRolls },
-      run: (choices) => rollBattleAction(item, choices)
+      // Every weapon attack here is melee-type for follow-ups until rollAttack supports ranged attacks.
+      attack: readOnly || !item.id ? null : { followup: character.turn.followups.find((entry) => entry.cls === 'melee') ?? null },
+      run: (choices, attack) => {
+        if (!attack) { rollBattleAction(item, choices); return; }
+        // Pay the action first (an explicit choice either way), then roll. A shortfall opens the usual
+        // ask-the-DM prompt, and an approved resume rolls with the same choices.
+        const body = new FormData();
+        body.set('kind', 'weapon_attack');
+        body.set('inventoryId', item.id ?? '');
+        body.set('timing', attack.timing);
+        body.set('followup', attack.followup);
+        void runResourceAction('payTurn', body, `${item.name || 'Attack'} attack.`, () => rollBattleAction(item, choices));
+      }
     };
   }
 
@@ -1692,9 +1706,12 @@
     await runResourceAction('triggerContent',body,`${name} used.`);
   }
 
-  async function castSpell(spell:any,slot?:{type:string;level:number}){
+  // followup is sent only when the dialog offered an echo, and always explicitly then: 'use' casts a free
+  // echo at the spell's base level, 'skip' pays normally (a plain cast never spends a waiting echo).
+  async function castSpell(spell:any,slot?:{type:string;level:number},followup?:'use'|'skip'){
     const body=new FormData();
     if(slot){body.set('slotType',slot.type);body.set('slotLevel',String(slot.level));}
+    if(followup)body.set('followup',followup);
     if(spell.spellAccessId){body.set('spellAccessId',spell.spellAccessId);body.set('inventoryItemId',spell.inventoryItemId||'');}
     else body.set('instanceId',spell.id);
     await runResourceAction('castSpell',body,`${spell.name} cast.`);
@@ -1705,7 +1722,21 @@
   // Cantrips and free spells (action lines only) cast directly. The server stays authoritative.
   // A turn line never forces the dialog on its own (a cantrip casts directly), but when the dialog is
   // open it is listed against this turn's live pools. The server charges it either way.
-  let castDialog = $state<{ spell: any; slotKey: string } | null>(null);
+  let castDialog = $state<{ spell: any; slotKey: string; echo: boolean } | null>(null);
+  // A waiting spell or cantrip echo (a doublecast-style follow-up) that this spell could use: only an
+  // Action-timed, one-action spell takes part. The echo is completely free and resolves at the base level.
+  function echoFor(spell: any): { label: string; remaining: number; baseLevel: number | null } | null {
+    const entries = (spell?.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; timing?: string }>;
+    const turnLine = entries.find((entry) => entry.pool === 'turn');
+    if (!turnLine || turnLine.amount !== 1) return null;
+    const cls = spellFollowupClass(spell.spellLevel, turnLine.timing);
+    const waiting = cls ? character.turn.followups.find((entry) => entry.cls === cls) : undefined;
+    if (!waiting || waiting.remaining <= 0) return null;
+    const levels = entries.filter((entry) => entry.pool === 'spell_slot').map((entry) => entry.level ?? 1);
+    return { label: waiting.label, remaining: waiting.remaining, baseLevel: levels.length ? Math.min(...levels) : null };
+  }
+  const castEcho = $derived(castDialog ? echoFor(castDialog.spell) : null);
+  const castEchoing = $derived(Boolean(castDialog?.echo && castEcho));
   const castCostEntries = $derived((castDialog?.spell.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; key?: string }>);
   const castSlotLine = $derived(castCostEntries.find((entry) => entry.pool === 'spell_slot'));
   const castEligibleSlots = $derived(castSlotLine
@@ -1743,22 +1774,25 @@
 
   function openCast(spell: any) {
     const entries = (spell.cost?.entries ?? []) as Array<{ pool: string; level?: number; amount: number }>;
-    if (!entries.some((entry) => !isDisplayOnlyCost(entry))) { void castSpell(spell); return; }
+    const echo = echoFor(spell);
+    if (!echo && !entries.some((entry) => !isDisplayOnlyCost(entry))) { void castSpell(spell); return; }
     const slotLine = entries.find((entry) => entry.pool === 'spell_slot');
     const eligible = slotLine
       ? character.spellSlots.filter((slot) => slot.level >= (slotLine.level ?? 1))
           .sort((a, b) => a.level - b.level || (a.type === b.type ? 0 : a.type === 'standard' ? -1 : 1))
       : [];
     const pick = eligible.find((slot) => slot.current >= (slotLine?.amount ?? 1)) ?? eligible[0];
-    castDialog = { spell, slotKey: pick ? `${pick.type}:${pick.level}` : '' };
+    castDialog = { spell, slotKey: pick ? `${pick.type}:${pick.level}` : '', echo: false };
   }
 
   async function confirmCast() {
     if (!castDialog) return;
     const { spell, slotKey } = castDialog;
+    const echoing = castEchoing;
+    const offered = Boolean(castEcho);
     const [type, level] = slotKey.split(':');
     castDialog = null;
-    await castSpell(spell, castSlotLine && slotKey ? { type, level: Number(level) } : undefined);
+    await castSpell(spell, !echoing && castSlotLine && slotKey ? { type, level: Number(level) } : undefined, offered ? (echoing ? 'use' : 'skip') : undefined);
   }
 
   // db-traffic-reduction Phase 4: this used to stash its message in sessionStorage and do a
@@ -1770,7 +1804,7 @@
   // ---- Over-budget prompt and DM approval (cost engine Unit 6). The held click is kept in memory as
   // plain entries, so it can be re-sent with an approval or an override. The server decides who may
   // do what (src/lib/server/vttCostGate.ts); this only shows the right prompt and resends.
-  type Held={action:string;entries:Array<[string,string]>;heading:string};
+  type Held={action:string;entries:Array<[string,string]>;heading:string;onPaid?:()=>void};
   type CostPromptState={stage:'prompt'|'waiting'|'banner';mode:string;shortfalls:Array<{label:string;needed:number;available:number}>;label:string;
     busy:boolean;error:string;held:Held|null;activation:any;requestId:string|null;banner:any};
   let costPrompt=$state<CostPromptState|null>(null);
@@ -1796,7 +1830,7 @@
     const held=costPrompt?.held;
     if(!held)return;
     costPrompt=null;
-    await runResourceAction(held.action,heldForm(held,extra),held.heading);
+    await runResourceAction(held.action,heldForm(held,extra),held.heading,held.onPaid);
   }
 
   async function costApi(url:string,init?:RequestInit):Promise<{ok:boolean;status:number;data:any}>{
@@ -1882,13 +1916,15 @@
     return()=>clearInterval(timer);
   });
 
-  async function runResourceAction(action:string,body:FormData,heading:string){
+  // onPaid runs once the action succeeded (a weapon attack rolls after its action is paid), and is kept
+  // on the held click so an approved resume still runs it.
+  async function runResourceAction(action:string,body:FormData,heading:string,onPaid?:()=>void){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
     const failed=actionResult.type==='failure'?(actionResult.data as {costShortfall?:Array<{label:string;needed:number;available:number}>;costMode?:string;costActivation?:any;costError?:any}|undefined):undefined;
     if(failed?.costShortfall){
       // Can't afford it: offer the way past that fits who is acting and whether a DM is connected.
-      openCostPrompt({action,entries:[...body.entries()].filter(([key])=>key!=='approvalId'&&key!=='override').map(([key,value])=>[key,String(value)] as [string,string]),heading},
+      openCostPrompt({action,entries:[...body.entries()].filter(([key])=>key!=='approvalId'&&key!=='override').map(([key,value])=>[key,String(value)] as [string,string]),heading,onPaid},
         failed.costShortfall,failed.costMode||'no_dm',failed.costActivation);
       return;
     }
@@ -1907,6 +1943,7 @@
       `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
     inventoryMessage=lines.join('\n');
     await invalidate('app:character-sheet');
+    onPaid?.();
   }
 
   // db-traffic-reduction Phase 4: used to zero the quantity then requestSubmit() the whole
@@ -3009,15 +3046,23 @@
     <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (castDialog = null))}>
       <div class="panel compact-modal cast-dialog" role="dialog" aria-modal="true" aria-labelledby="cast-dialog-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
         <div class="panel-head"><h2 id="cast-dialog-title">Cast {castDialog.spell.name}</h2><span class="cost-chip">{castDialog.spell.cost.summary}</span></div>
-        {#if castSlotLine}
+        {#if castEcho}
+          <label class="roll-options-source">
+            <input type="checkbox" checked={castDialog.echo} onchange={(event) => { if (castDialog) castDialog.echo = event.currentTarget.checked; }} />
+            <span><strong>{castEcho.label} ({castEcho.remaining} left)</strong>: a free echo{castEcho.baseLevel ? `, cast at level ${castEcho.baseLevel}` : ''} (no action, no slot)</span>
+          </label>
+        {/if}
+        {#if castSlotLine && !castEchoing}
           <label>Slot
             <select bind:value={castDialog.slotKey}>
               {#each castEligibleSlots as slot}<option value={`${slot.type}:${slot.level}`}>{slot.type === 'pact' ? `Pact (level ${slot.level})` : `Level ${slot.level}`} - {slot.current} left{slot.level > (castSlotLine.level ?? 1) ? ' (upcast)' : ''}</option>{:else}<option value="">No suitable slot</option>{/each}
             </select>
           </label>
         {/if}
+        {#if castEchoing}<p class="muted">The echo costs nothing.</p>{:else}
         <ul class="cast-lines">{#each castLines as line}<li class:short={line.available < line.needed}>{line.needed} {line.label} <span class="muted">(have {line.available})</span></li>{/each}</ul>
         {#if castShort.length}<p class="form-error">It doesn't look like you've got the capacity to do that. {castShort.map((line) => `Needs ${line.needed} ${line.label}, you have ${line.available}.`).join(' ')}</p>{/if}
+        {/if}
         <div class="actions"><button type="button" onclick={confirmCast}>Cast</button><button type="button" class="text-button" onclick={() => (castDialog = null)}>Cancel</button></div>
       </div>
     </div>
@@ -3082,6 +3127,7 @@
       title={rollOptions.title}
       advantage={rollOptions.advantage}
       damageDice={rollOptions.damageDice}
+      attack={rollOptions.attack ?? null}
       onroll={submitRollOptions}
       oncancel={() => (rollOptions = null)}
     />

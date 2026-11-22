@@ -10,6 +10,9 @@
   import type { ModifierContext } from '$lib/rules/dnd5e';
   import type { ActiveCharacterEffect } from '$lib/types/character';
 
+  // What a weapon attack pays for, chosen alongside the roll (action economy).
+  export type AttackChoice = { timing: 'action' | 'bonus_action' | 'reaction'; followup: 'use' | 'skip' };
+
   // The one shared pre-roll options panel for every d20 roll on the sheet (saves, skills, ability
   // checks, initiative, attacks, death saves), plus a damage-dice-only variant for spell damage.
   // It reuses the same pure resolution code as the VTT endpoints (previewAdvantage etc.), so the
@@ -21,6 +24,7 @@
     title,
     advantage,
     damageDice,
+    attack = null,
     onroll,
     oncancel
   }: {
@@ -30,7 +34,10 @@
     advantage: { effects: ActiveCharacterEffect[]; candidates: string[]; context: ModifierContext; batch?: boolean } | null;
     // INTERIM: manual damage-dice control. null = hide it.
     damageDice: { baseExpression: string } | null;
-    onroll: (choices: RollChoices) => void;
+    // A weapon attack: shows when it is taken (Action, off-hand Bonus action, opportunity Reaction) and,
+    // while follow-ups wait for this kind of attack, an explicit "Extra Attack (N left)" choice.
+    attack?: { followup: { label: string; remaining: number } | null } | null;
+    onroll: (choices: RollChoices, attack?: AttackChoice) => void;
     oncancel: () => void;
   } = $props();
 
@@ -40,6 +47,10 @@
   // INTERIM: manual damage-dice delta, -5..+5.
   let manualDamageDice = $state(0);
   let rollButton = $state<HTMLButtonElement | null>(null);
+  let timing = $state<AttackChoice['timing']>('action');
+  let useFollowup = $state(true); // Extra Attack is the highlighted default while follow-ups remain
+  // Extra Attack is part of the Attack action: off-hand and opportunity attacks never use it.
+  const followupOffered = $derived(Boolean(attack?.followup && attack.followup.remaining > 0 && timing === 'action'));
 
   // Focus Roll on open (not `autofocus`, which Svelte warns about).
   $effect(() => {
@@ -78,7 +89,10 @@
   const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
   function roll() {
-    onroll({ disabledSourceIds: disabledIds, situationalAdvantage, situationalDisadvantage, manualDamageDice });
+    onroll(
+      { disabledSourceIds: disabledIds, situationalAdvantage, situationalDisadvantage, manualDamageDice },
+      attack ? { timing, followup: followupOffered && useFollowup ? 'use' : 'skip' } : undefined
+    );
   }
 
   // This component renders inside the sheet's own <form>, so it can't be a nested form. Enter on a
@@ -106,6 +120,30 @@
       <h2 id="roll-options-title">{title}</h2>
       <button type="button" class="text-button" onclick={oncancel}>Cancel</button>
     </div>
+
+    {#if attack}
+      <section class="roll-options-section">
+        <h3>Action</h3>
+        <label class="roll-options-row">
+          <span>Taken as</span>
+          <select bind:value={timing} aria-label="When the attack is taken">
+            <option value="action">Action</option>
+            <option value="bonus_action">Bonus action (off-hand)</option>
+            <option value="reaction">Reaction (opportunity attack)</option>
+          </select>
+        </label>
+        {#if followupOffered && attack.followup}
+          <label class="roll-options-source">
+            <input type="radio" name="attack-followup" checked={useFollowup} onchange={() => (useFollowup = true)} />
+            <span><strong>{attack.followup.label} ({attack.followup.remaining} left)</strong> - free repeat, spends no action</span>
+          </label>
+          <label class="roll-options-source">
+            <input type="radio" name="attack-followup" checked={!useFollowup} onchange={() => (useFollowup = false)} />
+            <span>Normal attack - spends the action</span>
+          </label>
+        {/if}
+      </section>
+    {/if}
 
     {#if advantage}
       <section class="roll-options-section">

@@ -6,11 +6,11 @@ import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
 import { CostShortfallError } from '$lib/server/services/cost-engine';
 import { openCostGate, runWithGate } from '$lib/server/vttCostGate';
-import { activationFromCastForm } from '$lib/server/vttCostApproval';
+import { activationFromCastForm, parseActivation } from '$lib/server/vttCostApproval';
 import { adjustCharacterPool } from '$lib/server/services/resource-pools';
 import { adjustTurnPool } from '$lib/server/services/turn-state';
 import { resetLiveTokenMovement } from '$lib/server/vttTurn';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, payTurnActivation, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
 import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
 import { addCharacterToCampaign, getCampaignByRoomCode, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
@@ -272,6 +272,21 @@ export const actions = {
     const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:{kind:'content',instanceId},approvalId:form.get('approvalId'),override:form.get('override')});
     if(!gate.ok)return fail(gate.status,{costError:gate.body});
     try{itemResult=await runWithGate(gate,(override)=>triggerCharacterContentActions(locals.user!.id,params.id,instanceId,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
+    emitRealtimeEvent('resource:changed',{characterId:params.id});
+    return{contentUpdated:true,itemResult};
+  },
+  // Pays a weapon attack's action (and spends an Extra Attack follow-up when chosen). The sheet then rolls
+  // locally. Fields: kind=weapon_attack, inventoryId, timing (action|bonus_action|reaction), followup (use|skip).
+  payTurn:async({request,params,locals})=>{
+    const form=await request.formData();
+    const text=(key:string)=>String(form.get(key)||'');
+    const activation=parseActivation({kind:text('kind'),inventoryId:text('inventoryId')||null,
+      ...(text('timing')?{timing:text('timing')}:{}),...(text('followup')?{followup:text('followup')}:{})});
+    if(!activation||activation.kind!=='weapon_attack'||!activation.inventoryId)return fail(400,{costError:{error:'bad_activation'}});
+    const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation,approvalId:form.get('approvalId'),override:form.get('override')});
+    if(!gate.ok)return fail(gate.status,{costError:gate.body});
+    let itemResult;
+    try{itemResult=(await runWithGate(gate,(override)=>payTurnActivation(locals.user!.id,params.id,activation,override))).results;}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});
     return{contentUpdated:true,itemResult};
   },
