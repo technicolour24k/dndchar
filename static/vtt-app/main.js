@@ -3656,6 +3656,9 @@ function renderSidebar() {
   sidebarEl.querySelectorAll('[data-draft][id]').forEach((el) => { drafts[el.id] = el.value; });
 
   sidebarEl.innerHTML = role === 'gm' ? gmSidebarHtml() : playerSidebarHtml();
+  // Synchronously, before anything can paint: put the persistent voice dock back into its slot (the
+  // innerHTML above detached it; the call and its audio elements are not affected).
+  voice.mount(sidebarEl.querySelector('#voiceSlot'));
 
   // Restore BEFORE wiring: wireMarkerForm() reads the shape select at wire time
   // to show/hide the radius vs cone/cube fields.
@@ -3681,7 +3684,10 @@ function playerListHtml() {
 function roomInfoHtml(roleLabel) {
   // A campaign table shows the campaign's name above its (long, fixed) room code.
   const campaignLine = campaignClient.campaignName ? `<strong>${escapeHtml(campaignClient.campaignName)}</strong><br/>Room: ` : '';
-  return `<div id="roomInfo">${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+  // Campaign tables get a slot at the top of the box for the voice controls (voice.mount moves the
+  // one persistent dock node into it after every render). Quick rooms get none, so no voice there.
+  const voiceSlot = campaignClient.active ? '<div id="voiceSlot"></div>' : '';
+  return `<div id="roomInfo">${voiceSlot}${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${overworld.buttonHtml()}
     ${combatControlHtml()}

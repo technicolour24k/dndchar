@@ -1,8 +1,10 @@
 // Voice chat dock (daily-voice plan, Units 2 and 3). Campaign tables only: main.js calls show() once
 // the table has joined and never calls it for Quick rooms, so those never see the dock.
 //
-// The dock is a direct child of <body>, outside #sidebar/#app, so renderSidebar() rebuilds, map
-// switches and socket reconnects never touch it, and the call carries on underneath them.
+// The dock is ONE persistent node. main.js's renderSidebar() rebuilds the sidebar with innerHTML,
+// which detaches it, so main.js calls voice.mount(slot) right after every rebuild to move the same
+// node into the room info box. Remote <audio> elements live in a separate hidden body child, so a
+// detached dock never stops audio, and map switches and socket reconnects don't touch the call.
 //
 // daily-js is loaded from a pinned CDN URL on first Join (the VTT has no bundler) and used in
 // call-object mode (our own UI). In that mode daily-js does not play remote audio, so we keep one
@@ -524,6 +526,11 @@ export function createVoice({ getCampaignId, getCharacterId = () => null }) {
       dock.hidden = false;
     },
     hide() { if (dock) dock.hidden = true; },
+    // Move the one dock node into the sidebar slot (called after every sidebar rebuild). The node is
+    // never re-created, so listeners and state survive; remote audio is outside it.
+    mount(slot) {
+      if (dock && slot && dock.parentNode !== slot) slot.appendChild(dock);
+    },
     leave,
     // Removed from the campaign (or it was archived): the server also ejects, this is the fast path.
     onKickedRemoved() { leave(); },
