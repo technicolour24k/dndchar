@@ -160,7 +160,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
       // The sheet shows it as a chip, with the pool's label.
       const characterId = await createCharacter(userId, 'Chips');
       await query(`INSERT INTO character_content_instances (character_id, content_id) VALUES ($1,$2)`, [characterId, spellId]);
-      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 Vowfire');
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 Vowfire + 1 action'); // an explicit cost inherits the default turn line (action economy Unit 1)
       // Caps, and a since-archived pool already in the stored cost can still be saved.
       await expect(save(JSON.stringify(Array.from({ length: 21 }, () => ({ pool: 'action', amount: 1 }))))).rejects.toThrow(/at most 20/);
       await expect(save(JSON.stringify([{ pool: 'action', amount: 1, pad: 'x'.repeat(4100) }]))).rejects.toThrow(/too long/);
@@ -175,7 +175,7 @@ describe.skipIf(!enabled)('character resource pools', () => {
       await save(JSON.stringify([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }]));
       await save('[]');
       expect(await stored()).toEqual([]);
-      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('');
+      expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('1 action'); // [] = no resources, the spell still uses its action
       await save('');
       expect(await stored()).toBeNull();
       expect((await listCharacterContent(characterId))[0].cost?.summary).toBe('L2 slot + 1 action');

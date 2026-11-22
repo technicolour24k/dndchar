@@ -820,7 +820,7 @@ async function getInventory(characterId: string, knownPoolLabels?: Record<string
     sourceContentId: row.source_content_id,
     attuned: row.attuned,
     // Only an explicit cost shows (the default item cost, one of itself, would be noise).
-    costSummary: (() => { const parsed = parseCostJson(row.source_cost_json); return parsed.entries?.length ? costSummary(parsed.entries, poolLabels) : undefined; })(),
+    costSummary: (() => { const parsed = parseCostJson(row.source_cost_json, { stored: true }); return parsed.entries?.length ? costSummary(parsed.entries, poolLabels) : undefined; })(),
     damageRolls: row.damage_rolls,
     effects: row.effects,
     abilityBonuses: {

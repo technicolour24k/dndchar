@@ -27,7 +27,7 @@ export type PoolDefinition = {
 };
 
 export const POOL_RECHARGE_PERIODS = ['short_rest', 'long_rest', 'dawn', 'encounter', 'manual'] as const;
-export const RESERVED_POOL_KEYS = ['spell_slot', 'charges', 'item', 'action', 'bonus_action', 'reaction', 'hp', 'temp_hp', 'inspiration'];
+export const RESERVED_POOL_KEYS = ['spell_slot', 'charges', 'item', 'action', 'bonus_action', 'reaction', 'turn', 'followup', 'hp', 'temp_hp', 'inspiration'];
 const KEY_PATTERN = /^[a-z][a-z0-9_]{1,39}$/;
 export const POOL_ROW_PREFIX = 'pool:';
 const rowKey = (key: string) => `${POOL_ROW_PREFIX}${key}`;

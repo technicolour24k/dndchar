@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { ActiveCharacterEffect, EffectModifier } from '$lib/types/character';
-import type { CostAvailability, CostEntry } from '$lib/types/cost';
+import type { Activation, CostAvailability, CostEntry } from '$lib/types/cost';
+import type { ProfileKey, TurnCategory, TurnLine, TurnTiming } from '$lib/types/actionEconomy';
+import { PROFILES } from './actionEconomy';
 import {
   activationSignature,
   applySpellAccessCost,
@@ -8,13 +10,15 @@ import {
   costSummary,
   defaultCostFor,
   effectiveCost,
+  isDisplayOnlyCost,
   overrideDecision,
   itemCostConflictsWithStep,
   parseCostJson,
   planCost,
   poolMaxima,
   shortfallMode,
-  validateCostEntries
+  validateCostEntries,
+  withCategory
 } from './cost';
 
 function mod(target: string, modifierType: string, valueExpression: string, conditionExpression = ''): EffectModifier {
@@ -106,12 +110,16 @@ describe('itemCostConflictsWithStep', () => {
 
 describe('castingTimeActionLine', () => {
   it('maps the three standard times', () => {
-    expect(castingTimeActionLine('1 action')).toEqual({ pool: 'action', amount: 1 });
-    expect(castingTimeActionLine(' 1 Bonus  Action ')).toEqual({ pool: 'bonus_action', amount: 1 });
-    expect(castingTimeActionLine('1 reaction')).toEqual({ pool: 'reaction', amount: 1 });
+    expect(castingTimeActionLine('1 action')).toEqual({ pool: 'turn', amount: 1, timing: 'action', category: 'spell' });
+    expect(castingTimeActionLine(' 1 Bonus  Action ')).toEqual({ pool: 'turn', amount: 1, timing: 'bonus_action', category: 'spell' });
+    expect(castingTimeActionLine('1 reaction')).toEqual({ pool: 'turn', amount: 1, timing: 'reaction', category: 'spell' });
+  });
+  it('matches on a prefix, so a reaction with its trigger still counts', () => {
+    expect(castingTimeActionLine('1 reaction, which you take when you are hit by an attack')).toEqual({ pool: 'turn', amount: 1, timing: 'reaction', category: 'spell' });
+    expect(castingTimeActionLine('1 bonus action, or 1 action')).toMatchObject({ timing: 'bonus_action' });
   });
   it('gives none for anything else', () => {
-    for (const text of ['1 minute', '10 minutes', 'Special', '', null, undefined, '1 reaction, which you take when hit']) {
+    for (const text of ['1 minute', '10 minutes', 'Special', '', null, undefined, '2 actions', '1 actions', 'Ritual, 1 action', '1 hour']) {
       expect(castingTimeActionLine(text)).toBeNull();
     }
   });
@@ -120,30 +128,70 @@ describe('castingTimeActionLine', () => {
 describe('defaultCostFor and effectiveCost', () => {
   it('spell level 1+ costs a slot of its level plus the action line', () => {
     expect(defaultCostFor({ contentType: 'spell', spellLevel: 3, castingTime: '1 action' })).toEqual([
-      { pool: 'spell_slot', amount: 1, level: 3 }, { pool: 'action', amount: 1 }
+      { pool: 'spell_slot', amount: 1, level: 3 }, { pool: 'turn', amount: 1, timing: 'action', category: 'spell' }
     ]);
     expect(defaultCostFor({ contentType: 'spell', spellLevel: 1, castingTime: '1 minute' })).toEqual([{ pool: 'spell_slot', amount: 1, level: 1 }]);
   });
   it('cantrips only get the action line', () => {
-    expect(defaultCostFor({ contentType: 'spell', spellLevel: 0, castingTime: '1 bonus action' })).toEqual([{ pool: 'bonus_action', amount: 1 }]);
+    expect(defaultCostFor({ contentType: 'spell', spellLevel: 0, castingTime: '1 bonus action' })).toEqual([{ pool: 'turn', amount: 1, timing: 'bonus_action', category: 'spell' }]);
     expect(defaultCostFor({ contentType: 'spell', spellLevel: 0, castingTime: 'Special' })).toEqual([]);
   });
-  it('item use costs one of itself unless a spend_item step pays', () => {
+  const useAction: CostEntry = { pool: 'turn', amount: 1, timing: 'action', category: 'general' };
+  it('item use costs one of itself; the general action line only comes with includeUseAction', () => {
     expect(defaultCostFor({ contentType: 'item', isItemUse: true })).toEqual([{ pool: 'item', amount: 1 }]);
     expect(defaultCostFor({ contentType: 'item', isItemUse: true, hasSpendItemStep: true })).toEqual([]);
+    expect(defaultCostFor({ contentType: 'item', isItemUse: true, includeUseAction: true })).toEqual([{ pool: 'item', amount: 1 }, useAction]);
+    expect(defaultCostFor({ contentType: 'item', isItemUse: true, hasSpendItemStep: true, includeUseAction: true })).toEqual([useAction]);
     expect(defaultCostFor({ contentType: 'item', isItemUse: false })).toEqual([]);
   });
-  it('feats, class features and anything else are free', () => {
+  it('feats, class features and anything else have no default turn line', () => {
     for (const contentType of ['feat', 'class_feature', 'condition', 'weird']) {
       expect(defaultCostFor({ contentType, spellLevel: 5, isItemUse: true })).toEqual([]);
     }
   });
-  it('an explicit list wins, including [] for free', () => {
+  it('a weapon attack is an attack-category action, with a timing choice', () => {
+    expect(defaultCostFor({ contentType: 'item', activationKind: 'weapon_attack' })).toEqual([{ pool: 'turn', amount: 1, timing: 'action', category: 'attack' }]);
+    expect(defaultCostFor({ contentType: 'item', activationKind: 'weapon_attack', weaponTiming: 'bonus_action' })[0]).toMatchObject({ timing: 'bonus_action', category: 'attack' });
+    expect(defaultCostFor({ contentType: 'item', activationKind: 'weapon_attack', weaponTiming: 'reaction' })[0]).toMatchObject({ timing: 'reaction' });
+  });
+  it('a dash is a general action of the given count', () => {
+    expect(defaultCostFor({ contentType: 'item', activationKind: 'dash', dashCount: 2 })).toEqual([{ pool: 'turn', amount: 2, timing: 'action', category: 'general' }]);
+    expect(defaultCostFor({ contentType: 'item', activationKind: 'dash' })[0]).toMatchObject({ amount: 1 });
+  });
+  it('an explicit list wins for resources, including [] for none', () => {
     const defaults: CostEntry[] = [{ pool: 'item', amount: 1 }];
     expect(effectiveCost(null, defaults)).toBe(defaults);
     expect(effectiveCost(undefined, defaults)).toBe(defaults);
     expect(effectiveCost([], defaults)).toEqual([]);
     expect(effectiveCost([{ pool: 'vowfire', amount: 1 }], defaults)).toEqual([{ pool: 'vowfire', amount: 1 }]);
+  });
+  it('an explicit list without a turn line inherits the default turn line (misty step: slot + vowfire + its action)', () => {
+    const bonus: CostEntry = { pool: 'turn', amount: 1, timing: 'bonus_action', category: 'spell' };
+    const defaults: CostEntry[] = [{ pool: 'spell_slot', amount: 1, level: 2 }, bonus];
+    expect(effectiveCost([{ pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }], defaults)).toEqual([
+      { pool: 'spell_slot', amount: 1, level: 2 }, { pool: 'vowfire', amount: 1 }, bonus
+    ]);
+    // [] means no resources, and the spell still uses its action.
+    expect(effectiveCost([], defaults)).toEqual([bonus]);
+  });
+  it('an explicit turn line wins, and timing free makes it take no action', () => {
+    const defaults: CostEntry[] = [{ pool: 'turn', amount: 1, timing: 'action', category: 'spell' }];
+    const free: CostEntry = { pool: 'turn', amount: 1, timing: 'free' };
+    expect(effectiveCost([free], defaults)).toEqual([free]);
+    expect(effectiveCost([{ pool: 'vowfire', amount: 1 }, free], defaults)).toEqual([{ pool: 'vowfire', amount: 1 }, free]);
+  });
+  it('a legacy action line counts as an explicit turn line', () => {
+    const parsed = parseCostJson([{ pool: 'reaction', amount: 1 }]).entries!;
+    expect(effectiveCost(parsed, [{ pool: 'turn', amount: 1, timing: 'action', category: 'spell' }])).toEqual(parsed);
+  });
+  it('with no default turn line there is nothing to inherit', () => {
+    expect(effectiveCost([{ pool: 'vowfire', amount: 1 }], [])).toEqual([{ pool: 'vowfire', amount: 1 }]);
+  });
+  it('withCategory fills only missing categories', () => {
+    const out = withCategory([{ pool: 'turn', amount: 1, timing: 'action' }, { pool: 'vowfire', amount: 1 }], 'spell');
+    expect(out).toEqual([{ pool: 'turn', amount: 1, timing: 'action', category: 'spell' }, { pool: 'vowfire', amount: 1 }]);
+    expect(withCategory([{ pool: 'turn', amount: 1, timing: 'action', category: 'attack' }], 'spell')[0]).toMatchObject({ category: 'attack' });
+    expect(withCategory([{ pool: 'bonus_action', amount: 1 }], 'general')[0]).toEqual({ pool: 'turn', amount: 1, timing: 'bonus_action', category: 'general' });
   });
 });
 
@@ -372,5 +420,210 @@ describe('activationSignature', () => {
   it('covers both ids of a spell_access activation', () => {
     expect(activationSignature({ kind: 'spell_access', spellAccessId: 'a', inventoryItemId: 'b' }))
       .not.toBe(activationSignature({ kind: 'spell_access', spellAccessId: 'a', inventoryItemId: 'c' }));
+  });
+  it('weapon_attack: stable, an id names the weapon, a label names an id-less attack, timing counts', () => {
+    const sig = (a: Activation) => activationSignature(a);
+    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).toBe('weapon_attack|w1||action');
+    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).toBe(sig({ kind: 'weapon_attack', inventoryId: 'w1', timing: 'action' }));
+    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).not.toBe(sig({ kind: 'weapon_attack', inventoryId: 'w1', timing: 'reaction' }));
+    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1' })).not.toBe(sig({ kind: 'weapon_attack', inventoryId: 'w2' }));
+    // The label is ignored once there is an id, and matters when there isn't.
+    expect(sig({ kind: 'weapon_attack', inventoryId: 'w1', label: 'x' })).toBe(sig({ kind: 'weapon_attack', inventoryId: 'w1', label: 'y' }));
+    expect(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike' })).toBe('weapon_attack|none|Unarmed Strike|action');
+    expect(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike' })).not.toBe(sig({ kind: 'weapon_attack', inventoryId: null, label: 'Bite' }));
+    expect(sig({ kind: 'weapon_attack', inventoryId: null })).toBe('weapon_attack|none||action');
+  });
+  it('dash: stable per count and distinct from everything else', () => {
+    expect(activationSignature({ kind: 'dash', count: 1 })).toBe('dash|1');
+    expect(activationSignature({ kind: 'dash', count: 1 })).not.toBe(activationSignature({ kind: 'dash', count: 2 }));
+  });
+});
+
+describe('turn lines: parseCostJson', () => {
+  it('accepts a full turn line and keeps only the known fields', () => {
+    const parsed = parseCostJson([{ pool: 'turn', amount: 1, timing: 'bonus_action', category: 'spell', actionPool: 'utility', junk: 1 }]);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.entries).toEqual([{ pool: 'turn', amount: 1, timing: 'bonus_action', category: 'spell', actionPool: 'utility' }]);
+  });
+  it('category and actionPool are optional', () => {
+    expect(parseCostJson([{ pool: 'turn', amount: 2, timing: 'free' }]).entries).toEqual([{ pool: 'turn', amount: 2, timing: 'free' }]);
+    expect(parseCostJson([{ pool: 'turn', amount: 1, timing: 'action', category: null, actionPool: null }]).entries).toEqual([{ pool: 'turn', amount: 1, timing: 'action' }]);
+  });
+  it('validates timing, category and actionPool', () => {
+    for (const timing of [undefined, 'sometimes', 5, '']) expect(parseCostJson([{ pool: 'turn', amount: 1, timing }]).errors).toHaveLength(1);
+    expect(parseCostJson([{ pool: 'turn', amount: 1, timing: 'action', category: 'melee' }]).errors).toHaveLength(1);
+    expect(parseCostJson([{ pool: 'turn', amount: 1, timing: 'action', actionPool: 'mana' }]).errors).toHaveLength(1);
+    expect(parseCostJson([{ pool: 'turn', amount: 0, timing: 'action' }]).errors).toHaveLength(1);
+    for (const actionPool of ['action', 'bonus_action', 'reaction', 'attack', 'utility']) {
+      expect(parseCostJson([{ pool: 'turn', amount: 1, timing: 'action', actionPool }]).errors).toEqual([]);
+    }
+  });
+  it('normalises legacy action lines to turn lines with no category', () => {
+    expect(parseCostJson([{ pool: 'action', amount: 1 }]).entries).toEqual([{ pool: 'turn', amount: 1, timing: 'action' }]);
+    expect(parseCostJson([{ pool: 'bonus_action', amount: 1 }]).entries).toEqual([{ pool: 'turn', amount: 1, timing: 'bonus_action' }]);
+    expect(parseCostJson([{ pool: 'reaction', amount: 2 }]).entries).toEqual([{ pool: 'turn', amount: 2, timing: 'reaction' }]);
+  });
+  it('stored costs keep the first turn line and ignore the rest, never erroring', () => {
+    const stored = (value: unknown) => parseCostJson(value, { stored: true });
+    expect(stored([{ pool: 'vowfire', amount: 1 }, { pool: 'action', amount: 1 }, { pool: 'reaction', amount: 1 }]))
+      .toEqual({ entries: [{ pool: 'vowfire', amount: 1 }, { pool: 'turn', amount: 1, timing: 'action' }], errors: [] });
+    expect(stored([{ pool: 'turn', amount: 1, timing: 'free' }, { pool: 'turn', amount: 1, timing: 'action' }]).entries).toEqual([{ pool: 'turn', amount: 1, timing: 'free' }]);
+    // Still rejects a malformed line.
+    expect(stored([{ pool: 'turn', amount: 1, timing: 'nope' }]).errors).toHaveLength(1);
+  });
+  it('authors get every line back, and validateCostEntries refuses more than one turn line', () => {
+    const parsed = parseCostJson([{ pool: 'action', amount: 1 }, { pool: 'turn', amount: 1, timing: 'free' }]);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.entries).toHaveLength(2);
+    const ctx = { contentType: 'feat', poolKeys: [], counterKeys: [] };
+    expect(validateCostEntries(parsed.entries!, ctx)).toHaveLength(1);
+    expect(validateCostEntries([{ pool: 'turn', amount: 2, timing: 'action' }], ctx)).toEqual([]);
+  });
+  it('isDisplayOnlyCost covers turn and legacy action lines only', () => {
+    for (const pool of ['turn', 'action', 'bonus_action', 'reaction']) expect(isDisplayOnlyCost({ pool })).toBe(true);
+    for (const pool of ['spell_slot', 'charges', 'item', 'vowfire']) expect(isDisplayOnlyCost({ pool })).toBe(false);
+    // A cantrip's cost is turn-only, so the cast dialog has nothing to prompt for.
+    const cantrip = defaultCostFor({ contentType: 'spell', spellLevel: 0, castingTime: '1 action' });
+    expect(cantrip.some((entry) => !isDisplayOnlyCost(entry))).toBe(false);
+    expect(defaultCostFor({ contentType: 'spell', spellLevel: 1, castingTime: '1 action' }).some((entry) => !isDisplayOnlyCost(entry))).toBe(true);
+  });
+  it('validateCostEntries accepts turn lines', () => {
+    expect(validateCostEntries([{ pool: 'turn', amount: 1, timing: 'action', category: 'general' }], { contentType: 'feat', poolKeys: [], counterKeys: [] })).toEqual([]);
+  });
+});
+
+describe('turn lines: planCost', () => {
+  const line = (timing: TurnTiming, category?: TurnCategory, extra: Partial<TurnLine> = {}): CostEntry => ({ pool: 'turn', amount: 1, timing, ...(category ? { category } : {}), ...extra });
+  const slots3 = [{ type: 'standard' as const, level: 3, current: 1 }];
+  const turn = (profile: ProfileKey, current: Record<string, number>, followups: Record<string, number> = {}): CostAvailability => {
+    const defs = PROFILES[profile].pools;
+    return avail({ turn: { profile, pools: Object.fromEntries(defs.map((d) => [d.key, { label: d.label, current: current[d.key] ?? 0 }])), followups } });
+  };
+
+  it('without turn state a turn line stays display-only and never short', () => {
+    const plan = planCost([line('action', 'spell'), line('reaction')], avail());
+    expect(plan.shortfalls).toEqual([]);
+    expect(plan.lines.map((l) => [l.label, l.displayOnly, l.payFrom])).toEqual([['Action', true, undefined], ['Reaction', true, undefined]]);
+  });
+  it('5e: pays the pool its timing names, and reports a shortfall by pool label', () => {
+    const plan = planCost([line('bonus_action', 'spell')], turn('dnd5e', { bonus_action: 1 }));
+    expect(plan.lines[0]).toMatchObject({ label: 'Bonus action', payFrom: { pool: 'turn', key: 'bonus_action' }, displayOnly: false });
+    expect(plan.shortfalls).toEqual([]);
+    expect(planCost([line('action', 'spell')], turn('dnd5e', { action: 0 })).shortfalls).toEqual([{ label: 'Action', needed: 1, available: 0 }]);
+  });
+  it('homebrew: a spell draws Attack, a general line Utility, whatever the timing', () => {
+    const a = turn('attack_utility', { attack: 2, utility: 2 });
+    expect(planCost([line('reaction', 'spell')], a).lines[0].payFrom).toEqual({ pool: 'turn', key: 'attack' });
+    expect(planCost([line('action', 'general')], a).lines[0].payFrom).toEqual({ pool: 'turn', key: 'utility' });
+  });
+  it('free and movement lines are display-only "Free" in both profiles', () => {
+    for (const profile of ['dnd5e', 'attack_utility'] as const) {
+      const plan = planCost([line('free', 'general'), line('movement', 'general')], turn(profile, {}));
+      expect(plan.shortfalls).toEqual([]);
+      expect(plan.lines.map((l) => [l.label, l.displayOnly])).toEqual([['Free', true], ['Free', true]]);
+    }
+  });
+  it('a missing category reads as general', () => {
+    expect(planCost([line('action')], turn('attack_utility', { attack: 2, utility: 2 })).lines[0].payFrom).toEqual({ pool: 'turn', key: 'utility' });
+  });
+  it('the actionPool escape hatch applies only when the profile has that pool', () => {
+    const forced = line('action', 'spell', { actionPool: 'utility' });
+    expect(planCost([forced], turn('attack_utility', { attack: 2, utility: 2 })).lines[0].payFrom).toEqual({ pool: 'turn', key: 'utility' });
+    expect(planCost([forced], turn('dnd5e', { action: 1 })).lines[0].payFrom).toEqual({ pool: 'turn', key: 'action' });
+  });
+  it('checks the turn pool against the running total with the amount', () => {
+    const two: CostEntry = { pool: 'turn', amount: 2, timing: 'action', category: 'attack' };
+    expect(planCost([two], turn('attack_utility', { attack: 1 })).shortfalls).toEqual([{ label: 'Attack', needed: 2, available: 1 }]);
+    expect(planCost([two], turn('attack_utility', { attack: 2 })).shortfalls).toEqual([]);
+  });
+  it('a waiting follow-up covers the turn line when asked, and only then', () => {
+    const a = turn('attack_utility', { attack: 0 }, { melee: 1 });
+    const attack = line('action', 'attack');
+    const covered = planCost([attack], a, { followupClass: 'melee' });
+    expect(covered.shortfalls).toEqual([]);
+    expect(covered.lines[0]).toMatchObject({ label: 'Extra Attack', payFrom: { pool: 'followup', cls: 'melee' }, displayOnly: false });
+    // Not asked: it pays the pool (and is short here).
+    expect(planCost([attack], a).shortfalls).toEqual([{ label: 'Attack', needed: 1, available: 0 }]);
+  });
+  it('a spell echo is completely free and resolves at the base level', () => {
+    const fireball: CostEntry[] = [{ pool: 'spell_slot', amount: 1, level: 3 }, { pool: 'vowfire', amount: 1 }, line('action', 'spell')];
+    const a = { ...turn('attack_utility', { attack: 0 }, { spell: 1 }), slots: [{ type: 'standard' as const, level: 5, current: 0 }] };
+    const plan = planCost(fireball, a, { followupClass: 'spell' });
+    // No slot, no Vowfire, no action: only the follow-up itself is consumed, and no shortfall even with nothing left.
+    expect(plan.shortfalls).toEqual([]);
+    expect(plan.lines).toHaveLength(1);
+    expect(plan.lines[0]).toMatchObject({ payFrom: { pool: 'followup', cls: 'spell' }, displayOnly: false });
+    expect(plan.castAtLevel).toBe(3);
+  });
+  it('a cantrip echo has no cast level; a spell with no waiting echo is planned normally', () => {
+    const cantrip = planCost([line('action', 'spell')], turn('dnd5e', {}, { cantrip: 1 }), { followupClass: 'cantrip' });
+    expect(cantrip.lines[0].payFrom).toEqual({ pool: 'followup', cls: 'cantrip' });
+    expect(cantrip.castAtLevel).toBeUndefined();
+    const normal = planCost([{ pool: 'spell_slot', amount: 1, level: 3 }, line('action', 'spell')], { ...turn('dnd5e', { action: 1 }, { spell: 0 }), slots: slots3 }, { followupClass: 'spell' });
+    expect(normal.lines).toHaveLength(2);
+    expect(normal.castAtLevel).toBeUndefined();
+  });
+  it('a weapon follow-up waives only the action: other lines are still paid', () => {
+    const a = { ...turn('attack_utility', { attack: 0 }, { melee: 1 }), pools: { vowfire: { label: 'Vowfire', current: 0 } } };
+    const plan = planCost([{ pool: 'vowfire', amount: 1 }, line('action', 'attack')], a, { followupClass: 'melee' });
+    expect(plan.shortfalls).toEqual([{ label: 'Vowfire', needed: 1, available: 0 }]);
+    expect(plan.lines[1].payFrom).toEqual({ pool: 'followup', cls: 'melee' });
+    expect(plan.castAtLevel).toBeUndefined();
+  });
+  it('follow-ups are keyed by type: a melee follow-up does not cover a spell', () => {
+    const a = turn('attack_utility', { attack: 0 }, { melee: 1, ranged: 1 });
+    expect(planCost([line('action', 'spell')], a, { followupClass: 'spell' }).shortfalls).toEqual([{ label: 'Attack', needed: 1, available: 0 }]);
+    expect(planCost([line('action', 'attack')], a, { followupClass: 'ranged' }).lines[0].payFrom).toEqual({ pool: 'followup', cls: 'ranged' });
+    expect(planCost([line('action', 'spell')], turn('dnd5e', {}, { cantrip: 2 }), { followupClass: 'cantrip' }).lines[0].payFrom).toEqual({ pool: 'followup', cls: 'cantrip' });
+  });
+  it('with no follow-ups left the pool pays', () => {
+    const a = turn('attack_utility', { attack: 1 }, { melee: 0 });
+    expect(planCost([line('action', 'attack')], a, { followupClass: 'melee' }).lines[0].payFrom).toEqual({ pool: 'turn', key: 'attack' });
+  });
+  it('a free line takes no follow-up even when one is waiting', () => {
+    const plan = planCost([line('free', 'attack')], turn('attack_utility', {}, { melee: 1 }), { followupClass: 'melee' });
+    expect(plan.lines[0]).toMatchObject({ label: 'Free', displayOnly: true });
+  });
+  it('legacy hand-built action lines plan like turn lines', () => {
+    expect(planCost([{ pool: 'action', amount: 1 }], turn('dnd5e', { action: 1 })).lines[0].payFrom).toEqual({ pool: 'turn', key: 'action' });
+  });
+  it('mixes with resource lines and does not mutate the availability', () => {
+    const a = { ...turn('dnd5e', { action: 1 }), pools: { vowfire: { label: 'Vowfire', current: 0 } } };
+    const plan = planCost([{ pool: 'vowfire', amount: 1 }, line('action', 'spell')], a);
+    expect(plan.shortfalls).toEqual([{ label: 'Vowfire', needed: 1, available: 0 }]);
+    expect(a.turn!.pools.action.current).toBe(1);
+  });
+});
+
+describe('turn lines: costSummary', () => {
+  const fireball: CostEntry[] = [{ pool: 'spell_slot', amount: 1, level: 3 }, { pool: 'turn', amount: 1, timing: 'action', category: 'spell' }];
+  it('reads in the profile words: "1 Action" in 5e, "1 Attack action" in homebrew', () => {
+    expect(costSummary(fireball, {}, 'dnd5e')).toBe('L3 slot + 1 Action');
+    expect(costSummary(fireball, {}, 'attack_utility')).toBe('L3 slot + 1 Attack action');
+    expect(costSummary([{ pool: 'turn', amount: 2, timing: 'action', category: 'general' }], {}, 'attack_utility')).toBe('2 Utility actions');
+  });
+  it('unknown profile keys fall back to 5e', () => {
+    expect(costSummary(fireball, {}, 'mystery')).toBe('L3 slot + 1 Action');
+  });
+  it('without a profile it reads as the old display-only text', () => {
+    expect(costSummary(fireball)).toBe('L3 slot + 1 action');
+    expect(costSummary([{ pool: 'turn', amount: 1, timing: 'reaction' }])).toBe('1 reaction');
+  });
+  it('free and movement lines add nothing, and an all-free cost says Free', () => {
+    expect(costSummary([{ pool: 'vowfire', amount: 1 }, { pool: 'turn', amount: 1, timing: 'free' }], { vowfire: 'Vowfire' }, 'dnd5e')).toBe('1 Vowfire');
+    expect(costSummary([{ pool: 'turn', amount: 1, timing: 'movement' }], {}, 'attack_utility')).toBe('Free');
+    expect(costSummary([{ pool: 'turn', amount: 1, timing: 'free' }])).toBe('Free');
+  });
+  it('the specific-pool escape hatch shows in the profile that has it', () => {
+    const forced: CostEntry[] = [{ pool: 'turn', amount: 1, timing: 'action', category: 'spell', actionPool: 'utility' }];
+    expect(costSummary(forced, {}, 'attack_utility')).toBe('1 Utility action');
+    expect(costSummary(forced, {}, 'dnd5e')).toBe('1 Action');
+  });
+});
+
+describe('sumTargetGrants via poolMaxima stays source-labelled', () => {
+  it('still ignores zero-value grants', () => {
+    const out = poolMaxima([{ key: 'p', baseMaxExpression: '1' }], [source('Nothing', [mod('resource.p.max', 'bonus', '0')])]);
+    expect(out.p.lines).toEqual([{ label: 'Base', value: 1 }]);
   });
 });

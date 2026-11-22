@@ -18,6 +18,7 @@
     adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
+  import { isDisplayOnlyCost } from '$lib/rules/cost';
   import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -1700,7 +1701,7 @@
   // ---- Cast dialog (cost engine Unit 4). A spell whose cost has a slot line or any non-display line
   // opens a small dialog: pick the slot (upcast), see the other costs against what's available.
   // Cantrips and free spells (action lines only) cast directly. The server stays authoritative.
-  const DISPLAY_ONLY_COSTS = ['action', 'bonus_action', 'reaction'];
+  // Turn lines (and legacy action lines) are display-only until the engine charges them.
   let castDialog = $state<{ spell: any; slotKey: string } | null>(null);
   const castCostEntries = $derived((castDialog?.spell.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; key?: string }>);
   const castSlotLine = $derived(castCostEntries.find((entry) => entry.pool === 'spell_slot'));
@@ -1717,7 +1718,7 @@
       ? (character.inventory.find((item) => item.id === castDialog!.spell.inventoryItemId)?.resources ?? [])
       : castDialog.spell.resources.map((r: any) => ({ key: r.key, label: r.label, currentValue: r.currentValue }));
     for (const entry of castCostEntries) {
-      if (DISPLAY_ONLY_COSTS.includes(entry.pool)) continue;
+      if (isDisplayOnlyCost(entry)) continue;
       if (entry.pool === 'spell_slot') lines.push({ label: chosen ? `Level ${chosen.level} Spell Slot` : `Level ${entry.level}+ Spell Slot`, needed: entry.amount, available: chosen?.current ?? 0 });
       else if (entry.pool === 'charges') {
         const counter = entry.key ? counters.find((c: any) => c.key === entry.key) : counters.length === 1 ? counters[0] : undefined;
@@ -1733,7 +1734,7 @@
 
   function openCast(spell: any) {
     const entries = (spell.cost?.entries ?? []) as Array<{ pool: string; level?: number; amount: number }>;
-    if (!entries.some((entry) => !DISPLAY_ONLY_COSTS.includes(entry.pool))) { void castSpell(spell); return; }
+    if (!entries.some((entry) => !isDisplayOnlyCost(entry))) { void castSpell(spell); return; }
     const slotLine = entries.find((entry) => entry.pool === 'spell_slot');
     const eligible = slotLine
       ? character.spellSlots.filter((slot) => slot.level >= (slotLine.level ?? 1))

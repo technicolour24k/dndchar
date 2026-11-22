@@ -417,7 +417,7 @@ export async function listCharacterContent(characterId: string, knownPoolLabels?
 // The cost shown on the sheet: explicit cost_json when a DM set one, else the type's default. A spell
 // access replaces the spell's slot line with its own rule (same maths as the cost engine).
 function costView(costJson: unknown, defaults: CostEntry[], labels: Record<string, string>, access?: Parameters<typeof applySpellAccessCost>[1]): { entries: CostEntry[]; summary: string } {
-  const parsed = parseCostJson(costJson);
+  const parsed = parseCostJson(costJson, { stored: true });
   let entries = effectiveCost(parsed.errors.length ? null : parsed.entries, defaults);
   if (access) entries = applySpellAccessCost(entries, access);
   return { entries, summary: entries.length ? costSummary(entries, labels) : '' };

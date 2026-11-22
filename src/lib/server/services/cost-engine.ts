@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type pg from 'pg';
-import { applySpellAccessCost, defaultCostFor, effectiveCost, parseCostJson, planCost } from '$lib/rules/cost';
+import { applySpellAccessCost, asTurnLine, defaultCostFor, effectiveCost, parseCostJson, planCost } from '$lib/rules/cost';
 import type { Activation, CostAvailability, CostEntry, CostShortfall, PlannedCost } from '$lib/types/cost';
 import { loadPoolMaxima, POOL_ROW_PREFIX, writeLedger } from '$lib/server/services/resource-pools';
 
@@ -61,7 +61,7 @@ export type LoadedCost = {
 };
 
 function parseExplicit(raw: unknown): CostEntry[] | null {
-  const parsed = parseCostJson(raw);
+  const parsed = parseCostJson(raw, { stored: true });
   if (parsed.errors.length) throw new Error(`This has an invalid cost: ${parsed.errors[0]}`);
   return parsed.entries;
 }
@@ -111,6 +111,8 @@ export async function loadActivationCost(client: pg.PoolClient, characterId: str
     if (spendStep.rowCount) entries = entries.filter((entry) => entry.pool !== 'item');
     return { entries, contentId: item.source_content_id, label: item.name, ...common };
   }
+  // weapon_attack and dash arrive with the turn-state service (action economy Unit 3).
+  if (activation.kind !== 'content') throw new Error('This activation is not supported yet.');
   // content: a feat, class feature, or a spell's "Use Actions" button. Free unless a DM set a cost.
   const row = (await client.query(
     `SELECT c.id, c.name, c.cost_json FROM character_content_instances i JOIN content_definitions c ON c.id = i.content_id
@@ -139,7 +141,7 @@ async function lockSources(client: pg.PoolClient, characterId: string, loaded: L
   const availability: CostAvailability = { slots: [], counters: [], itemQuantity: null, pools: {} };
   const counterRows = new Map<string, { id: string; current: number }>();
   const poolMax = new Map<string, number>();
-  const pools = loaded.entries.filter((e) => !['spell_slot', 'charges', 'item', 'action', 'bonus_action', 'reaction'].includes(e.pool));
+  const pools = loaded.entries.filter((e) => !['spell_slot', 'charges', 'item'].includes(e.pool) && !asTurnLine(e));
 
   if (loaded.entries.some((e) => e.pool === 'spell_slot')) {
     const slots = await client.query(
@@ -197,7 +199,7 @@ export async function payActivationCost(
   client: pg.PoolClient, characterId: string, activation: Activation, options: { actorUserId: string; override?: CostOverride | null }
 ): Promise<PaidLine[]> {
   const loaded = await loadActivationCost(client, characterId, activation);
-  if (!loaded.entries.some((e) => !['action', 'bonus_action', 'reaction'].includes(e.pool))) return [];
+  if (!loaded.entries.some((e) => !asTurnLine(e))) return [];
   const { availability, counterRows, poolMax } = await lockSources(client, characterId, loaded, true);
   const choices = slotChoice(activation);
   const plan = planCost(loaded.entries, availability, choices);
@@ -251,7 +253,7 @@ export async function payActivationCost(
       running.set('item', before - n);
       await ledger('item', { inventoryId: loaded.inventoryId }, line.label, n, before, short);
       if (n > 0) paid.push({ label: line.label, pool: 'item', delta: -n, before, after: before - n });
-    } else {
+    } else if (from.pool === 'pool') {
       const id = `pool:${from.key}`;
       const before = running.get(id) ?? availability.pools[from.key].current;
       await client.query(

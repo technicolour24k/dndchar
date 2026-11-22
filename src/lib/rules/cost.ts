@@ -1,4 +1,5 @@
 import type { ActiveCharacterEffect } from '$lib/types/character';
+import { ACTION_POOL_KEYS, TURN_CATEGORIES, TURN_TIMINGS, type TurnCategory, type TurnLine, type TurnTiming } from '$lib/types/actionEconomy';
 import {
   ACTION_ECONOMY_POOLS,
   type Activation,
@@ -14,7 +15,9 @@ import {
   type ShortfallMode,
   type SlotType
 } from '$lib/types/cost';
-import { matchingModifiers, resolveModifierNumericValue, resolveResourceMaximum, type ModifierContext } from './dnd5e';
+import { resolveResourceMaximum, type ModifierContext } from './dnd5e';
+import { sumTargetGrants } from './modifierGrants';
+import { profileFor, resolveTurnPool, turnCostLabel } from './actionEconomy';
 
 const MAX_AMOUNT = 99;
 
@@ -26,10 +29,21 @@ function isInt(value: unknown): value is number {
 // Parsing
 // ---------------------------------------------------------------------------------------------
 
+// A turn line as itself, a legacy line ({pool:'action'|'bonus_action'|'reaction'}) as a turn line
+// with no category (withCategory fills it in from the container), anything else null.
+export function asTurnLine(entry: CostEntry): TurnLine | null {
+  if (entry.pool === 'turn') return entry as TurnLine;
+  if (ACTION_ECONOMY_POOLS.includes(entry.pool)) return { pool: 'turn', amount: entry.amount, timing: entry.pool as TurnTiming };
+  return null;
+}
+
 // Validates a cost_json value. null/undefined means "use the content type's default" and passes
 // through as entries: null. Anything else must be an array of well-formed lines. Unknown pool
-// strings pass here; they're checked against the pool definitions when an admin saves.
-export function parseCostJson(value: unknown): { entries: CostEntry[] | null; errors: string[] } {
+// strings pass here; they're checked against the pool definitions when an admin saves. Legacy
+// action lines come out as turn lines. Stored costs ({ stored: true }) keep only the first turn
+// line and ignore the rest, so old data never breaks a cast; "one turn line" is enforced for
+// authors by validateCostEntries.
+export function parseCostJson(value: unknown, options: { stored?: boolean } = {}): { entries: CostEntry[] | null; errors: string[] } {
   if (value === null || value === undefined) return { entries: null, errors: [] };
   if (!Array.isArray(value)) return { entries: null, errors: ['Cost must be a list of cost lines.'] };
   const errors: string[] = [];
@@ -51,6 +65,29 @@ export function parseCostJson(value: unknown): { entries: CostEntry[] | null; er
       return;
     }
     const amount = line.amount;
+    if (pool === 'turn') {
+      if (typeof line.timing !== 'string' || !(TURN_TIMINGS as readonly string[]).includes(line.timing)) {
+        errors.push(`${where}: the action timing must be one of ${TURN_TIMINGS.join(', ')}.`);
+        return;
+      }
+      if (line.category !== undefined && line.category !== null && !(TURN_CATEGORIES as readonly unknown[]).includes(line.category)) {
+        errors.push(`${where}: the action category must be one of ${TURN_CATEGORIES.join(', ')}.`);
+        return;
+      }
+      if (line.actionPool !== undefined && line.actionPool !== null && !ACTION_POOL_KEYS.includes(line.actionPool as string)) {
+        errors.push(`${where}: the specific action pool must be one of ${ACTION_POOL_KEYS.join(', ')}.`);
+        return;
+      }
+      const turn: TurnLine = { pool: 'turn', amount, timing: line.timing as TurnTiming };
+      if (line.category) turn.category = line.category as TurnCategory;
+      if (line.actionPool) turn.actionPool = line.actionPool as string;
+      entries.push(turn);
+      return;
+    }
+    if (ACTION_ECONOMY_POOLS.includes(pool)) {
+      entries.push({ pool: 'turn', amount, timing: pool as TurnTiming });
+      return;
+    }
     if (pool === 'spell_slot') {
       if (!isInt(line.level) || line.level < 1 || line.level > 9) {
         errors.push(`${where}: a spell slot cost needs a level from 1 to 9.`);
@@ -70,19 +107,24 @@ export function parseCostJson(value: unknown): { entries: CostEntry[] | null; er
     }
     entries.push({ pool, amount });
   });
-  return errors.length ? { entries: null, errors } : { entries, errors };
+  if (errors.length) return { entries: null, errors };
+  if (options.stored) {
+    const firstTurn = entries.findIndex((entry) => entry.pool === 'turn');
+    return { entries: entries.filter((entry, index) => entry.pool !== 'turn' || index === firstTurn), errors };
+  }
+  return { entries, errors };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------------------------
 
-// '1 action' / '1 bonus action' / '1 reaction' become a display-only action-economy line.
-// Anything else ('1 minute', 'Special', '1 action, which you take when...') gives none.
-export function castingTimeActionLine(text: string | null | undefined): CostEntry | null {
-  const match = (text ?? '').trim().toLowerCase().replace(/\s+/g, ' ').match(/^1 (action|bonus action|reaction)$/);
+// A casting time that starts '1 action' / '1 bonus action' / '1 reaction' (so '1 reaction, which you
+// take when...' counts) becomes a spell turn line. Anything else ('1 minute', 'Special') gives none.
+export function castingTimeActionLine(text: string | null | undefined): TurnLine | null {
+  const match = (text ?? '').trim().toLowerCase().replace(/\s+/g, ' ').match(/^1 (action|bonus action|reaction)\b/);
   if (!match) return null;
-  return { pool: match[1].replace(' ', '_') as 'action' | 'bonus_action' | 'reaction', amount: 1 };
+  return { pool: 'turn', amount: 1, timing: match[1].replace(' ', '_') as TurnTiming, category: 'spell' };
 }
 
 export type DefaultCostInput = {
@@ -91,11 +133,25 @@ export type DefaultCostInput = {
   castingTime?: string | null;
   hasSpendItemStep?: boolean;
   isItemUse?: boolean;
+  // The new activation kinds. weapon_attack takes weaponTiming (default action); dash takes dashCount.
+  activationKind?: 'weapon_attack' | 'dash';
+  dashCount?: number;
+  weaponTiming?: 'action' | 'bonus_action' | 'reaction';
+  // Item use takes a general action only once turn costs are charged (action economy Unit 3 sets
+  // this); until then the default stays the item quantity alone, so chips are unchanged.
+  includeUseAction?: boolean;
 };
 
 // The cost a Container has while cost_json is NULL. Mirrors the procedural behaviour from before
 // the cost engine, so nothing changes until a DM sets an explicit cost.
 export function defaultCostFor(input: DefaultCostInput): CostEntry[] {
+  if (input.activationKind === 'weapon_attack') {
+    return [{ pool: 'turn', amount: 1, timing: input.weaponTiming ?? 'action', category: 'attack' }];
+  }
+  if (input.activationKind === 'dash') {
+    // A general action: 1 Action in 5e, 1 Utility in homebrew, with no special casing.
+    return [{ pool: 'turn', amount: Math.max(1, input.dashCount ?? 1), timing: 'action', category: 'general' }];
+  }
   if (input.contentType === 'spell') {
     const entries: CostEntry[] = [];
     const level = input.spellLevel ?? 0;
@@ -105,15 +161,37 @@ export function defaultCostFor(input: DefaultCostInput): CostEntry[] {
     return entries;
   }
   if (input.contentType === 'item' && input.isItemUse) {
-    // An on_use spend_item step already pays the quantity, as it always has.
-    return input.hasSpendItemStep ? [] : [{ pool: 'item', amount: 1 }];
+    // An on_use spend_item step already pays the quantity, as it always has. Using an object
+    // still takes an action (5e "Use an Object").
+    const use: TurnLine = { pool: 'turn', amount: 1, timing: 'action', category: 'general' };
+    const base: CostEntry[] = input.hasSpendItemStep ? [] : [{ pool: 'item', amount: 1 }];
+    return input.includeUseAction ? [...base, use] : base;
   }
   return [];
 }
 
-// An explicit list (even an empty one, meaning free) beats the default.
+// An explicit list beats the default for resource lines (an empty one means "no resources"), but
+// turn lines are inherited separately: an explicit list WITHOUT a turn line keeps its own lines and
+// takes the default's turn line. An explicit turn line (timing 'free' for no action) wins.
 export function effectiveCost(explicit: CostEntry[] | null | undefined, defaults: CostEntry[]): CostEntry[] {
-  return explicit ?? defaults;
+  if (!explicit) return defaults;
+  if (explicit.some((entry) => asTurnLine(entry))) return explicit;
+  const inherited = defaults.filter((entry) => asTurnLine(entry));
+  return inherited.length ? [...explicit, ...inherited] : explicit;
+}
+
+// True for lines that are only shown, never paid from a pool until the turn state is loaded:
+// turn lines and the legacy action lines. The cast dialog uses it to decide what needs a prompt.
+export function isDisplayOnlyCost(entry: { pool: string }): boolean {
+  return entry.pool === 'turn' || ACTION_ECONOMY_POOLS.includes(entry.pool);
+}
+
+// Fills in a missing category on turn lines (normalised legacy lines) from the container.
+export function withCategory(entries: CostEntry[], fallback: TurnCategory): CostEntry[] {
+  return entries.map((entry) => {
+    const turn = asTurnLine(entry);
+    return turn ? { ...turn, category: turn.category ?? fallback } : entry;
+  });
 }
 
 export type SpellAccessCostInput = {
@@ -147,8 +225,11 @@ export function validateCostEntries(
   ctx: { contentType: string; poolKeys: string[]; counterKeys: string[] }
 ): string[] {
   const errors: string[] = [];
+  if (entries.filter((entry) => asTurnLine(entry)).length > 1) {
+    errors.push('A cost can have only one action economy line. For two actions, set its amount to 2.');
+  }
   for (const entry of entries) {
-    if (ACTION_ECONOMY_POOLS.includes(entry.pool) || entry.pool === 'spell_slot') continue;
+    if (asTurnLine(entry) || entry.pool === 'spell_slot') continue; // turn lines are valid once parsed
     if (entry.pool === 'item') {
       if (ctx.contentType !== 'item') errors.push('Item quantity can only be a cost on an item.');
       continue;
@@ -195,14 +276,7 @@ export function poolMaxima(
   const result: Record<string, PoolMaximum> = {};
   for (const definition of definitions) {
     const base = resolveResourceMaximum(definition.baseMaxExpression, ctx);
-    // Labelled by the SOURCE (the feat or item), not the shared modifier's own label, so the
-    // breakdown reads "Oath of Embers +2" rather than "Vowfire (max) +2" twice.
-    const grants = matchingModifiers(modifierSources, [`resource.${definition.key}.max`], ['bonus', 'penalty'], ctx.modifierContext ?? {})
-      .map(({ effect, modifier }) => {
-        const value = resolveModifierNumericValue(modifier.valueExpression, ctx.modifierContext ?? {}, effect.modifiers, modifier);
-        return { label: effect.name, value: modifier.modifierType === 'penalty' ? -value : value };
-      })
-      .filter((grant) => grant.value !== 0);
+    const grants = sumTargetGrants(modifierSources, `resource.${definition.key}.max`, ctx.modifierContext ?? {});
     const lines = [{ label: 'Base', value: base }, ...grants];
     const total = lines.reduce((sum, line) => sum + line.value, 0);
     result[definition.key] = { max: Math.max(0, total), lines };
@@ -214,7 +288,7 @@ export function poolMaxima(
 // Planning
 // ---------------------------------------------------------------------------------------------
 
-const ACTION_LABELS: Record<string, string> = { action: 'Action', bonus_action: 'Bonus action', reaction: 'Reaction' };
+const TIMING_LABELS: Record<TurnTiming, string> = { action: 'Action', bonus_action: 'Bonus action', reaction: 'Reaction', movement: 'Movement', free: 'Free' };
 
 function slotLabel(level: number) {
   return `Level ${level} Spell Slot`;
@@ -245,9 +319,32 @@ function chooseSlot(
   return eligible.find((slot) => left(slot) >= entry.amount) ?? null;
 }
 
+// A spell or cantrip follow-up ("echo") is completely free: no action, no slot, no other
+// resources, so the plan has just the follow-up line. It always resolves at the spell's base level
+// (the lowest spell_slot line), whatever level the original was cast at. Needs a waiting follow-up
+// and a turn line that actually draws from a pool; otherwise the spell is planned normally.
+function planSpellEcho(entries: CostEntry[], availability: CostAvailability, choices: CostChoices): PlannedCost | null {
+  const cls = choices.followupClass;
+  const turn = availability.turn;
+  if ((cls !== 'spell' && cls !== 'cantrip') || !turn) return null;
+  const entry = entries.find((e) => asTurnLine(e));
+  const line = entry && asTurnLine(entry);
+  if (!entry || !line || resolveTurnPool(profileFor(turn.profile), line) === null) return null;
+  const waiting = turn.followups[cls] ?? 0;
+  if (waiting < line.amount) return null;
+  const levels = entries.flatMap((e) => (e.pool === 'spell_slot' ? [(e as { level: number }).level] : []));
+  return {
+    lines: [{ entry, label: 'Extra Attack', needed: line.amount, available: waiting, payFrom: { pool: 'followup', cls }, displayOnly: false }],
+    shortfalls: [],
+    ...(levels.length ? { castAtLevel: Math.min(...levels) } : {})
+  };
+}
+
 // Works out what each cost line would draw from, and what's short. Pure: it never mutates the
 // availability. Two lines drawing on the same source are checked against the running total.
 export function planCost(entries: CostEntry[], availability: CostAvailability, choices: CostChoices = {}): PlannedCost {
+  const echo = planSpellEcho(entries, availability, choices);
+  if (echo) return echo;
   const used = new Map<string, number>();
   const lines: PlannedCostLine[] = [];
   const shortfalls: CostShortfall[] = [];
@@ -263,9 +360,29 @@ export function planCost(entries: CostEntry[], availability: CostAvailability, c
 
   for (const entry of entries) {
     const needed = entry.amount;
-    if (ACTION_ECONOMY_POOLS.includes(entry.pool)) {
-      // Shown, never tracked, never short.
-      lines.push({ entry, label: ACTION_LABELS[entry.pool], needed, available: needed, displayOnly: true });
+    const turnLine = asTurnLine(entry);
+    if (turnLine) {
+      const turn = availability.turn;
+      if (!turn) {
+        // No turn state loaded (chips, old previews): shown, never tracked, never short.
+        lines.push({ entry, label: TIMING_LABELS[turnLine.timing], needed, available: needed, displayOnly: true });
+        continue;
+      }
+      const profile = profileFor(turn.profile);
+      const key = resolveTurnPool(profile, turnLine);
+      if (key === null) {
+        lines.push({ entry, label: 'Free', needed, available: needed, displayOnly: true });
+        continue;
+      }
+      // Extra Attack and friends: a waiting follow-up covers the whole turn line, and only that.
+      const waiting = choices.followupClass ? turn.followups[choices.followupClass] ?? 0 : 0;
+      if (choices.followupClass && waiting >= needed) {
+        lines.push({ entry, label: 'Extra Attack', needed, available: waiting, payFrom: { pool: 'followup', cls: choices.followupClass }, displayOnly: false });
+        continue;
+      }
+      const row = Object.hasOwn(turn.pools, key) ? turn.pools[key] : undefined;
+      const label = row?.label || profile.pools.find((p) => p.key === key)?.label || key;
+      settle({ entry, label, needed, available: 0, payFrom: { pool: 'turn', key }, displayOnly: false }, `turn:${key}`, row?.current ?? 0);
       continue;
     }
     if (entry.pool === 'spell_slot') {
@@ -313,24 +430,38 @@ export function planCost(entries: CostEntry[], availability: CostAvailability, c
 // Display
 // ---------------------------------------------------------------------------------------------
 
-// "L2 slot + 1 Vowfire + 1 action". `labels` maps a character pool key to its label.
-export function costSummary(entries: CostEntry[], labels: Record<string, string> = {}): string {
-  if (!entries.length) return 'Free';
-  return entries
+const TIMING_WORDS: Record<'action' | 'bonus_action' | 'reaction', [string, string]> = {
+  action: ['action', 'actions'], bonus_action: ['bonus action', 'bonus actions'], reaction: ['reaction', 'reactions']
+};
+
+// "L2 slot + 1 Vowfire + 1 Action". `labels` maps a character pool key to its label. With a profile
+// a turn line reads in its pool's words ("1 Attack action"); without one it reads neutrally
+// ("1 action", as before). Free and movement lines cost nothing, so they add no part.
+export function costSummary(entries: CostEntry[], labels: Record<string, string> = {}, profileKey?: string | null): string {
+  const parts = entries
     .map((entry) => {
       const n = entry.amount;
+      const turn = asTurnLine(entry);
+      if (turn) {
+        if (turn.timing === 'free' || turn.timing === 'movement') return null;
+        if (profileKey) {
+          const profile = profileFor(profileKey);
+          const key = resolveTurnPool(profile, turn);
+          return key === null ? null : turnCostLabel(profile, key, n);
+        }
+        const [one, many] = TIMING_WORDS[turn.timing];
+        return `${n} ${n === 1 ? one : many}`;
+      }
       if (entry.pool === 'spell_slot') {
         const level = (entry as { level: number }).level;
         return n === 1 ? `L${level} slot` : `${n} x L${level} slots`;
       }
       if (entry.pool === 'charges') return `${n} ${n === 1 ? 'charge' : 'charges'}`;
       if (entry.pool === 'item') return n === 1 ? '1 item' : `${n} items`;
-      if (entry.pool === 'action') return `${n} ${n === 1 ? 'action' : 'actions'}`;
-      if (entry.pool === 'bonus_action') return `${n} bonus ${n === 1 ? 'action' : 'actions'}`;
-      if (entry.pool === 'reaction') return `${n} ${n === 1 ? 'reaction' : 'reactions'}`;
       return `${n} ${labels[entry.pool] ?? entry.pool}`;
     })
-    .join(' + ');
+    .filter((part): part is string => part !== null);
+  return parts.length ? parts.join(' + ') : 'Free';
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -362,6 +493,11 @@ export function shortfallMode(input: { actorIsDm: boolean; dmPresent: boolean })
 // Stable string for an activation (kind, ids, slot choice). An approval only unlocks an
 // activation with the same signature.
 export function activationSignature(activation: Activation): string {
+  if (activation.kind === 'weapon_attack') {
+    // An id names the weapon; without one (Unarmed Strike, a GM-added action) the label does.
+    return `weapon_attack|${activation.inventoryId ?? 'none'}|${activation.inventoryId ? '' : activation.label ?? ''}|${activation.timing ?? 'action'}`;
+  }
+  if (activation.kind === 'dash') return `dash|${activation.count}`;
   const slot = `${activation.kind === 'item' || activation.kind === 'content' ? '' : `${activation.slotType ?? ''}:${activation.slotLevel ?? ''}`}`;
   switch (activation.kind) {
     case 'spell':

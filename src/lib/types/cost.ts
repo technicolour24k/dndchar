@@ -1,11 +1,13 @@
 // Cost engine types (docs: plans/dndchar/cost-engine). A Container's cost is a structured list,
 // never a scalar, so one activation can spend an action, a spell slot and a resource pool at once.
 
+import type { FollowupClass, ProfileKey, TurnLine } from './actionEconomy';
+
 export type CostEntry =
   | { pool: 'spell_slot'; amount: number; level: number } // level = minimum slot level; the player may upcast
   | { pool: 'charges'; amount: number; key?: string } // the activated Container's own counter
   | { pool: 'item'; amount: number } // the activated item's quantity
-  | { pool: 'action' | 'bonus_action' | 'reaction'; amount: number } // display-only in v1
+  | TurnLine // the turn's action economy; the campaign's profile decides which pool pays
   | { pool: string; amount: number }; // a resource_pool_definitions key
 
 export type ActionEconomyPool = 'action' | 'bonus_action' | 'reaction';
@@ -17,7 +19,9 @@ export type Activation =
   | { kind: 'spell'; instanceId: string; slotType?: SlotType; slotLevel?: number }
   | { kind: 'spell_access'; spellAccessId: string; inventoryItemId: string; slotType?: SlotType; slotLevel?: number }
   | { kind: 'item'; inventoryId: string }
-  | { kind: 'content'; instanceId: string };
+  | { kind: 'content'; instanceId: string }
+  | { kind: 'weapon_attack'; inventoryId: string | null; label?: string; timing?: 'action' | 'bonus_action' | 'reaction' }
+  | { kind: 'dash'; count: number };
 
 export type CostShortfall = { label: string; needed: number; available: number };
 
@@ -30,15 +34,19 @@ export type CostAvailability = {
   itemQuantity: number | null;
   // Active character pools by key. A key that is missing (no definition, or archived) is a shortfall.
   pools: Record<string, { label: string; current: number }>;
+  // Per-turn pools and follow-ups. Absent means turn lines stay display-only (chips, old previews).
+  turn?: { profile: ProfileKey; pools: Record<string, { label: string; current: number }>; followups: Record<string, number> };
 };
 
-export type CostChoices = { slotType?: SlotType; slotLevel?: number };
+export type CostChoices = { slotType?: SlotType; slotLevel?: number; followupClass?: FollowupClass };
 
 export type PayFrom =
   | { pool: 'spell_slot'; slotType: SlotType; slotLevel: number }
   | { pool: 'charges'; key: string }
   | { pool: 'item' }
-  | { pool: 'pool'; key: string };
+  | { pool: 'pool'; key: string }
+  | { pool: 'turn'; key: string }
+  | { pool: 'followup'; cls: FollowupClass };
 
 export type PlannedCostLine = {
   entry: CostEntry;
@@ -50,7 +58,8 @@ export type PlannedCostLine = {
   displayOnly: boolean;
 };
 
-export type PlannedCost = { lines: PlannedCostLine[]; shortfalls: CostShortfall[] };
+// castAtLevel is set only for a spell echo: the free repeat always resolves at the spell's base level.
+export type PlannedCost = { lines: PlannedCostLine[]; shortfalls: CostShortfall[]; castAtLevel?: number };
 
 export type OverrideRequest = 'dm' | 'self';
 export type OverrideDecision = 'dm_approved' | 'dm_self' | 'self_override' | 'ask_dm' | 'forbidden';
