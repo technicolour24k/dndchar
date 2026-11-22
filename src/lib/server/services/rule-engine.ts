@@ -49,22 +49,6 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
 
       UNION ALL
 
-      -- Branch 1b: active effects legacy path (rows not yet back-filled with container_id)
-      SELECT active.id::text, 'effect', effect.name,
-        COALESCE(effect.description, ''), link.id::text, modifier.id::text,
-        modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
-        COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
-        COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
-      FROM active_character_effects active
-      JOIN effect_definitions effect ON effect.id = active.effect_id
-      JOIN effect_modifier_links link ON link.effect_id = effect.id
-      JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
-      LEFT JOIN modifier_targets hook ON hook.target_key = modifier.target
-      WHERE active.character_id = $1 AND active.container_id IS NULL
-
-      UNION ALL
-
       SELECT instance.id::text, 'content', COALESCE(instance.custom_name, content.name), content.description,
         link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),

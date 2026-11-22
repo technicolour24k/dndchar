@@ -34,8 +34,7 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     WHERE link.source_content_id=$1 ORDER BY effect.name`,[selectedContentId]):{rows:[]};
   const actions=selectedContentId?await query<any>(`SELECT link.id AS link_id,link.trigger_type,action.id,action.name,action.description,
     step.id AS step_id,step.step_type,step.operation,step.target_type,step.target_key,step.value_expression,
-    COALESCE(step.effect_container_id,(SELECT cd.id FROM effect_definitions ed JOIN content_definitions cd
-      ON cd.content_type='condition' AND cd.content_key='condition:'||ed.effect_key WHERE ed.id=step.effect_id)) AS effect_id,
+    step.effect_container_id AS effect_id,
     step.target_mode,step.label,step.sort_order FROM content_action_links link
     JOIN content_definitions action ON action.id=link.action_container_id LEFT JOIN action_steps step ON step.container_id=action.id
     WHERE link.content_id=$1 ORDER BY link.sort_order,action.name,step.sort_order`,[selectedContentId]):{rows:[]};

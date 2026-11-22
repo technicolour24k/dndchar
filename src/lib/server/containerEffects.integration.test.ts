@@ -253,7 +253,8 @@ describe.skipIf(!enabled)('active effects on containers', () => {
     if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, '')) || target.searchParams.has('host')) {
       throw new Error('Refusing to run: database is not local.');
     }
-    const { query } = await import('$lib/server/db');
+    const { query, withTransaction } = await import('$lib/server/db');
+    const { findOrCreateActionContainer } = await import('./services/action-containers');
     const { createCharacter } = await import('./services/characters');
     const { useInventoryCatalogueItem } = await import('./services/catalogue');
     const { addContentResourceAction, attachActionToContent, attachEffectToAdminContent } = await import('./services/content-admin');
@@ -298,6 +299,15 @@ describe.skipIf(!enabled)('active effects on containers', () => {
       await attachActionToContent(form({ contentId: itemB, actionId: container, triggerType: 'on_use' }));
       await attachActionToContent(form({ contentId: itemB, actionId: container, triggerType: 'on_use' }));
       expect((await query(`SELECT 1 FROM content_action_links WHERE content_id=$1`, [itemB])).rows).toHaveLength(1);
+
+      // An archived action container is un-archived on reuse, and concurrent creators converge on one row.
+      await query(`UPDATE content_definitions SET is_archived=true WHERE id=$1`, [container]);
+      await addContentResourceAction(form({ contentId: itemA, activationType: 'on_use', stepType: 'roll_output', valueExpression: '1' }));
+      expect((await query<any>(`SELECT is_archived FROM content_definitions WHERE id=$1`, [container])).rows[0].is_archived).toBe(false);
+      const created = await Promise.all([itemB].flatMap((id) => [0, 1].map(() => withTransaction((client) =>
+        findOrCreateActionContainer(client, id, 'manual', 'IT race', 'x', null)))));
+      actionKeys.push(`action:content:${itemB}:manual`);
+      expect(new Set(created).size).toBe(1);
 
       // An on_use condition attach on the same item reuses the container and dedupes its step.
       const conditionId = (await query<{ id: string }>(`SELECT id FROM content_definitions WHERE content_type='condition' AND NOT is_archived LIMIT 1`)).rows[0].id;

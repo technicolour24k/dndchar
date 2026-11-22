@@ -14,15 +14,28 @@ export async function findOrCreateActionContainer(
 ): Promise<string> {
   const prefixed = `action:content:${contentId}:${trigger}`;
   const bare = `content:${contentId}:${trigger}`;
-  const found = await client.query<{ id: string }>(
-    `SELECT id FROM content_definitions WHERE content_type='action' AND content_key IN ($1,$2)
+  // An archived match is un-archived rather than ignored: ignoring it would collide on the unique key.
+  const find = () => client.query<{ id: string; is_archived: boolean }>(
+    `SELECT id, is_archived FROM content_definitions WHERE content_type='action' AND content_key IN ($1,$2)
      ORDER BY (content_key=$1) DESC LIMIT 1`, [prefixed, bare]);
-  if (found.rowCount) return found.rows[0].id;
+  // A per-content action container is only ever reused here when someone is attaching an action to
+  // that same content, so an archived one is brought back (its old steps come back with it) rather
+  // than failing on the unique content key. No UI archives these auto-created containers today.
+  const reuse = async (row: { id: string; is_archived: boolean }) => {
+    if (row.is_archived) await client.query('UPDATE content_definitions SET is_archived=false, updated_at=now() WHERE id=$1', [row.id]);
+    return row.id;
+  };
+  const found = await find();
+  if (found.rowCount) return reuse(found.rows[0]);
+  // Race-safe: a concurrent insert of the same key makes this a no-op, and we re-select.
   const created = await client.query<{ id: string }>(
     `INSERT INTO content_definitions(content_key,content_type,name,description,source_kind,owner_user_id,activation_type)
-     VALUES($1,'action',$2,$3,'homebrew',$4,'active_use') RETURNING id`,
+     VALUES($1,'action',$2,$3,'homebrew',$4,'active_use') ON CONFLICT DO NOTHING RETURNING id`,
     [prefixed, name, description, ownerUserId]);
-  return created.rows[0].id;
+  if (created.rowCount) return created.rows[0].id;
+  const again = await find();
+  if (!again.rowCount) throw new Error('Could not create the action container.');
+  return reuse(again.rows[0]);
 }
 
 // Links an action container to content (idempotent on content + container + trigger).

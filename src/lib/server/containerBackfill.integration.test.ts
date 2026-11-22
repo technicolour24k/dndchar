@@ -13,6 +13,7 @@ import { env } from '$env/dynamic/private';
 //   CONTAINER_DB_TEST=1 npx vitest run src/lib/server/containerBackfill.integration.test.ts
 const enabled = process.env.CONTAINER_DB_TEST === '1';
 const migration = fs.readFileSync(path.resolve('src/lib/server/db/migrations/041_container_backfill.sql'), 'utf8');
+const rerun = fs.readFileSync(path.resolve('src/lib/server/db/migrations/042_container_backfill_rerun.sql'), 'utf8');
 
 describe.skipIf(!enabled)('041 container backfill', () => {
   it('backfills drift fixtures idempotently', async () => {
@@ -93,6 +94,17 @@ describe.skipIf(!enabled)('041 container backfill', () => {
       expect(await q(`SELECT 1 FROM content_definitions WHERE content_key IN ($1, $2)`, [`condition:${tag}`, `action:${tag}`])).toHaveLength(2);
       expect(await q(`SELECT 1 FROM content_modifier_links WHERE content_id = $1`, [cond.id])).toHaveLength(1);
       expect(await q(`SELECT 1 FROM content_grants WHERE granted_content_id = $1`, [cond.id])).toHaveLength(1);
+
+      // 042 catches drift written after 041: a new legacy effect plus a step pointing at it.
+      const lateKey = `${tag}late`;
+      const lateEffect = (await q<{ id: string }>(
+        `INSERT INTO effect_definitions (effect_key, name, source_type) VALUES ($1, 'IT Late', 'homebrew') RETURNING id`, [lateKey]))[0].id;
+      await q(`INSERT INTO action_steps (action_id, step_type, effect_id, sort_order) VALUES ($1, 'apply_effect', $2, 5)`, [actionId, lateEffect]);
+      await client.query(rerun);
+      await client.query(rerun);
+      const [late] = await q<any>(`SELECT id FROM content_definitions WHERE content_type='condition' AND content_key=$1`, [`condition:${lateKey}`]);
+      expect(late).toBeTruthy();
+      expect(await q(`SELECT 1 FROM action_steps WHERE action_id=$1 AND effect_container_id=$2`, [actionId, late.id])).toHaveLength(1);
 
       // The container-keyed index rejects a second link for the same (content, container, trigger).
       await client.query('SAVEPOINT dup');
