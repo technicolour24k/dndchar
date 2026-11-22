@@ -65,6 +65,22 @@
     <div id="overworldFrameHost"></div>
   </div>
 
+  <!-- Voice dock (daily-voice plan, campaign tables only; shown by voice.js). Deliberately a direct
+       child of <body>, outside #sidebar/#app and the overworld overlay, so rebuilds and overlays
+       never touch it and a call survives them. -->
+  <div id="voiceDock" hidden>
+    <div id="voiceBar">
+      <span id="voiceStatus">Voice</span>
+      <button type="button" id="voiceJoin">Join voice</button>
+      <button type="button" id="voiceMute" hidden>Mute</button>
+      <button type="button" id="voiceLeave" hidden>Leave</button>
+      <button type="button" id="voiceListToggle" hidden aria-expanded="false">Who's in</button>
+    </div>
+    <button type="button" id="voiceSound" hidden>Tap to enable sound</button>
+    <ul id="voiceList" hidden></ul>
+    <div id="voiceAudioHost" hidden></div>
+  </div>
+
   <div id="app">
     <div id="sidebar"></div>
     <div id="mapWrap">

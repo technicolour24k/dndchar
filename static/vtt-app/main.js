@@ -13,6 +13,7 @@ import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptT
 import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
+import { createVoice } from './voice.js';
 import { drawTargetRings } from './render/targeting.js';
 import { getTokensInShape } from './render/shapeGeometry.js';
 
@@ -650,6 +651,8 @@ function handleMessage(msg) {
     // Campaign tables: the server's seat/kick messages. campaign.js decides what to show and
     // whether to reconnect; the socket's close follows straight after.
     case 'kicked':
+      // Removed from the campaign: leave voice at once. Role changes and seat moves leave it alone.
+      if (msg.reason === 'removed_from_campaign') voice.onKickedRemoved();
       campaignClient.onKicked(msg.reason);
       break;
 
@@ -674,7 +677,10 @@ function handleMessage(msg) {
       session = msg.session;
       session.markers = session.markers || {}; // guard against a session created before markers existed
       showApp();
-      if (campaignClient.active) campaignClient.onJoined();
+      if (campaignClient.active) {
+        campaignClient.onJoined();
+        voice.show(); // idempotent: state:full repeats on every reconnect and must not touch a live call
+      }
       // render() first - it computes currentRenderedTokens (vision-filtered
       // for a player), which renderSidebar()'s "other tokens in view" list
       // now reads from; the reverse order would show a stale/empty list
@@ -5541,9 +5547,13 @@ function wirePlayerSidebar() {
 // for the first join.
 // Overworld maps (overworld-map plan, Unit F): a button and full-screen overlay at campaign tables only.
 const overworld = createOverworld({ getCampaignId: () => campaignClient.campaignId });
+// Voice chat dock (daily-voice plan): campaign tables only, never reset by reconnects or re-renders.
+const voice = createVoice({ getCampaignId: () => campaignClient.campaignId });
 
 const campaignClient = createCampaignClient({
   connect,
+  // Removed from the table (or a dead end): drop out of voice, then hide the dock.
+  onTableGone: () => { voice.leave().finally(() => voice.hide()); },
   closeSocket: () => { if (ws) ws.close(); },
   // The ticket is the authority on who we are and which role we hold at this table.
   setIdentity: ({ roomCode, role: newRole, userId, displayName }) => {
