@@ -893,9 +893,8 @@ async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDe
   }>(
     `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
       cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
-      COALESCE(ed.is_condition, false) AS is_condition
+      COALESCE(cd.metadata_json->>'isCondition', 'false') = 'true' AS is_condition
      FROM content_definitions cd
-     LEFT JOIN effect_definitions ed ON cd.content_key = 'condition:' || ed.effect_key
      WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
      ORDER BY cd.name ASC`,
     [includeArchived]

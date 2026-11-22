@@ -189,4 +189,63 @@ describe.skipIf(!enabled)('active effects on containers', () => {
       await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`condition:${tag}`]);
     }
   });
+  it('authors conditions on containers only (rules admin)', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, '')) || target.searchParams.has('host')) {
+      throw new Error('Refusing to run: database is not local.');
+    }
+    const { query, withTransaction } = await import('$lib/server/db');
+    const { createCharacter } = await import('./services/characters');
+    const { applyCharacterEffect } = await import('./services/effects');
+    const { saveEffect, attachEffectModifier, detachEffectModifier, archiveEffect, loadEffects, loadModifiers } = await import('./services/rules-admin');
+    const tag = `zzauthor${crypto.randomBytes(4).toString('hex')}`;
+    const form = (values: Record<string, string>) => { const f = new FormData(); for (const [k, v] of Object.entries(values)) f.set(k, v); return f; };
+    const userId = (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Author', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    const before = Number((await query<any>(`SELECT count(*)::int AS n FROM effect_definitions`)).rows[0].n);
+    let id = '';
+    try {
+      id = await saveEffect(userId, form({ name: `IT Author ${tag}`, durationType: 'timed', durationRounds: '4', stackBehavior: 'refresh',
+        expiryBoundary: 'turn_end', sourceType: 'homebrew', isCondition: 'on', isSelectable: 'on', description: 'authored' }));
+      const row = (await query<any>(`SELECT * FROM content_definitions WHERE id=$1`, [id])).rows[0];
+      expect(row.content_type).toBe('condition');
+      expect(row.content_key.startsWith(`condition:homebrew:${userId}:`)).toBe(true);
+      expect(row.duration_type).toBe('rounds');
+      expect(row.metadata_json).toMatchObject({ isCondition: true, isSelectable: true, legacyDurationType: 'timed', isHomebrew: true });
+      expect(Number((await query<any>(`SELECT count(*)::int AS n FROM effect_definitions`)).rows[0].n)).toBe(before);
+
+      // Update keeps the container and round-trips the legacy duration.
+      await saveEffect(userId, form({ effectId: id, name: `IT Author ${tag} b`, durationType: 'variable', stackBehavior: 'stack', expiryBoundary: 'round_end', sourceType: 'homebrew' }));
+      let listed = (await loadEffects(id, tag)).effects.find((e: any) => e.id === id);
+      expect(listed).toMatchObject({ durationType: 'variable', stackBehavior: 'stack', isCondition: false, isSelectable: false, referenceCount: 0, modifierCount: 0 });
+
+      // Attach / detach a modifier, and the reference count comes from container links only.
+      const modifierId = (await query<{ id: string }>(`SELECT id FROM modifier_definitions LIMIT 1`)).rows[0].id;
+      const refsBefore = (await loadModifiers()).modifiers.find((m: any) => m.id === modifierId)!.referenceCount;
+      await attachEffectModifier(form({ effectId: id, modifierId, priority: '2' }));
+      const loaded = await loadEffects(id, tag);
+      expect(loaded.effectLinks).toHaveLength(1);
+      expect((await loadModifiers()).modifiers.find((m: any) => m.id === modifierId)!.referenceCount).toBe(refsBefore + 1);
+      await detachEffectModifier(id, loaded.effectLinks[0].id);
+      expect((await loadEffects(id, tag)).effectLinks).toHaveLength(0);
+
+      // A grant to the condition shows as a reference; it applies to a character via the container id.
+      const itemId = (await query<{ id: string }>(
+        `INSERT INTO content_definitions (content_key, content_type, name) VALUES ($1, 'item', 'IT Author Item') RETURNING id`, [`it:${tag}`])).rows[0].id;
+      await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type) VALUES ($1, $2, 'equipped')`, [itemId, id]);
+      listed = (await loadEffects(id, tag)).effects.find((e: any) => e.id === id);
+      expect(listed!.referenceCount).toBe(1);
+      const characterId = await createCharacter(userId, 'Author');
+      expect((await withTransaction((client) => applyCharacterEffect(client, characterId, id))).status).toBe('applied');
+
+      // Archive hides it from the default list.
+      await archiveEffect(id);
+      expect((await loadEffects(id, tag)).effects.some((e: any) => e.id === id)).toBe(false);
+      expect((await loadEffects(id, tag, true)).effects.some((e: any) => e.id === id)).toBe(true);
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`it:${tag}`]);
+      if (id) await query(`DELETE FROM content_definitions WHERE id = $1`, [id]);
+    }
+  });
 });
