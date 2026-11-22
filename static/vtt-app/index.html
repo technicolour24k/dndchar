@@ -75,6 +75,18 @@
       <button type="button" id="voiceMute" hidden>Mute</button>
       <button type="button" id="voiceLeave" hidden>Leave</button>
       <button type="button" id="voiceListToggle" hidden aria-expanded="false">Who's in</button>
+      <button type="button" id="voiceDevicesToggle" hidden aria-expanded="false">Devices</button>
+    </div>
+    <button type="button" id="voiceListen" hidden>Join to listen only</button>
+    <div id="voiceNote" hidden></div>
+    <div id="voicePrompt" hidden>
+      <span id="voicePromptText"></span>
+      <button type="button" id="voiceStay">Stay</button>
+      <button type="button" id="voicePromptLeave">Leave</button>
+    </div>
+    <div id="voiceDevices" hidden>
+      <label>Mic <select id="voiceInputSel"></select></label>
+      <label id="voiceOutputRow" hidden>Speaker <select id="voiceOutputSel"></select></label>
     </div>
     <button type="button" id="voiceSound" hidden>Tap to enable sound</button>
     <ul id="voiceList" hidden></ul>

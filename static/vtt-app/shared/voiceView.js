@@ -43,7 +43,7 @@ export function speakingIds(lastLoudAt, now, holdMs = SPEAKING_HOLD_MS) {
 /**
  * What the dock shows for each state.
  * state: 'idle' | 'loading' | 'joining' | 'joined' | 'leaving' | 'error'
- * opts: { count, muted, message }
+ * opts: { count, muted, message, listenOnly, offerListenOnly, rejoin }
  */
 export function dockLabel(state, opts = {}) {
   const count = Number.isFinite(opts.count) ? opts.count : 0;
@@ -54,20 +54,67 @@ export function dockLabel(state, opts = {}) {
       return { text: 'Voice: joining...', canJoin: false, canLeave: true, canMute: false, joinText: 'Join voice' };
     case 'joined':
       return {
-        text: `Voice: ${count} in`,
+        text: `Voice: ${count} in${opts.listenOnly ? ' (listening only)' : ''}`,
         canJoin: false,
         canLeave: true,
-        canMute: true,
+        canMute: !opts.listenOnly,
         joinText: 'Join voice',
         muteText: opts.muted ? 'Unmute' : 'Mute'
       };
     case 'leaving':
       return { text: 'Voice: leaving...', canJoin: false, canLeave: false, canMute: false, joinText: 'Join voice' };
     case 'error':
-      return { text: opts.message || 'Voice: something went wrong', canJoin: true, canLeave: false, canMute: false, joinText: 'Try again' };
+      return {
+        text: opts.message || 'Voice: something went wrong',
+        canJoin: true,
+        canLeave: false,
+        canMute: false,
+        joinText: 'Try again',
+        canListenOnly: !!opts.offerListenOnly
+      };
     default:
-      return { text: opts.message || 'Voice', canJoin: true, canLeave: false, canMute: false, joinText: 'Join voice' };
+      // After a reload the dock offers "Rejoin voice" (highlighted by the caller); it never auto-joins.
+      return {
+        text: opts.message || 'Voice',
+        canJoin: true,
+        canLeave: false,
+        canMute: false,
+        joinText: opts.rejoin ? 'Rejoin voice' : 'Join voice',
+        highlightJoin: !!opts.rejoin
+      };
   }
+}
+
+/** Mic errors from daily-js that can be worked around by joining to listen only. */
+export function isMicError(type) {
+  return ['permissions', 'not-found', 'mic-in-use', 'cam-mic-in-use', 'undefined-mediadevices', 'constraints'].includes(type);
+}
+
+/**
+ * Entries for a device <select> from navigator.mediaDevices.enumerateDevices() output.
+ * Unlabelled devices (no permission yet) get "Microphone 2" style names. The "default" and
+ * "communications" pseudo-devices are kept: they are what most people want.
+ */
+export function pickDevices(devices, kind) {
+  const word = kind === 'audiooutput' ? 'Speaker' : 'Microphone';
+  const out = [];
+  for (const d of devices || []) {
+    if (!d || d.kind !== kind || !d.deviceId) continue;
+    out.push({ id: d.deviceId, label: String(d.label || '').trim() || `${word} ${out.length + 1}` });
+  }
+  return out;
+}
+
+/** The remembered device id if it still exists in the list, else null (ignore stale ids). */
+export function rememberedDevice(id, list) {
+  return id && (list || []).some((d) => d.id === id) ? id : null;
+}
+
+/** Text for a Daily-side removal (fatal 'ejected'): the session cap, or someone removing us. */
+export function describeEject(joinedMs, capMs) {
+  return joinedMs >= capMs - 5 * 60 * 1000
+    ? 'Voice session ended after the time limit. Join again to carry on.'
+    : 'You were removed from the voice call.';
 }
 
 /**
@@ -90,6 +137,8 @@ export function describeVoiceError(code) {
       return "Couldn't reach the server, try again.";
     case 'script_load':
       return "Couldn't load the voice library. Check your connection and try again.";
+    case 'meeting-full':
+      return 'The voice call is full.';
     case 'unsupported':
       return "This browser can't do voice chat.";
     case 'permissions':

@@ -503,3 +503,11 @@ body {
 .voice-row.speaking .voice-name { border-color: #3ddc84; }
 .voice-row .voice-muted-mark { font-size: 11px; color: #e07070; text-decoration: line-through; }
 body:has(#overworldOverlay:not([hidden])) #voiceDock { z-index: 650; }
+#voiceDock button.voice-rejoin { border-color: #f0b84a; box-shadow: 0 0 0 2px rgba(240,184,74,.4); }
+#voicePrompt { margin-top: 6px; padding: 6px; border-radius: 6px; background: #2a2d36; border: 1px solid #f0b84a; }
+#voicePrompt button { margin-left: 4px; }
+#voiceDevices { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+#voiceDevices label { display: flex; align-items: center; gap: 6px; }
+#voiceDevices select { min-width: 0; flex: 1; max-width: 200px; font-size: 12px; }
+#voiceListen { margin-top: 6px; }
+#voiceNote { margin-top: 6px; font-size: 12px; color: #f0b84a; }
