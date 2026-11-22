@@ -9,7 +9,7 @@
 ## 0. Things to flag before the findings
 
 **Spec claims that assume something not true of the codebase:**
-- §2.1 and the Open Questions list both refer to **Soulfire** and **Vowfire** as existing resource pools. Neither exists anywhere in code - no `modifier_targets` row, no resource table, no string literal. They are aspirational only.
+- §2.1 and the Open Questions list refer to **Soulfire** and **Vowfire** resource pools. As of migration 044 both exist (`resource_pool_definitions` rows plus `resource.soulfire.max` / `resource.vowfire.max` targets); this bullet used to say they did not.
 - §5.2's worked example talks about "Rage (the class feature)" and "Raging (the state)" as two distinct things. The actual seed data has exactly one `Rage` row with its modifiers attached directly - there is no `Raging` entity. This implies content needs to be re-modeled as two pieces, not only that the engine needs a new capability.
 
 ---
@@ -32,16 +32,19 @@ Rules where the live code already does what the spec requires.
 - **§6.3 - A Container may attach multiple independent Modifier instances.** `ContentTypeAdmin.svelte`'s repeatable `?/attachModifier` form adds one `content_modifier_links` row per submission; nothing limits a content record to a single modifier.
 - **§6.4 - Two-phase roll resolution for outcome-dependent conditions.** Attack roll phase runs first; crit detection gates damage modifier conditions before the damage roll is computed.
 
+- **§2.3 - Structured cost list and cost engine (cost-engine plan, migration 044, 2026-11-22).** `content_definitions.cost_json` is a list of `{pool, amount, ...}` lines (spell slot with a minimum level, own counter, item quantity, any resource pool) paid by `cost-engine.ts` at activation: casting, item use, weapon attacks and dashes. Every pay is atomic and takes locks in one fixed order (turn row first). Unaffordable costs go through the DM approval flow (`ask_dm` / `no_dm` / `dm_self`), every override is written to a resource ledger, and the DM can review and undo it.
+- **§3.1 - Resource grants sum by count.** Character resource pools (`resource_pool_definitions`, e.g. Soulfire, Vowfire) take their maxima from `bonus`/`penalty` modifiers on `resource.<key>.max`, summed by count with a source-attributed breakdown. The per-turn action pools do the same on `action_pool.<key>.max`, and Extra Attack-style follow-ups on `followup.<type>.count`.
+- **§2.3 - The character's own action economy is a target (action-economy plan, migration 045, 2026-11-22).** Two built-in profiles (`dnd5e`: Action / Bonus action / Reaction; `attack_utility`: 2 Attack + 2 Utility, homebrew), chosen per campaign. Cost lines carry a timing and a category and the profile maps them to a pool. Per-turn spend lives in `character_turn_state`. A weapon attack, a dash, spells and items all charge it. Free follow-ups (Extra Attack, spell echoes) and manual resets (sheet Next Turn / Round / New Battle, VTT Reset and Reset all) are built. The VTT shows the remaining actions on the token and offers a dash when the owning player moves past their movement.
+
 ---
 
 ## 2. Partially Conforms (Needs Reshaping)
 
 Rules where a real, working piece of the mechanism exists, but it is incomplete or scoped too narrowly.
 
-- **§2.1 - Modifier target categories.** Derived stats, roll categories, and discrete rules are all real and seeded. Resource-pool targets are conceptually supported by dot-notation but no actual `resource.*` targets exist yet - Soulfire/Vowfire have zero representation. Needs extending.
+- **§2.1 - Modifier target categories.** Derived stats, roll categories, and discrete rules are all real and seeded. Resource-pool targets are real now: `resource.<key>.max` per character pool (Soulfire, Vowfire and DM-defined ones), `action_pool.<key>.max` and `followup.<type>.count` (see §1).
 - **§2.1 - Stat-derived formula value source.** `modifier_targets.value_kind` declares a `formula` kind, but `resolveModifierNumericValue` (`dnd5e.ts`) only evaluates one hardcoded literal (`rage_damage_bonus`). No general formula evaluator exists.
 - **§2.2 - Container field completeness.** Migration 019 added `activation_type`, `cost_json`, `duration_type`, `duration_rounds`, `requires_concentration`, `expiry_boundary`, `stack_behavior` to `content_definitions`. These fields are present but the **service layer** (catalogue.ts, characters.ts) does not yet read or honour `cost_json` or `activation_type` declaratively - cost is still handled procedurally per content type. The schema is right; the engine hasn't caught up.
-- **§2.3 - Structured cost list.** `cost_json JSONB` now exists on `content_definitions`. No engine path reads it yet to deduct multi-pool costs at activation time.
 - **§2.5 - Source and target-of-effect tracked independently.** The schema is ready (`active_character_effects.source_character_id` exists). No UI and no service code actually exercises cross-character targeting.
 - **§2.6 - Audit trail for every resolved value.** Real and working for attack rolls and damage (`rollDamageExpression` builds a labelled breakdown). AC, skill checks, saving throws have `?` formula modals with source attribution. Not uniformly structured as a reusable audit-trail type - each value implements its own breakdown independently. A first reusable piece now exists for the 9 overridable combat-summary/magic stats specifically: `resolveCharacterStats()` (`src/lib/rules/characterStats.ts`) is the single resolver for Proficiency/AC/Initiative/Speed/the three Passives/Spell Save DC/Spell Attack Bonus, and its `manualOverrideLines`/`withManualLines` helpers generate the manual-override portion of each stat's `?` breakdown uniformly. Saves, skills, and other rolls still build their own breakdown text independently. Senses (vision, darkvision, truesight, devil's sight) now also have a source-attributed breakdown (`resolveSense`/`visionBreakdown` in `dnd5e.ts`), shown via a `?` modal in the sheet's Combat Summary.
 - **§3.1 - Stacking by operation type: `minimum` (highest wins) op.** The `minimum` op ("At least - highest wins") exists in `ModifierOperation` and `operationRegistry`, and the spec's §3.1 table has a matching row (user-approved 2026-11-19). Only senses (`vision.*_ft`) honour it so far; on any other target it does nothing. Added 2026-11-19 (VTT batch 2: darkvision).
@@ -55,14 +58,11 @@ Rules where a real, working piece of the mechanism exists, but it is incomplete 
 Rules with no trace anywhere in schema, services, or UI.
 
 - **§2.1 - Derived-from-sibling value source.** No column, no resolver branch. Crit-bonus damage derived from a weapon's own base die doesn't exist in any form.
-- **§2.3 - Cost engine.** The `cost_json` column exists but nothing reads it to deduct resources at activation time. The cost of casting/activating anything is still hard-coded procedurally in service functions.
 - **§2.4 - Expiry side-effects as a grant-on-trigger.** No `on_expire` trigger type. A Container that fires something specific when it wears off (spec's Haste-lethargy example) has no mechanism.
 - **§3.1 - Resistance/vulnerability per-damage-type netting.** No code nets resistance against vulnerability per damage type.
 - **§3.1 - "Doesn't stack with itself" flag.** No per-modifier-definition boolean for this. The adjacent `effect_definitions.stack_behavior` enum controls re-application behaviour, not modifier-level stacking exceptions.
-- **§3.1 - Resource-grant-sums-by-count.** Nothing resembling countable resource grants that sum across sources (the `luck_dice` pattern) exists. `character_content_resources` tracks a single current/max value per definition.
 - **§4.4 - Version-history drift display.** `VersionList.svelte` renders a label and a restore button only. No logic distinguishes character-state diffs from modifier-definition drift. No drift display at all. This now has a second dimension worth flagging once it's built: `statOverrides` (see §4a) are frozen/restored as character state, but a stored `override` value can silently mask a computed value that has since changed (e.g. the underlying rules/items changed since the override was set). The future drift view should flag when an override is hiding a computed value that no longer matches what was true when the override was set - not just modifier-definition drift.
 - **Magic system - concentration state tracking.** `spell_definitions.concentration` is a boolean metadata field only. No mechanism enforces the "only one concentration spell at a time" rule or applies the concentration Container to the character when a spell is cast.
-- **Magic system - cost engine for spell slots.** Spell slots are deducted procedurally in `castCharacterSpell`. They are not declared as `cost_json` on the spell Container and not handled by a general cost engine.
 - **Content/inventory resource maxima don't recompute on a proficiency override, adjustment, or level change.** `initializeContentResources`/`initializeInventoryResources` (`catalogue.ts`) resolve `max_value_expression` (including `proficiency_bonus`) once, at the moment content is added or its resource definition is edited - via `effectiveProficiencyBonus()` (`characterStats.ts`), so it does respect an override/adjustment set *at that moment*. Neither function re-runs when the override/adjustment changes afterwards or when the character levels up, so an already-initialized pool's max can go stale until content is re-added or edited. Accepted as-is; a follow-up to recompute would need a trigger point (e.g. on save) that doesn't exist yet.
 
 ---
@@ -96,6 +96,15 @@ Rules where the code intentionally does not follow the spec's letter, by a decis
   - **Why:** the user wanted a quick stopgap at the table before proper modifiers for extra damage dice exist. They introduce no `modifier_definitions` rows, targets or op types, and every piece carries an `// INTERIM:` comment. To be replaced by real modifiers later; at that point the delete-list is those comments.
 
 - **Homebrew crit rule: max of the primary damage dice, added once (added 2026-11-19).** On a critical hit the damage dice are rolled normally, then the maximum of the weapon's/spell's own primary dice is added once on top (2d8 + 1d4 poison + 4 becomes 2d8 + 1d4 + 4 + 16; nothing is doubled, flat bonuses and secondary/extra dice are not maximised). Primary dice = the first die size in the expression, merged, same rule as the interim manual damage-dice control. This is a deliberate homebrew departure from 5e's double-the-dice rule. It is hard-coded in `critMaxDiceBonus` (`dnd5e.ts`) and applied by `rollDamage` whenever the hit's outcomes include `critical_hit`, covering the primary dice after any INTERIM manual adjustment (not sneak attack or other extra dice), for sheet and VTT weapon and spell attacks. It is not a Modifier, so it isn't DM-configurable yet; making it one (e.g. a crit-damage rule target) is future work.
+
+- **Action economy (2026-11-22): deliberate choices.**
+  - **Profiles are built in, in code** (`src/lib/rules/actionEconomy.ts`), not DM-editable data: the mapping is logic (by timing in 5e, by category in the homebrew profile). Cost lines carry tags, not pool names, so an editable profile table can be added later without touching content.
+  - **Turn state lives outside `resource_pool_definitions`** (`character_turn_state`, storing what was SPENT this turn). Pool definitions are global but turn pools depend on the campaign's profile, rests and the Save/replace code don't know a "turn" period, and a snapshot restore must not time-travel "spent an Attack this turn".
+  - **Turn lines are inherited separately from resource lines.** NULL `cost_json` is the full default; an explicit list without a turn line keeps its own resources and still takes the default action line; a turn line with timing Free is how an author makes something take no action.
+  - **A normal turn spend is not ledgered** (it resets every turn); the turn row's own log is the audit trail. Overrides do get ledger rows.
+  - **Resets are manual** (no initiative tracker), and movement within speed is free; only going past it (a dash) costs a general action.
+  - **`token.turn` is a display copy** pushed by the owner's client and rebuilt server-side (`sanitizeTurn`); every change goes through HTTP. A token whose owner is not connected shows a stale copy until they join.
+  - **Not in the modifier model:** the dash itself (a built-in activation, not a granted action) and the 5e bonus-action-spell restriction.
 
 ---
 
@@ -143,47 +152,66 @@ This is a significant migration (removing a dedicated table, replacing with gene
 
 ## 6. Container Unification - Current Progress and Remaining Work
 
+*§6 re-audited 2026-11-21 against `vttpoc` (`7de8dea6`). Only this section was regenerated - the rest of the document is still dated 2026-11-19. The migration plan lives at `~/.claude/plans/dndchar/container-migration/container-migration.md`.*
+
 ### 6.1 What migration 019 accomplished
 
 - `content_definitions` now carries all Container-level fields: `activation_type`, `cost_json`, `duration_type`, `duration_rounds`, `requires_concentration`, `expiry_boundary`, `stack_behavior`, `is_system`.
 - `content_type` now accepts `'condition'` and `'action'` in addition to the original four.
-- All rows from `effect_definitions` were inserted into `content_definitions` with `content_type = 'condition'` (key prefix `condition:`).
-- All rows from `effect_modifier_links` were migrated into `content_modifier_links` for the new condition Containers.
-- `active_character_effects` now has a `container_id` column referencing `content_definitions`. Existing rows were back-filled. New active effects should set `container_id` in addition to (or instead of) `effect_id`.
-- All rows from `action_definitions` were inserted into `content_definitions` with `content_type = 'action'` (key prefix `action:`).
-- `action_steps` and `content_action_links` now each have a `container_id` column referencing the new action Containers.
-- `content_effect_links` rows were migrated into `content_grants` (effect grants become Container grants).
-- The rule engine (`resolveCharacterModifierSources`) branch 1 now queries via `container_id → content_definitions → content_modifier_links`, with a legacy fallback for any remaining rows where `container_id IS NULL`.
+- `effect_definitions` rows were copied into `content_definitions` as `content_type = 'condition'` (key `condition:<effect_key>`). Not copied: `source_type`, `source_ref`, `is_condition`, `is_selectable`, `is_homebrew`, `sort_order`, `metadata_json`, `owner_user_id`. The legacy `duration_type` was mapped lossily into the new vocabulary.
+- `effect_modifier_links` were copied into `content_modifier_links`. `content_effect_links` were copied into `content_grants`.
+- `action_definitions` were copied into `content_definitions` as `content_type = 'action'` (key `action:<action_key>`).
+- Added `container_id` to `active_character_effects` and `action_steps`, and `action_container_id` to `content_action_links` (not `container_id`). All three were back-filled. `action_steps.effect_id` (a legacy effect reference) got **no** container equivalent.
+- The rule engine's branch 1 reads via `container_id`, with a legacy fallback (`rule-engine.ts:52-64`) for `container_id IS NULL`.
+- Since 019, some condition mechanics exist **only** on the container side: migration 032 added 15 `content_modifier_links` on condition Containers with no `effect_modifier_links` twin. So the legacy tables are no longer a complete picture.
 
-### 6.2 Remaining service-layer work
+### 6.2 Remaining legacy reads/writes (audit 2026-11-21)
 
-The following service functions still write to the old tables and need updating to write to `content_definitions` directly:
+Schema blockers: `active_character_effects.effect_id`, `action_steps.action_id` and `content_action_links.action_id` are still `NOT NULL`, so no write path can go container-only yet.
 
-| Function | File | Old write target | New target |
-|---|---|---|---|
-| `applyCharacterEffect` | `effects.ts` | `active_character_effects.effect_id` | `active_character_effects.container_id` |
-| `removeCharacterEffect` | `effects.ts` | looks up by `effect_id` | look up by `container_id` |
-| `listEffectDefinitions` | `characters.ts` | `effect_definitions` query | `content_definitions WHERE content_type = 'condition'` |
-| `getActiveEffects` | `characters.ts` | UNION through `effect_definitions` | UNION through `content_definitions` via `container_id` |
-| `createHomebrewContent` | `catalogue.ts` | routes on old `ContentType` | add 'condition' and 'action' routing |
-| `executeActionStep` | `catalogue.ts` | `action_steps.action_id` | `action_steps.container_id` |
-| `triggerCharacterContentActions` | `catalogue.ts` | `content_action_links.action_id` | `content_action_links.action_container_id` |
+| File:line (`src/lib/server/services/`) | R/W | Legacy touch |
+|---|---|---|
+| action-engine.ts:17-22 | R | Legacy action branch via `content_action_links.action_id` -> `action_definitions` -> `action_steps.action_id` |
+| action-engine.ts:44-49 | R | `step.effect_id` (legacy id) -> apply/removeCharacterEffect |
+| catalogue.ts:39-43 | R | listCatalogue effects: `content_effect_links` ⋈ `effect_definitions` |
+| catalogue.ts:179-189 | W | attachEffectToContent dual-writes `content_effect_links` + `content_grants` |
+| catalogue.ts:204-224 | W | attachEffectToOwnedContent on_use: `action_definitions`, `content_action_links.action_id`, `action_steps(action_id, effect_id)`. Bug: a repeat attach nulls `action_container_id` |
+| catalogue.ts:268 | R | listEffectsForLinking -> `effect_definitions` |
+| catalogue.ts:490 | R | Spend-step check via `action_steps.action_id` |
+| catalogue.ts:640-651 | R | syncSpellSlots via `active_character_effects.effect_id`, `content_effect_links`, `effect_modifier_links` |
+| characters.ts:520-529 | R | buildSnapshot JOIN `effect_definitions` on `effect_id` |
+| characters.ts:694-700 | W | Snapshot restore writes `effect_id` (+ `container_id`) via `effect_definitions` |
+| characters.ts:897-899 | R | loadEffectDefinitions LEFT JOIN `effect_definitions` for `is_condition` |
+| characters.ts:1286-1293 | W/R | replaceActiveEffects via `effect_definitions`/`effect_id` |
+| content-admin.ts:28-37 | R | Effect picker, attached effects (`content_effect_links`), actions/steps via `action_id`, actionCandidates (`action_definitions`) |
+| content-admin.ts:93 | W | attachEffectToAdminContent writes **only** `content_effect_links`. The rule engine never sees it (live bug) |
+| content-admin.ts:95-100, 111-118, 122-123 | W | Action authoring writes `action_definitions`, `content_action_links.action_id` and `action_steps(action_id, effect_id)` with **no** containers. Steps added to a container-linked action are skipped by the engine (live bug) |
+| content-admin.ts:102 | W | detachEffectFromAdminContent deletes only `content_effect_links`, so the `content_grants` copy keeps applying (live bug) |
+| content-admin.ts:135 | R | groupActions maps `step.effect_id` |
+| effects.ts:15-58 | R/W | apply/removeCharacterEffect read `effect_definitions` and write/look up `active_character_effects.effect_id` (+ `container_id`) |
+| modifier-admin.ts:145-611 | R/W | Deleted in container migration Unit 4 (was dead code) |
+| rule-engine.ts:52-64 | R | Branch 1b legacy fallback |
+| rules-admin.ts:40, 49-50 | R | Modifier reference counts/lists over `effect_modifier_links`. Double-counts condition links |
+| rules-admin.ts:66-88 | R | loadEffects from `effect_definitions`/`effect_modifier_links`/`content_effect_links`. Misses the 032 container-only links |
+| rules-admin.ts:163-238 | W | saveEffect, attach/detachEffectModifier, archiveEffect: legacy-first dual writes |
+| scripts/seed-core-effects.ts, import-srd-effects.ts, import-srd-content.ts, trim-effect-catalog.ts | W | Legacy-only writes (`effect_definitions`, `effect_modifier_links`, `effect_sources`, `content_effect_links`). Intended for the pre-019 `migrate --to 018` flow |
 
-### 6.3 Tables that can be dropped after service-layer migration is complete
+No direct legacy SQL in `src/routes`, `vtt/`, `server.js` or `vttConditions.ts` (already container-keyed).
 
-- `effect_definitions` (superseded by `content_definitions WHERE content_type = 'condition'`)
-- `effect_modifier_links` (superseded by `content_modifier_links` on condition Containers)
-- `active_character_effects.effect_id` column (superseded by `container_id`)
-- `content_effect_links` (superseded by `content_grants`)
-- `action_definitions` (superseded by `content_definitions WHERE content_type = 'action'`)
-- `action_steps.action_id` column (superseded by `container_id`)
-- `content_action_links.action_id` column (superseded by `action_container_id`)
+Drift risk: the legacy-only write paths above (content-admin actions and effect attach, scripts) can have created rows since 019 that have no container twin or have NULL container columns. On the local dev DB (2026-11-21) every drift count is 0. Prod is unchecked - the plan's read-only check query covers it.
 
-Do not drop these until all write paths above are confirmed updated and tested.
+### 6.3 Tables/columns to drop once 6.2 is empty
+
+- `effect_definitions`, `effect_modifier_links`, `effect_sources`, `content_effect_links`, `action_definitions`
+- `active_character_effects.effect_id`, `action_steps.effect_id` (needs a new `effect_container_id` first), `action_steps.action_id`, `content_action_links.action_id`
+
+Don't drop these until every 6.2 row is gone, a re-run backfill has passed its guards, and the app has been through at least one real session on the container-only code.
 
 ---
 
 ## 7. What changed since the prior version of this document
+
+- **2026-11-22 - cost engine and action economy.** Moved to §1: the structured cost list and engine (§2.3), resource grants summing by count (§3.1) and the character's action economy as a target (§2.3). Removed the four now-false "missing" entries (cost engine, structured cost list, spell-slot cost engine, resource-grant sums). §4a records the deliberate action economy choices. §0's Soulfire/Vowfire bullet is corrected (both are seeded by migration 044 with resource.<key>.max targets). Still open: the VTT has no spell echo choice yet.
 
 - **2026-11-19, VTT batch 2 (advantage):** the §0 bullet claiming the code used binary cancellation and the §4 "cancellation rule" conflict were already false (the dice pool was wired on 2026-06-30, `5da2ab88`) and are removed. `resolveAdvantageState` derives from the pool's net, and `rollWithModifiers` rolls the real pool for every d20 roll. The §2 per-bucket scoping entry is rewritten (all origins stack by count in one bucket). See also §4a for the interim manual dice controls.
 

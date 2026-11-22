@@ -12,6 +12,16 @@ export type CharacterClass = {
   spellcastingAbility?: AbilityKey | null;
 };
 
+export type CharacterPool = {
+  key: string;
+  label: string;
+  current: number;
+  max: number;
+  rechargePeriod: string;
+  /** Source-attributed lines for the max: Base, then each grant. */
+  breakdown: Array<{ label: string; value: number }>;
+};
+
 export type CharacterResource = {
   key: string;
   label: string;
@@ -34,6 +44,8 @@ export type InventoryItem = {
   proficient: boolean;
   sourceContentId?: string | null;
   attuned?: boolean;
+  /** Muted cost chip for an item with an explicit cost (display only; never posted back). */
+  costSummary?: string;
   damageRolls: string;
   effects: string;
   abilityBonuses: Partial<Record<AbilityKey, number>>;
@@ -139,6 +151,11 @@ export type CharacterDetail = {
   content: import('$lib/types/content').CharacterContentInstance[];
   spellSlots: import('$lib/types/content').SpellSlot[];
   combatClock: { roundNumber: number; turnNumber: number };
+  /** Character resource pools (Soulfire, Vowfire, ...) with live maxima. Only the visible ones. */
+  pools: CharacterPool[];
+  /** This turn's action economy under the campaign's profile (spent pools, follow-ups waiting, log). */
+  turn: import('$lib/types/actionEconomy').TurnView;
+  actionEconomy: import('$lib/types/actionEconomy').ProfileKey;
   updatedAt: string;
   /** Bumped by every whole-sheet write; the sheet posts it back with Save (stale-save guard). */
   sheetVersion: number;

@@ -4,7 +4,13 @@ import { query } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { openCostGate, runWithGate } from '$lib/server/vttCostGate';
+import { activationFromCastForm, parseActivation } from '$lib/server/vttCostApproval';
+import { adjustCharacterPool } from '$lib/server/services/resource-pools';
+import { adjustTurnPool } from '$lib/server/services/turn-state';
+import { resetLiveTokenMovement } from '$lib/server/vttTurn';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, payTurnActivation, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
 import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
 import { addCharacterToCampaign, getCampaignByRoomCode, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
@@ -210,6 +216,19 @@ export const actions = {
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true };
   },
+  poolAdjust: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    await adjustCharacterPool(locals.user!.id, params.id, String(form.get('key') || ''), Number(form.get('delta')) || 0);
+    emitRealtimeEvent('resource:changed', { characterId: params.id });
+    return { contentUpdated: true };
+  },
+  // +/- on a per-turn action pool (bookkeeping, like poolAdjust). Delta changes what is left.
+  turnAdjust: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    await adjustTurnPool(locals.user!.id, params.id, String(form.get('key') || ''), Number(form.get('delta')) || 0);
+    emitRealtimeEvent('resource:changed', { characterId: params.id });
+    return { contentUpdated: true };
+  },
   rest: async ({ request, params, locals }) => {
     const form = await request.formData();
     await restCharacter(locals.user!.id, params.id, String(form.get('restType')) as 'short_rest' | 'long_rest');
@@ -218,33 +237,65 @@ export const actions = {
   },
   advanceRound: async ({ params, locals }) => {
     await advanceCharacterRound(locals.user!.id, params.id);
+    resetLiveTokenMovement(params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },
   advanceTurn: async ({ params, locals }) => {
     await advanceCharacterTurn(locals.user!.id, params.id);
+    resetLiveTokenMovement(params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },
   newBattle: async ({ params, locals }) => {
     await newBattle(locals.user!.id, params.id);
+    resetLiveTokenMovement(params.id);
     emitRealtimeEvent('round:advanced', { characterId: params.id });
     return { contentUpdated: true };
   },
   useItem: async ({ request, params, locals }) => {
     const form = await request.formData();
-    const itemResult=await useInventoryCatalogueItem(locals.user!.id, params.id, String(form.get('inventoryId') || ''));
+    let itemResult;
+    // The cost gate decides, before the transaction, whether this may go over budget (DM approval, the DM's own
+    // go-ahead, or the no-DM "Did your DM OK this?"). Form fields: approvalId, override ('dm' | 'self').
+    const inventoryId = String(form.get('inventoryId') || '');
+    const gate = await openCostGate({ userId: locals.user!.id, characterId: params.id, activation: { kind: 'item', inventoryId }, approvalId: form.get('approvalId'), override: form.get('override') });
+    if (!gate.ok) return fail(gate.status, { costError: gate.body });
+    try { itemResult=await runWithGate(gate, (override) => useInventoryCatalogueItem(locals.user!.id, params.id, inventoryId, override)); } catch (error) { if (error instanceof CostShortfallError) return fail(409, { costShortfall: error.shortfalls, costMode: gate.mode, costActivation: gate.activation }); throw error; }
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true, itemResult };
   },
   triggerContent:async({request,params,locals})=>{
     const form=await request.formData();
-    const itemResult=await triggerCharacterContentActions(locals.user!.id,params.id,String(form.get('instanceId')||''));
+    let itemResult;
+    const instanceId=String(form.get('instanceId')||'');
+    const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:{kind:'content',instanceId},approvalId:form.get('approvalId'),override:form.get('override')});
+    if(!gate.ok)return fail(gate.status,{costError:gate.body});
+    try{itemResult=await runWithGate(gate,(override)=>triggerCharacterContentActions(locals.user!.id,params.id,instanceId,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
+    emitRealtimeEvent('resource:changed',{characterId:params.id});
+    return{contentUpdated:true,itemResult};
+  },
+  // Pays a weapon attack's action (and spends an Extra Attack follow-up when chosen). The sheet then rolls
+  // locally. Fields: kind=weapon_attack, inventoryId, timing (action|bonus_action|reaction), followup (use|skip).
+  payTurn:async({request,params,locals})=>{
+    const form=await request.formData();
+    const text=(key:string)=>String(form.get(key)||'');
+    const activation=parseActivation({kind:text('kind'),inventoryId:text('inventoryId')||null,
+      ...(text('timing')?{timing:text('timing')}:{}),...(text('followup')?{followup:text('followup')}:{})});
+    if(!activation||activation.kind!=='weapon_attack'||!activation.inventoryId)return fail(400,{costError:{error:'bad_activation'}});
+    const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation,approvalId:form.get('approvalId'),override:form.get('override')});
+    if(!gate.ok)return fail(gate.status,{costError:gate.body});
+    let itemResult;
+    try{itemResult=(await runWithGate(gate,(override)=>payTurnActivation(locals.user!.id,params.id,activation,override))).results;}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});
     return{contentUpdated:true,itemResult};
   },
   castSpell:async({request,params,locals})=>{
-    const itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());
+    let itemResult;
+    const form=await request.formData();
+    const gate=await openCostGate({userId:locals.user!.id,characterId:params.id,activation:activationFromCastForm(form),approvalId:form.get('approvalId'),override:form.get('override')});
+    if(!gate.ok)return fail(gate.status,{costError:gate.body});
+    try{itemResult=await runWithGate(gate,(override)=>castCharacterSpell(locals.user!.id,params.id,form,override));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls,costMode:gate.mode,costActivation:gate.activation});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
   },
   // The one join a player needs, covering combat, rolls, and session notes at

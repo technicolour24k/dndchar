@@ -10,7 +10,8 @@
     toScreen,
     selectedRouteId = null,
     selectedLegId = null,
-    tracing = null
+    tracing = null,
+    previews = []
   }: {
     routes: RouteView[];
     toScreen: (p: Pt) => Pt;
@@ -18,6 +19,8 @@
     selectedLegId?: string | null;
     // The route being drawn: its points, the mouse-hover end (desktop), colour and the running label.
     tracing?: { points: Pt[]; hover: Pt | null; colour: string; label: string } | null;
+    // Other people's in-progress routes (live preview): faint dashed light blue, like the VTT's remote paths.
+    previews?: { id: string; points: Pt[]; label: string }[];
   } = $props();
 
   const trace = $derived(tracing ? tracing.points.map(toScreen) : []);
@@ -47,6 +50,16 @@
         />
       {/each}
     </g>
+  {/each}
+
+  {#each previews as preview (preview.id)}
+    {@const pts = preview.points.map(toScreen)}
+    {@const end = pts[pts.length - 1]}
+    {#if pts.length > 1}
+      <polyline points={pts.map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke="#7fd4ff" stroke-width="3" stroke-dasharray="7 5" stroke-linejoin="round" stroke-linecap="round" opacity="0.6" />
+    {/if}
+    <circle cx={end.x} cy={end.y} r="4" fill="#7fd4ff" opacity="0.8" />
+    <text x={end.x + 9} y={end.y - 9} class="ow-svg-label" opacity="0.85">{preview.label}</text>
   {/each}
 
   {#if tracing}

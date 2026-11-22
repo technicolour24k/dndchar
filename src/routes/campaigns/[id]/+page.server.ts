@@ -1,8 +1,12 @@
 import { error, fail, redirect } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
+import { emitRealtimeEvent } from '$lib/server/realtime';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
+import { listUnreviewedOverrides, reviewOverride } from '$lib/server/services/resource-pools';
+import { announceCostUndo } from '$lib/server/vttCostGate';
 import { listMapsForViewer } from '$lib/server/services/overworld';
+import { dropCampaignPreviews, dropUserPreviews } from '$lib/server/overworldNotify';
 import { closeCampaignRoom, kickFromCampaignRoom, pruneDepartedCharacterTokens, syncGmSeats } from '$lib/server/services/campaignRooms';
 import {
   addCharacterToCampaign,
@@ -13,6 +17,7 @@ import {
   removeCharacterFromCampaign,
   removeMember,
   setCharacterPartyActive,
+  setCampaignActionEconomy,
   setMemberRole,
   updateCampaignDetails
 } from '$lib/server/services/campaigns';
@@ -38,6 +43,8 @@ export async function load({ params, locals }) {
     hasNoDm: !page.members.some((m) => m.role === 'dm'),
     // DMs and admins get a "Find tables: N active" line (foraging needs at least one table). Null for everyone else.
     findTableCount: page.access.canManage && !archived ? await countActiveFindTables(page.campaign.id) : null,
+    // Over-budget uses a player confirmed with "my DM OK'd it", waiting for a DM to mark OK or undo. canManage only.
+    overrideReviews: page.access.canManage && !archived ? await listUnreviewedOverrides(params.id) : [],
     // Maps this viewer may open (campaign role only, so null for a non-member, site admin or not).
     overworld: await listMapsForViewer(user.id, params.id),
     // The admin banner is for people who only have access through the override.
@@ -56,6 +63,15 @@ export const actions = {
     return result.ok ? { saved: 'details' } : result.failure;
   },
 
+  // DM-only: which action-economy profile the campaign plays by. Open sheets and VTT tokens re-sync.
+  setActionEconomy: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => setCampaignActionEconomy(locals.user!.id, params.id, String(form.get('actionEconomy') || '')));
+    if (!result.ok) return result.failure;
+    for (const characterId of result.value) emitRealtimeEvent('resource:changed', { characterId });
+    return { saved: 'actionEconomy' };
+  },
+
   regenerate: async ({ params, locals }) => {
     const result = await attempt(() => regenerateInviteCode(locals.user!.id, params.id));
     return result.ok ? { saved: 'invite' } : result.failure;
@@ -67,7 +83,10 @@ export const actions = {
     if (!ROLES.includes(role)) return fail(400, { error: 'Unknown role.' });
     const result = await attempt(() => setMemberRole(locals.user!.id, params.id, String(form.get('userId') || ''), role));
     if (result.ok) {
-      for (const id of result.value?.demotedToPlayer ?? []) kickFromCampaignRoom(result.value?.roomCode, id, 'role_changed');
+      for (const id of result.value?.demotedToPlayer ?? []) {
+        kickFromCampaignRoom(result.value?.roomCode, id, 'role_changed');
+        dropUserPreviews(params.id, id);
+      }
       // A swap or admin "make primary" changes who outranks whom, so refresh seated GMs' rank.
       await syncGmSeats(params.id, result.value?.roomCode);
     }
@@ -79,6 +98,7 @@ export const actions = {
     const result = await attempt(() => removeMember(locals.user!.id, params.id, String(form.get('userId') || '')));
     if (result.ok) {
       kickFromCampaignRoom(result.value?.roomCode, result.value?.targetUserId, 'removed_from_campaign');
+      if (result.value?.targetUserId) dropUserPreviews(params.id, result.value.targetUserId);
       // Removing the primary promotes the co-DM, whose seated socket is now 'primary'.
       await syncGmSeats(params.id, result.value?.roomCode);
       // Their characters left the campaign, so their tokens leave the live map.
@@ -91,6 +111,7 @@ export const actions = {
     const result = await attempt(() => leaveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     kickFromCampaignRoom(result.value?.roomCode, locals.user!.id, 'removed_from_campaign');
+    dropUserPreviews(params.id, locals.user!.id);
     await syncGmSeats(params.id, result.value?.roomCode);
     await pruneDepartedCharacterTokens();
     throw redirect(303, '/campaigns');
@@ -100,6 +121,7 @@ export const actions = {
     const result = await attempt(() => archiveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     closeCampaignRoom(result.value?.roomCode);
+    dropCampaignPreviews(params.id);
     throw redirect(303, '/campaigns');
   },
 
@@ -117,6 +139,24 @@ export const actions = {
     // The character left the campaign, so its token leaves the live map.
     if (result.ok) await pruneDepartedCharacterTokens();
     return result.ok ? { saved: 'character' } : result.failure;
+  },
+
+  // Over-budget review (cost engine). OK just marks it; Undo refunds what it spent. Both are idempotent.
+  reviewOk: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => reviewOverride(locals.user!.id, params.id, String(form.get('activationId') || ''), 'ok'));
+    return result.ok ? { reviewed: result.value.message } : result.failure;
+  },
+
+  reviewUndo: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attempt(() => reviewOverride(locals.user!.id, params.id, String(form.get('activationId') || ''), 'undo'));
+    if (!result.ok) return result.failure;
+    const done = result.value;
+    if (done.status === 'undone' && done.characterId) {
+      await announceCostUndo({ characterId: done.characterId, characterName: done.characterName ?? 'Someone', label: done.sourceLabel ?? 'use', refunded: done.refunded ?? [], roomId: done.roomId ?? null });
+    }
+    return { reviewed: done.message };
   },
 
   setActive: async ({ request, params, locals }) => {

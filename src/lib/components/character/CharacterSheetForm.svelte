@@ -6,16 +6,20 @@
   import { tick, untrack } from 'svelte';
   import SessionNotesModal from '$lib/components/SessionNotesModal.svelte';
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
-  import RollOptionsModal from '$lib/components/character/RollOptionsModal.svelte';
+  import RollOptionsModal, { type AttackChoice } from '$lib/components/character/RollOptionsModal.svelte';
   import ForageModal from '$lib/components/character/ForageModal.svelte';
   import { readOnlyLock } from '$lib/ui/readOnlyLock';
   import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
   import type { ForageMine } from '$lib/types/forage';
+  import CostRequestPrompt from './CostRequestPrompt.svelte';
+  import { promptSpec, approvalErrorText, closedMessage, formForActivation, mineStep } from '../../../../static/vtt-app/shared/costApproval.js';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
     adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
+  import { isDisplayOnlyCost } from '$lib/rules/cost';
+  import { profileFor, resolveTurnPool, spellFollowupClass } from '$lib/rules/actionEconomy';
   import { SKILL_CHECKS, skillCandidates, skillCheckBonus, skillModifierBonuses } from '$lib/rules/skills';
   import { OVERRIDABLE_STATS, parseStatInput, readStatOverrides, resolveCharacterStats, resolveSpellcastingAbility, withManualLines, type OverridableStat, type StatOverrides } from '$lib/rules/characterStats';
   import type { AbilityKey, CharacterDetail, InventoryItem, ItemCategory } from '$lib/types/character';
@@ -274,7 +278,31 @@
   let playerModificationsOpen = $state(false);
   let activityLogOpen = $state(false);
   let sessionNotesModalId = $state<string | null>(null);
-  let activityLogTab = $state<'combat' | 'rolls' | 'notes'>('combat');
+  let activityLogTab = $state<'combat' | 'rolls' | 'resources' | 'notes'>('combat');
+
+  // Resources tab (cost engine Unit 7): the newest ledger rows, fetched when the tab opens.
+  type LedgerRow = { id: string; createdAt: string; label: string; delta: number; before: number | null; after: number | null; shortfall: number;
+    reason: string; sourceLabel: string; badge: string | null; actorName: string | null; approvedByName: string | null };
+  let ledgerRows = $state<LedgerRow[]>([]);
+  let ledgerLoaded = $state(false);
+  $effect(() => {
+    if (!activityLogOpen || activityLogTab !== 'resources') return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/characters/${character.id}/resource-ledger`);
+        if (cancelled || !res.ok) return;
+        ledgerRows = (await res.json()).rows ?? [];
+        ledgerLoaded = true;
+      } catch {
+        // best-effort: the tab keeps whatever it last showed
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+  const ledgerAmount = (row: LedgerRow) => (row.delta > 0 ? `+${row.delta}` : String(row.delta));
 
   // db-traffic-reduction Phase 4: Past Encounters / Past Sessions used to arrive as props
   // from load(), fetched on every single sheet view even though this modal is rarely
@@ -306,6 +334,7 @@
   let selectedSkillProficiencies = $state<string[]>([]);
   let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
   let contentBusy = $state(false);
+  let turnOpen = $state(false); // the "Actions this turn" panel
   let modifierSearch = $state('');
   let modifierFilter = $state<'active' | 'automated' | 'potential' | 'condition' | 'spell' | 'combat' | 'class_feature' | 'environment' | 'all'>('active');
   let newItemOpen = $state(false);
@@ -541,6 +570,13 @@
     { label: "Devil's Sight", sense: senses.devilFt, always: false }
   ].filter((row) => row.always || row.sense.value > 0));
   const senseHelpLines = $derived(senseRows.flatMap((row) => [`${row.label}:`, ...row.sense.lines.map((line) => `  ${line}`)]));
+
+  // "Base 0, Oath of Embers +2" style lines for a pool's maximum.
+  function poolHelpLines(pool: CharacterDetail['pools'][number]): string[] {
+    return pool.breakdown.map((line) => `${line.label}: ${line.value >= 0 ? '+' : ''}${line.value}`).concat(`Maximum: ${pool.max}`);
+  }
+  const POOL_RECHARGE_LABELS: Record<string, string> = { short_rest: 'Short rest', long_rest: 'Long rest', dawn: 'Dawn', encounter: 'New battle', manual: 'Manual' };
+  const poolRechargeLabel = (period: string) => POOL_RECHARGE_LABELS[period] ?? period;
 
   function openFormulaHelp(title: string, lines: string[]) {
     formulaHelp = { title, lines };
@@ -871,7 +907,9 @@
     title: string;
     advantage: { effects: typeof character.modifierSources; candidates: string[]; context: ModifierContext; batch?: boolean } | null;
     damageDice: { baseExpression: string } | null;
-    run: (choices: RollChoices) => void;
+    // Set on a weapon attack: the panel then also asks when it is taken and whether to use a follow-up.
+    attack?: { followup: { label: string; remaining: number } | null } | null;
+    run: (choices: RollChoices, attack?: AttackChoice) => void;
   };
   let rollOptions = $state<RollOptionsSpec | null>(null);
 
@@ -889,10 +927,10 @@
     void tick().then(() => { if (trigger.isConnected) trigger.focus(); });
   });
 
-  function submitRollOptions(choices: RollChoices) {
+  function submitRollOptions(choices: RollChoices, attack?: AttackChoice) {
     const spec = rollOptions;
     rollOptions = null;
-    spec?.run(choices);
+    spec?.run(choices, attack);
   }
 
   // A plain d20 roll (save, skill, ability check, initiative, death save).
@@ -1137,6 +1175,7 @@
       onResync: () => {
         refreshActivityStatus();
         void refreshForage();
+        void refreshCost();
         fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
         if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
       },
@@ -1147,6 +1186,10 @@
           combatLogEntries = mergeLogEntries(combatLogEntries, [msg.entry as (typeof combatLogEntries)[number]], 200);
         } else if (msg.type === 'combat:state' || msg.type === 'game_session:state') {
           refreshActivityStatus();
+        } else if (msg.type === 'cost:ping') {
+          // Detail-free nudge (it carries no user id): fetch our own cost-request state, which only ever
+          // holds this user's request for this character.
+          untrack(() => void refreshCost());
         } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
           // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
           // nothing read in here can become a dependency of this effect (Review 3).
@@ -1473,7 +1516,19 @@
         context: { classes: classRows, ability: item.attackAbility, attackType: 'melee_weapon' }
       },
       damageDice: { baseExpression: item.damageRolls },
-      run: (choices) => rollBattleAction(item, choices)
+      // Every weapon attack here is melee-type for follow-ups until rollAttack supports ranged attacks.
+      attack: readOnly || !item.id ? null : { followup: character.turn.followups.find((entry) => entry.cls === 'melee') ?? null },
+      run: (choices, attack) => {
+        if (!attack) { rollBattleAction(item, choices); return; }
+        // Pay the action first (an explicit choice either way), then roll. A shortfall opens the usual
+        // ask-the-DM prompt, and an approved resume rolls with the same choices.
+        const body = new FormData();
+        body.set('kind', 'weapon_attack');
+        body.set('inventoryId', item.id ?? '');
+        body.set('timing', attack.timing);
+        body.set('followup', attack.followup);
+        void runResourceAction('payTurn', body, `${item.name || 'Attack'} attack.`, () => rollBattleAction(item, choices));
+      }
     };
   }
 
@@ -1651,11 +1706,93 @@
     await runResourceAction('triggerContent',body,`${name} used.`);
   }
 
-  async function castSpell(spell:any){
+  // followup is sent only when the dialog offered an echo, and always explicitly then: 'use' casts a free
+  // echo at the spell's base level, 'skip' pays normally (a plain cast never spends a waiting echo).
+  async function castSpell(spell:any,slot?:{type:string;level:number},followup?:'use'|'skip'){
     const body=new FormData();
+    if(slot){body.set('slotType',slot.type);body.set('slotLevel',String(slot.level));}
+    if(followup)body.set('followup',followup);
     if(spell.spellAccessId){body.set('spellAccessId',spell.spellAccessId);body.set('inventoryItemId',spell.inventoryItemId||'');}
     else body.set('instanceId',spell.id);
     await runResourceAction('castSpell',body,`${spell.name} cast.`);
+  }
+
+  // ---- Cast dialog (cost engine Unit 4). A spell whose cost has a slot line or any non-display line
+  // opens a small dialog: pick the slot (upcast), see the other costs against what's available.
+  // Cantrips and free spells (action lines only) cast directly. The server stays authoritative.
+  // A turn line never forces the dialog on its own (a cantrip casts directly), but when the dialog is
+  // open it is listed against this turn's live pools. The server charges it either way.
+  let castDialog = $state<{ spell: any; slotKey: string; echo: boolean } | null>(null);
+  // A waiting spell or cantrip echo (a doublecast-style follow-up) that this spell could use: only an
+  // Action-timed, one-action spell takes part. The echo is completely free and resolves at the base level.
+  function echoFor(spell: any): { label: string; remaining: number; baseLevel: number | null } | null {
+    const entries = (spell?.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; timing?: string }>;
+    const turnLine = entries.find((entry) => entry.pool === 'turn');
+    if (!turnLine || turnLine.amount !== 1) return null;
+    const cls = spellFollowupClass(spell.spellLevel, turnLine.timing);
+    const waiting = cls ? character.turn.followups.find((entry) => entry.cls === cls) : undefined;
+    if (!waiting || waiting.remaining <= 0) return null;
+    const levels = entries.filter((entry) => entry.pool === 'spell_slot').map((entry) => entry.level ?? 1);
+    return { label: waiting.label, remaining: waiting.remaining, baseLevel: levels.length ? Math.min(...levels) : null };
+  }
+  const castEcho = $derived(castDialog ? echoFor(castDialog.spell) : null);
+  const castEchoing = $derived(Boolean(castDialog?.echo && castEcho));
+  const castCostEntries = $derived((castDialog?.spell.cost?.entries ?? []) as Array<{ pool: string; amount: number; level?: number; key?: string }>);
+  const castSlotLine = $derived(castCostEntries.find((entry) => entry.pool === 'spell_slot'));
+  const castEligibleSlots = $derived(castSlotLine
+    ? character.spellSlots.filter((slot) => slot.level >= (castSlotLine.level ?? 1))
+        .sort((a, b) => a.level - b.level || (a.type === b.type ? 0 : a.type === 'standard' ? -1 : 1))
+    : []);
+  // Availability of every non-slot, non-display line, plus the chosen slot.
+  const castLines = $derived.by(() => {
+    if (!castDialog) return [] as Array<{ label: string; needed: number; available: number }>;
+    const lines: Array<{ label: string; needed: number; available: number }> = [];
+    const chosen = castEligibleSlots.find((slot) => `${slot.type}:${slot.level}` === castDialog!.slotKey);
+    const counters = castDialog.spell.spellAccessId
+      ? (character.inventory.find((item) => item.id === castDialog!.spell.inventoryItemId)?.resources ?? [])
+      : castDialog.spell.resources.map((r: any) => ({ key: r.key, label: r.label, currentValue: r.currentValue }));
+    for (const entry of castCostEntries) {
+      if (entry.pool === 'turn') {
+        const key = resolveTurnPool(profileFor(character.actionEconomy), entry as unknown as { timing: any; category?: any; actionPool?: string });
+        const turnPool = key ? character.turn.pools.find((p) => p.key === key) : undefined;
+        if (turnPool) lines.push({ label: turnPool.label, needed: entry.amount, available: turnPool.current });
+        continue;
+      }
+      if (isDisplayOnlyCost(entry)) continue;
+      if (entry.pool === 'spell_slot') lines.push({ label: chosen ? `Level ${chosen.level} Spell Slot` : `Level ${entry.level}+ Spell Slot`, needed: entry.amount, available: chosen?.current ?? 0 });
+      else if (entry.pool === 'charges') {
+        const counter = entry.key ? counters.find((c: any) => c.key === entry.key) : counters.length === 1 ? counters[0] : undefined;
+        lines.push({ label: counter?.label ?? 'Counter', needed: entry.amount, available: counter?.currentValue ?? 0 });
+      } else {
+        const pool = character.pools.find((p) => p.key === entry.pool);
+        lines.push({ label: pool?.label ?? entry.pool, needed: entry.amount, available: pool?.current ?? 0 });
+      }
+    }
+    return lines;
+  });
+  const castShort = $derived(castLines.filter((line) => line.available < line.needed));
+
+  function openCast(spell: any) {
+    const entries = (spell.cost?.entries ?? []) as Array<{ pool: string; level?: number; amount: number }>;
+    const echo = echoFor(spell);
+    if (!echo && !entries.some((entry) => !isDisplayOnlyCost(entry))) { void castSpell(spell); return; }
+    const slotLine = entries.find((entry) => entry.pool === 'spell_slot');
+    const eligible = slotLine
+      ? character.spellSlots.filter((slot) => slot.level >= (slotLine.level ?? 1))
+          .sort((a, b) => a.level - b.level || (a.type === b.type ? 0 : a.type === 'standard' ? -1 : 1))
+      : [];
+    const pick = eligible.find((slot) => slot.current >= (slotLine?.amount ?? 1)) ?? eligible[0];
+    castDialog = { spell, slotKey: pick ? `${pick.type}:${pick.level}` : '', echo: false };
+  }
+
+  async function confirmCast() {
+    if (!castDialog) return;
+    const { spell, slotKey } = castDialog;
+    const echoing = castEchoing;
+    const offered = Boolean(castEcho);
+    const [type, level] = slotKey.split(':');
+    castDialog = null;
+    await castSpell(spell, !echoing && castSlotLine && slotKey ? { type, level: Number(level) } : undefined, offered ? (echoing ? 'use' : 'skip') : undefined);
   }
 
   // db-traffic-reduction Phase 4: this used to stash its message in sessionStorage and do a
@@ -1664,9 +1801,138 @@
   // pools etc. are all plain $derived off the `character` prop (or resynced-on-change local
   // $state - see statOverrides/hitDicePools above), so a narrow invalidate() refreshes every
   // visible value exactly as well as a full reload did, without the round-trip cost.
-  async function runResourceAction(action:string,body:FormData,heading:string){
+  // ---- Over-budget prompt and DM approval (cost engine Unit 6). The held click is kept in memory as
+  // plain entries, so it can be re-sent with an approval or an override. The server decides who may
+  // do what (src/lib/server/vttCostGate.ts); this only shows the right prompt and resends.
+  type Held={action:string;entries:Array<[string,string]>;heading:string;onPaid?:()=>void};
+  type CostPromptState={stage:'prompt'|'waiting'|'banner';mode:string;shortfalls:Array<{label:string;needed:number;available:number}>;label:string;
+    busy:boolean;error:string;held:Held|null;activation:any;requestId:string|null;banner:any};
+  let costPrompt=$state<CostPromptState|null>(null);
+  let costSeq=0;
+  let costResuming=false;
+  const costOwner=$derived(!readOnly&&!!currentUserId);
+
+  function heldForm(held:Held,extra:Record<string,string>){
+    const form=new FormData();
+    for(const [key,value] of held.entries)form.set(key,value);
+    for(const [key,value] of Object.entries(extra))form.set(key,value);
+    return form;
+  }
+
+  function openCostPrompt(held:Held,shortfalls:CostPromptState['shortfalls'],mode:string,activation:any){
+    const label=held.heading.replace(/ (cast|used)\..*$/,'');
+    costPrompt={stage:'prompt',mode,shortfalls,label,busy:false,error:'',held,activation,requestId:null,banner:null};
+  }
+
+  // Runs the held click again with an approval or an override. The dialog closes first; a fresh
+  // shortfall or refusal opens a new prompt or message from runResourceAction.
+  async function resendHeld(extra:Record<string,string>){
+    const held=costPrompt?.held;
+    if(!held)return;
+    costPrompt=null;
+    await runResourceAction(held.action,heldForm(held,extra),held.heading,held.onPaid);
+  }
+
+  async function costApi(url:string,init?:RequestInit):Promise<{ok:boolean;status:number;data:any}>{
+    try{
+      const response=await fetch(url,init);
+      return{ok:response.ok,status:response.status,data:await response.json().catch(()=>({}))};
+    }catch{return{ok:false,status:0,data:{error:'network'}};}
+  }
+  const costPost=(body:Record<string,unknown>)=>costApi('/vtt/api/cost-requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+
+  async function askDm(){
+    const prompt=costPrompt;
+    if(!prompt||!prompt.activation)return;
+    prompt.busy=true;prompt.error='';
+    const result=await costPost({action:'ask',characterId:character.id,activation:prompt.activation});
+    if(costPrompt!==prompt)return;
+    prompt.busy=false;
+    if(result.ok&&result.data.notNeeded){await resendHeld({});return;} // it is affordable now: just run it
+    if(result.ok&&result.data.request){prompt.stage='waiting';prompt.requestId=result.data.request.id;return;}
+    if(result.status===409&&result.data.error==='pending'&&result.data.request){prompt.stage='waiting';prompt.requestId=result.data.request.id;return;}
+    if(result.status===409&&(result.data.error==='no_dm'||result.data.error==='dm_self')){prompt.mode=result.data.error;return;}
+    prompt.error='Could not ask the DM. Try again.';
+  }
+
+  async function chooseCost(id:string){
+    const prompt=costPrompt;
+    if(!prompt||prompt.busy)return;
+    if(id==='ask')return askDm();
+    if(id==='go_ahead')return resendHeld({override:'dm'});
+    if(id==='self')return resendHeld({override:'self'}); // the server also closes a request still waiting
+    if(id==='use_now'){
+      const form=formForActivation(prompt.banner?.activation);
+      if(!form||!prompt.requestId){costPrompt=null;return;}
+      const label=prompt.label;
+      costPrompt={...prompt,held:{action:form.action,entries:form.entries as Array<[string,string]>,heading:`${label} used.`}};
+      return resendHeld({approvalId:prompt.requestId});
+    }
+    if(id==='withdraw'||id==='dismiss'){
+      const requestId=prompt.requestId;
+      costPrompt=null;
+      if(requestId)await costPost({action:'withdraw',requestId});
+      return;
+    }
+    costPrompt=null; // cancel: nothing was spent
+  }
+
+  // The latest of our own request for this character (fetched, never pushed): decides what to show.
+  async function refreshCost(){
+    if(!costOwner)return;
+    const characterId=character.id;
+    const seq=++costSeq;
+    const result=await costApi(`/vtt/api/cost-requests/mine?characterId=${encodeURIComponent(characterId)}`);
+    if(!result.ok||seq!==costSeq||characterId!==character.id)return;
+    const mine=result.data;
+    const prompt=costPrompt;
+    const step=mineStep(mine,prompt?.requestId??null);
+    if(step==='resume'&&prompt?.held&&!costResuming){
+      costResuming=true;
+      try{await resendHeld({approvalId:mine.request.id});}finally{costResuming=false;}
+    }else if(step==='banner'){
+      // A resume is already spending this approval: don't flash a "Use now" banner for it.
+      if(costResuming)return;
+      if(prompt&&prompt.stage==='prompt')return; // don't replace a prompt the player is answering
+      costPrompt={stage:'banner',mode:'ask_dm',shortfalls:[],label:mine.request.activationLabel||'That',busy:false,error:'',held:null,activation:null,
+        requestId:mine.request.id,banner:{...mine.request}};
+    }else if(step==='waiting'){
+      if(prompt&&prompt.stage==='waiting'){prompt.mode='ask_dm';}
+    }else if(step==='no_dm_pending'){
+      if(prompt&&prompt.stage==='waiting')costPrompt={...prompt,stage:'prompt',mode:'no_dm_pending',requestId:mine.request.id,busy:false,error:''};
+    }else if(step==='none'&&prompt&&prompt.stage==='waiting'){
+      // Our request is gone and we didn't use it: the DM said no (or it ran out). Nothing was spent.
+      costPrompt=null;
+      inventoryMessage=closedMessage('denied');
+    }else if(step==='none'&&prompt&&prompt.stage==='banner'){
+      costPrompt=null;
+    }
+  }
+
+  // While a request waits, look again every few seconds: a DM leaving sends no ping.
+  $effect(()=>{
+    if(costPrompt?.stage!=='waiting')return;
+    const timer=setInterval(()=>untrack(()=>void refreshCost()),8000);
+    return()=>clearInterval(timer);
+  });
+
+  // onPaid runs once the action succeeded (a weapon attack rolls after its action is paid), and is kept
+  // on the held click so an approved resume still runs it.
+  async function runResourceAction(action:string,body:FormData,heading:string,onPaid?:()=>void){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
+    const failed=actionResult.type==='failure'?(actionResult.data as {costShortfall?:Array<{label:string;needed:number;available:number}>;costMode?:string;costActivation?:any;costError?:any}|undefined):undefined;
+    if(failed?.costShortfall){
+      // Can't afford it: offer the way past that fits who is acting and whether a DM is connected.
+      openCostPrompt({action,entries:[...body.entries()].filter(([key])=>key!=='approvalId'&&key!=='override').map(([key,value])=>[key,String(value)] as [string,string]),heading,onPaid},
+        failed.costShortfall,failed.costMode||'no_dm',failed.costActivation);
+      return;
+    }
+    if(failed?.costError){
+      costPrompt=null;
+      inventoryMessage=approvalErrorText(failed.costError);
+      return;
+    }
     if(actionResult.type!=='success'){
       inventoryMessage='Could not apply the resource action.';
       return;
@@ -1677,6 +1943,7 @@
       `${result.label}: ${result.expression} rolled ${result.rolled}; ${result.target} ${result.before} -> ${result.after}`)];
     inventoryMessage=lines.join('\n');
     await invalidate('app:character-sheet');
+    onPaid?.();
   }
 
   // db-traffic-reduction Phase 4: used to zero the quantity then requestSubmit() the whole
@@ -1716,6 +1983,8 @@
 
   // Modals never stack in this UI, so closing whichever one is open is unambiguous.
   function closeOpenModal() {
+    // The safe choice (cancel / withdraw) is what Escape picks on the cost prompt.
+    if (costPrompt && costPrompt.stage === 'prompt') { void chooseCost(promptSpec(costPrompt.mode).escape); return; }
     if (forageOpen) { forageOpen = false; return; }
     if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
@@ -1723,6 +1992,7 @@
     if (inventoryMessage) { inventoryMessage = null; return; }
     if (simpleItemOpen) { simpleItemOpen = false; return; }
     if (newItemOpen) { newItemOpen = false; return; }
+    if (castDialog) { castDialog = null; return; }
     if (formulaHelp) { formulaHelp = null; return; }
     if (playerModificationsOpen) { playerModificationsOpen = false; return; }
     if (activityLogOpen) { activityLogOpen = false; return; }
@@ -1818,6 +2088,26 @@
     <div class="actions sheet-header-actions">
       <div class="combat-clock">
         <span class="save-state combat-clock-status">Round {character.combatClock.roundNumber} / Turn {character.combatClock.turnNumber}</span>
+        <!-- Actions this turn (action economy). Display and bookkeeping only for now: nothing charges it yet. Next Turn resets it. -->
+        <div class="turn-strip">
+          <button type="button" class="turn-strip-chips" aria-expanded={turnOpen} title="Actions this turn" onclick={() => (turnOpen = !turnOpen)}>
+            {#each character.turn.pools as pool (pool.key)}<span class="cost-chip" class:spent={pool.current === 0}>{pool.label} {pool.current}/{pool.max}</span>{/each}
+            {#each character.turn.followups as followup (followup.cls)}<span class="cost-chip">{followup.label}: {followup.remaining} left</span>{/each}
+          </button>
+          {#if turnOpen}
+            <div class="turn-panel">
+              <strong>Actions this turn <span class="muted">({character.turn.profileLabel})</span></strong>
+              {#each character.turn.pools as pool (pool.key)}
+                <div class="turn-panel-row">
+                  <span>{pool.label} {pool.current}/{pool.max}</span>
+                  {#if !readOnly}<button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('turnAdjust', { key: pool.key, delta: -1 })}>-</button><button type="button" class="compact-button" disabled={contentBusy} onclick={() => runContentAction('turnAdjust', { key: pool.key, delta: 1 })}>+</button>{/if}
+                  <span class="muted">{pool.breakdown.map((line) => `${line.label} ${line.value >= 0 && line.label !== 'Base' ? '+' : ''}${line.value}`).join(', ')}</span>
+                </div>
+              {/each}
+              {#if character.turn.log.length}<ul class="turn-log">{#each character.turn.log as entry}<li>{entry.label}{entry.amount ? ` (${entry.amount})` : ''}</li>{/each}</ul>{:else}<span class="muted">Nothing spent yet. Next Turn resets this.</span>{/if}
+            </div>
+          {/if}
+        </div>
         <button type="button" class="compact-button combat-clock-full" disabled={contentBusy || readOnly} onclick={() => runContentAction('newBattle')}>New Battle</button>
         <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceTurn')}>Next Turn</button>
         <button type="button" class="compact-button" disabled={contentBusy || readOnly} onclick={() => runContentAction('advanceRound')}>Next Round</button>
@@ -2138,11 +2428,21 @@
               {:else}<span class="muted">No spell slots for the current classes.</span>{/each}
             </div>
           </div>
+          {#if character.pools.length}
+            <div class="structured-section">
+              <div class="panel-head compact-head"><h3>Resources</h3></div>
+              <div class="slot-grid">
+                {#each character.pools as pool (pool.key)}
+                  <div class="slot-counter"><strong>{pool.label} <button type="button" class="formula-help-button" title={helpTitle(poolHelpLines(pool))} aria-label={`${pool.label} maximum breakdown`} onclick={() => openFormulaHelp(`${pool.label} maximum`, poolHelpLines(pool))}>?</button></strong><span>{pool.current} / {pool.max}</span><span class="muted">{poolRechargeLabel(pool.rechargePeriod)}</span>{#if !readOnly}<div><button type="button" disabled={contentBusy} onclick={() => runContentAction('poolAdjust', { key: pool.key, delta: -1 })}>-</button><button type="button" disabled={contentBusy} onclick={() => runContentAction('poolAdjust', { key: pool.key, delta: 1 })}>+</button></div>{/if}</div>
+                {/each}
+              </div>
+            </div>
+          {/if}
           <div class="structured-section">
             <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
-                <article class="content-instance-row"><div><strong>{spell.name}</strong><span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => castSpell(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
+                <article class="content-instance-row"><div><strong>{spell.name}</strong>{#if spell.cost?.summary}<span class="cost-chip" title="Cost to cast">{spell.cost.summary}</span>{/if}<span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => openCast(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
               {/each}
             </div>
           </div>
@@ -2188,7 +2488,7 @@
       <div class="content-instance-list">
         {#each [...characterFeatures, ...characterFeats] as entry}
           <article class="content-instance-card">
-            <div class="panel-head compact-head"><div><span class="eyebrow">{entry.type.replace('_', ' ')}{entry.grantedBy ? ` / granted by ${entry.grantedBy}` : ''}</span><h3>{entry.name}</h3></div>{#if !entry.grantedBy}<button type="button" class="danger compact-button" onclick={() => runContentAction('removeContent', { instanceId: entry.id })}>Remove</button>{/if}</div>
+            <div class="panel-head compact-head"><div><span class="eyebrow">{entry.type.replace('_', ' ')}{entry.grantedBy ? ` / granted by ${entry.grantedBy}` : ''}</span><h3>{entry.name}{#if entry.cost?.summary} <span class="cost-chip" title="Cost to use">{entry.cost.summary}</span>{/if}</h3></div>{#if !entry.grantedBy}<button type="button" class="danger compact-button" onclick={() => runContentAction('removeContent', { instanceId: entry.id })}>Remove</button>{/if}</div>
             <p>{entry.description}</p>
             {#if entry.hasResourceActions}<button type="button" class="compact-button" onclick={() => triggerContentResourceAction(entry.id,entry.name)}>Use Actions</button>{/if}
             {#each entry.resources as resource}
@@ -2310,6 +2610,7 @@
               </label>
               <label>Notes <input name="inventoryNotes" value={item.notes} /></label>
               <div class="row-actions">
+                {#if item.costSummary}<span class="cost-chip" title="Cost to use">{item.costSummary}</span>{/if}
                 <button type="button" class="compact-button" onclick={useInventoryItem}>Use</button>
                 <button type="button" class="compact-button danger" onclick={removeInventoryItem}>Remove</button>
               </div>
@@ -2738,6 +3039,34 @@
     </div>
   {/if}
 
+  {#if costPrompt}
+    <CostRequestPrompt prompt={costPrompt} onChoose={(id) => void chooseCost(id)} />
+  {/if}
+  {#if castDialog}
+    <div class="modal-backdrop" role="presentation" onpointerdown={backdropPress(() => (castDialog = null))}>
+      <div class="panel compact-modal cast-dialog" role="dialog" aria-modal="true" aria-labelledby="cast-dialog-title" tabindex="-1" use:readOnlyLock={readOnly} onpointerdown={(event) => event.stopPropagation()}>
+        <div class="panel-head"><h2 id="cast-dialog-title">Cast {castDialog.spell.name}</h2><span class="cost-chip">{castDialog.spell.cost.summary}</span></div>
+        {#if castEcho}
+          <label class="roll-options-source">
+            <input type="checkbox" checked={castDialog.echo} onchange={(event) => { if (castDialog) castDialog.echo = event.currentTarget.checked; }} />
+            <span><strong>{castEcho.label} ({castEcho.remaining} left)</strong>: a free echo{castEcho.baseLevel ? `, cast at level ${castEcho.baseLevel}` : ''} (no action, no slot)</span>
+          </label>
+        {/if}
+        {#if castSlotLine && !castEchoing}
+          <label>Slot
+            <select bind:value={castDialog.slotKey}>
+              {#each castEligibleSlots as slot}<option value={`${slot.type}:${slot.level}`}>{slot.type === 'pact' ? `Pact (level ${slot.level})` : `Level ${slot.level}`} - {slot.current} left{slot.level > (castSlotLine.level ?? 1) ? ' (upcast)' : ''}</option>{:else}<option value="">No suitable slot</option>{/each}
+            </select>
+          </label>
+        {/if}
+        {#if castEchoing}<p class="muted">The echo costs nothing.</p>{:else}
+        <ul class="cast-lines">{#each castLines as line}<li class:short={line.available < line.needed}>{line.needed} {line.label} <span class="muted">(have {line.available})</span></li>{/each}</ul>
+        {#if castShort.length}<p class="form-error">It doesn't look like you've got the capacity to do that. {castShort.map((line) => `Needs ${line.needed} ${line.label}, you have ${line.available}.`).join(' ')}</p>{/if}
+        {/if}
+        <div class="actions"><button type="button" onclick={confirmCast}>Cast</button><button type="button" class="text-button" onclick={() => (castDialog = null)}>Cancel</button></div>
+      </div>
+    </div>
+  {/if}
   {#if formulaHelp}
     {@const statKey = formulaHelp.statKey}
     {@const stat = statKey ? stats[statKey] : null}
@@ -2798,6 +3127,7 @@
       title={rollOptions.title}
       advantage={rollOptions.advantage}
       damageDice={rollOptions.damageDice}
+      attack={rollOptions.attack ?? null}
       onroll={submitRollOptions}
       oncancel={() => (rollOptions = null)}
     />
@@ -2866,6 +3196,7 @@
         <div class="modifier-tabs" role="tablist" aria-label="Activity log sections">
           <button type="button" class:active={activityLogTab === 'combat'} onclick={() => (activityLogTab = 'combat')}>Combat</button>
           <button type="button" class:active={activityLogTab === 'rolls'} onclick={() => (activityLogTab = 'rolls')}>Rolls</button>
+          <button type="button" class:active={activityLogTab === 'resources'} onclick={() => (activityLogTab = 'resources')}>Resources</button>
           <button type="button" class:active={activityLogTab === 'notes'} onclick={() => (activityLogTab = 'notes')}>Session Notes</button>
         </div>
 
@@ -2899,6 +3230,23 @@
               {:else}
                 <p class="muted">No combat encounters yet.</p>
               {/each}
+            </div>
+          </section>
+        {:else if activityLogTab === 'resources'}
+          <section class="stack">
+            <div class="combat-log-panel">
+              <div class="combat-log-entries">
+                {#each ledgerRows as row (row.id)}
+                  <div class="combat-log-line">
+                    <strong>{row.label}</strong> {ledgerAmount(row)}{row.before !== null && row.after !== null ? ` (${row.before} -> ${row.after})` : ''}
+                    - {row.sourceLabel || row.reason}{row.shortfall ? `, short ${row.shortfall}` : ''}
+                    <span class="muted">{new Date(row.createdAt).toLocaleString()}{row.actorName ? `, ${row.actorName}` : ''}{row.approvedByName ? `, approved by ${row.approvedByName}` : ''}</span>
+                    {#if row.badge}<span class="badge badge-muted">{row.badge}</span>{/if}
+                  </div>
+                {:else}
+                  <span class="combat-log-empty">{ledgerLoaded ? 'Nothing spent or changed yet.' : 'Loading...'}</span>
+                {/each}
+              </div>
             </div>
           </section>
         {:else if activityLogTab === 'rolls'}

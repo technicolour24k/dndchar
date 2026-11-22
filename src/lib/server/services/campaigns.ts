@@ -15,6 +15,7 @@ import type {
   CampaignSummary
 } from '$lib/types/campaign';
 import type { CharacterClass } from '$lib/types/character';
+import { PROFILE_KEYS, type ProfileKey } from '$lib/types/actionEconomy';
 
 // Campaign service. Every function takes the acting user id and throws a user-facing Error when
 // something isn't allowed; permission rules live in access.ts. Writes run in a transaction that
@@ -210,8 +211,8 @@ export async function getCampaignPage(userId: string, campaignId: string): Promi
 
   const campaignRow = await query<{
     id: string; name: string; description: string; invite_code: string; room_code: string;
-    created_by_user_id: string | null; is_archived: boolean; created_at: string;
-  }>('SELECT id, name, description, invite_code, room_code, created_by_user_id, is_archived, created_at FROM campaigns WHERE id = $1', [campaignId]);
+    created_by_user_id: string | null; is_archived: boolean; created_at: string; action_economy: ProfileKey;
+  }>('SELECT id, name, description, invite_code, room_code, created_by_user_id, is_archived, created_at, action_economy FROM campaigns WHERE id = $1', [campaignId]);
   const c = campaignRow.rows[0];
   if (!c) return null;
 
@@ -278,7 +279,8 @@ export async function getCampaignPage(userId: string, campaignId: string): Promi
       roomCode: c.room_code,
       createdByUserId: c.created_by_user_id,
       isArchived: c.is_archived,
-      createdAt: c.created_at
+      createdAt: c.created_at,
+      actionEconomy: c.action_economy
     },
     access,
     members: memberRows.rows.map((row) => ({ userId: row.user_id, displayName: row.display_name, role: row.role, joinedAt: row.joined_at })),
@@ -452,6 +454,20 @@ export async function regenerateInviteCode(userId: string, campaignId: string): 
       return code;
     })
   );
+}
+
+// DMs and admin. Picks the action-economy profile the campaign plays by. Returns the campaign's
+// character ids so the caller can tell open sheets and VTT tokens to re-read their turn view.
+export async function setCampaignActionEconomy(userId: string, campaignId: string, key: string): Promise<string[]> {
+  if (!(PROFILE_KEYS as readonly string[]).includes(key)) throw new CampaignError('Unknown action economy.');
+  return withTransaction(async (client) => {
+    const locked = await lockCampaign(client, userId, campaignId);
+    const access = decideCampaignAccess({ isAdmin: locked.isAdmin, memberRole: roleOf(locked, userId), archived: locked.campaign.isArchived });
+    if (!access.canManage) throw new CampaignError("You can't manage this campaign.");
+    await client.query('UPDATE campaigns SET action_economy = $2, updated_at = now() WHERE id = $1', [campaignId, key]);
+    const characters = await client.query<{ id: string }>('SELECT id FROM characters WHERE campaign_id = $1', [campaignId]);
+    return characters.rows.map((row) => row.id);
+  });
 }
 
 // DMs and admin.

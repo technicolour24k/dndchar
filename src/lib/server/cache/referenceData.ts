@@ -15,7 +15,7 @@ const cache = new Map<string, CacheEntry>();
 // Safety net for content changed outside the app (scripts, manual SQL) that
 // can't call invalidateReferenceData themselves. In-app writes invalidate
 // immediately (see the write functions in catalogue.ts, content-admin.ts,
-// rules-admin.ts and modifier-admin.ts), so this TTL is a backstop, not the
+// and rules-admin.ts), so this TTL is a backstop, not the
 // primary invalidation path.
 const defaultTtlMs = 10 * 60 * 1000;
 

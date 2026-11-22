@@ -5,6 +5,7 @@
   import { formatInviteCode, roleLabel } from '$lib/campaigns/listParams';
   import { canOpenAsGm, tableHref } from '$lib/campaigns/vttLinks';
   import { totalLevel } from '$lib/rules/dnd5e';
+  import { PROFILES } from '$lib/rules/actionEconomy';
 
   let { data, form } = $props();
 
@@ -332,6 +333,56 @@
         </div>
         {#if data.findTableCount === 0}
           <p class="muted">Foraging is off for this campaign until it has a find table with something to find.</p>
+        {/if}
+      </section>
+    {/if}
+
+    {#if data.overrideReviews.length}
+      <section class="panel campaign-box">
+        <h2>Over-budget uses to review</h2>
+        <p class="muted">A player said you OK'd these. Mark OK, or Undo to refund what they spent.</p>
+        <ul class="member-list">
+          {#each data.overrideReviews as review (review.activationId)}
+            <li>
+              <div class="member-name">
+                <strong>{review.characterName}</strong> - {review.sourceLabel}
+                <span class="muted">{review.playerName}, {new Date(review.createdAt).toLocaleString()}{review.shortText ? `, short ${review.shortText}` : ''}</span>
+              </div>
+              <span class="campaign-box-foot">
+                <form method="POST" action="?/reviewOk" use:enhance>
+                  <input type="hidden" name="activationId" value={review.activationId} />
+                  <button type="submit" class="compact-button">OK</button>
+                </form>
+                <form method="POST" action="?/reviewUndo" use:enhance={confirmFirst(`Undo ${review.characterName}'s ${review.sourceLabel}? What it spent is given back. Anything it did needs fixing by hand.`)}>
+                  <input type="hidden" name="activationId" value={review.activationId} />
+                  <button type="submit" class="compact-button danger">Undo</button>
+                </form>
+              </span>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
+    {#if form?.reviewed}<p class="muted">{form.reviewed}</p>{/if}
+
+    {#if !archived}
+      <section class="panel campaign-box">
+        <h2>Rules</h2>
+        {#if access.canManage}
+          <form method="POST" action="?/setActionEconomy" use:enhance class="stack">
+            <label>
+              Action economy
+              <select name="actionEconomy" value={campaign.actionEconomy}>
+                <option value="dnd5e">D&amp;D 5e (Action, Bonus action, Reaction per turn)</option>
+                <option value="attack_utility">Attack &amp; Utility (2 Attack + 2 Utility per turn, homebrew)</option>
+              </select>
+            </label>
+            <p class="muted">{PROFILES[campaign.actionEconomy]?.description} Characters in this campaign track their actions per turn this way.</p>
+            <button type="submit" class="compact-button stack-button">Save rules</button>
+          </form>
+          {#if form?.saved === 'actionEconomy'}<p class="muted">Saved.</p>{/if}
+        {:else}
+          <p class="muted">Action economy: {PROFILES[campaign.actionEconomy]?.label}. {PROFILES[campaign.actionEconomy]?.description}</p>
         {/if}
       </section>
     {/if}

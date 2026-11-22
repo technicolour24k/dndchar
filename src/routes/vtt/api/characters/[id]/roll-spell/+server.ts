@@ -3,7 +3,11 @@ import type { RequestHandler } from './$types';
 import { query } from '$lib/server/db';
 import { getCharacter } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
-import { castCharacterSpell, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
+import { castCharacterSpellDetailed, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
+import { emitRealtimeEvent } from '$lib/server/realtime';
+import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
+import { activationFromCastForm } from '$lib/server/vttCostApproval';
 import { resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, totalLevel } from '$lib/rules/dnd5e';
 import { characterStatsFor, resolveSpellcastingAbility } from '$lib/rules/characterStats';
 import { adjustPrimaryDamageDice, previewAdvantage, rollDamage, rollWithModifiers, spellAttackAgainstCandidates, spellAttackCandidates } from '$lib/rules/attackRoll';
@@ -76,11 +80,23 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   if (slotLevel) castForm.set('slotLevel', String(slotLevel));
 
   let effects;
+  let spent: { slotType: 'standard' | 'pact'; slotLevel: number } | null = null;
+  // Over-budget cast: body.approvalId (the DM approved) or body.override ('dm' | 'self'), checked server-side.
+  // The approval is bound to this activation: instanceId plus the slot actually used (slotLevel is at
+  // least the spell's own level), so a client asks and resends with the same instanceId/slotType/slotLevel.
+  const gate = await openCostGate({ userId: locals.user!.id, characterId, activation: activationFromCastForm(castForm), approvalId: body.approvalId, override: body.override, roomId: body.roomId });
+  if (!gate.ok) return json(gate.body, { status: gate.status });
   try {
-    effects = await castCharacterSpell(locals.user!.id, characterId, castForm);
+    const cast = await runWithGate(gate, (override) => castCharacterSpellDetailed(locals.user!.id, characterId, castForm, override));
+    effects = cast.results;
+    spent = cast.spent;
   } catch (error) {
+    if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
     return json({ error: error instanceof Error ? error.message : 'Could not cast spell.' }, { status: 400 });
   }
+
+  // What the cast spent (slots, pools, charges) changed the sheet: tokens and open sheets re-sync.
+  emitRealtimeEvent('resource:changed', { characterId });
 
   const character = await getCharacter(locals.user!.id, characterId);
   if (!character) return json({ error: 'not_found' }, { status: 404 });
@@ -143,6 +159,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     saveDc: profile.resolution === 'save' ? stats.spellSaveDc.value : undefined,
     saveAbility: profile.saveAbility,
     saveEffect: profile.saveEffect,
-    effects
+    effects,
+    spent
   });
 };

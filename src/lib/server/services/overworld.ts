@@ -2,7 +2,7 @@ import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { getCampaignAccess, isUuid, type Queryable } from '$lib/server/services/access';
 import { OverworldError } from '$lib/server/overworldError';
-import { notifyOverworldChanged } from '$lib/server/overworldNotify';
+import { dropMapPreviews, notifyOverworldChanged } from '$lib/server/overworldNotify';
 import {
   removeImageFile,
   storeImageThenRun,
@@ -286,6 +286,18 @@ export async function getMapView(userId: string, campaignId: string, mapId: stri
 }
 
 /**
+ * Live route preview: may this user join the map's preview channel? Same gate as seeing the map
+ * (campaign role only). Returns the facts the ticket carries, or null.
+ */
+export async function getLivePreviewAccess(userId: string, campaignId: string, mapId: string): Promise<{ isDm: boolean } | null> {
+  const viewer = await loadViewer({ query }, userId, campaignId);
+  if (!viewer || !canOpenOverworld(viewer)) return null;
+  const map = await loadMap({ query }, campaignId, mapId);
+  if (!map || !canSeeMap(viewer, map)) return null;
+  return { isDm: isOverworldDm(viewer) };
+}
+
+/**
  * Absolute path of a map's CURRENT image for a viewer who may see the map, or null (wrong file name,
  * old file after a replace, not allowed, no such map). The image route does the rest.
  */
@@ -373,6 +385,8 @@ export async function setMapGranted(
     return { mapName: map.name, roomCode: campaign.rows[0].room_code as string };
   });
   notifyOverworldChanged(campaignId, mapId);
+  // Unsharing: players on the map lose the live preview channel (DMs keep it).
+  if (!granted) dropMapPreviews(mapId);
   return result;
 }
 
@@ -383,6 +397,7 @@ export async function archiveMap(userId: string, campaignId: string, mapId: stri
     await client.query('UPDATE overworld_maps SET archived_at = now(), updated_at = now() WHERE id = $1', [mapId]);
   });
   notifyOverworldChanged(campaignId, mapId);
+  dropMapPreviews(mapId, true);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -8,6 +8,9 @@ import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/move
 import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
+import { createCostApproval } from './costApproval.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, paidText, resetAllNote, turnChips } from './shared/actionEconomy.js';
+import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
 import { drawTargetRings } from './render/targeting.js';
@@ -34,6 +37,8 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'actions',
   'spellSlots',
   'preparedSpells',
+  'pools',
+  'turn', // display copy of the character's turn view (see shared/actionEconomy.js trimTurnView)
   // Last sheet vision values the token took (see token:vision:sync). Client-side list only, so
   // the generic token:stat:update path on the server can't write it.
   'sheetVision',
@@ -113,10 +118,12 @@ function getImage(url) {
   return media;
 }
 
+// Escapes for HTML text AND attribute values: textContent -> innerHTML covers & < >, and the
+// quotes are replaced too, so the result is also safe inside data-*="..." / title="...".
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str ?? '';
-  return div.innerHTML;
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // Every .modal-overlay shares the same CSS z-index, so when one modal opens
@@ -624,13 +631,13 @@ function dropMovePreview(tokenId) {
 
 // Brief message after our plan is aborted by someone else's change (there is no toast system).
 let movePlanNoticeTimer = null;
-function showMovePlanNotice(text) {
+function showMovePlanNotice(text, ms = 2500) {
   const notice = document.getElementById('movePlanNotice');
   if (!notice) return;
   notice.textContent = text;
   notice.classList.add('visible');
   clearTimeout(movePlanNoticeTimer);
-  movePlanNoticeTimer = setTimeout(() => notice.classList.remove('visible'), 2500);
+  movePlanNoticeTimer = setTimeout(() => notice.classList.remove('visible'), ms);
 }
 
 function clearAllMovePreviews() {
@@ -678,6 +685,7 @@ function handleMessage(msg) {
       // Forage: the GM's pending requests (or the player's own view and result) arrive in
       // session.forage / session.forageResults. Targeted updates only, no extra sidebar rebuild.
       forage.onStateFull();
+      costApproval.onStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
       // 'character:changed' below instead. See that case and
@@ -966,6 +974,19 @@ function handleMessage(msg) {
 
     case 'forage:closed':
       forage.onClosed(msg);
+      break;
+
+    // Cost-engine DM approval (cost-engine unit 6): the GM's queue, and a player's own request.
+    case 'cost:update':
+      costApproval.onUpdate(msg);
+      break;
+
+    case 'cost:closed':
+      costApproval.onClosed(msg);
+      break;
+
+    case 'cost:ping':
+      costApproval.onPing();
       break;
 
     // A DM shared an overworld map (campaign tables only).
@@ -1472,14 +1493,16 @@ function sendMovePreview() {
 function commitMovePlan() {
   if (!movePlan || !movePlan.points.length) return;
   const final = movePlan.points[movePlan.points.length - 1];
-  send({
+  const sent = sendTokenMove({
     type: 'token:move',
     tokenId: movePlan.tokenId,
     x: final.x,
     y: final.y,
     waypoints: movePlan.points.slice(0, -1),
   });
-  // No clear message needed: every client drops the preview on the token:move broadcast.
+  // A sent move needs no clear message: every client drops the preview on the token:move broadcast.
+  // A move held for a dash never reaches the server, so the preview is cleared by hand.
+  if (!sent && movePlan.broadcast) send({ type: 'token:move:preview:clear', tokenId: movePlan.tokenId });
   endMovePlan();
 }
 
@@ -1600,6 +1623,7 @@ const attackModalBody = document.getElementById('attackModalBody');
 let pendingAttack = null; // { sourceTokenId, action, intent, targetId, targetName, options, stage }
 
 function closeAttackModal() {
+  if (dashHold?.stage === 'paying') return; // a dash is being paid: closing now would look like cancelling it
   attackModal.classList.remove('visible');
   attackModalBody.innerHTML = '';
   if (awaitingAttackResult) {
@@ -1610,12 +1634,15 @@ function closeAttackModal() {
     clearTimeout(awaitingSpellResult.timeoutId);
     awaitingSpellResult = null;
   }
+  // A cost request still waiting on the DM goes with the modal (nothing was spent).
+  costApproval.onAttackClosed();
   if (pendingAttack) {
     send({ type: 'target:clear' });
     currentTargetTokenIds = [];
     render();
   }
   pendingAttack = null;
+  dashHold = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,7 +1656,7 @@ function closeAttackModal() {
 // INTERIM: the "Damage dice" control is a manual per-roll stopgap until proper modifiers handle
 // extra damage dice. It is not part of the modifier model (see the vtt-combat-mechanics plan).
 // ---------------------------------------------------------------------------
-function newAttackOptions(action, intent) {
+function newAttackOptions(action, intent, hasTurn = false) {
   const isSpell = action.kind === 'spell';
   const skipsPreview = intent === 'heal' || action.kind === 'item';
   // Whether the advantage panel is shown: never for heals/items; manual spells only when they
@@ -1647,6 +1674,12 @@ function newAttackOptions(action, intent) {
     dis: 0,               // situational disadvantage counter, 0-5
     damageDelta: 0,       // INTERIM: manual damage-dice delta, -5..+5
     primaryDamageDice: '',
+    // Action economy: a character's weapon attack also pays its action. The preview supplies the live
+    // turn view; the player picks when it is taken and whether to spend an Extra Attack follow-up.
+    showTurn: hasTurn,
+    turn: null,           // the turn view from the preview
+    timing: 'action',
+    followup: 'use',      // Extra Attack is the highlighted default while follow-ups wait
   };
 }
 
@@ -1725,6 +1758,16 @@ function advancedOptionsHtml(options) {
       <div class="attack-subtext">Each point counts as one source. Advantage and disadvantage cancel one for one.</div>
       <div class="adv-readout" id="advReadout"></div>
     </div>` : '';
+  const turnPanel = options.showTurn ? `
+    <div class="adv-panel" id="turnPanel">
+      <h4>Action</h4>
+      <div class="adv-row">
+        <span class="adv-row-label">Taken as</span>
+        <select id="turnTiming" aria-label="When the attack is taken">${ATTACK_TIMINGS.map((t) => `<option value="${t.value}">${t.label}</option>`).join('')}</select>
+      </div>
+      <div id="turnFollowup"></div>
+      <div class="adv-readout" id="turnCost"></div>
+    </div>` : '';
   const dmgPanel = `
     <div class="adv-panel" id="dmgPanel">
       <h4>Damage dice <span class="adv-manual">manual</span></h4>
@@ -1736,7 +1779,7 @@ function advancedOptionsHtml(options) {
       </div>
       <div class="attack-subtext" id="dmgPreview"></div>
     </div>`;
-  return advPanel + dmgPanel;
+  return advPanel + turnPanel + dmgPanel;
 }
 
 // Repaints the parts of the panel that depend on state (not the whole card, so focus is kept).
@@ -1769,6 +1812,29 @@ function refreshAdvantagePanel() {
   if (dmgPreview) dmgPreview.textContent = previewPrimaryDice(options.primaryDamageDice, options.damageDelta);
   const advPanel = document.getElementById('advPanel');
   if (advPanel && !options.showAdvantage) advPanel.remove();
+  refreshTurnPanel(options);
+}
+
+// The Action part of the confirm card: when the attack is taken, the explicit Extra Attack choice while
+// follow-ups wait, and what it will cost. Display only; the server pays and decides.
+function refreshTurnPanel(options) {
+  const panel = document.getElementById('turnPanel');
+  if (!panel) return;
+  const timing = document.getElementById('turnTiming');
+  if (timing && timing.value !== options.timing) timing.value = options.timing;
+  const offered = attackFollowup(options.turn, options.timing);
+  const followupEl = document.getElementById('turnFollowup');
+  if (followupEl) {
+    const key = offered ? `${offered.label}|${offered.remaining}` : '';
+    if (followupEl.dataset.renderedKey !== key) {
+      followupEl.dataset.renderedKey = key;
+      followupEl.innerHTML = offered ? `
+        <label class="adv-source"><input type="radio" name="turnFollowup" value="use" class="turnFollowupRadio" ${options.followup === 'use' ? 'checked' : ''} /> <strong>${escapeHtml(offered.label)} (${offered.remaining} left)</strong>: free repeat, spends no action</label>
+        <label class="adv-source"><input type="radio" name="turnFollowup" value="skip" class="turnFollowupRadio" ${options.followup === 'skip' ? 'checked' : ''} /> Normal attack: spends the action</label>` : '';
+    }
+  }
+  const cost = document.getElementById('turnCost');
+  if (cost) cost.textContent = options.turn ? `Cost: ${attackCostText(options.turn, options.timing, options.followup)}` : '';
 }
 
 // One delegated listener for the whole panel (the modal body is rebuilt as the flow moves on).
@@ -1783,6 +1849,11 @@ attackModalBody.addEventListener('click', (event) => {
   refreshAdvantagePanel();
 });
 attackModalBody.addEventListener('change', (event) => {
+  const turnOptions = pendingAttack?.options;
+  if (turnOptions && pendingAttack.stage === 'confirm') {
+    if (event.target.id === 'turnTiming') { turnOptions.timing = event.target.value; refreshTurnPanel(turnOptions); return; }
+    if (event.target.classList?.contains('turnFollowupRadio')) { turnOptions.followup = event.target.value; refreshTurnPanel(turnOptions); return; }
+  }
   const box = event.target.closest('.advSourceCheckbox');
   const options = pendingAttack?.options;
   if (!box || !options || pendingAttack.stage !== 'confirm') return;
@@ -1799,6 +1870,13 @@ function attackRollExtras(sourceTokenId, targetId, options, preview) {
     vtt: { sessionId, sourceTokenId, targetTokenId: targetId },
     advantage: { disabled: [...options.disabled], situationalAdvantage: options.adv, situationalDisadvantage: options.dis },
     manualDamageDice: options.damageDelta, // INTERIM
+    // The action economy choices for a character's weapon attack (the server defaults match).
+    // A follow-up is only used when the card actually offered it (and it's still the choice);
+    // otherwise send 'skip', so a hidden/unknown follow-up is never spent silently.
+    ...(options.showTurn ? {
+      timing: options.timing,
+      followup: attackFollowup(options.turn, options.timing) && options.followup === 'use' ? 'use' : 'skip'
+    } : {}),
   };
 }
 
@@ -1813,6 +1891,7 @@ async function loadAttackPreview(pending) {
     options.primaryDamageDice = preview.primaryDamageDice || '';
     if (preview.usesAttackRoll === false) options.showAdvantage = false;
     options.sources = (preview.sources || []).filter((src) => src.origin !== 'situational');
+    if (preview.turn) options.turn = preview.turn;
   } catch (err) {
     if (pendingAttack !== pending) return;
     console.warn('[VTT] advantage preview failed', err);
@@ -1826,7 +1905,7 @@ async function loadAttackPreview(pending) {
 function openAttackConfirm(sourceTokenId, action, target, intent = 'attack') {
   const isSpell = action.kind === 'spell';
   const isHeal = intent === 'heal';
-  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name, options: newAttackOptions(action, intent), stage: 'confirm' };
+  pendingAttack = { sourceTokenId, action, intent, targetId: target.id, targetName: target.name, options: newAttackOptions(action, intent, !isSpell && !isHeal && action.kind !== 'item' && Boolean(session.tokens[sourceTokenId]?.characterId)), stage: 'confirm' };
   const pending = pendingAttack;
   send({ type: 'target:select', sourceTokenId, targetTokenIds: [target.id] });
   currentTargetTokenIds = [target.id];
@@ -1879,12 +1958,28 @@ async function rollManualAction(action, extraBody = {}) {
     }),
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+  if (!res.ok) throw new Error(costShortfallText(body) || body.error || ('roll request failed (' + res.status + ')'));
   return body;
 }
 
 // extraBody carries the advantage choices (and `preview: true` for a preview) into whichever
 // endpoint applies; the item_not_found fallback covers previews too.
+// A 409 'insufficient' from roll-spell/roll-item: the clear sentence plus what's short.
+// The Error a roll route's non-OK answer becomes. A 409 'insufficient' keeps the whole body on
+// err.insufficient so resolveAttack can offer the ask-the-DM prompt instead of a dead end.
+function rollError(body, res) {
+  const refused = body?.error === 'approval_invalid' || body?.error === 'forbidden' || body?.error === 'wrong_room' || body?.error === 'not_in_room';
+  const err = new Error(costShortfallText(body) || (refused ? costApprovalErrorText(body) : '') || body.error || ('roll request failed (' + res.status + ')'));
+  if (isCostInsufficient(body)) err.insufficient = body;
+  return err;
+}
+
+function costShortfallText(body) {
+  if (body?.error !== 'insufficient') return '';
+  const lines = (body.shortfalls || []).map((l) => `Needs ${l.needed} ${l.label}, you have ${l.available}`);
+  return [body.message || "It doesn't look like you've got the capacity to do that.", ...lines].join(' ');
+}
+
 async function rollPendingAction(action, source, extraBody = {}) {
   // Manual stat-block spell: no character/slots behind it, just the numbers on the action.
   if (action.kind === 'spell' && action.manual) return rollManualAction(action, extraBody);
@@ -1895,7 +1990,7 @@ async function rollPendingAction(action, source, extraBody = {}) {
       body: JSON.stringify({ ...extraBody, instanceId: action.instanceId, slotLevel: action.slotLevel }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+    if (!res.ok) throw rollError(body, res);
     return body;
   }
 
@@ -1905,7 +2000,7 @@ async function rollPendingAction(action, source, extraBody = {}) {
       body: JSON.stringify({ ...extraBody, inventoryId: action.inventoryId }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+    if (!res.ok) throw rollError(body, res);
     return body;
   }
 
@@ -1926,7 +2021,23 @@ async function rollPendingAction(action, source, extraBody = {}) {
   // stored on the action itself (same as an enemy/npc attack) - loses the
   // sheet's rich advantage/disadvantage-aware roll, but a homebrew extra
   // attack was never going to have that anyway.
-  if (body.error === 'item_not_found') return rollManualAction(action, extraBody);
+  if (body.error === 'item_not_found') {
+    // The attack isn't on the sheet (Unarmed Strike, a GM-added action), so its action is paid through
+    // the turn route instead. A 409 becomes the usual cost prompt (rollError keeps the body).
+    if (!extraBody.preview) {
+      const paid = await fetch('/vtt/api/characters/' + source.characterId + '/turn', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'pay', approvalId: extraBody.approvalId, override: extraBody.override, roomId: extraBody.roomId,
+          activation: { kind: 'weapon_attack', inventoryId: null, label: action.name, timing: extraBody.timing || 'action', followup: extraBody.followup === 'use' ? 'use' : 'skip' },
+        }),
+      });
+      const paidBody = await paid.json().catch(() => ({}));
+      if (paid.status === 404) return rollManualAction(action, extraBody); // can't act for this character: rolls unpaid, as before
+      if (!paid.ok) throw rollError(paidBody, paid);
+    }
+    return rollManualAction(action, extraBody);
+  }
 
   // Any other reason (not_found, missing_item) is a real failure - surface
   // the server's actual reason rather than just a bare status code.
@@ -1938,14 +2049,13 @@ async function rollPendingAction(action, source, extraBody = {}) {
 // the same token:stat:update broadcast the manual Use button already sends -
 // deliberately not mutated locally first, so every client (including this one)
 // picks up the new count the same way, off the server echo.
-function deductLocalSpellSlot(tokenId, level) {
+function deductLocalSpellSlot(tokenId, level, type) {
   const token = session.tokens[tokenId];
   if (!token) return;
   const slots = token.spellSlots || [];
-  // The roll-spell request doesn't specify slot type, so the server's own
-  // preference (spendAvailableSlot in catalogue.ts: standard before pact at the
-  // same level) is mirrored here to pick the same slot the DB actually spent.
-  const candidates = slots.filter((s) => s.level === level && s.current > 0);
+  // roll-spell reports which slot the cost engine actually spent (`spent`), so the token's copy
+  // follows the same slot rather than guessing the type.
+  const candidates = slots.filter((s) => s.level === level && s.current > 0 && (!type || s.type === type));
   const match = candidates.find((s) => s.type !== 'pact') || candidates[0];
   if (!match) return;
   const value = slots.map((s) => (s === match ? { ...s, current: Math.max(0, s.current - 1) } : s));
@@ -1956,8 +2066,10 @@ function deductLocalSpellSlot(tokenId, level) {
 // target's HP (attack:resolve for weapons and attack-resolution spells alike -
 // a spell attack roll vs. AC is mechanically identical once you have a to-hit
 // total; spell:resolve for save/auto spells, see renderSpellResolutionControls).
-async function resolveAttack() {
+// costExtra is { approvalId } or { override } when re-running after the cost prompt (same target and options).
+async function resolveAttack(costExtra = {}) {
   if (!pendingAttack) return;
+  const pending = pendingAttack;
   const { sourceTokenId, action, intent, targetId, targetName, options } = pendingAttack;
   pendingAttack.stage = 'rolling'; // the panel's listeners ignore clicks from here on
   const source = session.tokens[sourceTokenId];
@@ -1967,8 +2079,17 @@ async function resolveAttack() {
   attackModalBody.innerHTML = `<h2>${isHeal ? 'Heal' : isSpell ? 'Cast Spell' : 'Attack'}</h2><p class="attack-subtext">${isHeal ? 'Healing with' : isSpell ? 'Casting' : 'Rolling'} ${escapeHtml(action.name)}…</p>`;
   let result;
   try {
-    result = await rollPendingAction(action, source, attackRollExtras(sourceTokenId, targetId, options, false));
+    result = await rollPendingAction(action, source, { ...attackRollExtras(sourceTokenId, targetId, options, false), ...costExtra, roomId: sessionId });
   } catch (err) {
+    if (err.insufficient && pendingAttack === pending) {
+      // Can't afford it: offer the way past that fits (ask the DM, the DM's own go-ahead, or the no-DM confirm).
+      pending.stage = 'cost';
+      costApproval.promptPlayer({
+        body: err.insufficient, label: action.name, characterId: source.characterId,
+        retry: (extra) => { if (pendingAttack === pending) resolveAttack(extra); }
+      });
+      return;
+    }
     console.error('[VTT] roll failed', err);
     attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
     return;
@@ -1979,7 +2100,7 @@ async function resolveAttack() {
   // own displayed slot count is a separate, client-tracked snapshot that only the
   // manual Use/Reset buttons used to touch, so a real cast never showed up there
   // until now. Sync it here, once the slot spend is confirmed to have happened.
-  if (isSpell && action.slotLevel) deductLocalSpellSlot(sourceTokenId, action.slotLevel);
+  if (isSpell && result.spent) deductLocalSpellSlot(sourceTokenId, result.spent.slotLevel, result.spent.slotType);
 
   // Heal always lands (no to-hit/save layer, per the brief's Section 3) and items have
   // no attack-roll concept in this simple model - both skip straight to the no-hidden-
@@ -1988,6 +2109,12 @@ async function resolveAttack() {
   renderAttackBreakdown(targetName, result, usesAttackRoll
     ? '<span class="attack-subtext">Resolving hit/miss…</span>'
     : '<span class="attack-subtext">Loading…</span>');
+  if (result.turn && paidText(result.turn)) {
+    const paidEl = document.createElement('div');
+    paidEl.className = 'attack-subtext';
+    paidEl.textContent = paidText(result.turn);
+    attackModalBody.querySelector('.attack-target-name')?.after(paidEl);
+  }
 
   if (usesAttackRoll) {
     const outcome = (result.outcomes || []).includes('critical_hit') ? 'critical_hit'
@@ -2350,7 +2477,7 @@ window.addEventListener('mouseup', (e) => {
       if (fromPlan) cancelMovePlan(); // dragging the planned token abandons the plan
       const raw = canvasCoords(e);
       const { x, y } = clampToMapBounds(raw.x, raw.y);
-      send({ type: 'token:move', tokenId, x, y });
+      sendTokenMove({ type: 'token:move', tokenId, x, y });
       // dragState itself is cleared once the server echoes the move back (see
       // handleMessage's token:move case) - the token doesn't actually move on
       // screen until then, per the "server is the only writer" rule.
@@ -2471,7 +2598,7 @@ function endTouchDrag(e, commit) {
       if (fromPlan) cancelMovePlan();
       const raw = canvasCoords(touch);
       const { x, y } = clampToMapBounds(raw.x, raw.y);
-      send({ type: 'token:move', tokenId, x, y });
+      sendTokenMove({ type: 'token:move', tokenId, x, y });
       // dragState itself clears once the server echoes the move back (see
       // handleMessage's token:move case), same as the mouse path above.
     }
@@ -2828,6 +2955,8 @@ characterPickerList.addEventListener('click', async (e) => {
       actions: snapshot.actions,
       spellSlots: snapshot.spellSlots,
       preparedSpells: snapshot.preparedSpells,
+      pools: snapshot.pools || [],
+      ...(snapshot.turn ? { turn: snapshot.turn } : {}),
       stats: { hp: snapshot.hp, maxHp: snapshot.maxHp },
     },
   });
@@ -2906,6 +3035,10 @@ function applyCharacterSyncFields(token, snapshot) {
     saves: snapshot.saves,
     actions: snapshot.actions,
     preparedSpells: snapshot.preparedSpells,
+    // Resource pools follow the database (server-authoritative), unlike spellSlots which are session-tracked.
+    pools: snapshot.pools || [],
+    // This turn's actions follow the database too (a display copy: changes go through the turn routes).
+    ...(snapshot.turn ? { turn: snapshot.turn } : {}),
   };
   for (const [stat, value] of Object.entries(updates)) {
     if (JSON.stringify(token[stat]) !== JSON.stringify(value)) {
@@ -3248,6 +3381,166 @@ function resetTokenSpeedRemaining(tokenId) {
   const token = session.tokens[tokenId];
   if (!token) return;
   send({ type: 'token:stat:update', tokenId, stat: 'speedRemainingFt', value: token.speedFt || 0 });
+  void resetTokenTurn(token);
+}
+
+// ---------------------------------------------------------------------------
+// Dash (action economy Unit 5). A character token moved by its OWNING PLAYER past its remaining
+// movement is held, and a dash is offered: a general action (1 Utility in homebrew, 1 Action in 5e)
+// that adds one full speed per dash. Paid through the turn route, so a shortfall goes through the same
+// ask-the-DM prompt as everything else. Movement within speed is free; the GM never gets this prompt
+// (the server still clamps the budget at 0). Server-side the move is not blocked: this is a prompt.
+// ---------------------------------------------------------------------------
+let dashHold = null; // { tokenId, count, over, move (a held token:move message, or null), stage }
+
+// The same distance the server deducts: the path total, never less than the straight line.
+function moveDistanceFt(token, waypoints, x, y) {
+  const grid = session?.map?.gridSizePx;
+  if (!grid) return null;
+  const path = pathFt([{ x: token.x, y: token.y }, ...waypoints, { x, y }], grid);
+  const straight = chebyshevFt(token.x, token.y, x, y, grid);
+  return path === null || straight === null ? null : Math.max(path, straight);
+}
+
+function dashForMove(token, msg) {
+  if (role !== 'player' || token.ownerId !== playerId) return null;
+  if (!token.characterId || !token.turn || !(token.speedFt > 0) || typeof token.speedRemainingFt !== 'number') return null;
+  if (!dashHold && attackModal.classList.contains('visible')) return null; // another prompt is open: leave it alone
+  const distance = moveDistanceFt(token, msg.waypoints || [], msg.x, msg.y);
+  if (distance === null) return null;
+  const need = dashNeeded(distance, token.speedRemainingFt, token.speedFt);
+  return need.count > 0 ? need : null;
+}
+
+// Sends a token:move, or holds it and offers a dash. Returns true when the move was sent.
+function sendTokenMove(msg) {
+  const token = session?.tokens[msg.tokenId];
+  // A dash prompt is already open. While it is being paid the new drop is refused (the ghost snaps back);
+  // while it waits for an answer the newest move REPLACES the held one (never sent unpaid).
+  if (dashHold && token && dashHold.tokenId === msg.tokenId) {
+    dragState = null;
+    render();
+    if (dashHold.stage !== 'ask') return false;
+    const again = dashForMove(token, msg);
+    if (again) { openDashPrompt(token, again.count, again.over, msg); return false; }
+    closeAttackModal(); // the new move is within movement after all: no dash needed
+    send(msg);
+    return true;
+  }
+  const need = token ? dashForMove(token, msg) : null;
+  if (!need) { send(msg); return true; }
+  dragState = null; // the ghost snaps back: nothing has moved
+  render();
+  openDashPrompt(token, need.count, need.over, msg);
+  return false;
+}
+
+function openDashPrompt(token, count, over, move) {
+  const hold = { tokenId: token.id, count, over, move, stage: 'ask' };
+  dashHold = hold;
+  attackModalBody.innerHTML = `<h2>Dash?</h2><p class="attack-subtext">${escapeHtml(dashPromptText(token.turn, count, over, token.speedFt))}</p>
+    <div class="actions">
+      <button type="button" class="secondary" data-dash="cancel">Cancel</button>
+      <button type="button" data-dash="go">${move ? 'Dash and move' : 'Dash'}</button>
+    </div>`;
+  attackModal.classList.add('visible');
+  attackModalBody.querySelector('[data-dash="go"]')?.focus();
+}
+
+// Pays the dash. On success: the turn copy, the extra movement, then the held move (same socket, so the
+// order holds). A 409 shortfall becomes the usual prompt, and approving it re-runs this with the approval.
+async function payDash(hold, extra = {}) {
+  const token = session?.tokens[hold.tokenId];
+  if (!token?.characterId) { closeAttackModal(); return; }
+  hold.stage = 'paying';
+  attackModalBody.innerHTML = '<h2>Dash</h2><p class="attack-subtext">Dashing…</p>';
+  let res;
+  let body;
+  try {
+    res = await fetch('/vtt/api/characters/' + token.characterId + '/turn', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...extra, action: 'pay', roomId: sessionId, activation: { kind: 'dash', count: hold.count } }),
+    });
+    body = await res.json().catch(() => ({}));
+  } catch {
+    res = { ok: false, status: 0 };
+    body = { error: 'network' };
+  }
+  if (res.ok) {
+    const current = session?.tokens[hold.tokenId];
+    if (current) {
+      if (body.turn) send({ type: 'token:stat:update', tokenId: current.id, stat: 'turn', value: body.turn });
+      send({ type: 'token:stat:update', tokenId: current.id, stat: 'speedRemainingFt', value: (current.speedRemainingFt ?? 0) + hold.count * (current.speedFt || 0) });
+      if (hold.move) send(hold.move);
+    }
+    if (dashHold === hold) { hold.stage = 'done'; closeAttackModal(); }
+    return;
+  }
+  if (dashHold !== hold) return; // closed meanwhile
+  if (isCostInsufficient(body)) {
+    hold.stage = 'cost';
+    costApproval.promptPlayer({
+      body, label: 'Dash', characterId: token.characterId,
+      retry: (again) => { if (dashHold === hold) payDash(hold, again); },
+    });
+    return;
+  }
+  hold.stage = 'error';
+  const message = body.error === 'not_found' ? "You can't spend actions for this character." : rollError(body, res).message;
+  attackModalBody.innerHTML = `<h2>Dash</h2><p style="color:#e57373;font-size:13px;">${escapeHtml(message)}</p><div class="actions"><button type="button" data-dash="cancel">Close</button></div>`;
+}
+
+attackModalBody.addEventListener('click', (e) => {
+  const button = e.target.closest?.('[data-dash]');
+  if (!button || !dashHold || dashHold.stage === 'paying') return;
+  if (button.dataset.dash === 'cancel') closeAttackModal();
+  else if (dashHold.stage === 'ask') payDash(dashHold);
+});
+
+// Per-token Reset also gives the character a fresh turn (the VTT server has no database, so it is an
+// HTTP call). Only the character's owner or DM may; anyone else just gets the movement reset.
+async function resetTokenTurn(token) {
+  if (!token?.characterId) return;
+  try {
+    const res = await fetch('/vtt/api/characters/' + token.characterId + '/turn', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'reset' }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok) { if (body.turn) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: body.turn }); return; }
+    if (res.status === 404 || res.status === 403) showMovePlanNotice("Movement reset; actions need the character's owner or DM", 4000);
+  } catch { /* the movement reset already happened; the next character sync fixes the display */ }
+}
+
+// GM "Reset all": the HTTP half of token:move:resetAll. Pushes each reset character's fresh turn copy onto
+// its tokens, so the GM's display is right even when an owner is not connected.
+async function resetAllTurns() {
+  if (!sessionId) return;
+  try {
+    const res = await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/turn-reset', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) return;
+    for (const token of Object.values(session.tokens)) {
+      const view = token.characterId && body.views?.[token.characterId];
+      if (view) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: view });
+    }
+    const note = resetAllNote(body);
+    if (note) showMovePlanNotice(note, 4000);
+  } catch { /* movement was reset over the socket; actions follow on the next sync */ }
+}
+
+// Sidebar Dash button: a dash with no move behind it (just adds speed to this turn's movement).
+function dashButtonClicked(tokenId) {
+  const token = session?.tokens[tokenId];
+  if (token?.turn && token.characterId && token.speedFt > 0) openDashPrompt(token, 1, null, null);
+}
+
+// The "Actions" chips on the token cards: labels come from the profile, display only.
+function turnChipsHtml(t) {
+  const chips = turnChips(t.turn);
+  return chips.length ? `<div class="field turn-chips">${chips.map((chip) => `<span class="tag">${escapeHtml(chip)}</span>`).join(' ')}</div>` : '';
+}
+function dashButtonHtml(t) {
+  return t.characterId && t.turn && t.speedFt > 0 ? '<button class="secondary speedDashBtn" title="Spend a general action to add your speed to this turn\'s movement">Dash</button>' : '';
 }
 
 // Rescue for a token dragged somewhere unreachable (see clampToMapBounds's
@@ -3387,6 +3680,7 @@ function roomInfoHtml(roleLabel) {
     ${overworld.buttonHtml()}
     ${combatControlHtml()}
     ${forage.forageControlHtml()}
+    ${costApproval.queueHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
     ${sessionNotesControlHtml()}
@@ -3853,8 +4147,10 @@ function tokenManagerRowsHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            ${dashButtonHtml(t)}
             <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
+          ${turnChipsHtml(t)}
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
           <div class="actions">
@@ -3945,7 +4241,7 @@ function wireGmSidebar() {
   // Bulk counterpart to each token's own per-token Reset button - there's no
   // turn tracker in the VTT to hang an automatic reset on, so this is a
   // deliberate manual "everyone's back to full movement" GM action.
-  document.getElementById('resetAllMovementBtn').addEventListener('click', () => send({ type: 'token:move:resetAll' }));
+  document.getElementById('resetAllMovementBtn').addEventListener('click', () => { send({ type: 'token:move:resetAll' }); void resetAllTurns(); });
 
   wireMarkerForm();
 
@@ -4679,6 +4975,8 @@ tokenManagerList.addEventListener('click', (e) => {
     adjustTokenSpeedRemaining(tokenId, 5);
   } else if (e.target.classList.contains('speedResetBtn')) {
     resetTokenSpeedRemaining(tokenId);
+  } else if (e.target.classList.contains('speedDashBtn')) {
+    dashButtonClicked(tokenId);
   }
 });
 
@@ -4773,8 +5071,10 @@ function ownTokenListHtml(tokens) {
             <button class="secondary speedMinusBtn">−5 ft</button>
             <button class="secondary speedPlusBtn">+5 ft</button>
             <button class="secondary speedResetBtn">Reset move</button>
+            ${dashButtonHtml(t)}
             <button class="secondary planMoveBtn" title="Lay out a path, then Move or Cancel">Plan move</button>
           </div>
+          ${turnChipsHtml(t)}
           <div class="field">${conditionTagsHtml(t.conditions)}</div>
           `}
           <div class="actions">
@@ -4894,7 +5194,7 @@ function openSpellPicker(tokenId, clickedLevel, intent = 'attack') {
           return `
         <div class="mini-sheet-action spell-picker-row" data-spell-id="${escapeHtml(s.id)}" data-spell-name="${escapeHtml(s.name)}">
           <span>${escapeHtml(s.name)}</span>
-          <span style="color:#aaa;">${levelHtml}</span>
+          <span style="color:#aaa;">${levelHtml}${s.costText ? ` · <span class="spell-picker-cost">${escapeHtml(s.costText)}</span>` : ''}</span>
         </div>
       `;
         })
@@ -4972,7 +5272,7 @@ function renderCombatActionsBody() {
           (a) => `
         <div class="mini-sheet-action" data-action-name="${escapeHtml(a.name)}">
           <span>${escapeHtml(a.name)}</span>
-          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${a.damageRolls || ''}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
+          <span style="color:#aaa;">${signedVtt(a.toHitBonus)} to hit, ${escapeHtml(a.damageRolls || '')}${a.damageRolls && a.damageBonus ? ' ' : ''}${a.damageBonus ? signedVtt(a.damageBonus) : ''}</span>
           <span class="row-chevron">›</span>
         </div>
       `
@@ -4990,8 +5290,10 @@ function renderCombatActionsBody() {
   // plain label sitting next to Use/Reset buttons was easy to miss entirely.
   const slotsHtml = (token.spellSlots || []).length
     ? (token.spellSlots || [])
-        .map(
-          (s) => `
+        .map((slot) => {
+          // Token fields are client-written, so numbers are coerced (never interpolated raw).
+          const s = { type: slot.type, level: Number(slot.level) || 0, current: Number(slot.current) || 0, max: Number(slot.max) || 0 };
+          return `
         <div class="mini-sheet-slot" data-slot-type="${escapeHtml(s.type)}" data-slot-level="${s.level}">
           <span class="mini-sheet-slot-label">${s.type === 'pact' ? 'Pact' : 'Level'} ${s.level}: ${s.current}/${s.max}</span>
           <div class="mini-sheet-slot-actions">
@@ -5000,8 +5302,8 @@ function renderCombatActionsBody() {
             <button type="button" class="secondary slotResetBtn">Reset</button>
           </div>
         </div>
-      `
-        )
+      `;
+        })
         .join('')
     : '';
 
@@ -5017,12 +5319,51 @@ function renderCombatActionsBody() {
     `
     : '';
 
+  // Resource pools (Soulfire, Vowfire...). Always the database value: -/+ post to the pool route, which
+  // clamps and logs it, and the answer replaces the token's display copy. The token cannot be edited by hand.
+  const poolsHtml = (token.pools || [])
+    .map((pool) => {
+      // The numbers are coerced and the disabled flags come from the coerced numbers, never the raw fields.
+      const current = Number(pool.current) || 0;
+      const max = Number(pool.max) || 0;
+      return `
+        <div class="mini-sheet-slot mini-sheet-pool" data-pool-key="${escapeHtml(pool.key)}">
+          <span class="mini-sheet-slot-label">${escapeHtml(pool.label)}: ${current}/${max}</span>
+          <div class="mini-sheet-slot-actions">
+            <button type="button" class="secondary poolMinusBtn" ${current <= 0 ? 'disabled' : ''} aria-label="Spend one ${escapeHtml(pool.label)}">-</button>
+            <button type="button" class="secondary poolPlusBtn" ${current >= max ? 'disabled' : ''} aria-label="Regain one ${escapeHtml(pool.label)}">+</button>
+          </div>
+        </div>`;
+    })
+    .join('');
+
+  // This turn's actions (action economy). Always the database value: -/+ post to the turn route and the answer
+  // replaces the token's display copy. Labels come from the campaign's profile. Numbers are coerced, never raw.
+  const turnRowsHtml = (token.turn?.pools || [])
+    .map((pool) => {
+      const current = Number(pool.current) || 0;
+      const max = Number(pool.max) || 0;
+      return `
+        <div class="mini-sheet-slot mini-sheet-turn" data-turn-key="${escapeHtml(pool.key)}">
+          <span class="mini-sheet-slot-label">${escapeHtml(pool.label)}: ${current}/${max}</span>
+          <div class="mini-sheet-slot-actions">
+            <button type="button" class="secondary turnMinusBtn" ${current <= 0 ? 'disabled' : ''} aria-label="Spend one ${escapeHtml(pool.label)}">-</button>
+            <button type="button" class="secondary turnPlusBtn" ${current >= max ? 'disabled' : ''} aria-label="Regain one ${escapeHtml(pool.label)}">+</button>
+          </div>
+        </div>`;
+    })
+    .join('');
+  const turnFollowupsHtml = (token.turn?.followups || [])
+    .filter((entry) => Number(entry.remaining) > 0)
+    .map((entry) => `<div class="mini-sheet-slot"><span class="mini-sheet-slot-label">${escapeHtml(entry.label)}: ${Number(entry.remaining) || 0} left</span></div>`)
+    .join('');
+
   const itemsHtml = (token.items || []).length
     ? (token.items || [])
         .map(
           (item) => `
         <div class="mini-sheet-action" data-item-id="${escapeHtml(item.id)}" data-item-name="${escapeHtml(item.name)}">
-          <span>${escapeHtml(item.name)} <span style="color:#666;">×${item.quantity}</span></span>
+          <span>${escapeHtml(item.name)} <span style="color:#666;">×${Number(item.quantity) || 0}</span></span>
           <span style="color:#aaa;">${escapeHtml(item.damageRolls || '')}</span>
           <span class="row-chevron">›</span>
         </div>
@@ -5032,11 +5373,47 @@ function renderCombatActionsBody() {
     : '';
 
   combatActionsBody.innerHTML = `
+    ${turnRowsHtml ? `<label class="combat-actions-heading">Actions this turn</label>${turnRowsHtml}${turnFollowupsHtml}` : ''}
     <label class="combat-actions-heading">Weapons</label>
     ${actionsHtml}
     ${(cantripsHtml || slotsHtml) ? `<label class="combat-actions-heading">Spells</label>${cantripsHtml}${slotsHtml}` : ''}
+    ${poolsHtml ? `<label class="combat-actions-heading">Resources</label>${poolsHtml}` : ''}
     ${itemsHtml ? `<label class="combat-actions-heading">Items</label>${itemsHtml}` : ''}
   `;
+
+  combatActionsBody.querySelectorAll('.turnMinusBtn, .turnPlusBtn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const key = btn.closest('.mini-sheet-turn')?.dataset.turnKey;
+      if (!key || !token.characterId) return;
+      combatActionsBody.querySelectorAll('.turnMinusBtn, .turnPlusBtn').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await fetch('/vtt/api/characters/' + token.characterId + '/turn', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'adjust', key, delta: btn.classList.contains('turnMinusBtn') ? -1 : 1 }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok && body.turn) { token.turn = body.turn; send({ type: 'token:stat:update', tokenId, stat: 'turn', value: body.turn }); }
+      } catch { /* the buttons come back on the next render */ }
+      if (combatActionsState && combatActionsModal.classList.contains('visible')) renderCombatActionsBody();
+    });
+  });
+
+  combatActionsBody.querySelectorAll('.poolMinusBtn, .poolPlusBtn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const key = btn.closest('.mini-sheet-pool')?.dataset.poolKey;
+      if (!key || !token.characterId) return;
+      combatActionsBody.querySelectorAll('.poolMinusBtn, .poolPlusBtn').forEach((b) => { b.disabled = true; });
+      try {
+        const res = await fetch('/vtt/api/characters/' + token.characterId + '/pool', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, delta: btn.classList.contains('poolMinusBtn') ? -1 : 1 }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok && Array.isArray(body.pools)) { token.pools = body.pools; send({ type: 'token:stat:update', tokenId, stat: 'pools', value: body.pools }); }
+      } catch { /* the buttons come back on the next render */ }
+      if (combatActionsState && combatActionsModal.classList.contains('visible')) renderCombatActionsBody();
+    });
+  });
 
   combatActionsBody.querySelectorAll('.mini-sheet-action[data-action-name]').forEach((row) => {
     row.addEventListener('click', () => {
@@ -5135,6 +5512,8 @@ function wirePlayerSidebar() {
       adjustTokenSpeedRemaining(tokenId, 5);
     } else if (e.target.classList.contains('speedResetBtn')) {
       resetTokenSpeedRemaining(tokenId);
+    } else if (e.target.classList.contains('speedDashBtn')) {
+      dashButtonClicked(tokenId);
     } else if (e.target.classList.contains('combatActionsBtn')) {
       openCombatActionsModal(tokenId);
     }
@@ -5178,6 +5557,15 @@ const campaignClient = createCampaignClient({
   },
 });
 campaignClient.start();
+
+const costApproval = createCostApproval({
+  getSession: () => session,
+  getRole: () => role,
+  getSessionId: () => sessionId,
+  attackModalBody,
+  closeAttackModal,
+  escapeHtml,
+});
 
 const forage = createForage({
   getSession: () => session,

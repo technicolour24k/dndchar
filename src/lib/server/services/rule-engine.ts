@@ -21,11 +21,13 @@ type ModifierRow = {
   container_key: string | null;
 };
 
-export async function resolveCharacterModifierSources(characterId: string): Promise<{
+// `db` lets a caller inside a transaction read on its own client instead of taking a second pool
+// connection (which could starve the pool under concurrent activations).
+export async function resolveCharacterModifierSources(characterId: string, db: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> } = { query }): Promise<{
   sources: ActiveCharacterEffect[];
   audit: ResolvedModifier[];
 }> {
-  const result = await query<ModifierRow>(`
+  const result: { rows: ModifierRow[] } = await db.query(`
     WITH modifier_rows AS (
       -- Branch 1a: active effects resolved via unified Container (container_id path)
       SELECT active.id::text AS source_id, 'effect'::text AS source_type,
@@ -46,22 +48,6 @@ export async function resolveCharacterModifierSources(characterId: string): Prom
       JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
       LEFT JOIN modifier_targets hook ON hook.target_key = modifier.target
       WHERE active.character_id = $1
-
-      UNION ALL
-
-      -- Branch 1b: active effects legacy path (rows not yet back-filled with container_id)
-      SELECT active.id::text, 'effect', effect.name,
-        COALESCE(effect.description, ''), link.id::text, modifier.id::text,
-        modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
-        COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
-        COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
-      FROM active_character_effects active
-      JOIN effect_definitions effect ON effect.id = active.effect_id
-      JOIN effect_modifier_links link ON link.effect_id = effect.id
-      JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
-      LEFT JOIN modifier_targets hook ON hook.target_key = modifier.target
-      WHERE active.character_id = $1 AND active.container_id IS NULL
 
       UNION ALL
 

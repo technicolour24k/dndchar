@@ -12,6 +12,8 @@ export type Campaign = {
   createdByUserId: string | null;
   isArchived: boolean;
   createdAt: string;
+  /** The built-in action-economy profile the campaign plays by (src/lib/rules/actionEconomy.ts). */
+  actionEconomy: import('$lib/types/actionEconomy').ProfileKey;
 };
 
 export type CampaignMember = {

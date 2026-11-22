@@ -17,7 +17,8 @@ const enabled = process.env.CAMPAIGN_DB_TEST === '1';
 
 vi.mock('$lib/server/overworldNotify', () => ({
   notifyOverworldChanged: vi.fn(),
-  notifyMapGranted: vi.fn()
+  notifyMapGranted: vi.fn(),
+  dropMapPreviews: vi.fn()
 }));
 
 const { query } = await import('$lib/server/db');
@@ -127,6 +128,9 @@ describe.skipIf(!enabled)('overworld against the local dev DB', () => {
     expect((await overworld.listMapsForViewer(u('p1'), C))?.maps).toEqual([]);
     expect((await overworld.listMapsForViewer(u('codm'), C))?.maps.map((m) => m.id)).toEqual([mapId]);
     expect(await overworld.getMapImageForViewer(u('p1'), C, mapId, firstFile)).toBeNull();
+    // Live preview ticket gate: same rule as seeing the map (ungranted = DMs only).
+    expect(await overworld.getLivePreviewAccess(u('p1'), C, mapId)).toBeNull();
+    expect(await overworld.getLivePreviewAccess(u('codm'), C, mapId)).toEqual({ isDm: true });
 
     const before = await filesIn(C);
     await expectCode(overworld.createMap(u('p1'), C, { name: 'Nope', milesAcross: null }, await image()), 'forbidden');
@@ -137,6 +141,7 @@ describe.skipIf(!enabled)('overworld against the local dev DB', () => {
     expect((await overworld.listMapsForViewer(u('p1'), C))?.maps.map((m) => m.id)).toEqual([mapId]);
     expect(await overworld.getMapImageForViewer(u('p1'), C, mapId, firstFile)).toBe(path.join(dirFor(C), firstFile));
     expect(await overworld.getMapImageForViewer(u('p1'), C, mapId, 'other.png')).toBeNull();
+    expect(await overworld.getLivePreviewAccess(u('p1'), C, mapId)).toEqual({ isDm: false });
     await expectCode(overworld.updateMap(u('p1'), C, mapId, { name: 'x', milesAcross: null }), 'forbidden');
     await expectCode(overworld.setMapGranted(u('p1'), C, mapId, false), 'forbidden');
     await expectCode(overworld.archiveMap(u('p1'), C, mapId), 'forbidden');
@@ -147,6 +152,7 @@ describe.skipIf(!enabled)('overworld against the local dev DB', () => {
       expect(await overworld.listMapsForViewer(u(key), C)).toBeNull();
       expect(await overworld.getMapView(u(key), C, mapId)).toBeNull();
       expect(await overworld.getMapImageForViewer(u(key), C, mapId, firstFile)).toBeNull();
+      expect(await overworld.getLivePreviewAccess(u(key), C, mapId)).toBeNull();
       await expectCode(overworld.createMap(u(key), C, { name: 'x', milesAcross: null }, await image()), 'not_found');
       await expectCode(overworld.createPin(u(key), C, mapId, { x: 0.5, y: 0.5 }), 'not_found');
       await expectCode(overworld.setMapGranted(u(key), C, mapId, false), 'not_found');

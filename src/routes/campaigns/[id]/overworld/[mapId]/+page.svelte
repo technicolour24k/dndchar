@@ -11,6 +11,7 @@
   import RoutePanel from '$lib/components/overworld/RoutePanel.svelte';
   import { formatDistance, legMiles, milesAcrossFromCalibration, nearestLeg, routeMiles } from '$lib/overworld/geometry';
   import { COLOURS, DEFAULT_PIN_COLOUR, DEFAULT_PIN_ICON, ICONS, PARTY_GLYPH, type OverworldColour, type OverworldIcon } from '$lib/overworld/palette';
+  import { createLiveChannel, type RemotePreview } from '$lib/overworld/liveChannel';
   import { subscribeTopic } from '$lib/stores/liveUpdates';
   import type { OverworldVisibility, PinDraft, Pt } from '$lib/types/overworld';
 
@@ -110,7 +111,7 @@
     points: Pt[];
     hover: Pt | null;
     // Continuing a saved route: points[0] is its current end.
-    continueOf: { routeId: string; colour: OverworldColour } | null;
+    continueOf: { routeId: string; colour: OverworldColour; visibility: OverworldVisibility } | null;
   };
   const SAME_POINT = 1e-6;
   const VIS_KEY = 'overworld-route-visibility';
@@ -312,8 +313,9 @@
     const end = selectedRoute.legs[selectedRoute.legs.length - 1];
     const routeId = selectedRoute.id;
     const colour = selectedRoute.colour;
+    const visibility = selectedRoute.visibility;
     selectedLeg = null;
-    trace = { mode: 'route', points: [{ x: end.x2, y: end.y2 }], hover: null, continueOf: { routeId, colour } };
+    trace = { mode: 'route', points: [{ x: end.x2, y: end.y2 }], hover: null, continueOf: { routeId, colour, visibility } };
   }
 
   // ---- Map taps ----
@@ -457,6 +459,51 @@
     };
   });
 
+  // ---- Live route preview (Unit G) ----
+  // While tracing a route, the in-progress points are relayed to other viewers of this map (nothing is
+  // stored); their previews arrive here and are drawn as a faint dashed line. The channel only lives
+  // while this page does, and the server clears a preview on save/cancel/disconnect/timeout.
+  let remotePreviews = $state<Record<string, RemotePreview>>({});
+  let live: ReturnType<typeof createLiveChannel> | null = null;
+  let liveReady = $state(0); // bumped on every (re)join so the effect below resends the current trace
+  $effect(() => {
+    const channel = createLiveChannel({
+      campaignId: data.campaignId,
+      mapId: map.id,
+      onPreview: (p) => (remotePreviews = { ...remotePreviews, [p.previewId]: p }),
+      onClear: (id) => {
+        const { [id]: _gone, ...rest } = remotePreviews;
+        remotePreviews = rest;
+      },
+      onReset: () => (remotePreviews = {}),
+      onReady: () => (liveReady += 1)
+    });
+    live = channel;
+    return () => {
+      live = null;
+      channel.close();
+      remotePreviews = {};
+    };
+  });
+  $effect(() => {
+    void liveReady;
+    if (trace && trace.mode === 'route' && trace.points.length > 0) {
+      live?.preview({
+        points: trace.points.map((p) => ({ x: p.x, y: p.y })),
+        visibility: trace.continueOf ? trace.continueOf.visibility : routeVisibility,
+        colour: trace.continueOf ? COLOURS[trace.continueOf.colour].hex : '#ffffff'
+      });
+    } else {
+      live?.clear();
+    }
+  });
+  const previews = $derived(
+    Object.values(remotePreviews).map((p) => {
+      const miles = formatDistance(routeMiles(legsOf(p.points), dims, map.milesAcross));
+      return { id: p.previewId, points: p.points, label: `${p.drawerName} is drawing${miles ? ' - ' + miles : ''}` };
+    })
+  );
+
   const placing = $derived(mode.type === 'place' || mode.type === 'move');
   const banner = $derived(
     mode.type === 'place'
@@ -546,6 +593,7 @@
         <RouteLayer
           routes={view.routes}
           {toScreen}
+          {previews}
           selectedRouteId={selectedLeg?.routeId ?? null}
           selectedLegId={selectedLeg?.legId ?? null}
           tracing={trace

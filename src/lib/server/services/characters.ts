@@ -9,6 +9,9 @@ import { getActiveEncounterForCharacter } from '$lib/server/services/encounters'
 import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
+import { costSummary, parseCostJson } from '$lib/rules/cost';
+import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
+import { characterProfile, getTurnView } from '$lib/server/services/turn-state';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -235,12 +238,23 @@ export async function createCharacter(userId: string, name: string): Promise<str
 async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> {
   const characterId = row.id;
   const resolvedModifiers = await resolveCharacterModifierSources(characterId);
+  const classes = await getClasses(characterId);
+  const abilities = await getAbilities(characterId);
+  const poolDefinitions = await listPoolDefinitions({ includeArchived: true });
+  const poolLabels = Object.fromEntries(poolDefinitions.map((pool) => [pool.key, pool.label]));
+  const poolCtx = poolContextFor(classes, abilities, row.metadata_json);
+  const pools = await getCharacterPools({ query }, characterId, poolDefinitions, resolvedModifiers.sources, poolCtx);
+  // Reuses the sources and context already loaded above, so the turn view costs the profile and turn-row queries only.
+  const turn = await getTurnView({ query }, characterId, { profile: await characterProfile({ query }, characterId), sources: resolvedModifiers.sources, ctx: poolCtx });
 
   return mapCharacterRow(row, {
-    classes: await getClasses(characterId),
-    abilities: await getAbilities(characterId),
+    classes,
+    abilities,
+    pools,
+    turn,
+    actionEconomy: turn.profileKey,
     resources: await getResources(characterId),
-    inventory: await getInventory(characterId),
+    inventory: await getInventory(characterId, poolLabels, turn.profileKey),
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId),
     proficiencies: await getProficiencies(characterId),
@@ -249,7 +263,7 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
     modifierAudit: resolvedModifiers.audit,
     availableEffects: await listEffectDefinitions(),
     exhaustionLevel: await getExhaustionLevel(characterId),
-    content: await listCharacterContent(characterId),
+    content: await listCharacterContent(characterId, poolLabels, turn.profileKey),
     spellSlots: await listSpellSlots(characterId),
     combatClock: await getCombatClock(characterId)
   });
@@ -412,7 +426,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
 
     await replaceClasses(client, characterId, parseClasses(form));
     await replaceAbilities(client, characterId, parseAbilities(form));
-    await replaceResources(client, characterId, resources);
+    await replaceSheetResources(client, characterId, resources);
     // Changes only when the sheet sent its loaded baseline (see saveInventoryChanges); otherwise the
     // old full replace.
     const inventoryBaseline = parseInventoryBaseline(form);
@@ -519,13 +533,13 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const proficiencies = await client.query('SELECT proficiency_type, proficiency_key FROM character_proficiencies WHERE character_id = $1 ORDER BY proficiency_type, proficiency_key', [characterId]);
   const activeEffects = await client.query(
     `
-      SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json,
+      SELECT regexp_replace(cd.content_key, '^condition:', '') AS effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json,
         active_character_effects.source_content_instance_id, active_character_effects.expiry_boundary,
         active_character_effects.application_key,active_character_effects.source_key
       FROM active_character_effects
-      JOIN effect_definitions ON effect_definitions.id = active_character_effects.effect_id
+      JOIN content_definitions cd ON cd.id = active_character_effects.container_id
       WHERE active_character_effects.character_id = $1
-      ORDER BY effect_definitions.sort_order, effect_definitions.name
+      ORDER BY CASE WHEN cd.metadata_json->>'sortOrder' ~ '^-?[0-9]{1,9}$' THEN (cd.metadata_json->>'sortOrder')::int END NULLS LAST, cd.name
     `,
     [characterId]
   );
@@ -691,12 +705,11 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
   await restoreStructuredContent(client, characterId, snapshot);
   await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
   for (const row of snapshot.active_effects ?? []) {
-    await client.query(`INSERT INTO active_character_effects(character_id,effect_id,container_id,remaining_rounds,metadata_json,
+    await client.query(`INSERT INTO active_character_effects(character_id,container_id,remaining_rounds,metadata_json,
       source_content_instance_id,expiry_boundary,application_key,source_key)
-      SELECT $1,effect.id,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
-      FROM effect_definitions effect
-      LEFT JOIN content_definitions cd ON cd.content_key='condition:'||effect.effect_key AND cd.content_type='condition'
-      WHERE effect.effect_key=$8`,
+      SELECT $1,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
+      FROM content_definitions cd
+      WHERE cd.content_type='condition' AND cd.content_key='condition:'||$8`,
       [characterId,row.remaining_rounds??null,JSON.stringify(row.metadata_json||{}),row.source_content_instance_id||null,
         row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,row.effect_key]);
   }
@@ -753,7 +766,8 @@ async function getAbilities(characterId: string): Promise<CharacterAbility[]> {
 
 async function getResources(characterId: string): Promise<CharacterResource[]> {
   const result = await query<{ resource_key: string; label: string; current_value: number; max_value: number }>(
-    'SELECT resource_key, label, current_value, max_value FROM character_resources WHERE character_id = $1 ORDER BY sort_order ASC',
+    // pool:* rows (character resource pools) are not sheet fields: they load as detail.pools.
+    `SELECT resource_key, label, current_value, max_value FROM character_resources WHERE character_id = $1 AND resource_key NOT LIKE 'pool:%' ORDER BY sort_order ASC`,
     [characterId]
   );
   return result.rows.map((row) => ({
@@ -764,7 +778,7 @@ async function getResources(characterId: string): Promise<CharacterResource[]> {
   }));
 }
 
-async function getInventory(characterId: string): Promise<InventoryItem[]> {
+async function getInventory(characterId: string, knownPoolLabels?: Record<string, string>, profileKey?: string): Promise<InventoryItem[]> {
   const result = await query<{
     id: string;
     name: string;
@@ -789,7 +803,9 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     effects: string;
     source_content_id: string | null;
     attuned: boolean;
-  }>('SELECT * FROM character_inventory_items WHERE character_id = $1 ORDER BY sort_order ASC', [characterId]);
+    source_cost_json: unknown;
+  }>('SELECT i.*, c.cost_json AS source_cost_json FROM character_inventory_items i LEFT JOIN content_definitions c ON c.id = i.source_content_id WHERE i.character_id = $1 ORDER BY i.sort_order ASC', [characterId]);
+  const poolLabels = knownPoolLabels ?? Object.fromEntries((await listPoolDefinitions({ includeArchived: true })).map((pool) => [pool.key, pool.label]));
   const resources=await query<any>(`SELECT resource.id,resource.inventory_item_id,definition.resource_key,definition.label,
     definition.recharge_period,resource.current_value,resource.max_value FROM character_inventory_resources resource
     JOIN content_resource_definitions definition ON definition.id=resource.resource_definition_id
@@ -809,6 +825,8 @@ async function getInventory(characterId: string): Promise<InventoryItem[]> {
     proficient: row.proficient ?? true,
     sourceContentId: row.source_content_id,
     attuned: row.attuned,
+    // Only an explicit cost shows (the default item cost, one of itself, would be noise).
+    costSummary: (() => { const parsed = parseCostJson(row.source_cost_json, { stored: true }); return parsed.entries?.length ? costSummary(parsed.entries, poolLabels, profileKey) : undefined; })(),
     damageRolls: row.damage_rolls,
     effects: row.effects,
     abilityBonuses: {
@@ -894,9 +912,8 @@ async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDe
   }>(
     `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
       cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
-      COALESCE(ed.is_condition, false) AS is_condition
+      COALESCE(cd.metadata_json->>'isCondition', 'false') = 'true' AS is_condition
      FROM content_definitions cd
-     LEFT JOIN effect_definitions ed ON cd.content_key = 'condition:' || ed.effect_key
      WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
      ORDER BY cd.name ASC`,
     [includeArchived]
@@ -1082,8 +1099,15 @@ async function replaceAbilities(client: pg.PoolClient, characterId: string, abil
   }
 }
 
-async function replaceResources(client: pg.PoolClient, characterId: string, resources: CharacterResource[]): Promise<void> {
-  await client.query('DELETE FROM character_resources WHERE character_id = $1', [characterId]);
+// The whole-sheet Save owns only hp / temp_hp / inspiration / hit_dice_N. It must leave the pool:*
+// rows (cost-engine resource pools) alone; creating a character and restoring a snapshot still use
+// the full replace below, because a restore SHOULD put pool quantities back.
+async function replaceSheetResources(client: pg.PoolClient, characterId: string, resources: CharacterResource[]): Promise<void> {
+  await replaceResources(client, characterId, resources, true);
+}
+
+async function replaceResources(client: pg.PoolClient, characterId: string, resources: CharacterResource[], keepPools = false): Promise<void> {
+  await client.query(`DELETE FROM character_resources WHERE character_id = $1${keepPools ? " AND resource_key NOT LIKE 'pool:%'" : ''}`, [characterId]);
   for (const [index, row] of resources.entries()) {
     const maxValue = Math.max(0, Number(row.maxValue) || 0);
     await client.query(
@@ -1284,12 +1308,14 @@ async function replaceProficiencies(
 async function replaceActiveEffects(client: pg.PoolClient, characterId: string, effectKeys: string[]): Promise<void> {
   const uniqueKeys = [...new Set(effectKeys.map((key) => key.trim()).filter(Boolean))];
   await client.query(`DELETE FROM active_character_effects active WHERE character_id=$1
-    AND NOT EXISTS (SELECT 1 FROM effect_definitions effect WHERE effect.id=active.effect_id AND effect.effect_key=ANY($2::text[]))`,
-    [characterId, uniqueKeys]);
+    AND NOT EXISTS (SELECT 1 FROM content_definitions cd WHERE cd.id=active.container_id AND cd.content_type='condition'
+      AND cd.content_key=ANY($2::text[]))`,
+    [characterId, uniqueKeys.map((key) => 'condition:' + key)]);
   for (const key of uniqueKeys) {
-    const effect=await client.query<{id:string}>('SELECT id FROM effect_definitions WHERE effect_key=$1 AND is_archived=false',[key]);
+    const effect=await client.query<{id:string}>(`SELECT id FROM content_definitions WHERE content_type='condition'
+      AND content_key='condition:'||$1 AND is_archived=false`,[key]);
     if(effect.rowCount){
-      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND effect_id=$2',[characterId,effect.rows[0].id]);
+      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND container_id=$2',[characterId,effect.rows[0].id]);
       if(!active.rowCount)await applyCharacterEffect(client,characterId,effect.rows[0].id);
     }
   }

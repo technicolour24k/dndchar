@@ -106,6 +106,9 @@ export type CharacterContentInstance = {
   spellAccessId?: string;
   inventoryItemId?: string;
   hasResourceActions?: boolean;
+  // What activating this costs (entries drive the Cast dialog, summary the muted chip). Grants carry
+  // a summary only (they run no activation).
+  cost?: { entries: import('$lib/types/cost').CostEntry[]; summary: string };
   resources: Array<ContentResourceDefinition & { currentValue: number; maxValue: number }>;
 };
 
