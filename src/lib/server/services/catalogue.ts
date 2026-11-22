@@ -1,4 +1,5 @@
 import type pg from 'pg';
+import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/services/action-containers';
 import { query, withTransaction } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
@@ -190,31 +191,17 @@ export async function attachEffectToOwnedContent(userId: string, form: FormData)
   if (String(form.get('activationType') || 'manual') === 'on_use') {
     await withTransaction(async (client) => {
       const content = await client.query<any>('SELECT name, owner_user_id FROM content_definitions WHERE id=$1', [contentId]);
-      const actionKey = `content:${contentId}:on_use`;
-      const actionName = `Use ${content.rows[0].name}`;
-      const actionDesc = `Actions for ${content.rows[0].name}`;
-      // Legacy write: action_definitions.
-      const action = await client.query<{ id: string }>(`INSERT INTO action_definitions(action_key,name,description,owner_user_id)
-        VALUES($1,$2,$3,$4) ON CONFLICT(action_key) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
-        [actionKey, actionName, actionDesc, content.rows[0].owner_user_id]);
-      // Unified Container write: content_definitions as type='action'.
-      const actionContainer = await client.query<{ id: string }>(`INSERT INTO content_definitions(content_key,content_type,name,description,source_kind,owner_user_id,activation_type)
-        VALUES($1,'action',$2,$3,'homebrew',$4,'active_use')
-        ON CONFLICT DO NOTHING RETURNING id`,
-        [actionKey, actionName, actionDesc, content.rows[0].owner_user_id]);
-      const actionContainerId = actionContainer.rows[0]?.id ?? null;
-      // Link action to content (legacy action_id path + new action_container_id path).
-      await client.query(`INSERT INTO content_action_links(content_id,action_id,action_container_id,trigger_type)
-        VALUES($1,$2,$3,'on_use') ON CONFLICT(content_id,action_id,trigger_type) DO UPDATE SET action_container_id=EXCLUDED.action_container_id`,
-        [contentId, action.rows[0].id, actionContainerId]);
+      const actionContainerId = await findOrCreateActionContainer(client, contentId, 'on_use', `Use ${content.rows[0].name}`,
+        `Actions for ${content.rows[0].name}`, content.rows[0].owner_user_id);
+      await linkActionContainer(client, contentId, actionContainerId, 'on_use');
       const effectId = String(form.get('effectId') || '');
-      // effectId is the condition container id; the step carries it as effect_container_id (effect_id stays NULL).
-      await client.query(`INSERT INTO action_steps(action_id,container_id,step_type,operation,effect_container_id,label,sort_order)
-        SELECT $1,$3,'apply_effect','apply',effect.id,effect.name,
-          COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE action_id=$1),0)
+      // effectId is the condition container id; the step carries it as effect_container_id.
+      await client.query(`INSERT INTO action_steps(container_id,step_type,operation,effect_container_id,label,sort_order)
+        SELECT $1,'apply_effect','apply',effect.id,effect.name,
+          COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE container_id=$1),0)
         FROM content_definitions effect WHERE effect.id=$2 AND effect.content_type='condition'
-          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE action_id=$1 AND step_type='apply_effect' AND effect_container_id=$2)`,
-        [action.rows[0].id, effectId, actionContainerId]);
+          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE container_id=$1 AND step_type='apply_effect' AND effect_container_id=$2)`,
+        [actionContainerId, effectId]);
     });
     invalidateReferenceData('attachEffectToOwnedContent');
     return;
@@ -480,7 +467,7 @@ export async function useInventoryCatalogueItem(userId: string, characterId: str
       await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1', [inventoryId]);
       return [];
     }
-    const hasSpendStep=await client.query(`SELECT 1 FROM content_action_links link JOIN action_steps step ON step.action_id=link.action_id
+    const hasSpendStep=await client.query(`SELECT 1 FROM content_action_links link JOIN action_steps step ON step.container_id=link.action_container_id
       WHERE link.content_id=$1 AND link.trigger_type='on_use' AND step.step_type='spend_item' LIMIT 1`,[item.rows[0].source_content_id]);
     if(!hasSpendStep.rowCount)await client.query('UPDATE character_inventory_items SET quantity=quantity-1 WHERE id=$1',[inventoryId]);
     const results=await executeContentActions(client,characterId,item.rows[0].source_content_id,['on_use'],{inventoryId});

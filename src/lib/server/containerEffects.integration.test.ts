@@ -177,7 +177,7 @@ describe.skipIf(!enabled)('active effects on containers', () => {
       // on_use attach writes an action step carrying effect_container_id; using the item applies the condition.
       await attachEffectToAdminContent(form({ contentId: itemId, effectId: conditionId, activationType: 'on_use' }));
       const step = (await query<any>(`SELECT s.effect_id, s.effect_container_id FROM action_steps s
-        JOIN content_action_links l ON l.action_id = s.action_id WHERE l.content_id=$1`, [itemId])).rows;
+        JOIN content_action_links l ON l.action_container_id = s.container_id WHERE l.content_id=$1`, [itemId])).rows;
       expect(step).toEqual([{ effect_id: null, effect_container_id: conditionId }]);
       const results = await withTransaction((client) => executeContentActions(client, characterId, itemId, ['on_use'], { inventoryId: inv }));
       expect(results[0].detail).toBe('applied');
@@ -185,7 +185,7 @@ describe.skipIf(!enabled)('active effects on containers', () => {
     } finally {
       await query(`DELETE FROM users WHERE id = $1`, [userId]);
       await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`it:${tag}`]); // cascades its action links
-      if (itemId) await query(`DELETE FROM action_definitions WHERE action_key = $1`, [`content:${itemId}:on_use`]);
+      if (itemId) await query(`DELETE FROM content_definitions WHERE content_type='action' AND content_key = $1`, [`action:content:${itemId}:on_use`]);
       await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`condition:${tag}`]);
     }
   });
@@ -246,6 +246,69 @@ describe.skipIf(!enabled)('active effects on containers', () => {
       await query(`DELETE FROM users WHERE id = $1`, [userId]);
       await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`it:${tag}`]);
       if (id) await query(`DELETE FROM content_definitions WHERE id = $1`, [id]);
+    }
+  });
+  it('writes actions as containers: admin step, use, spend_item and no duplicate attach', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, '')) || target.searchParams.has('host')) {
+      throw new Error('Refusing to run: database is not local.');
+    }
+    const { query } = await import('$lib/server/db');
+    const { createCharacter } = await import('./services/characters');
+    const { useInventoryCatalogueItem } = await import('./services/catalogue');
+    const { addContentResourceAction, attachActionToContent, attachEffectToAdminContent } = await import('./services/content-admin');
+    const tag = `zzact${crypto.randomBytes(4).toString('hex')}`;
+    const form = (values: Record<string, string>) => { const f = new FormData(); for (const [k, v] of Object.entries(values)) f.set(k, v); return f; };
+    const userId = (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Actions', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    const actionKeys: string[] = [];
+    const itemKeys = [`it:${tag}a`, `it:${tag}b`];
+    try {
+      const characterId = await createCharacter(userId, 'Actions');
+      const mkItem = async (key: string) => (await query<{ id: string }>(
+        `INSERT INTO content_definitions (content_key, content_type, name) VALUES ($1, 'item', $2) RETURNING id`, [key, `IT ${key}`])).rows[0].id;
+      const itemA = await mkItem(itemKeys[0]);
+      const itemB = await mkItem(itemKeys[1]);
+      actionKeys.push(`action:content:${itemA}:on_use`);
+      const inv = (await query<{ id: string }>(
+        `INSERT INTO character_inventory_items (character_id, name, category, quantity, source_content_id)
+         VALUES ($1, 'IT Potion', 'gear', 3, $2) RETURNING id`, [characterId, itemA])).rows[0].id;
+
+      // Admin adds a spend_item step: container + link + step, no legacy rows.
+      await addContentResourceAction(form({ contentId: itemA, activationType: 'on_use', stepType: 'spend_item', valueExpression: '1', actionLabel: 'Drink' }));
+      const links = (await query<any>(`SELECT action_id, action_container_id FROM content_action_links WHERE content_id=$1`, [itemA])).rows;
+      expect(links).toHaveLength(1);
+      expect(links[0].action_id).toBeNull();
+      const container = links[0].action_container_id as string;
+      expect((await query<any>(`SELECT content_key FROM content_definitions WHERE id=$1`, [container])).rows[0].content_key).toBe(`action:content:${itemA}:on_use`);
+      const steps = (await query<any>(`SELECT action_id, container_id, step_type FROM action_steps WHERE container_id=$1`, [container])).rows;
+      expect(steps).toEqual([{ action_id: null, container_id: container, step_type: 'spend_item' }]);
+      expect((await query(`SELECT 1 FROM action_definitions WHERE action_key LIKE $1`, [`%${itemA}%`])).rows).toHaveLength(0);
+
+      // A second step reuses the same container (no new action).
+      await addContentResourceAction(form({ contentId: itemA, activationType: 'on_use', stepType: 'resource_change', actionOperation: 'add', targetType: 'hp', targetKey: '', valueExpression: '1' }));
+      expect((await query(`SELECT 1 FROM content_action_links WHERE content_id=$1`, [itemA])).rows).toHaveLength(1);
+      expect((await query(`SELECT 1 FROM action_steps WHERE container_id=$1`, [container])).rows).toHaveLength(2);
+
+      // Using the item runs the steps, and spend_item suppresses the default decrement (3 -> 2, not 1).
+      await useInventoryCatalogueItem(userId, characterId, inv);
+      expect((await query<any>(`SELECT quantity FROM character_inventory_items WHERE id=$1`, [inv])).rows[0].quantity).toBe(2);
+
+      // Attaching the same action twice does not duplicate the link.
+      await attachActionToContent(form({ contentId: itemB, actionId: container, triggerType: 'on_use' }));
+      await attachActionToContent(form({ contentId: itemB, actionId: container, triggerType: 'on_use' }));
+      expect((await query(`SELECT 1 FROM content_action_links WHERE content_id=$1`, [itemB])).rows).toHaveLength(1);
+
+      // An on_use condition attach on the same item reuses the container and dedupes its step.
+      const conditionId = (await query<{ id: string }>(`SELECT id FROM content_definitions WHERE content_type='condition' AND NOT is_archived LIMIT 1`)).rows[0].id;
+      await attachEffectToAdminContent(form({ contentId: itemA, effectId: conditionId, activationType: 'on_use' }));
+      await attachEffectToAdminContent(form({ contentId: itemA, effectId: conditionId, activationType: 'on_use' }));
+      expect((await query(`SELECT 1 FROM content_action_links WHERE content_id=$1`, [itemA])).rows).toHaveLength(1);
+      expect((await query(`SELECT 1 FROM action_steps WHERE container_id=$1 AND step_type='apply_effect'`, [container])).rows).toHaveLength(1);
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE content_key = ANY($1::text[])`, [itemKeys]); // cascades links
+      await query(`DELETE FROM content_definitions WHERE content_type='action' AND content_key = ANY($1::text[])`, [actionKeys]);
     }
   });
 });

@@ -188,7 +188,7 @@ export async function attachEffectModifier(form: FormData) {
   const override=String(form.get('valueOverride')||'').trim();
   const condition=String(form.get('condition')||'').trim();
   const priority=Number(form.get('priority'))||0;
-  const result=await query(`INSERT INTO content_modifier_links(content_id,modifier_id,activation_type,value_override_expression,condition_expression,priority,sort_order)
+  await query(`INSERT INTO content_modifier_links(content_id,modifier_id,activation_type,value_override_expression,condition_expression,priority,sort_order)
     SELECT cd.id,$2,'carried',NULLIF($3,''),NULLIF($4,''),$5,$5 FROM content_definitions cd
     WHERE cd.id=$1 AND cd.content_type='condition' ON CONFLICT DO NOTHING`,[effectId,modifierId,override,condition,priority]);
   invalidateReferenceData('attachEffectModifier');

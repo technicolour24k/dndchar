@@ -180,7 +180,7 @@ Schema blockers: `active_character_effects.effect_id`, `action_steps.action_id` 
 | content-admin.ts:102 | W | detachEffectFromAdminContent deletes only `content_effect_links`, so the `content_grants` copy keeps applying (live bug) |
 | content-admin.ts:135 | R | groupActions maps `step.effect_id` |
 | effects.ts:15-58 | R/W | apply/removeCharacterEffect read `effect_definitions` and write/look up `active_character_effects.effect_id` (+ `container_id`) |
-| modifier-admin.ts:145-611 | R/W | Dead code (imported nowhere). Legacy tables throughout |
+| modifier-admin.ts:145-611 | R/W | Deleted in container migration Unit 4 (was dead code) |
 | rule-engine.ts:52-64 | R | Branch 1b legacy fallback |
 | rules-admin.ts:40, 49-50 | R | Modifier reference counts/lists over `effect_modifier_links`. Double-counts condition links |
 | rules-admin.ts:66-88 | R | loadEffects from `effect_definitions`/`effect_modifier_links`/`content_effect_links`. Misses the 032 container-only links |
