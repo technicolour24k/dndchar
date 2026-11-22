@@ -7,14 +7,18 @@ export type ActionResult = { label:string; target:string; expression:string; rol
 export async function executeContentActions(client:pg.PoolClient,characterId:string,contentId:string,triggers:string[],context:{inventoryId?:string;instanceId?:string}={}):Promise<ActionResult[]>{
   const rows=await client.query<any>(`
     WITH resolved AS (
-      SELECT link.sort_order AS link_order, container.name, step.*
+      SELECT link.sort_order AS link_order, container.name, step.*,
+        COALESCE(step.effect_container_id,(SELECT cd.id FROM effect_definitions ed JOIN content_definitions cd
+          ON cd.content_type='condition' AND cd.content_key='condition:'||ed.effect_key WHERE ed.id=step.effect_id)) AS resolved_effect_container_id
       FROM content_action_links link
       JOIN content_definitions container ON container.id=link.action_container_id
       JOIN action_steps step ON step.container_id=link.action_container_id
       WHERE link.content_id=$1 AND link.trigger_type=ANY($2::text[])
         AND container.is_archived=false AND link.action_container_id IS NOT NULL
       UNION ALL
-      SELECT link.sort_order, action.name, step.*
+      SELECT link.sort_order, action.name, step.*,
+        COALESCE(step.effect_container_id,(SELECT cd.id FROM effect_definitions ed JOIN content_definitions cd
+          ON cd.content_type='condition' AND cd.content_key='condition:'||ed.effect_key WHERE ed.id=step.effect_id)) AS resolved_effect_container_id
       FROM content_action_links link
       JOIN action_definitions action ON action.id=link.action_id
       JOIN action_steps step ON step.action_id=action.id
@@ -41,12 +45,12 @@ async function executeStep(client:pg.PoolClient,characterId:string,step:any,cont
     const result=await applyResourceChange(client,characterId,{...step,target_type:'hp',operation},amount);
     return result?[{...result,label,expression:step.value_expression,rolled:amount}]:[];
   }
-  if(step.step_type==='apply_effect'&&step.effect_id){
-    const applied=await applyCharacterEffect(client,characterId,step.effect_id,{sourceContentInstanceId:context.instanceId,sourceKey:context.inventoryId?`inventory:${context.inventoryId}`:null});
+  if(step.step_type==='apply_effect'&&step.resolved_effect_container_id){
+    const applied=await applyCharacterEffect(client,characterId,step.resolved_effect_container_id,{sourceContentInstanceId:context.instanceId,sourceKey:context.inventoryId?`inventory:${context.inventoryId}`:null});
     return[{label,target:applied.name,expression:'',rolled:0,before:null,after:null,detail:applied.status}];
   }
-  if(step.step_type==='remove_effect'&&step.effect_id){
-    const removed=await removeCharacterEffect(client,characterId,step.effect_id);
+  if(step.step_type==='remove_effect'&&step.resolved_effect_container_id){
+    const removed=await removeCharacterEffect(client,characterId,step.resolved_effect_container_id);
     return[{label,target:'Effect',expression:'',rolled:removed,before:null,after:null,detail:removed?'removed':'not active'}];
   }
   if(step.step_type==='spend_item'){

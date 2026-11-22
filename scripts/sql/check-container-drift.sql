@@ -43,6 +43,8 @@ UNION ALL SELECT 'conditions (info): content_modifier_links on conditions with n
              AND cml.priority = eml.priority))
 UNION ALL SELECT 'active effects: container_id IS NULL',
        (SELECT count(*) FROM active_character_effects WHERE container_id IS NULL)
+UNION ALL SELECT 'active effects: both effect_id and container_id NULL',
+       (SELECT count(*) FROM active_character_effects WHERE effect_id IS NULL AND container_id IS NULL)
 UNION ALL SELECT 'active effects: container_id disagrees with effect_id',
        (SELECT count(*) FROM active_character_effects ace JOIN cond ON cond.id = ace.effect_id
          WHERE ace.container_id IS DISTINCT FROM cond.container_id)

@@ -519,13 +519,13 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
   const proficiencies = await client.query('SELECT proficiency_type, proficiency_key FROM character_proficiencies WHERE character_id = $1 ORDER BY proficiency_type, proficiency_key', [characterId]);
   const activeEffects = await client.query(
     `
-      SELECT effect_definitions.effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json,
+      SELECT regexp_replace(cd.content_key, '^condition:', '') AS effect_key, active_character_effects.remaining_rounds, active_character_effects.metadata_json,
         active_character_effects.source_content_instance_id, active_character_effects.expiry_boundary,
         active_character_effects.application_key,active_character_effects.source_key
       FROM active_character_effects
-      JOIN effect_definitions ON effect_definitions.id = active_character_effects.effect_id
+      JOIN content_definitions cd ON cd.id = active_character_effects.container_id
       WHERE active_character_effects.character_id = $1
-      ORDER BY effect_definitions.sort_order, effect_definitions.name
+      ORDER BY CASE WHEN cd.metadata_json->>'sortOrder' ~ '^-?[0-9]{1,9}$' THEN (cd.metadata_json->>'sortOrder')::int END NULLS LAST, cd.name
     `,
     [characterId]
   );
@@ -691,12 +691,11 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
   await restoreStructuredContent(client, characterId, snapshot);
   await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
   for (const row of snapshot.active_effects ?? []) {
-    await client.query(`INSERT INTO active_character_effects(character_id,effect_id,container_id,remaining_rounds,metadata_json,
+    await client.query(`INSERT INTO active_character_effects(character_id,container_id,remaining_rounds,metadata_json,
       source_content_instance_id,expiry_boundary,application_key,source_key)
-      SELECT $1,effect.id,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
-      FROM effect_definitions effect
-      LEFT JOIN content_definitions cd ON cd.content_key='condition:'||effect.effect_key AND cd.content_type='condition'
-      WHERE effect.effect_key=$8`,
+      SELECT $1,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
+      FROM content_definitions cd
+      WHERE cd.content_type='condition' AND cd.content_key='condition:'||$8`,
       [characterId,row.remaining_rounds??null,JSON.stringify(row.metadata_json||{}),row.source_content_instance_id||null,
         row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,row.effect_key]);
   }
@@ -1284,12 +1283,14 @@ async function replaceProficiencies(
 async function replaceActiveEffects(client: pg.PoolClient, characterId: string, effectKeys: string[]): Promise<void> {
   const uniqueKeys = [...new Set(effectKeys.map((key) => key.trim()).filter(Boolean))];
   await client.query(`DELETE FROM active_character_effects active WHERE character_id=$1
-    AND NOT EXISTS (SELECT 1 FROM effect_definitions effect WHERE effect.id=active.effect_id AND effect.effect_key=ANY($2::text[]))`,
-    [characterId, uniqueKeys]);
+    AND NOT EXISTS (SELECT 1 FROM content_definitions cd WHERE cd.id=active.container_id AND cd.content_type='condition'
+      AND cd.content_key=ANY($2::text[]))`,
+    [characterId, uniqueKeys.map((key) => 'condition:' + key)]);
   for (const key of uniqueKeys) {
-    const effect=await client.query<{id:string}>('SELECT id FROM effect_definitions WHERE effect_key=$1 AND is_archived=false',[key]);
+    const effect=await client.query<{id:string}>(`SELECT id FROM content_definitions WHERE content_type='condition'
+      AND content_key='condition:'||$1 AND is_archived=false`,[key]);
     if(effect.rowCount){
-      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND effect_id=$2',[characterId,effect.rows[0].id]);
+      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND container_id=$2',[characterId,effect.rows[0].id]);
       if(!active.rowCount)await applyCharacterEffect(client,characterId,effect.rows[0].id);
     }
   }

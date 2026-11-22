@@ -637,8 +637,7 @@ async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: stri
   const classes = await getClasses(client, characterId);
   const standard = standardSpellSlotMaximums(classes);
   const bonusResult = await client.query<{ bonus: string }>(`WITH effect_ids AS (
-      SELECT effect_id FROM active_character_effects WHERE character_id=$1
-      UNION SELECT l.effect_id FROM character_content_instances i
+      SELECT l.effect_id FROM character_content_instances i
         JOIN content_effect_links l ON l.content_id=i.content_id
         WHERE i.character_id=$1 AND i.is_active AND l.activation_type IN ('manual','carried','equipped','attuned')
       UNION SELECT l.effect_id FROM character_inventory_items inventory
@@ -650,6 +649,15 @@ async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: stri
       SELECT COALESCE(l.value_override_expression,m.default_value_expression,'') AS value_expression,m.target,m.modifier_type
       FROM effect_ids active JOIN effect_modifier_links l ON l.effect_id=active.effect_id
       JOIN modifier_definitions m ON m.id=l.modifier_id
+      UNION ALL
+      SELECT COALESCE(l.value_override_expression,m.default_value_expression,''),m.target,m.modifier_type
+      FROM (SELECT DISTINCT container_id FROM active_character_effects WHERE character_id=$1 AND container_id IS NOT NULL) ace
+      JOIN content_modifier_links l ON l.content_id=ace.container_id
+      JOIN modifier_definitions m ON m.id=l.modifier_id
+      WHERE NOT EXISTS ( -- already counted through effect_ids (granted by active content / equipped items)
+        SELECT 1 FROM effect_ids e JOIN effect_definitions ed ON ed.id=e.effect_id
+        JOIN content_definitions cd ON cd.content_type='condition' AND cd.content_key='condition:'||ed.effect_key
+        WHERE cd.id=ace.container_id)
       UNION ALL
       SELECT COALESCE(l.value_override_expression,m.default_value_expression,''),m.target,m.modifier_type
       FROM character_content_instances instance JOIN content_modifier_links l ON l.content_id=instance.content_id
