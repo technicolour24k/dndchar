@@ -14,7 +14,7 @@ import {
   type ShortfallMode,
   type SlotType
 } from '$lib/types/cost';
-import { resolveResourceMaximum, resolvedAdditiveModifiers, type ModifierContext } from './dnd5e';
+import { matchingModifiers, resolveModifierNumericValue, resolveResourceMaximum, type ModifierContext } from './dnd5e';
 
 const MAX_AMOUNT = 99;
 
@@ -159,8 +159,15 @@ export function poolMaxima(
   const result: Record<string, PoolMaximum> = {};
   for (const definition of definitions) {
     const base = resolveResourceMaximum(definition.baseMaxExpression, ctx);
-    const grants = resolvedAdditiveModifiers(modifierSources, [`resource.${definition.key}.max`], ctx.modifierContext ?? {});
-    const lines = [{ label: 'Base', value: base }, ...grants.map((grant) => ({ label: grant.label, value: grant.value }))];
+    // Labelled by the SOURCE (the feat or item), not the shared modifier's own label, so the
+    // breakdown reads "Oath of Embers +2" rather than "Vowfire (max) +2" twice.
+    const grants = matchingModifiers(modifierSources, [`resource.${definition.key}.max`], ['bonus', 'penalty'], ctx.modifierContext ?? {})
+      .map(({ effect, modifier }) => {
+        const value = resolveModifierNumericValue(modifier.valueExpression, ctx.modifierContext ?? {}, effect.modifiers, modifier);
+        return { label: effect.name, value: modifier.modifierType === 'penalty' ? -value : value };
+      })
+      .filter((grant) => grant.value !== 0);
+    const lines = [{ label: 'Base', value: base }, ...grants];
     const total = lines.reduce((sum, line) => sum + line.value, 0);
     result[definition.key] = { max: Math.max(0, total), lines };
   }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from '$app/state';
   let { children } = $props();
-  const tabs=[['/admin/rules/modifiers','Modifiers'],['/admin/rules/effects','Effects'],['/admin/rules/hooks','Rule Hooks']];
+  const tabs=[['/admin/rules/modifiers','Modifiers'],['/admin/rules/effects','Effects'],['/admin/rules/pools','Pools'],['/admin/rules/hooks','Rule Hooks']];
 </script>
 
 <section class="page-head rules-page-head admin-page-intro">

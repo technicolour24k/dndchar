@@ -542,6 +542,13 @@
   ].filter((row) => row.always || row.sense.value > 0));
   const senseHelpLines = $derived(senseRows.flatMap((row) => [`${row.label}:`, ...row.sense.lines.map((line) => `  ${line}`)]));
 
+  // "Base 0, Oath of Embers +2" style lines for a pool's maximum.
+  function poolHelpLines(pool: CharacterDetail['pools'][number]): string[] {
+    return pool.breakdown.map((line) => `${line.label}: ${line.value >= 0 ? '+' : ''}${line.value}`).concat(`Maximum: ${pool.max}`);
+  }
+  const POOL_RECHARGE_LABELS: Record<string, string> = { short_rest: 'Short rest', long_rest: 'Long rest', dawn: 'Dawn', encounter: 'New battle', manual: 'Manual' };
+  const poolRechargeLabel = (period: string) => POOL_RECHARGE_LABELS[period] ?? period;
+
   function openFormulaHelp(title: string, lines: string[]) {
     formulaHelp = { title, lines };
   }
@@ -2138,6 +2145,16 @@
               {:else}<span class="muted">No spell slots for the current classes.</span>{/each}
             </div>
           </div>
+          {#if character.pools.length}
+            <div class="structured-section">
+              <div class="panel-head compact-head"><h3>Resources</h3></div>
+              <div class="slot-grid">
+                {#each character.pools as pool (pool.key)}
+                  <div class="slot-counter"><strong>{pool.label} <button type="button" class="formula-help-button" title={helpTitle(poolHelpLines(pool))} aria-label={`${pool.label} maximum breakdown`} onclick={() => openFormulaHelp(`${pool.label} maximum`, poolHelpLines(pool))}>?</button></strong><span>{pool.current} / {pool.max}</span><span class="muted">{poolRechargeLabel(pool.rechargePeriod)}</span>{#if !readOnly}<div><button type="button" disabled={contentBusy} onclick={() => runContentAction('poolAdjust', { key: pool.key, delta: -1 })}>-</button><button type="button" disabled={contentBusy} onclick={() => runContentAction('poolAdjust', { key: pool.key, delta: 1 })}>+</button></div>{/if}</div>
+                {/each}
+              </div>
+            </div>
+          {/if}
           <div class="structured-section">
             <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">

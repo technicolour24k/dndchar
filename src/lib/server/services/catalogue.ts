@@ -6,6 +6,7 @@ import { cachedReference, invalidateReferenceData } from '$lib/server/cache/refe
 import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
+import { loadPoolMaxima, refillCharacterPools, writeLedger } from '$lib/server/services/resource-pools';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
 import type { CharacterContentInstance, ContentDefinition, ContentType, RechargePeriod, SpellSlot } from '$lib/types/content';
@@ -485,10 +486,36 @@ export async function triggerCharacterContentActions(userId:string,characterId:s
   });
 }
 
+// Short rest: refills short_rest pools and counters plus pact slots. Long rest is the full 5e one:
+// HP to max (temp HP untouched), half the hit dice back (min 1 each), short/long/dawn pools and
+// counters to max, every spell slot to max. HP and hit dice changes are ledgered as 'rest' rows;
+// the HP change posts no combat-log delta (it isn't combat damage or healing).
 export async function restCharacter(userId: string, characterId: string, rest: 'short_rest' | 'long_rest'): Promise<void> {
+  await assertCanEditCharacter({ query }, userId, characterId);
+  const loadedPools = await loadPoolMaxima(characterId); // before the transaction: it reads on its own connection
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
-    const periods = rest === 'long_rest' ? ['short_rest', 'long_rest'] : ['short_rest'];
+    const periods = rest === 'long_rest' ? ['short_rest', 'long_rest', 'dawn'] : ['short_rest'];
+    await refillCharacterPools(client, characterId, periods, userId, loadedPools);
+    if (rest === 'long_rest') {
+      // Regaining HP ends a death-save streak (they live in metadata_json). No sheet_version bump:
+      // a rest must not make an open sheet refuse its next Save.
+      await client.query(`UPDATE characters SET metadata_json = metadata_json || '{"deathSaveSuccesses":0,"deathSaveFailures":0}'::jsonb
+        WHERE id = $1 AND (COALESCE(metadata_json->>'deathSaveSuccesses', '') NOT IN ('', '0') OR COALESCE(metadata_json->>'deathSaveFailures', '') NOT IN ('', '0'))`, [characterId]);
+      const vitals = await client.query<{ resource_key: string; current_value: number; max_value: number }>(
+        `SELECT resource_key, current_value, max_value FROM character_resources
+         WHERE character_id = $1 AND (resource_key = 'hp' OR resource_key ~ '^hit_dice_[0-9]+$') ORDER BY resource_key FOR UPDATE`, [characterId]);
+      for (const row of vitals.rows) {
+        const isHp = row.resource_key === 'hp';
+        const after = isHp ? Math.max(row.current_value, row.max_value) : Math.min(row.max_value, row.current_value + Math.max(1, Math.floor(row.max_value / 2)));
+        if (after === row.current_value || row.max_value <= 0) continue;
+        await client.query('UPDATE character_resources SET current_value = $3 WHERE character_id = $1 AND resource_key = $2', [characterId, row.resource_key, after]);
+        await writeLedger(client, {
+          characterId, pool: row.resource_key, label: isHp ? 'HP' : 'Hit Dice', delta: after - row.current_value,
+          before: row.current_value, after, reason: 'rest', actorUserId: userId
+        });
+      }
+    }
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
       FROM content_resource_definitions d, character_content_instances i
       WHERE r.resource_definition_id = d.id AND r.character_content_id = i.id
@@ -545,8 +572,11 @@ export async function advanceCharacterTurn(userId: string, characterId: string):
 // so a buff with a real-time duration shouldn't be silently wiped just
 // because a new battle starts.
 export async function newBattle(userId: string, characterId: string): Promise<void> {
+  await assertCanEditCharacter({ query }, userId, characterId);
+  const loadedPools = await loadPoolMaxima(characterId);
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
+    await refillCharacterPools(client, characterId, ['encounter'], userId, loadedPools);
     await client.query(`INSERT INTO character_combat_clocks (character_id, round_number, turn_number) VALUES ($1, 1, 1)
       ON CONFLICT (character_id) DO UPDATE SET round_number = 1, turn_number = 1, updated_at = now()`, [characterId]);
     await client.query(`UPDATE character_content_resources r SET current_value = max_value

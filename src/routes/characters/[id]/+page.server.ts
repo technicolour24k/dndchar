@@ -4,6 +4,7 @@ import { query } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
+import { adjustCharacterPool } from '$lib/server/services/resource-pools';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
 import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
@@ -207,6 +208,12 @@ export const actions = {
   spellSlot: async ({ request, params, locals }) => {
     const form = await request.formData();
     await spendSpellSlot(locals.user!.id, params.id, String(form.get('slotType')) as 'standard' | 'pact', Number(form.get('slotLevel')), Number(form.get('delta')) || 0);
+    emitRealtimeEvent('resource:changed', { characterId: params.id });
+    return { contentUpdated: true };
+  },
+  poolAdjust: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    await adjustCharacterPool(locals.user!.id, params.id, String(form.get('key') || ''), Number(form.get('delta')) || 0);
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true };
   },

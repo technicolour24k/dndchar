@@ -166,6 +166,10 @@ describe('poolMaxima', () => {
     expect(poolMaxima(defs, sources).vowfire.max).toBe(0);
     expect(poolMaxima(defs, sources, { modifierContext: { flags: ['raging'] } }).vowfire.max).toBe(2);
   });
+  it('labels breakdown lines by the source, not the shared modifier label', () => {
+    const labelled = { ...mod('resource.vowfire.max', 'bonus', '2'), label: 'Vowfire (max)' };
+    expect(poolMaxima(defs, [source('Oath of Embers', [labelled])]).vowfire.lines[1]).toEqual({ label: 'Oath of Embers', value: 2 });
+  });
   it('reads a level-based base expression', () => {
     expect(poolMaxima([{ key: 'p', baseMaxExpression: 'level' }], [], { level: 4 }).p.max).toBe(4);
   });

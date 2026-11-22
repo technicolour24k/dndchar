@@ -9,6 +9,7 @@ import { getActiveEncounterForCharacter } from '$lib/server/services/encounters'
 import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
+import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
 import type {
   AbilityKey,
   CharacterAbility,
@@ -235,10 +236,14 @@ export async function createCharacter(userId: string, name: string): Promise<str
 async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> {
   const characterId = row.id;
   const resolvedModifiers = await resolveCharacterModifierSources(characterId);
+  const classes = await getClasses(characterId);
+  const abilities = await getAbilities(characterId);
+  const pools = await getCharacterPools({ query }, characterId, await listPoolDefinitions({ includeArchived: true }), resolvedModifiers.sources, poolContextFor(classes, abilities, row.metadata_json));
 
   return mapCharacterRow(row, {
-    classes: await getClasses(characterId),
-    abilities: await getAbilities(characterId),
+    classes,
+    abilities,
+    pools,
     resources: await getResources(characterId),
     inventory: await getInventory(characterId),
     attacks: await getAttacks(characterId),
@@ -412,7 +417,7 @@ export async function updateCharacter(userId: string, characterId: string, form:
 
     await replaceClasses(client, characterId, parseClasses(form));
     await replaceAbilities(client, characterId, parseAbilities(form));
-    await replaceResources(client, characterId, resources);
+    await replaceSheetResources(client, characterId, resources);
     // Changes only when the sheet sent its loaded baseline (see saveInventoryChanges); otherwise the
     // old full replace.
     const inventoryBaseline = parseInventoryBaseline(form);
@@ -752,7 +757,8 @@ async function getAbilities(characterId: string): Promise<CharacterAbility[]> {
 
 async function getResources(characterId: string): Promise<CharacterResource[]> {
   const result = await query<{ resource_key: string; label: string; current_value: number; max_value: number }>(
-    'SELECT resource_key, label, current_value, max_value FROM character_resources WHERE character_id = $1 ORDER BY sort_order ASC',
+    // pool:* rows (character resource pools) are not sheet fields: they load as detail.pools.
+    `SELECT resource_key, label, current_value, max_value FROM character_resources WHERE character_id = $1 AND resource_key NOT LIKE 'pool:%' ORDER BY sort_order ASC`,
     [characterId]
   );
   return result.rows.map((row) => ({
@@ -1080,8 +1086,15 @@ async function replaceAbilities(client: pg.PoolClient, characterId: string, abil
   }
 }
 
-async function replaceResources(client: pg.PoolClient, characterId: string, resources: CharacterResource[]): Promise<void> {
-  await client.query('DELETE FROM character_resources WHERE character_id = $1', [characterId]);
+// The whole-sheet Save owns only hp / temp_hp / inspiration / hit_dice_N. It must leave the pool:*
+// rows (cost-engine resource pools) alone; creating a character and restoring a snapshot still use
+// the full replace below, because a restore SHOULD put pool quantities back.
+async function replaceSheetResources(client: pg.PoolClient, characterId: string, resources: CharacterResource[]): Promise<void> {
+  await replaceResources(client, characterId, resources, true);
+}
+
+async function replaceResources(client: pg.PoolClient, characterId: string, resources: CharacterResource[], keepPools = false): Promise<void> {
+  await client.query(`DELETE FROM character_resources WHERE character_id = $1${keepPools ? " AND resource_key NOT LIKE 'pool:%'" : ''}`, [characterId]);
   for (const [index, row] of resources.entries()) {
     const maxValue = Math.max(0, Number(row.maxValue) || 0);
     await client.query(
