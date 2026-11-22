@@ -21,11 +21,13 @@ type ModifierRow = {
   container_key: string | null;
 };
 
-export async function resolveCharacterModifierSources(characterId: string): Promise<{
+// `db` lets a caller inside a transaction read on its own client instead of taking a second pool
+// connection (which could starve the pool under concurrent activations).
+export async function resolveCharacterModifierSources(characterId: string, db: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> } = { query }): Promise<{
   sources: ActiveCharacterEffect[];
   audit: ResolvedModifier[];
 }> {
-  const result = await query<ModifierRow>(`
+  const result: { rows: ModifierRow[] } = await db.query(`
     WITH modifier_rows AS (
       -- Branch 1a: active effects resolved via unified Container (container_id path)
       SELECT active.id::text AS source_id, 'effect'::text AS source_type,

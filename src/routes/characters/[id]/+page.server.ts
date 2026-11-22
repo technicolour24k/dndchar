@@ -4,6 +4,7 @@ import { query } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { emitRealtimeEvent } from '$lib/server/realtime';
 import { getCharacterWithAccess, listItemCategories, restoreCharacterVersion, spendHitDice, StaleSheetError, updateCharacter } from '$lib/server/services/characters';
+import { CostShortfallError } from '$lib/server/services/cost-engine';
 import { adjustCharacterPool } from '$lib/server/services/resource-pools';
 import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
 import { attempt } from '$lib/server/campaignAction';
@@ -240,18 +241,21 @@ export const actions = {
   },
   useItem: async ({ request, params, locals }) => {
     const form = await request.formData();
-    const itemResult=await useInventoryCatalogueItem(locals.user!.id, params.id, String(form.get('inventoryId') || ''));
+    let itemResult;
+    try { itemResult=await useInventoryCatalogueItem(locals.user!.id, params.id, String(form.get('inventoryId') || '')); } catch (error) { if (error instanceof CostShortfallError) return fail(409, { costShortfall: error.shortfalls }); throw error; }
     emitRealtimeEvent('resource:changed', { characterId: params.id });
     return { contentUpdated: true, itemResult };
   },
   triggerContent:async({request,params,locals})=>{
     const form=await request.formData();
-    const itemResult=await triggerCharacterContentActions(locals.user!.id,params.id,String(form.get('instanceId')||''));
+    let itemResult;
+    try{itemResult=await triggerCharacterContentActions(locals.user!.id,params.id,String(form.get('instanceId')||''));}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});
     return{contentUpdated:true,itemResult};
   },
   castSpell:async({request,params,locals})=>{
-    const itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());
+    let itemResult;
+    try{itemResult=await castCharacterSpell(locals.user!.id,params.id,await request.formData());}catch(error){if(error instanceof CostShortfallError)return fail(409,{costShortfall:error.shortfalls});throw error;}
     emitRealtimeEvent('resource:changed',{characterId:params.id});return{contentUpdated:true,itemResult};
   },
   // The one join a player needs, covering combat, rolls, and session notes at

@@ -3,7 +3,8 @@ import type { RequestHandler } from './$types';
 import { query } from '$lib/server/db';
 import { getCharacter } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
-import { castCharacterSpell, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
+import { castCharacterSpellDetailed, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
+import { CostShortfallError } from '$lib/server/services/cost-engine';
 import { resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, totalLevel } from '$lib/rules/dnd5e';
 import { characterStatsFor, resolveSpellcastingAbility } from '$lib/rules/characterStats';
 import { adjustPrimaryDamageDice, previewAdvantage, rollDamage, rollWithModifiers, spellAttackAgainstCandidates, spellAttackCandidates } from '$lib/rules/attackRoll';
@@ -76,9 +77,13 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   if (slotLevel) castForm.set('slotLevel', String(slotLevel));
 
   let effects;
+  let spent: { slotType: 'standard' | 'pact'; slotLevel: number } | null = null;
   try {
-    effects = await castCharacterSpell(locals.user!.id, characterId, castForm);
+    const cast = await castCharacterSpellDetailed(locals.user!.id, characterId, castForm);
+    effects = cast.results;
+    spent = cast.spent;
   } catch (error) {
+    if (error instanceof CostShortfallError) return json({ error: 'insufficient', message: error.message, shortfalls: error.shortfalls }, { status: 409 });
     return json({ error: error instanceof Error ? error.message : 'Could not cast spell.' }, { status: 400 });
   }
 
@@ -143,6 +148,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     saveDc: profile.resolution === 'save' ? stats.spellSaveDc.value : undefined,
     saveAbility: profile.saveAbility,
     saveEffect: profile.saveEffect,
-    effects
+    effects,
+    spent
   });
 };

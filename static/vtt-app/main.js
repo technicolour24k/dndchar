@@ -1879,12 +1879,19 @@ async function rollManualAction(action, extraBody = {}) {
     }),
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+  if (!res.ok) throw new Error(costShortfallText(body) || body.error || ('roll request failed (' + res.status + ')'));
   return body;
 }
 
 // extraBody carries the advantage choices (and `preview: true` for a preview) into whichever
 // endpoint applies; the item_not_found fallback covers previews too.
+// A 409 'insufficient' from roll-spell/roll-item: the clear sentence plus what's short.
+function costShortfallText(body) {
+  if (body?.error !== 'insufficient') return '';
+  const lines = (body.shortfalls || []).map((l) => `Needs ${l.needed} ${l.label}, you have ${l.available}`);
+  return [body.message || "It doesn't look like you've got the capacity to do that.", ...lines].join(' ');
+}
+
 async function rollPendingAction(action, source, extraBody = {}) {
   // Manual stat-block spell: no character/slots behind it, just the numbers on the action.
   if (action.kind === 'spell' && action.manual) return rollManualAction(action, extraBody);
@@ -1895,7 +1902,7 @@ async function rollPendingAction(action, source, extraBody = {}) {
       body: JSON.stringify({ ...extraBody, instanceId: action.instanceId, slotLevel: action.slotLevel }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+    if (!res.ok) throw new Error(costShortfallText(body) || body.error || ('roll request failed (' + res.status + ')'));
     return body;
   }
 
@@ -1905,7 +1912,7 @@ async function rollPendingAction(action, source, extraBody = {}) {
       body: JSON.stringify({ ...extraBody, inventoryId: action.inventoryId }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || ('roll request failed (' + res.status + ')'));
+    if (!res.ok) throw new Error(costShortfallText(body) || body.error || ('roll request failed (' + res.status + ')'));
     return body;
   }
 
@@ -1938,14 +1945,13 @@ async function rollPendingAction(action, source, extraBody = {}) {
 // the same token:stat:update broadcast the manual Use button already sends -
 // deliberately not mutated locally first, so every client (including this one)
 // picks up the new count the same way, off the server echo.
-function deductLocalSpellSlot(tokenId, level) {
+function deductLocalSpellSlot(tokenId, level, type) {
   const token = session.tokens[tokenId];
   if (!token) return;
   const slots = token.spellSlots || [];
-  // The roll-spell request doesn't specify slot type, so the server's own
-  // preference (spendAvailableSlot in catalogue.ts: standard before pact at the
-  // same level) is mirrored here to pick the same slot the DB actually spent.
-  const candidates = slots.filter((s) => s.level === level && s.current > 0);
+  // roll-spell reports which slot the cost engine actually spent (`spent`), so the token's copy
+  // follows the same slot rather than guessing the type.
+  const candidates = slots.filter((s) => s.level === level && s.current > 0 && (!type || s.type === type));
   const match = candidates.find((s) => s.type !== 'pact') || candidates[0];
   if (!match) return;
   const value = slots.map((s) => (s === match ? { ...s, current: Math.max(0, s.current - 1) } : s));
@@ -1979,7 +1985,7 @@ async function resolveAttack() {
   // own displayed slot count is a separate, client-tracked snapshot that only the
   // manual Use/Reset buttons used to touch, so a real cast never showed up there
   // until now. Sync it here, once the slot spend is confirmed to have happened.
-  if (isSpell && action.slotLevel) deductLocalSpellSlot(sourceTokenId, action.slotLevel);
+  if (isSpell && result.spent) deductLocalSpellSlot(sourceTokenId, result.spent.slotLevel, result.spent.slotType);
 
   // Heal always lands (no to-hit/save layer, per the brief's Section 3) and items have
   // no attack-roll concept in this simple model - both skip straight to the no-hidden-

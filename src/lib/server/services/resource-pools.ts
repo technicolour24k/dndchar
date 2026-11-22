@@ -44,7 +44,7 @@ function mapDefinition(row: DefinitionRow): PoolDefinition {
   };
 }
 
-async function loadDefinitions(db: Queryable, includeArchived: boolean): Promise<PoolDefinition[]> {
+export async function loadDefinitions(db: Queryable, includeArchived: boolean): Promise<PoolDefinition[]> {
   const result = await db.query(
     `SELECT * FROM resource_pool_definitions ${includeArchived ? '' : 'WHERE NOT is_archived'} ORDER BY sort_order, label`
   );
@@ -95,17 +95,18 @@ export async function getCharacterPools(
 
 // Live maxima for every non-archived pool (every pool with includeArchived), loading what it needs.
 // Call OUTSIDE a transaction.
-export async function loadPoolMaxima(characterId: string, includeArchived = false): Promise<{ definitions: PoolDefinition[]; maxima: Record<string, PoolMaximum> }> {
-  const [definitions, sources, classes, abilities, character] = await Promise.all([
-    listPoolDefinitions({ includeArchived }),
-    resolveCharacterModifierSources(characterId),
-    query<{ class_name: string; level: number }>('SELECT class_name, level FROM character_classes WHERE character_id = $1', [characterId]),
-    query<{ ability_key: CharacterAbility['key']; score: number }>('SELECT ability_key, score FROM character_abilities WHERE character_id = $1', [characterId]),
-    query<{ metadata_json: Record<string, unknown> }>('SELECT metadata_json FROM characters WHERE id = $1', [characterId])
-  ]);
+// With `db` (a transaction client) it reads sequentially on that client and never takes another
+// pool connection.
+export async function loadPoolMaxima(characterId: string, includeArchived = false, db?: Queryable): Promise<{ definitions: PoolDefinition[]; maxima: Record<string, PoolMaximum> }> {
+  const q = db ?? { query };
+  const definitions = db ? await loadDefinitions(db, includeArchived) : await listPoolDefinitions({ includeArchived });
+  const sources = await resolveCharacterModifierSources(characterId, q);
+  const classes = await q.query('SELECT class_name, level FROM character_classes WHERE character_id = $1', [characterId]);
+  const abilities = await q.query('SELECT ability_key, score FROM character_abilities WHERE character_id = $1', [characterId]);
+  const character = await q.query('SELECT metadata_json FROM characters WHERE id = $1', [characterId]);
   const ctx = poolContextFor(
-    classes.rows.map((row) => ({ className: row.class_name, level: row.level }) as CharacterClass),
-    abilities.rows.map((row) => ({ key: row.ability_key, score: row.score })),
+    classes.rows.map((row: { class_name: string; level: number }) => ({ className: row.class_name, level: row.level }) as CharacterClass),
+    abilities.rows.map((row: { ability_key: CharacterAbility['key']; score: number }) => ({ key: row.ability_key, score: row.score })),
     character.rows[0]?.metadata_json
   );
   return { definitions, maxima: poolMaxima(definitions.map((d) => ({ key: d.key, baseMaxExpression: d.baseMaxExpression })), sources.sources, ctx) };

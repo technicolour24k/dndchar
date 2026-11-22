@@ -1674,6 +1674,11 @@
   async function runResourceAction(action:string,body:FormData,heading:string){
     const response=await fetch(`?/${action}`,{method:'POST',body});
     const actionResult=deserialize(await response.text());
+    if(actionResult.type==='failure'&&(actionResult.data as {costShortfall?:Array<{label:string;needed:number;available:number}>})?.costShortfall){
+      const short=(actionResult.data as {costShortfall:Array<{label:string;needed:number;available:number}>}).costShortfall;
+      inventoryMessage=["It doesn't look like you've got the capacity to do that.",...short.map((line)=>`Needs ${line.needed} ${line.label}, you have ${line.available}`)].join('\n');
+      return;
+    }
     if(actionResult.type!=='success'){
       inventoryMessage='Could not apply the resource action.';
       return;
