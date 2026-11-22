@@ -7,6 +7,7 @@ import { listUnreviewedOverrides, reviewOverride } from '$lib/server/services/re
 import { announceCostUndo } from '$lib/server/vttCostGate';
 import { listMapsForViewer } from '$lib/server/services/overworld';
 import { dropCampaignPreviews, dropUserPreviews } from '$lib/server/overworldNotify';
+import { ejectAllFromCampaignVoice, ejectFromCampaignVoice } from '$lib/server/voice/voiceEject';
 import { closeCampaignRoom, kickFromCampaignRoom, pruneDepartedCharacterTokens, syncGmSeats } from '$lib/server/services/campaignRooms';
 import {
   addCharacterToCampaign,
@@ -98,6 +99,8 @@ export const actions = {
     const result = await attempt(() => removeMember(locals.user!.id, params.id, String(form.get('userId') || '')));
     if (result.ok) {
       kickFromCampaignRoom(result.value?.roomCode, result.value?.targetUserId, 'removed_from_campaign');
+      // Fire and forget: never throws, never delays or fails the action (see voiceEject.ts).
+      void ejectFromCampaignVoice(params.id, result.value?.targetUserId);
       if (result.value?.targetUserId) dropUserPreviews(params.id, result.value.targetUserId);
       // Removing the primary promotes the co-DM, whose seated socket is now 'primary'.
       await syncGmSeats(params.id, result.value?.roomCode);
@@ -111,6 +114,7 @@ export const actions = {
     const result = await attempt(() => leaveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     kickFromCampaignRoom(result.value?.roomCode, locals.user!.id, 'removed_from_campaign');
+    void ejectFromCampaignVoice(params.id, locals.user!.id);
     dropUserPreviews(params.id, locals.user!.id);
     await syncGmSeats(params.id, result.value?.roomCode);
     await pruneDepartedCharacterTokens();
@@ -121,6 +125,7 @@ export const actions = {
     const result = await attempt(() => archiveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     closeCampaignRoom(result.value?.roomCode);
+    void ejectAllFromCampaignVoice(params.id);
     dropCampaignPreviews(params.id);
     throw redirect(303, '/campaigns');
   },

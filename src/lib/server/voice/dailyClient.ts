@@ -93,9 +93,16 @@ export function createDailyClient(config: DailyConfig, fetchImpl: typeof fetch =
       return data.token;
     },
 
-    /** Used by Unit 4. A 404 (room never created) is the caller's to treat as fine. */
+    /**
+     * Eject users from a live call (max 100 ids per request; callers chunk). Daily answers 404 when the
+     * room has no call going, which callers treat as "nothing to do".
+     */
+    async ejectUsers(roomName: string, userIds: string[]): Promise<void> {
+      await call(`/rooms/${roomName}/eject`, { user_ids: userIds });
+    },
+
     async ejectUser(roomName: string, userId: string): Promise<void> {
-      await call(`/rooms/${roomName}/eject`, { user_ids: [userId] });
+      await this.ejectUsers(roomName, [userId]);
     }
   };
 }
