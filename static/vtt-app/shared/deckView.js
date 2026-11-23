@@ -47,6 +47,27 @@ export function recentLine(draw) {
   return `${draw.drawerName} drew the ${cardTitle(draw.card)}${draw.chosenValue != null ? ` (as ${draw.chosenValue})` : ''}: ${successLabel(draw.success)}`;
 }
 
+/** The VTT toast headline: "Aria drew the 3 of Clubs - gold back - failure: Defender's Aura". */
+export function drawnTitle(draw) {
+  const outcome = draw?.outcome?.name ? `: ${draw.outcome.name}` : '';
+  return `${draw?.drawerName} drew the ${cardTitle(draw?.card)} - ${successLabel(draw?.success).toLowerCase()}${outcome}`;
+}
+
+/** The VTT toast headline when the DM undoes a draw. */
+export function undoneTitle(draw) {
+  return `The DM undid ${draw?.drawerName}'s draw of the ${draw?.card?.label ?? 'card'}`;
+}
+
+/** An open DM task in the GM's sidebar: "Red Joker: The party gains a high-powered magic item". */
+export function gmTaskLine(task) {
+  return `${task?.cardLabel ?? 'Card'}: ${task?.text ?? ''}`;
+}
+
+/** The GM's "last draw" line (the draw Undo applies to). */
+export function lastDrawLine(draw) {
+  return `Last draw: ${draw?.drawerName} drew the ${cardTitle(draw?.card)} (${successLabel(draw?.success).toLowerCase()})`;
+}
+
 /** Player-facing text for an error body from the deck endpoints. */
 export function errorText(error) {
   switch (error) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cardTitle, choiceOptions, errorText, recentLine, resultLines, rollLines, statusTag, taskLines } from '../../../static/vtt-app/shared/deckView.js';
+import { cardTitle, choiceOptions, drawnTitle, errorText, gmTaskLine, lastDrawLine, undoneTitle, recentLine, resultLines, rollLines, statusTag, taskLines } from '../../../static/vtt-app/shared/deckView.js';
 
 const draw: any = {
   drawerName: 'Aria', success: false, chosenValue: null, status: 'resolved',
@@ -33,5 +33,13 @@ describe('deckView', () => {
     expect(statusTag(draw)).toBe('');
     expect(errorText('choosing')).toMatch(/Finish the card/);
     expect(errorText('mystery')).toBe('Something went wrong.');
+  });
+  it('words the VTT toasts and the GM block', () => {
+    const named = { ...draw, outcome: { name: "Defender's Aura" } };
+    expect(drawnTitle(named)).toBe("Aria drew the 3 of Clubs - gold back - failure: Defender's Aura");
+    expect(drawnTitle({ ...draw, success: true })).toBe('Aria drew the 3 of Clubs - gold back - success');
+    expect(undoneTitle(draw)).toBe("The DM undid Aria's draw of the 3 of Clubs");
+    expect(gmTaskLine({ cardLabel: 'Red Joker', text: 'The party gains a high-powered magic item' })).toBe('Red Joker: The party gains a high-powered magic item');
+    expect(lastDrawLine(draw)).toBe('Last draw: Aria drew the 3 of Clubs - gold back (failure)');
   });
 });

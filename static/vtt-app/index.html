@@ -231,6 +231,14 @@
     </div>
   </div>
 
+  <!-- Decks (decks plan, unit 8). Player draw popup (closes freely) and the toast stack. Built by deck.js. -->
+  <div id="deckModal" class="modal-overlay">
+    <div class="modal modal-wide forage-modal deck-modal" role="dialog" aria-modal="true" aria-label="Decks">
+      <div id="deckModalBody"></div>
+    </div>
+  </div>
+  <div id="deckToasts" class="deck-toasts" aria-live="polite"></div>
+
   <!-- Forage GM popup. Deliberately no backdrop or Escape close: closing would cancel a player's request.
        The body is built by forage.js. -->
   <div id="forageModal" class="modal-overlay">

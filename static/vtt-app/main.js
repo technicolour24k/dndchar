@@ -8,6 +8,7 @@ import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/move
 import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
+import { createDeck } from './deck.js';
 import { createCostApproval } from './costApproval.js';
 import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, paidText, resetAllNote, turnChips } from './shared/actionEconomy.js';
 import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
@@ -692,6 +693,7 @@ function handleMessage(msg) {
       // Forage: the GM's pending requests (or the player's own view and result) arrive in
       // session.forage / session.forageResults. Targeted updates only, no extra sidebar rebuild.
       forage.onStateFull();
+      deck.onStateFull();
       costApproval.onStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
@@ -981,6 +983,20 @@ function handleMessage(msg) {
 
     case 'forage:closed':
       forage.onClosed(msg);
+      break;
+
+    // Decks (decks plan, unit 8). deck:drawn / deck:undone go to everyone at the table (the result is
+    // public); deck:tasks goes to the campaign's GM only. Toasts and a small sidebar block, no renderSidebar.
+    case 'deck:drawn':
+      deck.onDrawn(msg);
+      break;
+
+    case 'deck:undone':
+      deck.onUndone(msg);
+      break;
+
+    case 'deck:tasks':
+      deck.onTasks(msg);
       break;
 
     // Cost-engine DM approval (cost-engine unit 6): the GM's queue, and a player's own request.
@@ -3660,6 +3676,7 @@ function renderSidebar() {
   // Synchronously, before anything can paint: put the persistent voice dock back into its slot (the
   // innerHTML above detached it; the call and its audio elements are not affected).
   voice.mount(sidebarEl.querySelector('#voiceSlot'));
+  deck.afterSidebarRender(); // the GM's Deck block and the token-card Draw buttons
 
   // Restore BEFORE wiring: wireMarkerForm() reads the shape select at wire time
   // to show/hide the radius vs cone/cube fields.
@@ -3693,6 +3710,7 @@ function roomInfoHtml(roleLabel) {
     ${overworld.buttonHtml()}
     ${combatControlHtml()}
     ${forage.forageControlHtml()}
+    ${deck.deckControlHtml()}
     ${costApproval.queueHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
@@ -5094,6 +5112,7 @@ function ownTokenListHtml(tokens) {
             <button class="secondary changeImageBtn">Change Image…</button>
             ${isProp ? '' : '<button class="secondary conditionsBtn">Conditions…</button>'}
             ${forage.forageButtonHtml(t)}
+            ${deck.deckButtonHtml(t)}
             <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if your token ever gets dragged somewhere unreachable">Recenter on Map</button>
           </div>
           ${miniSheetHtml(t)}
@@ -5606,6 +5625,21 @@ const forage = createForage({
   advSourceLabel,
   advReadoutText,
   counterRowHtml,
+  bringModalToFront,
+  closeOnBackdropPress,
+});
+
+// Decks (decks plan, unit 8): the player's draw popup, the toasts and the GM's Deck block live in deck.js.
+// Like forage it only updates its own modal and small sidebar spots. Only campaign tables get a GM block
+// (campaignClient.campaignId is null in Quick rooms); the server decides who may draw.
+const deck = createDeck({
+  getSession: () => session,
+  getRole: () => role,
+  getSessionId: () => sessionId,
+  getCampaignId: () => campaignClient.campaignId,
+  isAccountLinked: () => !!accountPlayerId,
+  sidebarEl,
+  escapeHtml,
   bringModalToFront,
   closeOnBackdropPress,
 });
