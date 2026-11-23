@@ -58,7 +58,7 @@
     <label>Rules (JSON)
       <textarea name="rulesText" class="deck-admin-json" rows="18" spellcheck="false" autocomplete="off" required value={draft?.rulesText ?? deck.rulesText}></textarea>
     </label>
-    <p class="muted">Saved only when the JSON parses, the limits hold, and every condition key is a live global condition.</p>
+    <p class="muted">Saved only when the JSON parses, the limits hold, and every condition key is a live condition this deck may use: a global one, or one from a library or campaign it belongs to.</p>
     <button type="submit" disabled={saveDisabled}>Save deck</button>
   </form>
 

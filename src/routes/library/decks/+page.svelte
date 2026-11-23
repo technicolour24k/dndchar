@@ -23,6 +23,7 @@
 <nav class="library-tabs" aria-label="Library sections">
   {#each tabs as tab}<a href={tab[0]}>{tab[1]}</a>{/each}
   <a href="/library/decks" class="active" aria-current="page">Decks</a>
+  <a href="/library/conditions">Conditions</a>
 </nav>
 
 {#if !data.canAuthorMechanics}

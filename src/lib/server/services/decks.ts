@@ -340,13 +340,27 @@ async function flushMeta(client: pg.PoolClient, state: Awaited<ReturnType<typeof
   }
 }
 
-/** Applies one condition line through the normal effect path. A missing/archived condition becomes a DM task. */
+/**
+ * Applies one condition line through the normal effect path. A missing/archived/unavailable condition becomes a DM task.
+ * Which conditions a key may resolve to follows the deck (the same rule the editor validates with, in saveDeckCore,
+ * except that "libraries enabled" becomes "owner is still a member": a deck that already names a library condition keeps
+ * working when the DM later switches that library off; visibility gates new use, never what is already referenced).
+ */
 async function applyConditionLine(client: pg.PoolClient, draw: any, line: PlannedLine, names: Record<string, string>): Promise<{ result: Partial<DrawResultLine>; task?: string }> {
   const container = await client.query<{ id: string; name: string }>(
-    `SELECT id, name FROM content_definitions WHERE content_key = $1 AND content_type = 'condition' AND is_archived = false AND scope = 'global' AND owner_user_id IS NULL`, [line.conditionKey]);
+    `SELECT c.id, c.name FROM content_definitions c, content_definitions deck
+     WHERE c.content_key = $1 AND c.content_type = 'condition' AND NOT c.is_archived AND deck.id = $2
+       AND ((c.scope = 'global' AND c.owner_user_id IS NULL)
+         OR (c.scope = 'personal' AND deck.scope = 'personal' AND c.owner_user_id = deck.owner_user_id)
+         OR (c.scope = 'campaign' AND deck.scope = 'campaign' AND c.campaign_id = deck.campaign_id)
+         OR (c.scope = 'personal' AND deck.scope = 'campaign'
+             AND EXISTS (SELECT 1 FROM campaign_members m WHERE m.campaign_id = deck.campaign_id AND m.user_id = c.owner_user_id)))`,
+    [line.conditionKey, draw.deck_content_id]);
   const who = names[line.characterId] ?? 'Someone';
   if (!container.rows.length) {
-    const label = (line.conditionKey ?? 'condition').replace(/^condition:/, '').replace(/_/g, ' ');
+    // A library key is condition:library:<userId>:<slug>:<hex>: show the slug, not the ids.
+    const parts = (line.conditionKey ?? 'condition').replace(/^condition:/, '').split(':');
+    const label = (parts[0] === 'library' && parts.length >= 4 ? parts[parts.length - 2] : parts.join(':')).replace(/[_-]/g, ' ');
     return { result: { note: `Condition "${line.conditionKey}" is unavailable.` }, task: `Apply ${label} to ${who} by hand (${line.sourceLabel})` };
   }
   const applied = await applyCharacterEffect(client, line.characterId, container.rows[0].id, {
@@ -679,8 +693,7 @@ export type SaveDeckResult = { ok: true; warnings: string[] } | { ok: false; err
 
 /**
  * Validates and saves an owned deck's name, description and rules JSON. Nothing is written when there is any error:
- * bad JSON, a parser error, or a condition key that is not a live GLOBAL condition (the apply path only finds global
- * ones; campaign or homebrew conditions wait for the library conditions unit). Warnings save.
+ * bad JSON, a parser error, or a condition key this deck may not name (see the condition check below). Warnings save.
  */
 async function saveDeckCore(owner: DeckOwner, input: { id: string; name: string; description: string; rulesText: string }): Promise<SaveDeckResult> {
   if (!isUuid(input.id)) return { ok: false, errors: ['Deck not found.'] };
@@ -701,11 +714,20 @@ async function saveDeckCore(owner: DeckOwner, input: { id: string; name: string;
     if (parsed.rules) {
       const keys = collectConditionKeys(parsed.rules);
       if (keys.length) {
+        // Which conditions a deck may name (library plan, unit F; the pure rule is canReference in $lib/library/rules):
+        //   personal deck: global, plus the author's own conditions;
+        //   campaign deck: global, plus this campaign's own conditions, plus conditions of libraries enabled in it.
+        // Archived ones are refused here (a new reference); at draw time they become a DM task.
+        const owners = owner.kind === 'personal' ? [owner.userId] : (await loadCampaignLibraries({ query }, owner.campaignId)).enabledOwnerIds;
+        const campaignId = owner.kind === 'campaign' ? owner.campaignId : null;
         const found = await query<{ content_key: string }>(
-          `SELECT content_key FROM content_definitions
-           WHERE content_key = ANY($1::text[]) AND content_type = 'condition' AND NOT is_archived AND scope = 'global' AND owner_user_id IS NULL`, [keys]);
+          `SELECT c.content_key FROM content_definitions c
+           WHERE c.content_key = ANY($1::text[]) AND c.content_type = 'condition' AND NOT c.is_archived
+             AND ((c.scope = 'global' AND c.owner_user_id IS NULL)
+               OR (c.scope = 'campaign' AND c.campaign_id = $2::uuid)
+               OR (c.scope = 'personal' AND c.owner_user_id = ANY($3::uuid[])))`, [keys, campaignId, owners]);
         const ok = new Set(found.rows.map((row) => row.content_key));
-        for (const key of keys) if (!ok.has(key)) errors.push(`Condition "${key}" does not exist, is archived, or is not a global condition.`);
+        for (const key of keys) if (!ok.has(key)) errors.push(`Condition "${key}" does not exist, is archived, or is not available to this deck (global conditions, ${owner.kind === 'personal' ? 'and your own library' : "this campaign's own, and libraries enabled here"}).`);
       }
     }
   }
@@ -788,7 +810,7 @@ export async function listPersonalDecks(userId: string): Promise<PersonalDeckRow
   await requirePersonal(userId, { write: false });
   const result = await query<any>(
     `SELECT c.id, c.name, c.is_archived, d.rules_json,
-            (SELECT count(*) FROM campaign_decks cd WHERE cd.deck_content_id = c.id)::int AS enabled_in
+            (SELECT count(*) FROM campaign_decks cd WHERE cd.deck_content_id = c.id AND cd.is_enabled)::int AS enabled_in
      FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
      WHERE c.content_type = 'deck' AND ${ownedBy({ kind: 'personal', userId }, '$1')} ORDER BY c.is_archived, c.name`, [userId]);
   return result.rows.map((row) => {

@@ -27,6 +27,7 @@
       <nav class="library-tabs" aria-label="Library sections">
         {#each tabs as tab}<a href={tabHref(tab[0])} class:active={data.tab === tab[0]} aria-current={data.tab === tab[0] ? 'page' : undefined}>{tab[1]}</a>{/each}
         <a href="/library/decks">Decks</a>
+        <a href="/library/conditions">Conditions</a>
       </nav>
       {#if !data.canAuthorMechanics}
         <p class="panel library-banner">Your library holds descriptive entries: names, descriptions and details. Rules such as bonuses, damage, costs and charges are added by a DM or admin. Once you DM a campaign, those controls appear here.</p>

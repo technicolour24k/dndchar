@@ -10,6 +10,8 @@ import { getActiveEncounterForCharacter } from '$lib/server/services/encounters'
 import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
+import { resolveCharacterScope } from '$lib/server/services/library';
+import { isVisibleForNewUse, type VisibleScope } from '$lib/library/rules';
 import { costSummary, parseCostJson } from '$lib/rules/cost';
 import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
 import { characterProfile, getTurnView } from '$lib/server/services/turn-state';
@@ -243,6 +245,7 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   const abilities = await getAbilities(characterId);
   const poolDefinitions = await listPoolDefinitions({ includeArchived: true });
   const poolLabels = Object.fromEntries(poolDefinitions.map((pool) => [pool.key, pool.label]));
+  const activeEffects = await getActiveEffects(characterId);
   const poolCtx = poolContextFor(classes, abilities, row.metadata_json);
   const pools = await getCharacterPools({ query }, characterId, poolDefinitions, resolvedModifiers.sources, poolCtx);
   // Reuses the sources and context already loaded above, so the turn view costs the profile and turn-row queries only.
@@ -259,10 +262,10 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId),
     proficiencies: await getProficiencies(characterId),
-    activeEffects: await getActiveEffects(characterId),
+    activeEffects,
     modifierSources: resolvedModifiers.sources,
     modifierAudit: resolvedModifiers.audit,
-    availableEffects: await listEffectDefinitions(),
+    availableEffects: await listAvailableEffects(characterId, new Set(activeEffects.map((effect) => effect.effectId))),
     exhaustionLevel: await getExhaustionLevel(characterId),
     content: await listCharacterContent(characterId, poolLabels, turn.profileKey),
     spellSlots: await listSpellSlots(characterId),
@@ -926,10 +929,14 @@ async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDe
     requires_concentration: boolean;
     source_kind: string;
     is_condition: boolean;
+    scope: 'global' | 'personal' | 'campaign';
+    owner_user_id: string | null;
+    campaign_id: string | null;
   }>(
-    `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
+    `SELECT cd.id, regexp_replace(cd.content_key, '^condition:', '') AS effect_key, cd.name, cd.description,
       cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
-      COALESCE(cd.metadata_json->>'isCondition', 'false') = 'true' AS is_condition
+      COALESCE(cd.metadata_json->>'isCondition', 'false') = 'true' AS is_condition,
+      cd.scope, cd.owner_user_id, cd.campaign_id
      FROM content_definitions cd
      WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
      ORDER BY cd.name ASC`,
@@ -963,7 +970,8 @@ async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDe
     requiresConcentration: row.requires_concentration,
     isCondition: row.is_condition,
     isSelectable: true,
-    modifiers: modifiersByEffect.get(row.id) ?? []
+    modifiers: modifiersByEffect.get(row.id) ?? [],
+    scope: row.scope, ownerUserId: row.owner_user_id, campaignId: row.campaign_id
   }));
 }
 
@@ -978,6 +986,21 @@ async function listEffectDefinitions(includeArchived = false): Promise<EffectDef
   } catch {
     return [];
   }
+}
+
+/**
+ * The sheet's condition apply list: global conditions plus those of this character's visible set (libraries enabled in
+ * its campaign, the campaign's own copies). Visibility gates NEW use only, so a condition the character already has
+ * stays listed even if its library is now off.
+ */
+async function listAvailableEffects(characterId: string, activeEffectIds: Set<string>): Promise<EffectDefinition[]> {
+  const all = await listEffectDefinitions();
+  if (!all.some((effect) => effect.scope && effect.scope !== 'global')) return all; // nothing homebrew: no extra query
+  const scope = await resolveCharacterScope({ query }, characterId);
+  return all.filter((effect) => activeEffectIds.has(effect.id) || isVisibleForNewUse({
+    scope: effect.scope ?? 'global', ownerUserId: effect.ownerUserId ?? null, campaignId: effect.campaignId ?? null,
+    hiddenFromPlayers: false, isArchived: false, type: 'condition'
+  }, scope));
 }
 
 async function listEffectModifiers(): Promise<Array<{
@@ -1385,12 +1408,22 @@ async function replaceActiveEffects(client: pg.PoolClient, characterId: string, 
     AND NOT EXISTS (SELECT 1 FROM content_definitions cd WHERE cd.id=active.container_id AND cd.content_type='condition'
       AND cd.content_key=ANY($2::text[]))`,
     [characterId, uniqueKeys.map((key) => 'condition:' + key)]);
+  let scope: VisibleScope | null = null; // worked out only if a NEW homebrew condition is being applied
   for (const key of uniqueKeys) {
-    const effect=await client.query<{id:string}>(`SELECT id FROM content_definitions WHERE content_type='condition'
+    const effect=await client.query<any>(`SELECT id, scope, owner_user_id, campaign_id FROM content_definitions WHERE content_type='condition'
       AND content_key='condition:'||$1 AND is_archived=false`,[key]);
     if(effect.rowCount){
       const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND container_id=$2',[characterId,effect.rows[0].id]);
-      if(!active.rowCount)await applyCharacterEffect(client,characterId,effect.rows[0].id);
+      if(active.rowCount) continue;
+      // A new application must be a condition this character may be offered (a forged key of someone else's library is skipped).
+      const found = effect.rows[0];
+      if (found.scope !== 'global') {
+        scope ??= await resolveCharacterScope(client, characterId);
+        const visible = isVisibleForNewUse({ scope: found.scope, ownerUserId: found.owner_user_id, campaignId: found.campaign_id,
+          hiddenFromPlayers: false, isArchived: false, type: 'condition' }, scope);
+        if (!visible) continue;
+      }
+      await applyCharacterEffect(client,characterId,found.id);
     }
   }
 }

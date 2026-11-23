@@ -98,6 +98,23 @@ export async function resolveVisibleScope(db: Queryable, userId: string, target:
   };
 }
 
+/**
+ * The visible set for a CHARACTER, whoever is looking (conditions have no hidden flag, so the viewer does not matter).
+ * Used for the sheet's condition apply list and the sheet Save's apply check: global, plus the live campaign's enabled
+ * libraries and campaign entries, or just the owner's library when the character has no live campaign.
+ */
+export async function resolveCharacterScope(db: Queryable, characterId: string): Promise<VisibleScope> {
+  const row = (await db.query(
+    `SELECT c.owner_user_id, c.campaign_id, cp.is_archived FROM characters c
+     LEFT JOIN campaigns cp ON cp.id = c.campaign_id WHERE c.id = $1`, [characterId])).rows[0];
+  if (!row) return { campaignId: null, ownerIds: [], hiddenOkOwnerIds: [], hiddenOkCampaign: false };
+  if (!row.campaign_id || row.is_archived) {
+    return { campaignId: null, ownerIds: [row.owner_user_id], hiddenOkOwnerIds: [row.owner_user_id], hiddenOkCampaign: false };
+  }
+  const owners = (await loadCampaignLibraries(db, row.campaign_id)).enabledOwnerIds;
+  return { campaignId: row.campaign_id, ownerIds: owners, hiddenOkOwnerIds: owners, hiddenOkCampaign: true };
+}
+
 const SCOPE_TTL_MS = 60_000;
 
 /** The same, cached for 60 s (pickers and search). Library setting changes and forks clear it via invalidateReferenceData. */
@@ -177,7 +194,7 @@ export async function countHolders(db: Queryable, contentId: string): Promise<Ho
           UNION SELECT character_id FROM active_character_effects WHERE container_id = $1
         ) held)::int AS characters,
        (SELECT count(DISTINCT find_table_id) FROM find_table_entries WHERE item_id = $1)::int AS find_tables,
-       (SELECT count(*) FROM campaign_decks WHERE deck_content_id = $1)::int AS campaigns,
+       (SELECT count(*) FROM campaign_decks WHERE deck_content_id = $1 AND is_enabled)::int AS campaigns,
        -- Decks that name this condition in their rules (stored by content_key, not id). Matched quoted so condition:x does not match condition:x2.
        (SELECT count(*) FROM deck_definitions d, content_definitions me
          WHERE me.id = $1 AND me.content_type = 'condition' AND position('"' || me.content_key || '"' in d.rules_json::text) > 0)::int AS decks`,

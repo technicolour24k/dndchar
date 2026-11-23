@@ -61,7 +61,7 @@ export async function loadModifiers(search = '') {
 
 export async function loadEffects(selectedId = '', search = '', showArchived = false) {
   // Conditions are content_definitions rows (content_type='condition'); the legacy-only fields live in metadata_json.
-  const rows = await query<any>(`SELECT effect.id,REPLACE(effect.content_key,'condition:','') AS effect_key,effect.name,
+  const rows = await query<any>(`SELECT effect.id,regexp_replace(effect.content_key,'^condition:','') AS effect_key,effect.name,
     COALESCE(effect.metadata_json->>'sourceType',effect.source_kind) AS source_type,
     COALESCE(effect.description,'') AS description,
     COALESCE(effect.metadata_json->>'legacyDurationType',
