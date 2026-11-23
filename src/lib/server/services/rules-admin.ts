@@ -61,7 +61,7 @@ export async function loadModifiers(search = '') {
 
 export async function loadEffects(selectedId = '', search = '', showArchived = false) {
   // Conditions are content_definitions rows (content_type='condition'); the legacy-only fields live in metadata_json.
-  const rows = await query<any>(`SELECT effect.id,REPLACE(effect.content_key,'condition:','') AS effect_key,effect.name,
+  const rows = await query<any>(`SELECT effect.id,regexp_replace(effect.content_key,'^condition:','') AS effect_key,effect.name,
     COALESCE(effect.metadata_json->>'sourceType',effect.source_kind) AS source_type,
     COALESCE(effect.description,'') AS description,
     COALESCE(effect.metadata_json->>'legacyDurationType',
@@ -153,7 +153,9 @@ export async function saveEffect(userId: string, form: FormData) {
   if (!name) throw new Error('Effect name is required.');
   const durationType = String(form.get('durationType')||'variable');
   const description = String(form.get('description')||'');
-  const durationRounds = nullableInt(form.get('durationRounds'));
+  const expiryForDefault = String(form.get('expiryBoundary')||'round_end');
+  // 'Until next attack' effects are always capped: a blank duration defaults to 10 rounds.
+  const durationRounds = nullableInt(form.get('durationRounds')) ?? (expiryForDefault === 'next_attack' ? 10 : null);
   const requiresConcentration = form.get('requiresConcentration')==='on';
   const stackBehavior = String(form.get('stackBehavior')||'refresh');
   const expiryBoundary = String(form.get('expiryBoundary')||'round_end');

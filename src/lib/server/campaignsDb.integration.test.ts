@@ -263,7 +263,7 @@ describe.skipIf(!enabled)('campaigns against the local dev DB', () => {
     const room = (await codes(A)).room;
     await query('UPDATE users SET active_vtt_session_id = $2 WHERE id = $1', [u('p1'), room]);
     const out = await campaigns.removeMember(u('p2'), A, u('p1'));
-    expect(out).toEqual({ roomCode: room, targetUserId: u('p1') });
+    expect(out).toMatchObject({ roomCode: room, targetUserId: u('p1') });
     expect(await charCampaign('p1')).toBeNull();
     const cleared = await query<{ active_vtt_session_id: string | null }>('SELECT active_vtt_session_id FROM users WHERE id = $1', [u('p1')]);
     expect(cleared.rows[0].active_vtt_session_id).toBeNull();

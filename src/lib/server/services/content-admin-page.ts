@@ -12,107 +12,118 @@ import {
   createAdminContent,
   detachContentModifier,
   loadContentAdmin,
+  promoteContentToGlobal,
   removeContentResourceAction,
   toggleAdminContentArchive,
   updateAdminContent
 } from '$lib/server/services/content-admin';
 import type { ContentType } from '$lib/types/content';
 
-type ActionEvent = { request: Request; locals: App.Locals };
+type ActionEvent = { request: Request; locals: App.Locals; url: URL };
+
+// Redirect target after a write: the entry, keeping the /admin ?scope= filter.
+const back = (url: URL, id: string) => {
+  const scope = url.searchParams.get('scope');
+  return `?${scope ? `scope=${encodeURIComponent(scope)}&` : ''}content=${id}`;
+};
 
 export function createContentAdminPage(types: ContentType[], fallbackType: ContentType) {
   return {
-    load: async ({ url }: { url: URL }) => loadContentAdmin(types, url.searchParams.get('content') || ''),
+    load: async ({ url }: { url: URL }) => loadContentAdmin(types, url.searchParams.get('content') || '', { scope: url.searchParams.get('scope') || '' }),
     actions: {
-      create: async ({ request, locals }: ActionEvent) => {
+      create: async ({ request, locals, url }: ActionEvent) => {
         try {
           const form = await request.formData();
           const requested = String(form.get('contentType') || fallbackType) as ContentType;
           const type = types.includes(requested) ? requested : fallbackType;
           const id = await createAdminContent(locals.user!.id, type, form);
-          throw redirect(303, `?content=${id}`);
+          throw redirect(303, back(url, id));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not create entry.' });
         }
       },
-      update: async ({ request }: ActionEvent) => {
+      update: async ({ request, url }: ActionEvent) => {
         try {
           const id = await updateAdminContent(await request.formData());
-          throw redirect(303, `?content=${id}`);
+          throw redirect(303, back(url, id));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not update entry.' });
         }
       },
-      archive: async ({ request }: ActionEvent) => {
-        try { const id=await toggleAdminContentArchive(await request.formData());throw redirect(303,`?content=${id}`); }
+      promote: async ({ request, locals, url }: ActionEvent) => {
+        try { const id = await promoteContentToGlobal(locals.user!.id, await request.formData()); throw redirect(303, back(url, id)); }
+        catch (error) { if (isRedirect(error)) throw error; return fail(400, { error: error instanceof Error ? error.message : 'Could not promote entry.' }); }
+      },
+      archive: async ({ request, url }: ActionEvent) => {
+        try { const id=await toggleAdminContentArchive(await request.formData());throw redirect(303,back(url,id)); }
         catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not archive entry.'});}
       },
-      attachModifier: async ({ request }: ActionEvent) => {
+      attachModifier: async ({ request, url }: ActionEvent) => {
         try {
           const id = await attachModifierToContent(await request.formData());
-          throw redirect(303, `?content=${id}`);
+          throw redirect(303, back(url, id));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not attach modifier.' });
         }
       },
-      detachModifier: async ({ request }: ActionEvent) => {
+      detachModifier: async ({ request, url }: ActionEvent) => {
         try {
           const id = await detachContentModifier(await request.formData());
-          throw redirect(303, `?content=${id}`);
+          throw redirect(303, back(url, id));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not remove modifier.' });
         }
       },
-      attachEffect: async ({request}:ActionEvent)=>{try{const id=await attachEffectToAdminContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not attach Effect.'})}},
-      detachEffect: async ({request}:ActionEvent)=>{try{const id=await detachEffectFromAdminContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Effect.'})}},
-      addResource: async ({ request }: ActionEvent) => {
+      attachEffect: async ({request,url}:ActionEvent)=>{try{const id=await attachEffectToAdminContent(await request.formData());throw redirect(303,back(url,id))}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not attach Effect.'})}},
+      detachEffect: async ({request,url}:ActionEvent)=>{try{const id=await detachEffectFromAdminContent(await request.formData());throw redirect(303,back(url,id))}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Effect.'})}},
+      addResource: async ({ request, url }: ActionEvent) => {
         try {
           const form = await request.formData();
           await addContentResourceDefinition(form);
-          throw redirect(303, `?content=${String(form.get('contentId') || '')}`);
+          throw redirect(303, back(url, String(form.get('contentId') || '')));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not add resource.' });
         }
       },
-      grantContent: async ({ request }: ActionEvent) => {
+      grantContent: async ({ request, url }: ActionEvent) => {
         try {
           const form = await request.formData();
           await grantContentFromContent(form);
-          throw redirect(303, `?content=${String(form.get('sourceContentId') || '')}`);
+          throw redirect(303, back(url, String(form.get('sourceContentId') || '')));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not attach granted content.' });
         }
       }
       ,
-      addResourceAction: async ({ request }: ActionEvent) => {
+      addResourceAction: async ({ request, url }: ActionEvent) => {
         try {
           const id = await addContentResourceAction(await request.formData());
-          throw redirect(303, `?content=${id}`);
+          throw redirect(303, back(url, id));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not add action.' });
         }
       },
-      removeResourceAction: async ({ request }: ActionEvent) => {
+      removeResourceAction: async ({ request, url }: ActionEvent) => {
         try {
           const id = await removeContentResourceAction(await request.formData());
-          throw redirect(303, `?content=${id}`);
+          throw redirect(303, back(url, id));
         } catch (error) {
           if (isRedirect(error)) throw error;
           return fail(400, { error: error instanceof Error ? error.message : 'Could not remove action.' });
         }
       }
       ,
-      attachAction:async({request}:ActionEvent)=>{try{const id=await attachActionToContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not attach Action.'})}},
-      detachAction:async({request}:ActionEvent)=>{try{const id=await detachActionFromContent(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Action.'})}},
-      addSpellAccess:async({request}:ActionEvent)=>{try{const id=await addSpellAccess(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not grant Spell.'})}},
-      removeSpellAccess:async({request}:ActionEvent)=>{try{const id=await removeSpellAccess(await request.formData());throw redirect(303,`?content=${id}`)}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Spell access.'})}}
+      attachAction:async({request,url}:ActionEvent)=>{try{const id=await attachActionToContent(await request.formData());throw redirect(303,back(url,id))}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not attach Action.'})}},
+      detachAction:async({request,url}:ActionEvent)=>{try{const id=await detachActionFromContent(await request.formData());throw redirect(303,back(url,id))}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Action.'})}},
+      addSpellAccess:async({request,url}:ActionEvent)=>{try{const id=await addSpellAccess(await request.formData());throw redirect(303,back(url,id))}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not grant Spell.'})}},
+      removeSpellAccess:async({request,url}:ActionEvent)=>{try{const id=await removeSpellAccess(await request.formData());throw redirect(303,back(url,id))}catch(error){if(isRedirect(error))throw error;return fail(400,{error:error instanceof Error?error.message:'Could not remove Spell access.'})}}
     }
   };
 }

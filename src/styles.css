@@ -2438,7 +2438,7 @@ button.death-save-icon.failure.active {
   .forage-sheet { width: 100%; }
 }
 
-/* Forage find-table authoring (/forage/tables). */
+/* Forage find-table authoring (/campaigns/[id]/forage). */
 .forage-layout { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(0, 1.5fr); gap: 18px; align-items: start; }
 .forage-layout > * { min-width: 0; }
 .forage-layout input, .forage-layout select { min-width: 0; width: 100%; }
@@ -2465,6 +2465,7 @@ button.death-save-icon.failure.active {
   .forage-entry-name { grid-column: 1 / -1; }
   .forage-entry-label { display: inline; font-size: 11px; color: var(--muted); }
   .forage-entry input, .forage-entry select, .forage-entry button, .forage-add input, .forage-add button { min-height: 44px; }
+  .forage-layout .admin-create-disclosure summary, .forage-layout .admin-form input, .forage-layout .admin-form button, .forage-layout .forage-list-item, .forage-layout form button { min-height: 44px; }
   .forage-entry button { grid-column: 1 / -1; }
 }
 
@@ -3409,3 +3410,30 @@ button.compact-button.active {
 .cast-lines { list-style: none; margin: 0.4rem 0; padding: 0; display: grid; gap: 0.15rem; }
 .cast-lines .short { color: var(--danger, #e06c6c); }
 .spell-picker-cost { font-size: 0.75em; color: #8a8; }
+
+/* Decks popup (decks unit 7). Reuses the forage-sheet field/warn/error/actions look. */
+.deck-sheet .forage-field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+.deck-sheet .forage-field select { min-height: 44px; width: 100%; }
+.deck-sheet .forage-warn { color: #ffb300; font-size: 13px; }
+.deck-sheet .forage-error { color: var(--danger); font-size: 13px; margin: 8px 0; }
+.deck-sheet .forage-actions { flex-wrap: wrap; margin-top: 10px; }
+.deck-sheet .text-button { min-height: 44px; padding: 0 8px; }
+.deck-sheet .deck-badge { margin-left: 6px; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; color: #111; background: var(--danger); }
+.deck-sheet .deck-badge.good { background: #ffb300; }
+.deck-sheet .deck-badge.neutral { background: #b0bec5; }
+.deck-sheet .deck-lines { margin: 8px 0; padding-left: 18px; }
+.deck-sheet .deck-choice { display: grid; gap: 4px; margin: 8px 0; }
+.deck-sheet .deck-choice button { min-height: 44px; }
+.deck-sheet .deck-description { white-space: pre-wrap; }
+/* One row per deck (matches the VTT popup): 14px on a mouse, 44px on touch. */
+.deck-sheet .deck-row { display: flex; align-items: center; gap: 6px; font-size: 14px; border: 1px solid var(--border, #444); border-radius: 6px; padding: 6px 10px; margin-bottom: 4px; }
+.deck-sheet .deck-row-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.deck-sheet .deck-row button { font-size: 14px; padding: 4px 10px; }
+.deck-sheet .deck-description { margin: 0 0 8px; padding: 0 10px; font-size: 14px; }
+@media (pointer: coarse) { .deck-sheet .deck-row button { min-height: 44px; min-width: 44px; } }
+.deck-sheet .deck-recent { margin-top: 12px; }
+.deck-sheet .deck-recent-row { border-top: 1px solid var(--border, #444); padding: 6px 0; }
+.deck-sheet .deck-recent-row p { margin: 2px 0; }
+
+/* Homebrew library (unit D): the campaign page's link groups. */
+.campaign-row-links { display: flex; flex-wrap: wrap; gap: 8px; }

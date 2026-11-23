@@ -5,10 +5,14 @@ import { readStatOverrides, type StatOverrides } from '$lib/rules/characterStats
 import { getCombatClock, listCharacterContent, listSpellSlots, syncCharacterSpellSlots } from '$lib/server/services/catalogue';
 import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
 import { applyCharacterEffect } from '$lib/server/services/effects';
+import { readEffectMetadata, substituteParams } from '$lib/rules/effectParams';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
+import { resolveCharacterScope } from '$lib/server/services/library';
+import { loadCampaignCopyMap, type CopyMap } from '$lib/server/services/libraryFork';
+import { isVisibleForNewUse, type VisibleScope } from '$lib/library/rules';
 import { costSummary, parseCostJson } from '$lib/rules/cost';
 import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
 import { characterProfile, getTurnView } from '$lib/server/services/turn-state';
@@ -242,6 +246,7 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
   const abilities = await getAbilities(characterId);
   const poolDefinitions = await listPoolDefinitions({ includeArchived: true });
   const poolLabels = Object.fromEntries(poolDefinitions.map((pool) => [pool.key, pool.label]));
+  const activeEffects = await getActiveEffects(characterId);
   const poolCtx = poolContextFor(classes, abilities, row.metadata_json);
   const pools = await getCharacterPools({ query }, characterId, poolDefinitions, resolvedModifiers.sources, poolCtx);
   // Reuses the sources and context already loaded above, so the turn view costs the profile and turn-row queries only.
@@ -258,10 +263,10 @@ async function loadCharacterDetail(row: CharacterRow): Promise<CharacterDetail> 
     attacks: await getAttacks(characterId),
     notes: await getNotes(characterId),
     proficiencies: await getProficiencies(characterId),
-    activeEffects: await getActiveEffects(characterId),
+    activeEffects,
     modifierSources: resolvedModifiers.sources,
     modifierAudit: resolvedModifiers.audit,
-    availableEffects: await listEffectDefinitions(),
+    availableEffects: await listAvailableEffects(characterId, new Set(activeEffects.map((effect) => effect.effectId))),
     exhaustionLevel: await getExhaustionLevel(characterId),
     content: await listCharacterContent(characterId, poolLabels, turn.profileKey),
     spellSlots: await listSpellSlots(characterId),
@@ -377,7 +382,7 @@ export class StaleSheetError extends Error {
 // this shipped) skips the check.
 export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<number> {
   const resources = parseResources(form);
-  const newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
+  let newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
   let previousHp: number | null = null;
   let characterName = '';
 
@@ -393,14 +398,29 @@ export async function updateCharacter(userId: string, characterId: string, form:
     // change can be reported as a delta ("takes 12 damage") rather than just
     // an absolute overwrite - see the combat-log write below.
     const prevHpRow = await client.query<{ current_value: number }>(
-      `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'hp'`,
+      `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'hp' FOR UPDATE`,
       [characterId]
     );
     previousHp = prevHpRow.rows[0]?.current_value ?? null;
+    // The two reads above lock the hp / temp_hp rows (FOR UPDATE, after the characters row, the usual order): the
+    // action engine and rests write these rows without locking the characters row, so the lock is what keeps the
+    // value we preserve from changing before we write.
+    // Typing a value equal to the stale baseline counts as unedited (indistinguishable from not touching it; accepted).
+    // Decks unit 6: HP, temp HP and coin are also changed from outside the sheet (a deck draw, the VTT), so a
+    // value the user did not edit keeps whatever the database holds now instead of the sheet's stale copy.
+    // No baseline posted (an old tab, a script) = the old behaviour, everything posted is written.
+    const resourceBaseline = parseResourceBaseline(form);
+    if (resourceBaseline) {
+      const prevTempRow = await client.query<{ current_value: number }>(
+        `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'temp_hp' FOR UPDATE`, [characterId]);
+      keepUneditedResources(resources, resourceBaseline, { hp: previousHp, tempHp: prevTempRow.rows[0]?.current_value ?? null });
+      newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null; // so an unedited HP is never logged as a change
+    }
     characterName = String(form.get('name') || '').trim() || 'A character';
 
     const overrides = parseStatOverridesField(form);
-    const metadataPatch = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
+    const metadataPatch: Record<string, unknown> = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
+    if (resourceBaseline) keepUneditedCoins(metadataPatch, resourceBaseline);
 
     const updated = await client.query<{ sheet_version: number }>(
       `
@@ -511,7 +531,8 @@ export async function restoreCharacterVersion(userId: string, characterId: strin
   });
 }
 
-async function createVersionWithClient(client: pg.PoolClient, characterId: string, userId: string, summary: string): Promise<void> {
+// Exported for the fork tests, which need a snapshot taken at a known moment.
+export async function createVersionWithClient(client: pg.PoolClient, characterId: string, userId: string, summary: string): Promise<void> {
   const snapshot = await buildSnapshot(client, characterId);
   await client.query(
     `
@@ -572,6 +593,10 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
 }
 
 async function applySnapshot(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot): Promise<void> {
+  // Snapshots keep the ORIGINAL ids and keys (history is never rewritten). Inside a campaign that holds campaign copies of
+  // a leaver's library (homebrew library fork, unit G) the restored character lands on the copies instead, so a restore
+  // cannot pull the campaign back onto the original. Outside such a campaign the originals still resolve.
+  const copies = await loadCampaignCopyMap(client, characterId);
   const character = snapshot.character ?? {};
   const restoredClasses = snapshot.classes?.length
     ? snapshot.classes
@@ -655,7 +680,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       damageBonus: Number(row.damage_bonus) || 0,
       attackAbility: abilityKeys.includes(row.attack_ability as AbilityKey) ? (row.attack_ability as AbilityKey) : 'str',
       proficient: row.proficient ?? true,
-      sourceContentId: row.source_content_id || null,
+      sourceContentId: (row.source_content_id && copies.ids.get(row.source_content_id)) || row.source_content_id || null,
       attuned: row.attuned || false,
       damageRolls: row.damage_rolls || '',
       effects: row.effects || '',
@@ -693,7 +718,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
   for(const row of snapshot.inventory_resources??[]){await client.query(`INSERT INTO character_inventory_resources
     (id,inventory_item_id,resource_definition_id,current_value,max_value)
     SELECT $1,$2,$3,$4,$5 WHERE EXISTS(SELECT 1 FROM character_inventory_items WHERE id=$2)
-      AND EXISTS(SELECT 1 FROM content_resource_definitions WHERE id=$3)`,[row.id,row.inventory_item_id,row.resource_definition_id,row.current_value,row.max_value]);}
+      AND EXISTS(SELECT 1 FROM content_resource_definitions WHERE id=$3)`,[row.id,row.inventory_item_id,copies.resources.get(row.resource_definition_id) ?? row.resource_definition_id,row.current_value,row.max_value]);}
   await replaceProficiencies(
     client,
     characterId,
@@ -702,29 +727,34 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       key: row.proficiency_key || ''
     }))
   );
-  await restoreStructuredContent(client, characterId, snapshot);
+  await restoreStructuredContent(client, characterId, snapshot, copies);
   await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
+  // Restored effects keep metadata_json (params, label) but not source_character_id: snapshots don't store it (accepted).
   for (const row of snapshot.active_effects ?? []) {
+    // The key is stored without its "condition:" prefix (an anchored strip); a copy has the same shape, so it is looked up the same way.
+    const effectKey = (copies.keys.get('condition:' + row.effect_key) ?? 'condition:' + row.effect_key).replace(/^condition:/, '');
     await client.query(`INSERT INTO active_character_effects(character_id,container_id,remaining_rounds,metadata_json,
       source_content_instance_id,expiry_boundary,application_key,source_key)
       SELECT $1,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
       FROM content_definitions cd
       WHERE cd.content_type='condition' AND cd.content_key='condition:'||$8`,
       [characterId,row.remaining_rounds??null,JSON.stringify(row.metadata_json||{}),row.source_content_instance_id||null,
-        row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,row.effect_key]);
+        row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,effectKey]);
   }
   await setExhaustionLevel(client, characterId, Number(snapshot.exhaustion?.exhaustion_level) || 0);
 }
 
-async function restoreStructuredContent(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot): Promise<void> {
+async function restoreStructuredContent(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot, copies: CopyMap): Promise<void> {
   await client.query('DELETE FROM character_content_instances WHERE character_id = $1', [characterId]);
   for (const row of snapshot.content_instances ?? []) {
-    const contentExists = await client.query('SELECT id FROM content_definitions WHERE id = $1', [row.content_id]);
+    const contentId = copies.ids.get(row.content_id) ?? row.content_id;
+    const contentExists = await client.query('SELECT id FROM content_definitions WHERE id = $1', [contentId]);
     if (!contentExists.rowCount) continue;
     await client.query(`INSERT INTO character_content_instances
       (id, character_id, content_id, source_class_id, is_known, is_prepared, is_active, custom_name, notes, metadata_json, created_at)
-      VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,COALESCE($10,now()))`,
-      [row.id, characterId, row.content_id, row.is_known, row.is_prepared, row.is_active, row.custom_name,
+      VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,COALESCE($10,now()))
+      ON CONFLICT (character_id, content_id) DO NOTHING`,
+      [row.id, characterId, contentId, row.is_known, row.is_prepared, row.is_active, row.custom_name,
         row.notes || '', JSON.stringify(row.metadata_json || {}), row.created_at]);
   }
   for (const row of snapshot.content_resources ?? []) {
@@ -732,7 +762,7 @@ async function restoreStructuredContent(client: pg.PoolClient, characterId: stri
       (id, character_content_id, resource_definition_id, current_value, max_value)
       SELECT $1,$2,$3,$4,$5 WHERE EXISTS (SELECT 1 FROM character_content_instances WHERE id=$2)
         AND EXISTS (SELECT 1 FROM content_resource_definitions WHERE id=$3)`,
-      [row.id, row.character_content_id, row.resource_definition_id, row.current_value, row.max_value]);
+      [row.id, row.character_content_id, copies.resources.get(row.resource_definition_id) ?? row.resource_definition_id, row.current_value, row.max_value]);
   }
   await client.query('DELETE FROM character_spell_slots WHERE character_id = $1', [characterId]);
   for (const row of snapshot.spell_slots ?? []) {
@@ -909,10 +939,14 @@ async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDe
     requires_concentration: boolean;
     source_kind: string;
     is_condition: boolean;
+    scope: 'global' | 'personal' | 'campaign';
+    owner_user_id: string | null;
+    campaign_id: string | null;
   }>(
-    `SELECT cd.id, REPLACE(cd.content_key, 'condition:', '') AS effect_key, cd.name, cd.description,
+    `SELECT cd.id, regexp_replace(cd.content_key, '^condition:', '') AS effect_key, cd.name, cd.description,
       cd.duration_type, cd.duration_rounds, cd.requires_concentration, cd.source_kind,
-      COALESCE(cd.metadata_json->>'isCondition', 'false') = 'true' AS is_condition
+      COALESCE(cd.metadata_json->>'isCondition', 'false') = 'true' AS is_condition,
+      cd.scope, cd.owner_user_id, cd.campaign_id
      FROM content_definitions cd
      WHERE cd.content_type='condition' AND ($1::boolean OR cd.is_archived=false)
      ORDER BY cd.name ASC`,
@@ -946,7 +980,8 @@ async function loadEffectDefinitions(includeArchived: boolean): Promise<EffectDe
     requiresConcentration: row.requires_concentration,
     isCondition: row.is_condition,
     isSelectable: true,
-    modifiers: modifiersByEffect.get(row.id) ?? []
+    modifiers: modifiersByEffect.get(row.id) ?? [],
+    scope: row.scope, ownerUserId: row.owner_user_id, campaignId: row.campaign_id
   }));
 }
 
@@ -961,6 +996,21 @@ async function listEffectDefinitions(includeArchived = false): Promise<EffectDef
   } catch {
     return [];
   }
+}
+
+/**
+ * The sheet's condition apply list: global conditions plus those of this character's visible set (libraries enabled in
+ * its campaign, the campaign's own copies). Visibility gates NEW use only, so a condition the character already has
+ * stays listed even if its library is now off.
+ */
+async function listAvailableEffects(characterId: string, activeEffectIds: Set<string>): Promise<EffectDefinition[]> {
+  const all = await listEffectDefinitions();
+  if (!all.some((effect) => effect.scope && effect.scope !== 'global')) return all; // nothing homebrew: no extra query
+  const scope = await resolveCharacterScope({ query }, characterId);
+  return all.filter((effect) => activeEffectIds.has(effect.id) || isVisibleForNewUse({
+    scope: effect.scope ?? 'global', ownerUserId: effect.ownerUserId ?? null, campaignId: effect.campaignId ?? null,
+    hiddenFromPlayers: false, isArchived: false, type: 'condition'
+  }, scope));
 }
 
 async function listEffectModifiers(): Promise<Array<{
@@ -1001,14 +1051,14 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
   const definitions = await listEffectDefinitions(true);
   const byId = new Map(definitions.map((d) => [d.id, d]));
   try {
-    const active = await query<{ id: string; container_id: string; remaining_rounds: number | null }>(
+    const active = await query<{ id: string; container_id: string; remaining_rounds: number | null; metadata_json: unknown }>(
       `-- Direct active effects (primary: container_id)
-       SELECT id::text, container_id::text AS container_id, remaining_rounds
+       SELECT id::text, container_id::text AS container_id, remaining_rounds, metadata_json
        FROM active_character_effects
        WHERE character_id=$1 AND container_id IS NOT NULL
        UNION ALL
        -- Conditions granted by active content instances
-       SELECT 'content:' || i.id || ':' || cg.id, cg.granted_content_id::text, NULL
+       SELECT 'content:' || i.id || ':' || cg.id, cg.granted_content_id::text, NULL, NULL::jsonb
        FROM character_content_instances i
        JOIN content_definitions c ON c.id=i.content_id
        JOIN content_grants cg ON cg.source_content_id=i.content_id
@@ -1017,7 +1067,7 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
          AND cg.activation_type IN ('carried','equipped','attuned','manual')
        UNION ALL
        -- Conditions granted by equipped/carried inventory items
-       SELECT 'item:' || inv.id || ':' || cg.id, cg.granted_content_id::text, NULL
+       SELECT 'item:' || inv.id || ':' || cg.id, cg.granted_content_id::text, NULL, NULL::jsonb
        FROM character_inventory_items inv
        JOIN content_grants cg ON cg.source_content_id=inv.source_content_id
        JOIN content_definitions granted ON granted.id=cg.granted_content_id AND granted.content_type='condition'
@@ -1028,7 +1078,7 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
        )
        UNION ALL
        -- Conditions granted transitively (item grants a content, that content grants a condition)
-       SELECT 'grant:' || inv.id || ':' || cg2.id, cg2.granted_content_id::text, NULL
+       SELECT 'grant:' || inv.id || ':' || cg2.id, cg2.granted_content_id::text, NULL, NULL::jsonb
        FROM character_inventory_items inv
        JOIN content_grants cg1 ON cg1.source_content_id=inv.source_content_id
        JOIN content_grants cg2 ON cg2.source_content_id=cg1.granted_content_id
@@ -1045,11 +1095,14 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
       .map((row) => {
         const definition = byId.get(row.container_id);
         if (!definition) return null;
+        // Applied-instance params/label (e.g. a deck card's AC value): show the label and the resolved value.
+        const { params, sourceLabel } = readEffectMetadata(row.metadata_json);
+        const hasParams = Object.keys(params).length > 0;
         return {
           id: row.id,
           effectId: definition.id,
           effectKey: definition.key,
-          name: definition.name,
+          name: sourceLabel ? `${definition.name} (${sourceLabel})` : definition.name,
           sourceType: definition.sourceType,
           sourceName: definition.sourceName,
           description: definition.description,
@@ -1058,7 +1111,13 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
           isCondition: definition.isCondition,
           isSelectable: definition.isSelectable,
           remainingRounds: row.remaining_rounds,
-          modifiers: definition.modifiers
+          modifiers: hasParams
+            ? definition.modifiers.map((m) => ({
+              ...m,
+              valueExpression: substituteParams(m.valueExpression, params),
+              valueOverrideExpression: substituteParams(m.valueOverrideExpression, params)
+            }))
+            : definition.modifiers
         };
       })
       .filter((effect): effect is CharacterDetail['activeEffects'][number] => Boolean(effect));
@@ -1122,6 +1181,9 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
 
 // Upserts one posted inventory row (insert, or update when the id already belongs to this
 // character). Shared by the full replace below and by the changes-only Save.
+// source_content_id is written on INSERT only. It is not user-editable, and a fork (homebrew library, unit G)
+// re-points it from a leaver's library entry to the campaign's copy, so a stale open sheet must never put the old
+// id back when it saves.
 async function upsertInventoryRow(client: pg.PoolClient, characterId: string, row: InventoryItem, sortOrder: number): Promise<void> {
   await client.query(
     `
@@ -1133,7 +1195,7 @@ async function upsertInventoryRow(client: pg.PoolClient, characterId: string, ro
         ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
         attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
         effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
-        source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
+        attuned=EXCLUDED.attuned
       WHERE character_inventory_items.character_id = EXCLUDED.character_id
     `,
     [
@@ -1196,9 +1258,57 @@ const INVENTORY_SAVE_FIELDS: Array<[column: string, read: (row: InventoryItem) =
   ['damage_rolls', (row) => row.damageRolls || ''],
   ['effects', (row) => row.effects || ''],
   ['notes', (row) => row.notes || ''],
-  ['source_content_id', (row) => row.sourceContentId || null],
+  // source_content_id is deliberately not here: see upsertInventoryRow.
   ['attuned', (row) => !!row.attuned]
 ];
+
+/**
+ * What the sheet showed for HP, temp HP and coin when it loaded (hidden field resourceBaseline, posted with Save).
+ * A posted value equal to its baseline was not edited by the user. Null when missing or malformed.
+ */
+export type ResourceBaseline = { hp?: number; tempHp?: number; coins: Record<string, string> };
+const COIN_FIELDS = ['currencyCp', 'currencySp', 'currencyEp', 'currencyGp', 'currencyPp'];
+
+function parseResourceBaseline(form: FormData): ResourceBaseline | null {
+  const raw = form.get('resourceBaseline');
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const coins: Record<string, string> = {};
+    for (const field of COIN_FIELDS) if (parsed[field] !== undefined) coins[field] = String(parsed[field]).trim();
+    return {
+      hp: Number.isFinite(Number(parsed.hp)) && parsed.hp !== undefined ? Number(parsed.hp) : undefined,
+      tempHp: Number.isFinite(Number(parsed.tempHp)) && parsed.tempHp !== undefined ? Number(parsed.tempHp) : undefined,
+      coins
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mutates the parsed resources: an HP / temp HP the user did not edit (posted equals baseline) takes the
+ * database's current value. A missing database row keeps the posted value (nothing to preserve).
+ */
+export function keepUneditedResources(
+  resources: CharacterResource[], baseline: ResourceBaseline, db: { hp: number | null; tempHp: number | null }
+): void {
+  const hp = resources.find((r) => r.key === 'hp');
+  if (hp && baseline.hp !== undefined && hp.currentValue === baseline.hp && db.hp !== null) hp.currentValue = db.hp;
+  const temp = resources.find((r) => r.key === 'temp_hp');
+  if (temp && baseline.tempHp !== undefined && temp.currentValue === baseline.tempHp && db.tempHp !== null) {
+    temp.currentValue = db.tempHp;
+    temp.maxValue = db.tempHp; // temp HP has no cap of its own (parseResources mirrors current into max)
+  }
+}
+
+/** Drops each coin field the user did not edit from the metadata patch, so the stored (possibly newer) value stays. */
+export function keepUneditedCoins(patch: Record<string, unknown>, baseline: ResourceBaseline): void {
+  for (const field of COIN_FIELDS) {
+    if (field in baseline.coins && String(patch[field] ?? '').trim() === baseline.coins[field]) delete patch[field];
+  }
+}
 
 /**
  * The inventory the sheet had loaded when the user pressed Save (hidden field inventoryBaseline).
@@ -1307,16 +1417,32 @@ async function replaceProficiencies(
 
 async function replaceActiveEffects(client: pg.PoolClient, characterId: string, effectKeys: string[]): Promise<void> {
   const uniqueKeys = [...new Set(effectKeys.map((key) => key.trim()).filter(Boolean))];
+  // A held condition is kept when its key was posted, OR when it is a campaign copy of a condition whose key was posted
+  // (homebrew library fork, unit G): a sheet that was open before the fork still lists the ORIGINAL key, and saving it
+  // must not take the re-pointed copy off the character.
   await client.query(`DELETE FROM active_character_effects active WHERE character_id=$1
     AND NOT EXISTS (SELECT 1 FROM content_definitions cd WHERE cd.id=active.container_id AND cd.content_type='condition'
-      AND cd.content_key=ANY($2::text[]))`,
+      AND (cd.content_key=ANY($2::text[])
+        OR cd.forked_from_content_id IN (SELECT id FROM content_definitions WHERE content_type='condition' AND content_key=ANY($2::text[]))))`,
     [characterId, uniqueKeys.map((key) => 'condition:' + key)]);
+  let scope: VisibleScope | null = null; // worked out only if a NEW homebrew condition is being applied
   for (const key of uniqueKeys) {
-    const effect=await client.query<{id:string}>(`SELECT id FROM content_definitions WHERE content_type='condition'
+    const effect=await client.query<any>(`SELECT id, scope, owner_user_id, campaign_id FROM content_definitions WHERE content_type='condition'
       AND content_key='condition:'||$1 AND is_archived=false`,[key]);
     if(effect.rowCount){
-      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND container_id=$2',[characterId,effect.rows[0].id]);
-      if(!active.rowCount)await applyCharacterEffect(client,characterId,effect.rows[0].id);
+      // Already held, as itself or as a campaign copy of it (see the DELETE above).
+      const active=await client.query(`SELECT 1 FROM active_character_effects a JOIN content_definitions cd ON cd.id=a.container_id
+        WHERE a.character_id=$1 AND (cd.id=$2 OR cd.forked_from_content_id=$2)`,[characterId,effect.rows[0].id]);
+      if(active.rowCount) continue;
+      // A new application must be a condition this character may be offered (a forged key of someone else's library is skipped).
+      const found = effect.rows[0];
+      if (found.scope !== 'global') {
+        scope ??= await resolveCharacterScope(client, characterId);
+        const visible = isVisibleForNewUse({ scope: found.scope, ownerUserId: found.owner_user_id, campaignId: found.campaign_id,
+          hiddenFromPlayers: false, isArchived: false, type: 'condition' }, scope);
+        if (!visible) continue;
+      }
+      await applyCharacterEffect(client,characterId,found.id);
     }
   }
 }

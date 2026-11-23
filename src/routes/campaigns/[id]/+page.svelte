@@ -6,6 +6,7 @@
   import { canOpenAsGm, tableHref } from '$lib/campaigns/vttLinks';
   import { totalLevel } from '$lib/rules/dnd5e';
   import { PROFILES } from '$lib/rules/actionEconomy';
+  import { cardTitle, resultLines, statusTag, successLabel } from '../../../../static/vtt-app/shared/deckView.js';
 
   let { data, form } = $props();
 
@@ -24,6 +25,10 @@
   let copied = $state('');
   let codeField = $state<HTMLInputElement | null>(null);
   let linkField = $state<HTMLInputElement | null>(null);
+
+  // Decks: which draws are still open to undo, and whether the section has anything to show.
+  const showDecks = $derived(access.canManage || data.decks.length > 0 || data.draws.length > 0);
+  const when = (iso: string) => new Date(iso).toLocaleString();
 
   // Wraps a form so it asks first. Cancelling the confirm cancels the submit.
   function confirmFirst(message: string): SubmitFunction {
@@ -98,6 +103,9 @@
 {/if}
 {#if form?.error}
   <p class="form-error">{form.error}</p>
+{/if}
+{#if form?.forkNote}
+  <p class="form-success">{form.forkNote} They are under Campaign copies.</p>
 {/if}
 
 <div class="campaign-layout">
@@ -328,7 +336,7 @@
           <h2>Foraging</h2>
           <span class="campaign-box-foot">
             <span class="muted">Find tables: {data.findTableCount} active</span>
-            <a class="button-link compact-link" href="/forage/tables">Manage</a>
+            <a class="button-link compact-link" href="/campaigns/{campaign.id}/forage">Manage</a>
           </span>
         </div>
         {#if data.findTableCount === 0}
@@ -364,6 +372,117 @@
       </section>
     {/if}
     {#if form?.reviewed}<p class="muted">{form.reviewed}</p>{/if}
+
+    {#if !archived}
+      <section class="panel campaign-box">
+        <div class="campaign-row">
+          <h2>Homebrew</h2>
+          <span class="campaign-row-links">
+            <a class="button-link compact-link deck-button" href="/catalogue?campaign={campaign.id}">Campaign homebrew</a>
+            {#if access.canManage}<a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/homebrew">Campaign copies</a>{/if}
+            <a class="button-link compact-link deck-button" href="/library">Make homebrew</a>
+          </span>
+        </div>
+        <p class="muted">What this campaign can use, and your own library.{access.canManage ? " The Libraries button in the Decks box switches members' libraries on." : ''}</p>
+      </section>
+    {/if}
+
+    {#if !archived && showDecks}
+      <section class="panel campaign-box">
+        <div class="campaign-row">
+          <h2>Decks</h2>
+          {#if access.canManage}<span class="campaign-row-links"><a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/decks">Manage decks</a> <a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/library">Libraries</a></span>{/if}
+        </div>
+        {#if data.decks.length === 0}
+          <p class="muted">{access.canManage ? 'No decks on this campaign yet. Add one below, or create your own under Manage decks, and players can draw from it on their sheets and at the table.' : 'This campaign has no decks yet.'}</p>
+        {:else}
+          <ul class="member-list">
+            {#each data.decks as deck (deck.id)}
+              <li>
+                <div class="member-name">
+                  <strong>{deck.name}</strong>
+                  {#if !deck.enabled}<span class="badge badge-muted">Off</span>{/if}
+                  {#if deck.archived}<span class="badge badge-muted">Archived</span>{/if}
+                </div>
+                {#if access.canManage}
+                  <form method="POST" action="?/setDeck" use:enhance>
+                    <input type="hidden" name="deckId" value={deck.id} />
+                    <input type="hidden" name="enabled" value={deck.enabled ? '0' : '1'} />
+                    <button type="submit" class="compact-button deck-button" disabled={deck.archived && !deck.enabled}>{deck.enabled ? 'Disable' : 'Enable'}</button>
+                  </form>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if access.canManage && data.availableDecks.length}
+          <form method="POST" action="?/setDeck" use:enhance class="stack">
+            <input type="hidden" name="enabled" value="1" />
+            <label>
+              Add a deck
+              <select name="deckId" required>
+                {#each data.availableDecks as deck (deck.id)}<option value={deck.id}>{deck.name}</option>{/each}
+              </select>
+            </label>
+            <button type="submit" class="compact-button stack-button deck-button">Add deck</button>
+          </form>
+        {/if}
+        {#if form?.saved === 'decks'}<p class="muted">Saved.</p>{/if}
+      </section>
+
+      {#if access.canManage && data.deckTasks.length}
+        <section class="panel campaign-box">
+          <h2>Waiting on you</h2>
+          <p class="muted">Things a card left for the DM to sort out.</p>
+          <ul class="member-list">
+            {#each data.deckTasks as task (task.taskId)}
+              <li>
+                <div class="member-name"><strong>{task.cardLabel}</strong> <span>{task.text}</span></div>
+                <form method="POST" action="?/taskDone" use:enhance>
+                  <input type="hidden" name="drawId" value={task.drawId} />
+                  <input type="hidden" name="taskId" value={task.taskId} />
+                  <button type="submit" class="compact-button deck-button">Done</button>
+                </form>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
+
+      {#if data.draws.length}
+        <section class="panel campaign-box">
+          <h2>Deck draws <span class="muted">(last {data.draws.length})</span></h2>
+          {#if form?.saved === 'draws'}<p class="muted">{form.note ? `Undone. ${form.note}` : 'Saved.'}</p>{/if}
+          <ul class="member-list deck-draws">
+            {#each data.draws as draw (draw.id)}
+              <li>
+                <div class="deck-draw-body">
+                  <strong>{draw.drawerName}</strong> drew the {cardTitle(draw.card)}
+                  {#if draw.status !== 'cancelled' && draw.status !== 'choosing'}<span class="badge" class:badge-muted={draw.success == null}>{successLabel(draw.success)}</span>{/if}
+                  {#if statusTag(draw)}<span class="badge badge-muted">{statusTag(draw)}</span>{/if}
+                  <span class="muted">{draw.deckName} - {when(draw.createdAt)}</span>
+                  {#if draw.status === 'resolved' || draw.status === 'reverted'}
+                    {#if draw.outcome?.name}<span>{draw.outcome.name}</span>{/if}
+                    {#each resultLines(draw) as line}<span class="muted">{line}</span>{/each}
+                    {#if draw.status === 'reverted' && draw.revertNote}<span class="muted">{draw.revertNote}</span>{/if}
+                  {/if}
+                </div>
+                {#if access.canManage && (draw.status === 'resolved' || draw.status === 'choosing')}
+                  <form
+                    method="POST"
+                    action="?/undoDraw"
+                    use:enhance={confirmFirst(draw.status === 'choosing' ? `Cancel ${draw.drawerName}'s undecided card?` : `Undo ${draw.drawerName}'s draw? Gold, HP and effects it changed are reversed where they still can be.`)}
+                  >
+                    <input type="hidden" name="drawId" value={draw.id} />
+                    <button type="submit" class="compact-button danger deck-button">{draw.status === 'choosing' ? 'Cancel' : 'Undo'}</button>
+                  </form>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
+    {/if}
 
     {#if !archived}
       <section class="panel campaign-box">
@@ -448,3 +567,10 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Decks section: 44px tap targets, and the draw rows stack like cards on a phone. */
+  .deck-button { min-height: 44px; min-width: 44px; }
+  .deck-draw-body { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; min-width: 0; flex: 1 1 220px; overflow-wrap: anywhere; }
+  .deck-draw-body > span:not(.badge) { flex-basis: 100%; }
+</style>

@@ -16,6 +16,11 @@ import { characterProfile, loadTurnContext, lockTurnRow, writeTurnRow } from '$l
 // restCharacter, newBattle, advanceCharacterTurn and advanceCharacterRound (catalogue.ts, via
 // lockTurnState), reviewOverride's undo and refillCharacterPools (resource-pools.ts) all follow it.
 // A new multi-source writer must too.
+// Decks (services/decks.ts) lock the affected `characters` rows in ascending id, then their hp / temp_hp
+// character_resources rows: the whole-sheet Save's order (characters row, then resources). They take no turn state.
+// Known, pre-existing inversion: the action engine's coin step locks resources (hp) before the characters row (coin)
+// inside one cast, the opposite of the sheet Save and of decks. A true collision is theoretical; Postgres aborts
+// one of the two transactions cleanly (deadlock error) rather than hanging.
 //
 // The one way anything is paid at activation (sheet and VTT). Reads the activated Container's
 // cost_json (or the content type's default, which copies the old procedural behaviour exactly),
@@ -31,6 +36,14 @@ export class CostShortfallError extends Error {
     super("It doesn't look like you've got the capacity to do that.");
     this.name = 'CostShortfallError';
     this.shortfalls = shortfalls;
+  }
+}
+
+// Thrown when a 'require' follow-up choice finds no follow-up to spend. Nothing has been paid.
+export class FollowupGoneError extends Error {
+  constructor() {
+    super('That free repeat is no longer available.');
+    this.name = 'FollowupGoneError';
   }
 }
 
@@ -165,7 +178,7 @@ function planChoices(activation: Activation, loaded: LoadedCost) {
   // spells to 'skip' (an echo is a deliberate choice, never a silent downgrade of a normal cast).
   const defaultChoice = activation.kind === 'weapon_attack' ? 'use' : 'skip';
   const choice = (activation.kind === 'spell' || activation.kind === 'spell_access' || activation.kind === 'weapon_attack' ? activation.followup : undefined) ?? defaultChoice;
-  return loaded.followup && choice === 'use' ? { ...slot, followupClass: loaded.followup.cls } : slot;
+  return loaded.followup && (choice === 'use' || choice === 'require') ? { ...slot, followupClass: loaded.followup.cls } : slot;
 }
 
 // The per-turn state an activation with a turn line works against (action economy). Read on the
@@ -279,10 +292,18 @@ export async function payActivationCost(
   client: pg.PoolClient, characterId: string, activation: Activation, options: { actorUserId: string; override?: CostOverride | null }
 ): Promise<PaidLine[]> {
   const loaded = await loadActivationCost(client, characterId, activation);
+  const required = 'followup' in activation && activation.followup === 'require';
   // Turn lines only: free unless one actually draws from the profile's pools. Takes no locks otherwise.
-  if (!loaded.entries.some((e) => !asTurnLine(e)) && !(await turnLinePays(client, characterId, loaded.entries))) return [];
+  // A required follow-up can't exist here (nothing draws from a pool), so it fails rather than pass as free.
+  if (!loaded.entries.some((e) => !asTurnLine(e)) && !(await turnLinePays(client, characterId, loaded.entries))) {
+    if (required) throw new FollowupGoneError();
+    return [];
+  }
   const { availability, counterRows, poolMax, turn } = await lockSources(client, characterId, loaded, true, await loadTurn(client, characterId, loaded, true));
   const plan = planCost(loaded.entries, availability, planChoices(activation, loaded));
+  // 'require' is "free repeat or nothing": checked before the shortfall and override logic so it can
+  // never fall through to paying the action (or asking the DM to let a short cost through).
+  if (required && !plan.lines.some((line) => line.payFrom?.pool === 'followup')) throw new FollowupGoneError();
   const override = plan.shortfalls.length ? options.override ?? null : null;
   if (plan.shortfalls.length && !override) throw new CostShortfallError(plan.shortfalls);
   const waived = Boolean(override?.waive);

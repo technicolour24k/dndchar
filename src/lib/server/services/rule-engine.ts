@@ -1,6 +1,7 @@
 import { query } from '$lib/server/db';
 import type { ActiveCharacterEffect, EffectModifier } from '$lib/types/character';
 import type { ResolvedModifier } from '$lib/types/rules';
+import { readEffectMetadata, substituteParams } from '$lib/rules/effectParams';
 
 type ModifierRow = {
   source_id: string;
@@ -19,6 +20,8 @@ type ModifierRow = {
   priority: number;
   runtime_supported: boolean;
   container_key: string | null;
+  // metadata_json of the applied effect row (branch 1a only): per-instance params and label.
+  instance_metadata: unknown;
 };
 
 // `db` lets a caller inside a transaction read on its own client instead of taking a second pool
@@ -41,7 +44,8 @@ export async function resolveCharacterModifierSources(characterId: string, db: {
         COALESCE(link.value_override_expression, '') AS value_override_expression,
         COALESCE(link.condition_expression, '') AS condition_expression, link.priority,
         COALESCE(hook.runtime_supported, false) AS runtime_supported,
-        container.content_key AS container_key
+        container.content_key AS container_key,
+        active.metadata_json AS instance_metadata
       FROM active_character_effects active
       JOIN content_definitions container ON container.id = active.container_id
       JOIN content_modifier_links link ON link.content_id = container.id
@@ -55,7 +59,7 @@ export async function resolveCharacterModifierSources(characterId: string, db: {
         link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text, NULL::jsonb
       FROM character_content_instances instance
       JOIN content_definitions content ON content.id = instance.content_id
       JOIN content_modifier_links link ON link.content_id = content.id
@@ -72,7 +76,7 @@ export async function resolveCharacterModifierSources(characterId: string, db: {
         modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text, NULL::jsonb
       FROM character_inventory_items inventory
       JOIN content_modifier_links link ON link.content_id = inventory.source_content_id
       JOIN modifier_definitions modifier ON modifier.id = link.modifier_id
@@ -89,7 +93,7 @@ export async function resolveCharacterModifierSources(characterId: string, db: {
         link.id::text, modifier.id::text, modifier.target, modifier.modifier_type, COALESCE(modifier.label, ''),
         COALESCE(link.value_override_expression, modifier.default_value_expression, ''),
         COALESCE(modifier.default_value_expression, ''), COALESCE(link.value_override_expression, ''),
-        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text
+        COALESCE(link.condition_expression, ''), link.priority, COALESCE(hook.runtime_supported, false), NULL::text, NULL::jsonb
       FROM character_inventory_items inventory
       JOIN content_grants grant_link ON grant_link.source_content_id = inventory.source_content_id
       JOIN content_definitions granted ON granted.id = grant_link.granted_content_id
@@ -104,6 +108,15 @@ export async function resolveCharacterModifierSources(characterId: string, db: {
     )
     SELECT * FROM modifier_rows ORDER BY priority, source_name, target
   `, [characterId]);
+
+  // Per-instance params ({name} in link expressions) and the card label, for applied effects only.
+  // Rows without metadata pass through untouched, so ordinary conditions behave exactly as before.
+  for (const row of result.rows) {
+    const { params, sourceLabel } = readEffectMetadata(row.instance_metadata);
+    if (sourceLabel) row.source_name = `${row.source_name} (${sourceLabel})`;
+    row.value_expression = substituteParams(row.value_expression, params);
+    row.value_override_expression = substituteParams(row.value_override_expression, params);
+  }
 
   const grouped = new Map<string, ActiveCharacterEffect>();
   for (const row of result.rows) {

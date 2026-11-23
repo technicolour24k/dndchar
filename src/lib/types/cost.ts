@@ -17,8 +17,10 @@ export type SlotType = 'standard' | 'pact';
 
 // Whether an activation spends a waiting follow-up ('use': Extra Attack, a spell echo) or pays
 // normally ('skip'). Weapon attacks default to 'use'. Spells default to 'skip': an echo must be
-// chosen, or a normal L5 Fireball would silently become a free L3 echo.
-export type FollowupChoice = 'use' | 'skip';
+// chosen, or a normal L5 Fireball would silently become a free L3 echo. 'require' is 'use' that must
+// succeed: if no follow-up of the right class is waiting it fails (FollowupGoneError) with nothing
+// spent, instead of quietly paying the action. The "Extra Attack" result button sends it.
+export type FollowupChoice = 'use' | 'skip' | 'require';
 
 export type Activation =
   | { kind: 'spell'; instanceId: string; slotType?: SlotType; slotLevel?: number; followup?: FollowupChoice }

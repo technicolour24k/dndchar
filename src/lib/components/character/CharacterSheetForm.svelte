@@ -8,14 +8,16 @@
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
   import RollOptionsModal, { type AttackChoice } from '$lib/components/character/RollOptionsModal.svelte';
   import ForageModal from '$lib/components/character/ForageModal.svelte';
+  import DeckModal from '$lib/components/character/DeckModal.svelte';
   import { readOnlyLock } from '$lib/ui/readOnlyLock';
   import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
+  import { CHANGED_NOTE } from '../../../../static/vtt-app/shared/deckView.js';
   import type { ForageMine } from '$lib/types/forage';
   import CostRequestPrompt from './CostRequestPrompt.svelte';
   import { promptSpec, approvalErrorText, closedMessage, formForActivation, mineStep } from '../../../../static/vtt-app/shared/costApproval.js';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
-    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
+    adjustPrimaryDamageDice, appliedEffectRowIds, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
   import { isDisplayOnlyCost } from '$lib/rules/cost';
@@ -176,6 +178,12 @@
     sourceContentId: item.sourceContentId ?? null, attuned: item.attuned ?? false, damageRolls: item.damageRolls,
     effects: item.effects, notes: item.notes
   }))));
+  // Same idea for HP, temp HP and coin (a deck draw or the VTT can change them while this sheet is open): Save
+  // only writes the ones the inputs show differently from this baseline. The inputs render from the same props.
+  const resourceBaselineJson = $derived(JSON.stringify({
+    hp: hp.currentValue, tempHp: tempHp.currentValue, currencyCp: meta('currencyCp'), currencySp: meta('currencySp'),
+    currencyEp: meta('currencyEp'), currencyGp: meta('currencyGp'), currencyPp: meta('currencyPp')
+  }));
   const equippedInventoryRows = $derived(equippedItems(inventoryRows));
   const backpackInventoryRows = $derived(
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
@@ -268,6 +276,36 @@
     }
   }
 
+  // Decks (decks plan, unit 7). The button shows when the character is in a campaign with an enabled deck and the
+  // viewer can act for it (owner or campaign DM; never a read-only viewer or the admin override).
+  const deckActor = $derived(!readOnly && !!character.campaignId && !!access && (access.isOwner || access.isCampaignDm));
+  let decksOpen = $state(false);
+  let campaignDecks = $state<Array<{ id: string; name: string; description: string }>>([]);
+  let deckRefreshTick = $state(0);
+  // A draw changed this sheet while it has unsaved edits: say so instead of reloading under the user's hands.
+  // The changes-only Save (unit 6) keeps the draw's HP, temp HP and coin, so the note is true.
+  let deckChangedNote = $state(false);
+  const deckCharacterId = $derived(character.id);
+  $effect(() => {
+    const id = deckCharacterId;
+    if (!id || !deckActor) { campaignDecks = []; return; }
+    untrack(() => void refreshDecks(id));
+  });
+  async function refreshDecks(id: string) {
+    try {
+      const response = await fetch(`/vtt/api/decks?characterId=${encodeURIComponent(id)}`);
+      if (!response.ok || id !== character.id) return;
+      campaignDecks = ((await response.json()) as { decks?: typeof campaignDecks }).decks ?? [];
+    } catch {
+      // Offline: the button just stays as it was.
+    }
+  }
+  // After a draw (here or elsewhere, via deck:ping): reload only when nothing is unsaved.
+  function deckLanded() {
+    if (hasUnsavedChanges) deckChangedNote = true;
+    else void invalidate('app:character-sheet');
+  }
+
   // With no room, nothing else will fetch it for the badge. (In a room the subscription's first resync
   // does, so this doesn't double up.) Keyed on the id only, so a reload doesn't refetch.
   const forageCharacterId = $derived(character.id);
@@ -332,7 +370,7 @@
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
   let selectedSkillProficiencies = $state<string[]>([]);
-  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
+  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '', deck: '' });
   let contentBusy = $state(false);
   let turnOpen = $state(false); // the "Actions this turn" panel
   let modifierSearch = $state('');
@@ -1176,6 +1214,7 @@
         refreshActivityStatus();
         void refreshForage();
         void refreshCost();
+        if (decksOpen) deckRefreshTick += 1;
         fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
         if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
       },
@@ -1190,6 +1229,11 @@
           // Detail-free nudge (it carries no user id): fetch our own cost-request state, which only ever
           // holds this user's request for this character.
           untrack(() => void refreshCost());
+        } else if (msg.type === 'deck:ping') {
+          // Content-free: just the character ids a draw touched. Only our own sheet matters.
+          if (Array.isArray(msg.characterIds) && (msg.characterIds as string[]).includes(character.id)) {
+            untrack(() => { deckRefreshTick += 1; deckLanded(); });
+          }
         } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
           // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
           // nothing read in here can become a dependency of this effect (Review 3).
@@ -1244,9 +1288,10 @@
   async function logRoll(
     label: string,
     result: { text: string; natural: number; total: number; pool?: AttackPool },
-    extras: { manualDamageDice?: number } = {}
+    extras: { manualDamageDice?: number; consumedEffectIds?: string[] } = {}
   ) {
-    if (!activeVttSessionId) return;
+    const consumed = extras.consumedEffectIds ?? [];
+    if (!activeVttSessionId && !consumed.length) return;
     const body = new FormData();
     body.set('label', label);
     body.set('total', String(result.total));
@@ -1262,7 +1307,10 @@
     }
     // INTERIM: manual damage-dice delta (weapon attacks).
     if (extras.manualDamageDice) body.set('manualDamageDice', String(extras.manualDamageDice));
+    // "Until your next attack" effects this roll counted: the server uses them up, then the sheet reloads.
+    for (const id of consumed) body.append('consumedEffectId', id);
     await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
+    if (consumed.length) await invalidate('app:character-sheet');
   }
 
   function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
@@ -1380,7 +1428,7 @@
     } catch {
       // Non-JSON error page (e.g. a 500) - treat as a failed save.
     }
-    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; }
+    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; deckChangedNote = false; }
     staleSheet = stale;
     saveStatus = ok ? 'Saved' : stale ? 'Not saved' : 'Save failed';
     return ok;
@@ -1547,7 +1595,7 @@
     // Sheet attacks now log like the other sheet rolls (once, here, after the panel).
     void logRoll(`${item.name || 'Attack'} attack`,
       { text: attackResult.attack, natural: attackResult.attackNatural, total: attackResult.attackTotal, pool: attackResult.attackPool },
-      { manualDamageDice: attackResult.manualDamageDice });
+      { manualDamageDice: attackResult.manualDamageDice, consumedEffectIds: appliedEffectRowIds(attackResult.advantageSources) });
   }
 
   // Per vtt-phase-3-magic-spec.md: the character sheet just displays what a spell resolves
@@ -1618,7 +1666,7 @@
           };
           void logRoll(`${spell.name} attack`,
             { text: attackRoll.text, natural: attackRoll.natural, total: attackRoll.total, pool: attackRoll.pool },
-            { manualDamageDice: dice.adjusted.applied });
+            { manualDamageDice: dice.adjusted.applied, consumedEffectIds: appliedEffectRowIds(attackRoll.advantageSources) });
         }
       };
       return;
@@ -1986,6 +2034,7 @@
     // The safe choice (cancel / withdraw) is what Escape picks on the cost prompt.
     if (costPrompt && costPrompt.stage === 'prompt') { void chooseCost(promptSpec(costPrompt.mode).escape); return; }
     if (forageOpen) { forageOpen = false; return; }
+    if (decksOpen) { decksOpen = false; return; }
     if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
     if (simpleRollResult) { simpleRollResult = null; return; }
@@ -2027,7 +2076,7 @@
       // depends('app:character-sheet') rather than also re-running unrelated layout loads.
       await update({ reset: false, invalidateAll: false });
       if (result.type === 'success') {
-        hasUnsavedChanges = false; haulWaitingForSave = false; staleSheet = false;
+        hasUnsavedChanges = false; haulWaitingForSave = false; deckChangedNote = false; staleSheet = false;
         const next = (result.data as { sheetVersion?: number } | undefined)?.sheetVersion;
         if (typeof next === 'number') sheetToken = next;
       }
@@ -2040,6 +2089,7 @@
   onchange={markUnsavedIfSheetField}
 >
   <input name="inventoryBaseline" type="hidden" value={inventoryBaselineJson} />
+  <input name="resourceBaseline" type="hidden" value={resourceBaselineJson} />
   <input name="sheetVersion" type="hidden" value={sheetToken} />
   {#if staleSheet}
     <div class="panel stale-sheet-banner" role="alert">
@@ -2122,6 +2172,9 @@
               <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
               {#if haulWaitingForSave && hasUnsavedChanges}
                 <span class="forage-pending-note">Your find will appear when you save.</span>
+              {/if}
+              {#if deckChangedNote && hasUnsavedChanges}
+                <span class="forage-pending-note">{CHANGED_NOTE}</span>
               {/if}
               {#if result?.saved}
                 <span class="save-state good">Saved</span>
@@ -2336,6 +2389,9 @@
                   {#if forageOff}<span class="forage-unavailable-note">{forageUnavailableText(forageOff)}</span>{/if}
                 </button>
               {/if}
+              {#if deckActor && campaignDecks.length}
+                <button type="button" class="text-button" onclick={() => (decksOpen = true)}><span>Decks</span></button>
+              {/if}
             </div>
           </div>
         </section>
@@ -2439,7 +2495,7 @@
             </div>
           {/if}
           <div class="structured-section">
-            <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
+            <div class="catalogue-add-row"><CatalogueSearch characterId={character.id} type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if !readOnly}<a class="compact-button" href={`/library?type=spell&from=${character.id}`}>Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
                 <article class="content-instance-row"><div><strong>{spell.name}</strong>{#if spell.cost?.summary}<span class="cost-chip" title="Cost to cast">{spell.cost.summary}</span>{/if}<span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => openCast(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
@@ -2478,10 +2534,10 @@
       </div>
     </section>
     <section class="panel stack">
-      <div class="panel-head"><h2>Structured Features</h2>{#if isAdmin}<a href="/catalogue">Create Homebrew</a>{/if}</div>
+      <div class="panel-head"><h2>Structured Features</h2>{#if !readOnly}<a href={`/library?type=feat&from=${character.id}`}>Create Homebrew</a>{/if}</div>
       {#each [['class_feature', 'Class Feature'], ['feat', 'Feat']] as option}
         <div class="catalogue-add-row">
-          <CatalogueSearch type={option[0] as ContentType} placeholder={`Search ${option[1].toLowerCase()}s...`} disabled={contentBusy} onPick={(id) => (selectedCatalogue[option[0] as ContentType] = id)} />
+          <CatalogueSearch characterId={character.id} type={option[0] as ContentType} placeholder={`Search ${option[1].toLowerCase()}s...`} disabled={contentBusy} onPick={(id) => (selectedCatalogue[option[0] as ContentType] = id)} />
           <button type="button" disabled={!selectedCatalogue[option[0] as ContentType] || contentBusy} onclick={() => addSelectedContent(option[0] as ContentType)}>Add</button>
         </div>
       {/each}
@@ -2506,7 +2562,7 @@
   <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="panel catalogue-add-panel">
       <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
-      <div class="catalogue-add-row"><CatalogueSearch type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
+      <div class="catalogue-add-row"><CatalogueSearch characterId={character.id} type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if !readOnly}<a class="compact-button" href={`/library?type=item&from=${character.id}`}>Create Homebrew</a>{/if}{#if !isAdmin}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
     </section>
     <section class="inventory-layout">
       <section class="panel stack inventory-section">
@@ -3119,6 +3175,17 @@
       onRefresh={refreshForage}
       onHaul={() => haulLanded()}
       onClose={() => (forageOpen = false)}
+    />
+  {/if}
+
+  {#if decksOpen && deckActor}
+    <DeckModal
+      characterId={character.id}
+      decks={campaignDecks}
+      canManage={!!access?.isCampaignDm}
+      refreshTick={deckRefreshTick}
+      onChanged={deckLanded}
+      onClose={() => (decksOpen = false)}
     />
   {/if}
 

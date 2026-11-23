@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ATTACK_TIMINGS, attackCostText, attackFollowup, attackPoolKey, dashNeeded, dashPoolKey, dashPromptText, paidText, poolCostText, resetAllNote, trimTurnView, turnChips } from '../../../static/vtt-app/shared/actionEconomy.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, attackPoolKey, dashNeeded, dashPoolKey, dashPromptText, followupToSend, paidText, poolCostText, repeatOffer, resetAllNote, trimTurnView, turnChips } from '../../../static/vtt-app/shared/actionEconomy.js';
 import { formForActivation } from '../../../static/vtt-app/shared/costApproval.js';
 import { activationFromCastForm, parseActivation } from './vttCostApproval';
 
@@ -44,6 +44,51 @@ describe('attack cost wording', () => {
     expect(paidText({ paid: [{ label: 'Attack', delta: -1 }] })).toBe('Paid: 1 Attack');
     expect(paidText({ usedFollowup: true, followupsLeft: [{ cls: 'melee', remaining: 0 }] })).toBe('Extra Attack (0 left)');
     expect(paidText({ paid: [] })).toBe('');
+  });
+});
+
+describe('the free repeat on a finished roll', () => {
+  const left = (cls: string, remaining: number, label = 'Extra Attack') => ({ followupCls: cls, followupsLeft: [{ cls, label, remaining }] });
+  it('offers the follow-up of the same class as the roll while some are waiting', () => {
+    expect(repeatOffer(left('melee', 1))).toEqual({ label: 'Extra Attack', remaining: 1 });
+    expect(repeatOffer(left('spell', 2, 'Doublecast'))).toEqual({ label: 'Doublecast', remaining: 2 });
+  });
+  it('offers nothing when none are left, the class differs, or there is no turn data', () => {
+    expect(repeatOffer(left('melee', 0))).toBeNull();
+    expect(repeatOffer({ followupCls: 'melee', followupsLeft: [{ cls: 'spell', label: 'Doublecast', remaining: 1 }] })).toBeNull();
+    expect(repeatOffer({ followupCls: null, followupsLeft: [{ cls: 'melee', label: 'Extra Attack', remaining: 1 }] })).toBeNull();
+    expect(repeatOffer({ paid: [] })).toBeNull();
+    expect(repeatOffer(null)).toBeNull();
+  });
+  it('words a used echo by its own follow-up, not as Extra Attack', () => {
+    expect(paidText({ usedFollowup: true, ...left('spell', 1, 'Doublecast') })).toBe('Doublecast (1 left)');
+    expect(paidText({ usedFollowup: true, followupCls: 'spell', followupsLeft: [] })).toBe('Free repeat (0 left)');
+  });
+});
+
+describe('which follow-up choice the client sends', () => {
+  const view = withExtra(homebrew, 1);
+  it('sends nothing without a turn view, so the server default uses a waiting Extra Attack (the early-click race)', () => {
+    expect(followupToSend(null, 'action', 'use')).toBeUndefined();
+    expect(followupToSend(null, 'action', 'skip')).toBeUndefined();
+  });
+  it('sends the pick only when the card really offered a follow-up', () => {
+    expect(followupToSend(view, 'action', 'use')).toBe('use');
+    expect(followupToSend(view, 'action', 'skip')).toBe('skip');
+    expect(followupToSend(homebrew, 'action', 'skip')).toBeUndefined(); // none waiting: nothing to choose
+    expect(followupToSend(view, 'bonus_action', 'use')).toBeUndefined(); // only an Action-timed attack repeats
+  });
+  it("always sends 'require' for the result button", () => {
+    expect(followupToSend(null, 'action', 'require')).toBe('require');
+    expect(followupToSend(view, 'action', 'require')).toBe('require');
+  });
+  it("'require' parses on the server, from a body and from a cast form", () => {
+    expect(parseActivation({ kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike', followup: 'require' })).toMatchObject({ followup: 'require' });
+    expect(parseActivation({ kind: 'weapon_attack', inventoryId: null, label: 'x', followup: 'maybe' })).toBeNull();
+    const form = new FormData();
+    form.set('instanceId', 'i');
+    form.set('followup', 'require');
+    expect(activationFromCastForm(form)).toMatchObject({ kind: 'spell', followup: 'require' });
   });
 });
 

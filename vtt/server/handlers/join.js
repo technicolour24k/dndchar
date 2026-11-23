@@ -1,5 +1,6 @@
 // @ts-nocheck - plain untyped JS by design, see vtt/README.md.
 import { consumeJoinTicket, filterSessionForRole, releaseSocket } from '../store.js';
+import { rejoinAndAnnounce } from '../roundState.js';
 
 // A live GM socket in the room other than `except` (a socket re-joining must not count itself).
 function liveGmSocketExcept(sockets, except) {
@@ -157,6 +158,10 @@ function handleJoin(meta, msg, context) {
     socketsBySession.set(sessionId, sockets);
   }
   sockets.add(meta);
+
+  // A round waiting on Ready expects this player again if they're on the map (before state:full, so
+  // their own card comes back with it). The GM sees them return.
+  if (meta.role === 'player') rejoinAndAnnounce(session, playerId, context.broadcast);
 
   meta.ws.send(JSON.stringify({
     type: 'state:full',

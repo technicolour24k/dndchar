@@ -1,16 +1,17 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { query } from '$lib/server/db';
+import { query, withTransaction } from '$lib/server/db';
+import { consumeNextAttackEffects } from '$lib/server/services/effects';
 import { getCharacter } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { castCharacterSpellDetailed, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { CostShortfallError, FollowupGoneError } from '$lib/server/services/cost-engine';
 import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { activationFromCastForm } from '$lib/server/vttCostApproval';
 import { resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, totalLevel } from '$lib/rules/dnd5e';
 import { characterStatsFor, resolveSpellcastingAbility } from '$lib/rules/characterStats';
-import { adjustPrimaryDamageDice, previewAdvantage, rollDamage, rollWithModifiers, spellAttackAgainstCandidates, spellAttackCandidates } from '$lib/rules/attackRoll';
+import { adjustPrimaryDamageDice, appliedEffectRowIds, previewAdvantage, rollDamage, rollWithModifiers, spellAttackAgainstCandidates, spellAttackCandidates } from '$lib/rules/attackRoll';
 import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAttackAdvantage';
 
 
@@ -19,6 +20,9 @@ import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAt
 // spell's full modifier-aware roll (and slot spend) can happen. Reuses castCharacterSpell()
 // UNCHANGED for the known/prepared validation and slot spend/on_cast effects - one slot-spend
 // implementation, not two - then layers damage/attack resolution on top for the VTT's combat flow.
+// Body extras: followup ('use' | 'skip' | 'require') for a spell echo (a free repeat of a waiting follow-up,
+// resolved at the spell's base level whatever slot was asked for). 'require' (the result button) answers 409
+// followup_gone with nothing spent if none is waiting. Without it a spell never spends an echo.
 export const POST: RequestHandler = async ({ locals, params, request }) => {
   const characterId = params.id!;
   const body = await request.json().catch(() => ({}));
@@ -41,13 +45,15 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   if (options.preview) {
     const previewCharacter = await getCharacter(locals.user!.id, characterId);
     if (!previewCharacter) return json({ error: 'not_found' }, { status: 404 });
+    // The turn view rides along so the client can tell whether an echo is waiting (display only).
+    const previewTurn = previewCharacter.turn;
     const previewProfile = resolveSpellDamage(spell, {
       castAtSlotLevel: slotLevel || spell.spellLevel,
       casterLevel: totalLevel(previewCharacter.classes),
       modifierSources: previewCharacter.modifierSources
     });
     if (spell.resolutionType !== 'attack') {
-      return json({ usesAttackRoll: false, primaryDamageDice: previewProfile.diceExpression });
+      return json({ usesAttackRoll: false, primaryDamageDice: previewProfile.diceExpression, turn: previewTurn });
     }
     const previewContext = { classes: previewCharacter.classes, attackType: 'spell', ability: resolveSpellcastingAbility(previewCharacter.classes, previewCharacter.metadata) } as const;
     const previewGathered = await gatherVttAdvantageSources({
@@ -56,7 +62,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     });
     const preview = previewAdvantage(previewCharacter.modifierSources, spellAttackCandidates,
       { ...previewContext, distanceFt: previewGathered.distanceFt }, previewGathered.extraSources, options.disabledSourceIds);
-    return json({ usesAttackRoll: true, ...preview, primaryDamageDice: previewProfile.diceExpression });
+    return json({ usesAttackRoll: true, ...preview, primaryDamageDice: previewProfile.diceExpression, turn: previewTurn });
   }
 
   // Gather the advantage sources BEFORE casting. This does DB work that can fail, and the cast
@@ -78,9 +84,13 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
   castForm.set('instanceId', instanceId);
   if (body.slotType) castForm.set('slotType', String(body.slotType));
   if (slotLevel) castForm.set('slotLevel', String(slotLevel));
+  if (body.followup === 'use' || body.followup === 'skip' || body.followup === 'require') castForm.set('followup', body.followup);
 
   let effects;
   let spent: { slotType: 'standard' | 'pact'; slotLevel: number } | null = null;
+  let castAtLevel: number | undefined;
+  let usedFollowup = false;
+  let followupCls: string | null = null;
   // Over-budget cast: body.approvalId (the DM approved) or body.override ('dm' | 'self'), checked server-side.
   // The approval is bound to this activation: instanceId plus the slot actually used (slotLevel is at
   // least the spell's own level), so a client asks and resends with the same instanceId/slotType/slotLevel.
@@ -90,8 +100,12 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     const cast = await runWithGate(gate, (override) => castCharacterSpellDetailed(locals.user!.id, characterId, castForm, override));
     effects = cast.results;
     spent = cast.spent;
+    castAtLevel = cast.castAtLevel;
+    usedFollowup = cast.usedFollowup;
+    followupCls = cast.followupCls;
   } catch (error) {
     if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
+    if (error instanceof FollowupGoneError) return json({ error: 'followup_gone', message: error.message }, { status: 409 });
     return json({ error: error instanceof Error ? error.message : 'Could not cast spell.' }, { status: 400 });
   }
 
@@ -111,6 +125,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
 
   let attack: Awaited<ReturnType<typeof rollWithModifiers>> | undefined;
   let outcomes: string[] = [];
+  let usedUp: string[] = [];
   if (spell.resolutionType === 'attack') {
     // Re-read after the cast (on_cast effects may have changed the sheet), but the target/token
     // sources were already gathered above, before the slot was spent.
@@ -129,10 +144,16 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     const critThreshold = resolveCritThreshold(character.modifierSources, { attackType: 'spell' });
     outcomes = resolveD20Outcomes(rolled.natural, critThreshold);
     attack = rolled;
+    // "Until your next attack" effects this roll counted are used up (only attack rolls, not saves).
+    // A failure here must never turn a paid cast into an error: log it and carry on.
+    usedUp = await withTransaction((client) => consumeNextAttackEffects(client, characterId, appliedEffectRowIds(rolled.advantageSources)))
+      .catch((consumeError) => { console.error('roll-spell: could not use up next-attack effects', consumeError); return [] as string[]; });
+    if (usedUp.length) emitRealtimeEvent('resource:changed', { characterId });
   }
 
+  // An echo resolves at the spell's base level, not the slot level that was asked for.
   const profile = resolveSpellDamage(spell, {
-    castAtSlotLevel: slotLevel || spell.spellLevel,
+    castAtSlotLevel: castAtLevel ?? (slotLevel || spell.spellLevel),
     casterLevel: level,
     modifierSources: character.modifierSources,
     outcomes
@@ -152,7 +173,8 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     manualDamageDice: adjusted.applied,
     attackPool: attack?.pool,
     advantageSources: attack?.advantageSources,
-    attack: attack?.text,
+    attack: attack ? (usedUp.length ? `${attack.text} - Advantage used up: ${usedUp.join(', ')}` : attack.text) : undefined,
+    consumedEffects: usedUp.length ? usedUp : undefined,
     attackTotal: attack?.total,
     attackNatural: attack?.natural,
     outcomes,
@@ -160,6 +182,13 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     saveAbility: profile.saveAbility,
     saveEffect: profile.saveEffect,
     effects,
-    spent
+    spent,
+    // What the result button needs: was an echo used, which follow-up class this spell uses, what is left.
+    turn: {
+      usedFollowup,
+      followupCls,
+      followupsLeft: (character.turn?.followups ?? []).map((f) => ({ cls: f.cls, label: f.label, remaining: f.remaining })),
+      ...(castAtLevel !== undefined ? { castAtLevel } : {})
+    }
   });
 };

@@ -58,17 +58,48 @@ export function attackCostText(view, timing, followup) {
 }
 
 /**
- * The line shown with the finished roll, from the roll-attack response's `turn` ("Paid: 1 Attack").
+ * The follow-up choice to send with a roll. The server decides and pays; this only says what the player
+ * chose. `choice` is the confirm card's pick ('use' | 'skip' | 'require'):
+ *  - 'require' (the result button's free repeat) is always sent as it is;
+ *  - with no turn view (the preview has not come back, or failed) nothing is sent, so the server's
+ *    default applies and a waiting follow-up is used rather than silently skipped;
+ *  - a follow-up the card offered goes as picked; with none offered nothing is sent either.
+ * @param {any} view @param {string} timing @param {string} choice
+ * @returns {'use' | 'skip' | 'require' | undefined}
+ */
+export function followupToSend(view, timing, choice) {
+  if (choice === 'require') return 'require';
+  if (!view || !attackFollowup(view, timing)) return undefined;
+  return choice === 'skip' ? 'skip' : 'use';
+}
+
+/**
+ * The line shown with the finished roll, from the roll's `turn` ("Paid: 1 Attack", "Extra Attack (1 left)").
  * @param {any} turn
  */
 export function paidText(turn) {
   if (!turn) return '';
   if (turn.usedFollowup) {
-    const waiting = (turn.followupsLeft || []).find((/** @type {any} */ entry) => entry.cls === 'melee');
-    return `Extra Attack (${waiting ? waiting.remaining : 0} left)`;
+    const cls = turn.followupCls || 'melee';
+    const waiting = (turn.followupsLeft || []).find((/** @type {any} */ entry) => entry.cls === cls);
+    const label = waiting?.label || (cls === 'melee' ? 'Extra Attack' : 'Free repeat');
+    return `${label} (${waiting ? waiting.remaining : 0} left)`;
   }
   const spent = (turn.paid || []).filter((/** @type {any} */ line) => line.delta < 0).map((/** @type {any} */ line) => `${-line.delta} ${line.label}`);
   return spent.length ? `Paid: ${spent.join(', ')}` : '';
+}
+
+/**
+ * The "repeat for free" button on a finished roll: the follow-up this roll's class still has waiting, from
+ * the roll response's `turn` ({ followupCls, followupsLeft }). Null when there is none (or no turn data).
+ * @param {any} turn
+ * @returns {{ label: string, remaining: number } | null}
+ */
+export function repeatOffer(turn) {
+  if (!turn || !turn.followupCls) return null;
+  const waiting = (turn.followupsLeft || []).find((/** @type {any} */ entry) => entry.cls === turn.followupCls && entry.remaining > 0);
+  if (!waiting) return null;
+  return { label: String(waiting.label || 'Extra Attack'), remaining: Number(waiting.remaining) || 0 };
 }
 
 // ---------------------------------------------------------------------------

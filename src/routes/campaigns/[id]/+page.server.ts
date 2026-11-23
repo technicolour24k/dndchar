@@ -1,10 +1,17 @@
-import { error, fail, redirect } from '@sveltejs/kit';
+import { error, fail, redirect, type ActionFailure } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
 import { emitRealtimeEvent } from '$lib/server/realtime';
+import { announceFork } from '$lib/server/libraryForkAnnounce';
+import { describeFork } from '$lib/library/rules';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
 import { listUnreviewedOverrides, reviewOverride } from '$lib/server/services/resource-pools';
 import { announceCostUndo } from '$lib/server/vttCostGate';
+import { query } from '$lib/server/db';
+import { announceDeck, announceDmTasks } from '$lib/server/vttDeckAnnounce';
+import {
+  DeckError, listAvailableDecks, listCampaignDecks, listDrawsForCampaign, listOpenDmTasks, revertDraw, setCampaignDeck, setDrawTaskDone
+} from '$lib/server/services/decks';
 import { listMapsForViewer } from '$lib/server/services/overworld';
 import { dropCampaignPreviews, dropUserPreviews } from '$lib/server/overworldNotify';
 import { ejectAllFromCampaignVoice, ejectFromCampaignVoice } from '$lib/server/voice/voiceEject';
@@ -23,6 +30,17 @@ import {
   updateCampaignDetails
 } from '$lib/server/services/campaigns';
 import type { CampaignRole } from '$lib/types/campaign';
+
+// Deck actions throw DeckErrors with player-facing messages; anything else is logged and shown generically.
+async function deckAttempt<T>(fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; failure: ActionFailure<{ error: string }> }> {
+  try {
+    return { ok: true, value: await fn() };
+  } catch (error) {
+    if (error instanceof DeckError) return { ok: false, failure: fail(error.code === 'forbidden' ? 403 : 400, { error: error.message }) };
+    console.error('[campaigns] unexpected deck error', error);
+    return { ok: false, failure: fail(500, { error: 'Something went wrong, please try again.' }) };
+  }
+}
 
 // Every action below only forwards to the campaign service, which does the real permission check
 // (access.ts). The controls computed in load are just what to show. Membership changes also reach
@@ -48,6 +66,12 @@ export async function load({ params, locals }) {
     overrideReviews: page.access.canManage && !archived ? await listUnreviewedOverrides(params.id) : [],
     // Maps this viewer may open (campaign role only, so null for a non-member, site admin or not).
     overworld: await listMapsForViewer(user.id, params.id),
+    // Decks (decks plan, unit 9). Everyone who can view the page sees the enabled decks and the draw log; only a
+    // DM / co-DM / admin gets the disabled ones, the add list and the open tasks (the services check it again).
+    decks: await listCampaignDecks(params.id, { includeDisabled: page.access.canManage }),
+    availableDecks: page.access.canManage && !archived ? await listAvailableDecks(params.id) : [],
+    draws: await listDrawsForCampaign(user.id, params.id),
+    deckTasks: page.access.canManage && !archived ? await listOpenDmTasks(user.id, params.id) : [],
     // The admin banner is for people who only have access through the override.
     viaAdmin: page.access.isAdmin && !page.access.isDm
   };
@@ -99,6 +123,8 @@ export const actions = {
     const result = await attempt(() => removeMember(locals.user!.id, params.id, String(form.get('userId') || '')));
     if (result.ok) {
       kickFromCampaignRoom(result.value?.roomCode, result.value?.targetUserId, 'removed_from_campaign');
+      // Their homebrew the campaign still uses was copied into campaign copies in the same transaction (unit G).
+      if (result.value?.fork) announceFork(result.value.fork, result.value.roomCode);
       // Fire and forget: never throws, never delays or fails the action (see voiceEject.ts).
       void ejectFromCampaignVoice(params.id, result.value?.targetUserId);
       if (result.value?.targetUserId) dropUserPreviews(params.id, result.value.targetUserId);
@@ -107,13 +133,17 @@ export const actions = {
       // Their characters left the campaign, so their tokens leave the live map.
       await pruneDepartedCharacterTokens();
     }
-    return result.ok ? { saved: 'removed' } : result.failure;
+    // The DM sees what was kept, once, in place.
+    const fork = result.ok ? result.value?.fork : null;
+    if (!result.ok) return result.failure;
+    return fork && fork.copies.length ? { saved: 'removed', forkNote: describeFork(fork.ownerName, fork.copies) } : { saved: 'removed' };
   },
 
   leave: async ({ params, locals }) => {
     const result = await attempt(() => leaveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     kickFromCampaignRoom(result.value?.roomCode, locals.user!.id, 'removed_from_campaign');
+    if (result.value.fork) announceFork(result.value.fork, result.value.roomCode);
     void ejectFromCampaignVoice(params.id, locals.user!.id);
     dropUserPreviews(params.id, locals.user!.id);
     await syncGmSeats(params.id, result.value?.roomCode);
@@ -162,6 +192,36 @@ export const actions = {
       await announceCostUndo({ characterId: done.characterId, characterName: done.characterName ?? 'Someone', label: done.sourceLabel ?? 'use', refunded: done.refunded ?? [], roomId: done.roomId ?? null });
     }
     return { reviewed: done.message };
+  },
+
+  // Decks: the DM turns a global deck on or off for this campaign (selection, not authoring).
+  setDeck: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await deckAttempt(() => setCampaignDeck({
+      userId: locals.user!.id, campaignId: params.id, deckId: String(form.get('deckId') || ''), enabled: form.get('enabled') === '1'
+    }));
+    return result.ok ? { saved: 'decks' } : result.failure;
+  },
+
+  // Undo a deck draw (or cancel an undecided Ace). The table and open sheets catch up through announceDeck.
+  undoDraw: async ({ request, locals }) => {
+    const form = await request.formData();
+    const result = await deckAttempt(() => revertDraw({ userId: locals.user!.id, drawId: String(form.get('drawId') || '') }));
+    if (!result.ok) return result.failure;
+    if (result.value.status === 'reverted') await announceDeck(result.value, 'undone');
+    return { saved: 'draws', note: result.value.status === 'reverted' ? result.value.revertNote : 'Cancelled.' };
+  },
+
+  taskDone: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await deckAttempt(() => setDrawTaskDone({
+      userId: locals.user!.id, drawId: String(form.get('drawId') || ''), taskId: String(form.get('taskId') || ''), done: true
+    }));
+    if (!result.ok) return result.failure;
+    // The GM's open-task list at the table updates live.
+    const room = await query<{ room_code: string | null }>('SELECT room_code FROM campaigns WHERE id = $1', [result.value.campaignId]);
+    if (room.rows[0]?.room_code) await announceDmTasks(room.rows[0].room_code, result.value.campaignId);
+    return { saved: 'draws' };
   },
 
   setActive: async ({ request, params, locals }) => {

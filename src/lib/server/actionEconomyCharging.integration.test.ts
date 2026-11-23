@@ -22,8 +22,8 @@ describe.skipIf(!enabled)('the cost engine charges the turn', () => {
     const { query, withTransaction } = await import('$lib/server/db');
     const { createCharacter, getCharacter } = await import('./services/characters');
     const { createCampaign, addCharacterToCampaign, setCampaignActionEconomy } = await import('./services/campaigns');
-    const { castCharacterSpell, castCharacterSpellDetailed, useInventoryCatalogueItem, advanceCharacterTurn, restCharacter, newBattle } = await import('./services/catalogue');
-    const { CostShortfallError, payActivationCost } = await import('./services/cost-engine');
+    const { castCharacterSpell, castCharacterSpellDetailed, useInventoryCatalogueItem, advanceCharacterTurn, advanceCharacterRound, restCharacter, newBattle } = await import('./services/catalogue');
+    const { CostShortfallError, FollowupGoneError, payActivationCost } = await import('./services/cost-engine');
     const { reviewOverride } = await import('./services/resource-pools');
     const tag = `zzchg${crypto.randomBytes(4).toString('hex')}`;
     const user = async (name: string) => (await query<{ id: string }>(
@@ -75,7 +75,7 @@ describe.skipIf(!enabled)('the cost engine charges the turn', () => {
         for (const [k, v] of Object.entries(extra)) form.set(k, v);
         return castCharacterSpellDetailed(userId, characterId, form);
       };
-      const attack = (characterId: string, timing?: 'action' | 'bonus_action' | 'reaction', override?: any, followup?: 'use' | 'skip') =>
+      const attack = (characterId: string, timing?: 'action' | 'bonus_action' | 'reaction', override?: any, followup?: 'use' | 'skip' | 'require') =>
         withTransaction((client) => payActivationCost(client, characterId, { kind: 'weapon_attack', inventoryId: null, label: 'Longsword', ...(timing ? { timing } : {}), ...(followup ? { followup } : {}) }, { actorUserId: userId, override }));
       const newBattleJob = (characterId: string) => newBattle(userId, characterId);
       const turn = async (characterId: string) => (await getCharacter(userId, characterId))!.turn;
@@ -348,6 +348,65 @@ describe.skipIf(!enabled)('the cost engine charges the turn', () => {
       await cast(duelist, cantrip, { followup: 'use' });
       expect(await followupsLeft(duelist)).toEqual([]);
       expect((await left(duelist)).attack).toBe(1); // only the first cast paid
+
+      // ---- followup 'require': a free repeat or nothing, never a paid action ---------------------------
+      const monk = await mkCharacter('Monk');
+      await addCharacterToCampaign(userId, monk, campaignId);
+      await grant(monk, 'followup.melee.count', '1', 'Extra Attack');
+      await advanceCharacterTurn(userId, monk);
+      // None waiting: it fails, with nothing spent (also under an override, which must not let it pay).
+      await expect(attack(monk, undefined, undefined, 'require')).rejects.toBeInstanceOf(FollowupGoneError);
+      await expect(attack(monk, undefined, { kind: 'self_override', roomId: null }, 'require')).rejects.toBeInstanceOf(FollowupGoneError);
+      expect(await left(monk)).toEqual({ attack: 2, utility: 2 });
+      expect(await followupsLeft(monk)).toEqual([]);
+      expect((await turn(monk)).log).toHaveLength(0);
+      // An Unarmed Strike (id-less, paid through payTurnActivation as the VTT turn route does) with no choice
+      // sent uses the waiting follow-up on the second attack, so the counter never climbs.
+      const { payTurnActivation: payTurn } = await import('./services/catalogue');
+      const strike = (followup?: 'use' | 'skip' | 'require') => payTurn(userId, monk, { kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike', ...(followup ? { followup } : {}) });
+      expect((await strike()).paid.map((l) => l.pool)).toEqual(['turn:attack']);
+      expect(await followupsLeft(monk)).toEqual([['melee', 1]]);
+      expect((await strike()).paid.map((l) => l.pool)).toEqual(['followup']);
+      expect(await followupsLeft(monk)).toEqual([]);
+      expect(await left(monk)).toEqual({ attack: 1, utility: 2 });
+      // A repeat with 'require' uses a waiting follow-up; the next one fails and the pool stays put.
+      await strike(); // pays the last Attack, grants 1
+      expect((await strike('require')).paid.map((l) => l.pool)).toEqual(['followup']);
+      await expect(strike('require')).rejects.toBeInstanceOf(FollowupGoneError);
+      expect(await left(monk)).toEqual({ attack: 0, utility: 2 });
+      expect(await followupsLeft(monk)).toEqual([]);
+
+      // Spell echo through 'require': free, at the base level, and a second one fails with nothing spent.
+      await advanceCharacterTurn(userId, mage);
+      await setSlots(mage, [[3, 2], [5, 2]]);
+      await expect(castDetailed(mage, mageBall, { slotLevel: '5', followup: 'require' })).rejects.toBeInstanceOf(FollowupGoneError);
+      expect(await slot(mage, 5)).toBe(2);
+      expect(await left(mage)).toEqual({ attack: 2, utility: 2 });
+      const original2 = await castDetailed(mage, mageBall, { slotLevel: '5' });
+      expect(original2.followupCls).toBe('spell');
+      expect(original2.usedFollowup).toBe(false);
+      const required = await castDetailed(mage, mageBall, { slotLevel: '5', followup: 'require' });
+      expect(required).toMatchObject({ spent: null, castAtLevel: 3, usedFollowup: true });
+      expect(await slot(mage, 5)).toBe(1);
+      expect(await slot(mage, 3)).toBe(2);
+      await expect(castDetailed(mage, mageBall, { slotLevel: '5', followup: 'require' })).rejects.toBeInstanceOf(FollowupGoneError);
+      expect(await slot(mage, 5)).toBe(1);
+      expect(await left(mage)).toEqual({ attack: 1, utility: 2 });
+
+      // ---- the VTT's Next round also ticks turn-based effects; the sheet's own Next Round does not ------
+      const tick = await mkCharacter('Ticker');
+      const effectRow = async (boundary: string) => {
+        const effect = (await query<{ id: string }>(
+          `INSERT INTO effect_definitions (effect_key, name, source_type, duration_type) VALUES ($1,$2,'custom','rounds') RETURNING id`, [`${tag}${n++}`, `IT ${boundary}`])).rows[0].id;
+        await query(`INSERT INTO active_character_effects (character_id, effect_id, remaining_rounds, expiry_boundary) VALUES ($1,$2,5,$3)`, [tick, effect, boundary]);
+        return async () => (await query<any>(`SELECT remaining_rounds FROM active_character_effects WHERE character_id=$1 AND effect_id=$2`, [tick, effect])).rows[0]?.remaining_rounds;
+      };
+      const roundEffect = await effectRow('round_end');
+      const turnEffect = await effectRow('turn_start');
+      await advanceCharacterRound(userId, tick); // the sheet's Next Round: round effects only
+      expect([await roundEffect(), await turnEffect()]).toEqual([4, 5]);
+      await advanceCharacterRound(userId, tick, { tickTurnEffects: true }); // the VTT GM's Next round: both
+      expect([await roundEffect(), await turnEffect()]).toEqual([3, 4]);
 
       // The turn row is the first lock: casts racing long rests never deadlock.
       const racer = await mkCharacter('Racer');

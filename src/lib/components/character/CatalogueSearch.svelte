@@ -8,15 +8,21 @@
   // so there's no accidental add from a stray click/Enter.
   import type { ContentType } from '$lib/types/content';
 
-  type SearchEntry = { id: string; type: ContentType; name: string; spellLevel: number | null; sourceKind: 'srd' | 'homebrew' };
+  type SearchEntry = { id: string; type: ContentType; name: string; spellLevel: number | null; sourceKind: 'srd' | 'homebrew'; sourceLabel?: string };
 
   let {
     type,
+    characterId,
+    campaignId,
     placeholder = 'Search...',
     disabled = false,
     onPick
   }: {
     type: ContentType;
+    /** Limits results to what this character may be offered (its campaign's libraries, or its owner's). */
+    characterId?: string;
+    /** Or to what this campaign may be offered (forage tables). Give one of the two, not both. */
+    campaignId?: string;
     placeholder?: string;
     disabled?: boolean;
     /** Called with the picked content id, or '' if the text changed since the last pick
@@ -50,6 +56,8 @@
     try {
       const params = new URLSearchParams({ type });
       if (query.trim()) params.set('q', query.trim());
+      if (characterId) params.set('characterId', characterId);
+      else if (campaignId) params.set('campaignId', campaignId);
       const response = await fetch(`/api/catalogue/search?${params}`, { signal: controller.signal });
       if (!response.ok) throw new Error(`Search failed (${response.status}).`);
       const data = await response.json();
@@ -120,7 +128,7 @@
 
   function badgeText(entry: SearchEntry): string {
     if (entry.type === 'spell') return `Lv ${entry.spellLevel ?? 0}`;
-    return entry.sourceKind === 'srd' ? 'SRD' : 'Homebrew';
+    return entry.sourceLabel || (entry.sourceKind === 'srd' ? 'SRD' : 'Homebrew');
   }
 
   const listboxId = $derived(`catalogue-search-listbox-${type}`);

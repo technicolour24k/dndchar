@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: vi.fn() }));
+// The library scope check has its own gated test (libraryLeaks.integration.test.ts); here it is a pass-through.
+vi.mock('$lib/server/services/library', () => ({ assertVisibleForNewUse: vi.fn(), resolveVisibleScope: vi.fn() }));
 
 import { query } from '$lib/server/db';
 import { invalidateReferenceData } from '$lib/server/cache/referenceData';
@@ -119,6 +121,7 @@ describe('more write rules', () => {
     queryMock
       .mockResolvedValueOnce(owned)
       .mockResolvedValueOnce({ rows: [{ is_archived: false }], rowCount: 1 } as any)
+      .mockResolvedValueOnce(owned) // the table's campaign, for the library scope check
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any); // ON CONFLICT DO NOTHING inserted nothing
     await expect(addFindTableEntry(user, form({ tableId: T1, itemId: I1, chance: '30', qtyDie: '1' })))
       .rejects.toThrow('That item is already on this table.');

@@ -10,7 +10,8 @@ export async function findOrCreateActionContainer(
   trigger: string,
   name: string,
   description: string,
-  ownerUserId: string | null
+  // Kept so callers don't change; the owner now always comes from the parent content (see the insert below).
+  _ownerUserId: string | null
 ): Promise<string> {
   const prefixed = `action:content:${contentId}:${trigger}`;
   const bare = `content:${contentId}:${trigger}`;
@@ -28,10 +29,13 @@ export async function findOrCreateActionContainer(
   const found = await find();
   if (found.rowCount) return reuse(found.rows[0]);
   // Race-safe: a concurrent insert of the same key makes this a no-op, and we re-select.
+  // Homebrew library: an action container is never offered on its own, so it inherits its parent's scope, owner and
+  // campaign. That keeps a personal entry's action personal (and out of everyone else's pickers).
   const created = await client.query<{ id: string }>(
-    `INSERT INTO content_definitions(content_key,content_type,name,description,source_kind,owner_user_id,activation_type)
-     VALUES($1,'action',$2,$3,'homebrew',$4,'active_use') ON CONFLICT DO NOTHING RETURNING id`,
-    [prefixed, name, description, ownerUserId]);
+    `INSERT INTO content_definitions(content_key,content_type,name,description,source_kind,owner_user_id,activation_type,scope,campaign_id)
+     SELECT $1,'action',$2,$3,'homebrew',parent.owner_user_id,'active_use',parent.scope,parent.campaign_id
+     FROM content_definitions parent WHERE parent.id=$4 ON CONFLICT DO NOTHING RETURNING id`,
+    [prefixed, name, description, contentId]);
   if (created.rowCount) return created.rows[0].id;
   const again = await find();
   if (!again.rowCount) throw new Error('Could not create the action container.');

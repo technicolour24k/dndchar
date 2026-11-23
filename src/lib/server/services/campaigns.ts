@@ -16,6 +16,8 @@ import type {
 } from '$lib/types/campaign';
 import type { CharacterClass } from '$lib/types/character';
 import { PROFILE_KEYS, type ProfileKey } from '$lib/types/actionEconomy';
+import { forkFailureMessage, forkLibraryContent, type ForkSummary } from '$lib/server/services/libraryFork';
+import { ForkPlanError } from '$lib/library/rules';
 
 // Campaign service. Every function takes the acting user id and throws a user-facing Error when
 // something isn't allowed; permission rules live in access.ts. Writes run in a transaction that
@@ -94,14 +96,40 @@ function assertNotArchived(locked: Locked) {
 }
 
 // A user leaving (or being removed): their characters leave the campaign and, if their sheet was
-// joined to this campaign's room, that join is cleared.
-async function releaseMember(client: pg.PoolClient, campaignId: string, roomCode: string, userId: string) {
+// joined to this campaign's room, that join is cleared. Then, in the SAME transaction, whatever of their personal
+// homebrew library the campaign still uses is forked into campaign copies (homebrew library, unit G). The leaver's
+// own characters have already been released, so only the rest of the party is re-pointed. If the fork fails the whole
+// leave rolls back with a clear message: a leave is never half-done.
+async function releaseMember(
+  client: pg.PoolClient, campaignId: string, roomCode: string, userId: string, fork: { reason: 'left' | 'removed'; actorUserId: string }
+): Promise<ForkSummary> {
+  // Lock the whole party in ascending id FIRST (the deck draw / sheet Save order). Without this the UPDATE below locks
+  // the leaver's characters in no set order and a concurrent deck draw could deadlock with the fork's own party lock.
+  await client.query('SELECT id FROM characters WHERE campaign_id = $1 ORDER BY id FOR UPDATE', [campaignId]);
   await client.query(
     'UPDATE characters SET campaign_id = NULL, party_active = true WHERE owner_user_id = $1 AND campaign_id = $2',
     [userId, campaignId]
   );
   await client.query('UPDATE users SET active_vtt_session_id = NULL WHERE id = $1 AND active_vtt_session_id = $2', [userId, roomCode]);
   await client.query('DELETE FROM campaign_members WHERE campaign_id = $1 AND user_id = $2', [campaignId, userId]);
+  return forkOrFail(client, campaignId, userId, fork);
+}
+
+// Runs the fork and turns any failure into a clear message (the real error is logged, never shown). Throwing makes
+// the caller's transaction roll back, so a failed fork leaves the member in place and nothing changed.
+async function forkOrFail(
+  client: pg.PoolClient, campaignId: string, ownerUserId: string, fork: { reason: 'left' | 'removed' | 'manual'; actorUserId: string }
+): Promise<ForkSummary> {
+  // Looked up first: once a statement fails the transaction is aborted and nothing more can be read from it.
+  const name = (await client.query<{ display_name: string }>('SELECT display_name FROM users WHERE id = $1', [ownerUserId])).rows[0]?.display_name;
+  try {
+    return await forkLibraryContent(client, campaignId, ownerUserId, fork);
+  } catch (error) {
+    console.error('[campaigns] library fork failed, rolling the change back', error);
+    // The cap message is our own text and tells the DM why, so it's safe (and useful) to show.
+    if (error instanceof ForkPlanError) throw new CampaignError(`${forkFailureMessage(name ?? 'this member')} ${error.message}`);
+    throw new CampaignError(forkFailureMessage(name ?? 'this member'));
+  }
 }
 
 function checkDetails(name: string, description: string) {
@@ -531,7 +559,7 @@ export async function setMemberRole(
 
 // Rules in canRemoveMember. Returns the room code and user so the caller can kick live sockets
 // (the campaign page action does, via campaignRooms.ts).
-export async function removeMember(userId: string, campaignId: string, targetUserId: string): Promise<{ roomCode: string; targetUserId: string }> {
+export async function removeMember(userId: string, campaignId: string, targetUserId: string): Promise<{ roomCode: string; targetUserId: string; fork: ForkSummary }> {
   return withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
     assertNotArchived(locked);
@@ -544,28 +572,46 @@ export async function removeMember(userId: string, campaignId: string, targetUse
     );
     if (!verdict.ok) throw new CampaignError(verdict.reason);
     // Delete first so the 'dm' slot is free for the co-DM to take.
-    await releaseMember(client, campaignId, locked.campaign.roomCode, targetUserId);
+    const fork = await releaseMember(client, campaignId, locked.campaign.roomCode, targetUserId, { reason: 'removed', actorUserId: userId });
     if (verdict.promoteCoDm) {
       await client.query(`UPDATE campaign_members SET role = 'dm' WHERE campaign_id = $1 AND role = 'co_dm'`, [campaignId]);
     }
-    return { roomCode: locked.campaign.roomCode, targetUserId };
+    return { roomCode: locked.campaign.roomCode, targetUserId, fork };
   });
 }
 
 // Any member, for themselves. Rules in canLeave (the last DM can't leave; a primary DM with a
 // co-DM hands over to them).
-export async function leaveCampaign(userId: string, campaignId: string): Promise<{ roomCode: string }> {
+export async function leaveCampaign(userId: string, campaignId: string): Promise<{ roomCode: string; fork: ForkSummary }> {
   return withTransaction(async (client) => {
     const locked = await lockCampaign(client, userId, campaignId);
     const myRole = roleOf(locked, userId);
     if (!myRole) throw new CampaignError("You're not in this campaign.");
     const verdict = canLeave({ userId, role: myRole }, locked.members.map((m) => m.role), locked.campaign.isArchived);
     if (!verdict.ok) throw new CampaignError(verdict.reason);
-    await releaseMember(client, campaignId, locked.campaign.roomCode, userId);
+    const fork = await releaseMember(client, campaignId, locked.campaign.roomCode, userId, { reason: 'left', actorUserId: userId });
     if (verdict.promoteCoDm) {
       await client.query(`UPDATE campaign_members SET role = 'dm' WHERE campaign_id = $1 AND role = 'co_dm'`, [campaignId]);
     }
-    return { roomCode: locked.campaign.roomCode };
+    return { roomCode: locked.campaign.roomCode, fork };
+  });
+}
+
+// DM, co-DM and admin. "Keep a campaign copy" (homebrew library, unit G): forks a member's in-use library content on
+// demand while they stay. Every character in the campaign is re-pointed, the member's own included, so nothing here
+// follows their later edits or archives. Same lock order as a leave (member rows, then characters) and the same
+// idempotent fork. Does not touch campaign_library_settings. The caller does the after-commit steps (announceFork).
+export async function keepCampaignCopy(userId: string, campaignId: string, ownerUserId: string): Promise<{ roomCode: string; fork: ForkSummary }> {
+  if (!isUuid(ownerUserId)) throw new CampaignError('That person is not a member of this campaign.');
+  return withTransaction(async (client) => {
+    const locked = await lockCampaign(client, userId, campaignId);
+    const access = decideCampaignAccess({ isAdmin: locked.isAdmin, memberRole: roleOf(locked, userId), archived: locked.campaign.isArchived });
+    if (!access.canManage) throw new CampaignError("You can't manage this campaign.");
+    if (locked.campaign.isArchived) throw new CampaignError('This campaign is archived.');
+    // A former member's content goes through the leave or repair path, not this button.
+    if (!roleOf(locked, ownerUserId)) throw new CampaignError('That person is not a member of this campaign.');
+    const fork = await forkOrFail(client, campaignId, ownerUserId, { reason: 'manual', actorUserId: userId });
+    return { roomCode: locked.campaign.roomCode, fork };
   });
 }
 
