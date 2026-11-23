@@ -336,7 +336,7 @@
           <h2>Foraging</h2>
           <span class="campaign-box-foot">
             <span class="muted">Find tables: {data.findTableCount} active</span>
-            <a class="button-link compact-link" href="/forage/tables">Manage</a>
+            <a class="button-link compact-link" href="/campaigns/{campaign.id}/forage">Manage</a>
           </span>
         </div>
         {#if data.findTableCount === 0}

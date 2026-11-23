@@ -32,6 +32,7 @@ describe.skipIf(!enabled)('fork on leave and Keep a campaign copy', () => {
   let decks: typeof import('./services/decks');
   let homebrew: typeof import('./services/library-campaign');
   let ruleEngine: typeof import('./services/rule-engine');
+  let forage: typeof import('./services/forage');
   let invalidateReferenceData: (reason: string) => void;
   const campaignIds: string[] = [];
   const triggers: string[] = [];
@@ -54,6 +55,7 @@ describe.skipIf(!enabled)('fork on leave and Keep a campaign copy', () => {
     decks = await import('./services/decks');
     homebrew = await import('./services/library-campaign');
     ruleEngine = await import('./services/rule-engine');
+    forage = await import('./services/forage');
   });
 
   afterAll(async () => {
@@ -66,6 +68,7 @@ describe.skipIf(!enabled)('fork on leave and Keep a campaign copy', () => {
     await q('DELETE FROM deck_draws WHERE campaign_id = ANY($1::uuid[])', [ids]);
     await q('DELETE FROM campaign_decks WHERE campaign_id = ANY($1::uuid[])', [ids]);
     await q('DELETE FROM campaign_library_settings WHERE campaign_id = ANY($1::uuid[])', [ids]);
+    await q('DELETE FROM finds WHERE campaign_id = ANY($1::uuid[])', [ids]);
     await q('DELETE FROM find_table_entries WHERE find_table_id IN (SELECT id FROM find_tables WHERE campaign_id = ANY($1::uuid[]))', [ids]);
     await q('DELETE FROM find_tables WHERE campaign_id = ANY($1::uuid[])', [ids]);
     await q(`DELETE FROM active_character_effects WHERE character_id IN (SELECT id FROM characters WHERE owner_user_id IN ${mine})`);
@@ -446,6 +449,29 @@ describe.skipIf(!enabled)('fork on leave and Keep a campaign copy', () => {
     await campaigns.removeMember(w.dm, w.c1, w.a);
     expect(await count('SELECT count(*) AS n FROM content_definitions WHERE campaign_id = $1 AND forked_from_content_id IS NOT NULL', [w.c1])).toBeGreaterThan(0);
   }, 120_000);
+
+  it('admin undo of a find made before a fork still reaches the row, now holding the campaign copy', async () => {
+    const w = await buildWorld('undo');
+    // B's sword row stands in for the row a find wrote to (quantity 1, the find added 1), then A leaves and the row moves to the copy.
+    const find = (await q<{ id: string }>(
+      `INSERT INTO finds (mode, status, character_id, finder_user_id, find_table_id, campaign_id, results, resolved_at)
+       VALUES ('dm', 'found', $1, $2, $3, $4, $5::jsonb, now()) RETURNING id`,
+      [w.charB, w.b, w.table, w.c1, JSON.stringify([
+        { item_id: w.sword.id, qty: 1, inventory_id: w.bSword },
+        { item_id: w.wand.id, qty: 1, inventory_id: w.bWand }
+      ])])).rows[0].id;
+    await campaigns.leaveCampaign(w.a, w.c1);
+    const swordCopy = await copyOf(w, w.sword);
+    expect((await q<any>('SELECT source_content_id FROM character_inventory_items WHERE id = $1', [w.bSword])).rows[0].source_content_id).toBe(swordCopy.id);
+    // The player has since swapped the wand row to something unrelated: that one must still be left alone.
+    await q('UPDATE character_inventory_items SET source_content_id = $2 WHERE id = $1', [w.bWand, w.forageItem.id]);
+
+    const reverted = await forage.revertFind({ findId: find, adminUserId: w.admin });
+    expect(reverted!.note).toContain('Sword: removed');
+    expect(reverted!.note).toContain('Wand: the row now holds a different item, left alone');
+    expect(await count('SELECT count(*) AS n FROM character_inventory_items WHERE id = $1', [w.bSword])).toBe(0);
+    expect(await count('SELECT count(*) AS n FROM character_inventory_items WHERE id = $1', [w.bWand])).toBe(1);
+  }, 60_000);
 
   // ------------------------------------------------------------------ switch-off and the manual button
 

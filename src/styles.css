@@ -2438,7 +2438,7 @@ button.death-save-icon.failure.active {
   .forage-sheet { width: 100%; }
 }
 
-/* Forage find-table authoring (/forage/tables). */
+/* Forage find-table authoring (/campaigns/[id]/forage). */
 .forage-layout { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(0, 1.5fr); gap: 18px; align-items: start; }
 .forage-layout > * { min-width: 0; }
 .forage-layout input, .forage-layout select { min-width: 0; width: 100%; }
@@ -2465,6 +2465,7 @@ button.death-save-icon.failure.active {
   .forage-entry-name { grid-column: 1 / -1; }
   .forage-entry-label { display: inline; font-size: 11px; color: var(--muted); }
   .forage-entry input, .forage-entry select, .forage-entry button, .forage-add input, .forage-add button { min-height: 44px; }
+  .forage-layout .admin-create-disclosure summary, .forage-layout .admin-form input, .forage-layout .admin-form button, .forage-layout .forage-list-item, .forage-layout form button { min-height: 44px; }
   .forage-entry button { grid-column: 1 / -1; }
 }
 

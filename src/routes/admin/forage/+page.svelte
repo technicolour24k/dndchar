@@ -35,7 +35,7 @@
     <p class="eyebrow">Administration</p>
     <h1>Finds Review</h1>
     <p class="muted">
-      Every forage find, newest first (200 at most). Find tables belong to campaigns and are edited at <a href="/forage/tables">/forage/tables</a>.
+      Every forage find, newest first (200 at most). Find tables belong to campaigns and are edited on each campaign's Forage page (<a href="/forage/tables">find yours</a>).
     </p>
   </div>
 </section>

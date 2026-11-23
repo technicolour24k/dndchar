@@ -86,12 +86,19 @@ export async function countActiveFindTables(campaignId: string): Promise<number>
   return result.rows[0]?.count ?? 0;
 }
 
+/** Which campaign a table belongs to (null if missing or malformed). The campaign page uses it to refuse a table id from another campaign. */
+export async function getFindTableCampaignId(tableId: string): Promise<string | null> {
+  if (!UUID_PATTERN.test(tableId)) return null;
+  const result = await query<{ campaign_id: string }>('SELECT campaign_id FROM find_tables WHERE id = $1', [tableId]);
+  return result.rows[0]?.campaign_id ?? null;
+}
+
 /**
- * Every table (archived included) with counts, for the authoring page, but only the ones this actor
+ * Every table (archived included) with counts, for the authoring page (optionally one campaign's), but only the ones this actor
  * may edit: their DM campaigns' tables, or all of them for an admin. The authoring page is
  * DM-only, so a player never sees a table name here.
  */
-export async function listFindTables(actor: ForageActor): Promise<FindTable[]> {
+export async function listFindTables(actor: ForageActor, campaignId?: string): Promise<FindTable[]> {
   const result = await query<TableRow>(`
     SELECT t.id, t.campaign_id, cp.name AS campaign_name, t.name, t.area_type, t.category, t.suggested_check, t.is_archived,
            t.owner_user_id, u.display_name AS owner_name,
@@ -102,9 +109,9 @@ export async function listFindTables(actor: ForageActor): Promise<FindTable[]> {
     LEFT JOIN users u ON u.id = t.owner_user_id
     LEFT JOIN find_table_entries e ON e.find_table_id = t.id
     LEFT JOIN content_definitions c ON c.id = e.item_id
-    WHERE $1::boolean OR t.campaign_id = ANY($2::uuid[])
+    WHERE ($1::boolean OR t.campaign_id = ANY($2::uuid[])) AND ($3::uuid IS NULL OR t.campaign_id = $3)
     GROUP BY t.id, cp.name, u.display_name
-    ORDER BY lower(cp.name), t.area_type, t.category, t.name`, [actor.role === 'admin', actor.dmCampaignIds]);
+    ORDER BY lower(cp.name), t.area_type, t.category, t.name`, [actor.role === 'admin', actor.dmCampaignIds, campaignId ?? null]);
   return result.rows.map(mapTable);
 }
 
@@ -576,14 +583,20 @@ export async function revertFind(input: { findId: string; adminUserId: string })
     const notes: string[] = [];
     for (const line of results) {
       const name = names.get(line.item_id) ?? 'Unknown item';
-      const row = await client.query<{ id: string; quantity: number; source_content_id: string | null }>(
-        'SELECT id, quantity, source_content_id FROM character_inventory_items WHERE id = $1 AND character_id = $2 FOR UPDATE',
-        [line.inventory_id, find.character_id]
+      // forked_from is the original of the row's item when that item is a campaign copy (homebrew library fork).
+      const row = await client.query<{ id: string; quantity: number; source_content_id: string | null; forked_from: string | null }>(
+        `SELECT i.id, i.quantity, i.source_content_id,
+                CASE WHEN c.campaign_id IS NOT DISTINCT FROM $3::uuid THEN c.forked_from_content_id END AS forked_from
+         FROM character_inventory_items i
+         LEFT JOIN content_definitions c ON c.id = i.source_content_id
+         WHERE i.id = $1 AND i.character_id = $2 FOR UPDATE OF i`,
+        [line.inventory_id, find.character_id, find.campaign_id ?? null]
       );
       const current = row.rows[0];
       if (!current) {
         notes.push(`${name}: already removed by the player`);
-      } else if (current.source_content_id !== line.item_id) {
+      } else if (current.source_content_id !== line.item_id && current.forked_from !== line.item_id) {
+        // Neither the found item nor a campaign copy of it (a fork re-points the row after the find was made).
         notes.push(`${name}: the row now holds a different item, left alone`);
       } else if (current.quantity > line.qty) {
         await client.query('UPDATE character_inventory_items SET quantity = quantity - $2 WHERE id = $1', [current.id, line.qty]);
