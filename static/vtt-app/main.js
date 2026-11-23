@@ -695,6 +695,7 @@ function handleMessage(msg) {
       forage.onStateFull();
       deck.onStateFull();
       costApproval.onStateFull();
+      roundPendingOnStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
       // 'character:changed' below instead. See that case and
@@ -1012,9 +1013,28 @@ function handleMessage(msg) {
       costApproval.onPing();
       break;
 
-    // The GM called the next round (players only; the GM presses the button).
+    // Next round waits for Ready (unit 12). The GM hears the whole picture, a player only their own
+    // standing, and watchers nothing. round:next means the round has started (players only); round:done is
+    // the GM's copy, with the turn views to push onto the tokens.
+    case 'round:pending':
+    case 'round:pending:update':
+      onRoundPending(msg);
+      break;
+
+    case 'round:hold':
+      showMovePlanNotice(`${msg.name} wants to do something first`, 5000);
+      break;
+
+    case 'round:cancelled':
+      onRoundCancelled();
+      break;
+
     case 'round:next':
       onRoundNext();
+      break;
+
+    case 'round:done':
+      onRoundDone(msg);
       break;
 
     // A DM shared an overworld map (campaign tables only).
@@ -3625,44 +3645,102 @@ async function resetAllTurns() {
   } catch { /* movement was reset over the socket; actions follow on the next sync */ }
 }
 
-// GM "Next round": the server advances every character on the map (round and turn effects tick, spent
-// actions and follow-ups clear) and resets every token's movement (broadcast to the room). This pushes the
-// fresh turn copies onto the tokens, like Reset all. A 409 too_soon (a double click) is ignored quietly.
+// GM "Next round" (unit 12): asks for the round. The server then waits for the players to press Ready
+// (or for Start now) before anything resets or ticks; the result comes back as round:done. A 409 too_soon
+// (a double click) is ignored quietly, and already_pending just shows the state that is there.
 let nextRoundBusy = false;
-async function nextRound() {
+async function postNextRound(action) {
   if (!sessionId || nextRoundBusy) return;
   nextRoundBusy = true;
-  document.getElementById('nextRoundBtn')?.setAttribute('disabled', '');
-  dropRepeatButton(); // an Extra Attack button on an open result is no longer valid
+  refreshCombatControl();
   try {
-    const res = await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/next-round', { method: 'POST' });
+    const res = await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/next-round', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }),
+    });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      if (body.error !== 'too_soon') showMovePlanNotice("Couldn't start the next round.", 4000);
+    if (res.ok || body.error === 'already_pending') {
+      if (body.pending) { session.roundPending = body.pending; }
       return;
     }
-    for (const token of Object.values(session.tokens)) {
-      const view = token.characterId && body.views?.[token.characterId];
-      if (view) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: view });
-    }
-    const count = Number(body.advanced) || 0;
-    const skipped = Number(body.skipped) || 0;
-    showMovePlanNotice(`Next round: ${count} ${count === 1 ? 'character' : 'characters'}${skipped ? `, ${skipped} skipped` : ''}`, 4000);
+    if (body.error === 'no_pending') { session.roundPending = null; return; } // already processed or cancelled: clear a stale waiting line (finally redraws)
+    if (body.error === 'too_soon') return; // a double click
+    showMovePlanNotice("Couldn't do that for the next round.", 4000);
   } catch {
-    showMovePlanNotice("Couldn't start the next round.", 4000);
+    showMovePlanNotice("Couldn't do that for the next round.", 4000);
   } finally {
     nextRoundBusy = false;
-    document.getElementById('nextRoundBtn')?.removeAttribute('disabled');
+    refreshCombatControl();
   }
 }
 
-// Players: a passing card when the GM calls the next round. It never blocks play and stays until dismissed.
-// One card at a time (a second round:next just shows it again). The text is fixed, nothing from data.
+// The GM's copy of a processed round: the fresh turn copies go onto the tokens (like Reset all). It
+// arrives whoever completed the round (Start now, the last Ready, or a disconnect).
+function onRoundDone(msg) {
+  session.roundPending = null;
+  dropRepeatButton();
+  for (const token of Object.values(session.tokens)) {
+    const view = token.characterId && msg.views?.[token.characterId];
+    if (view) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: view });
+  }
+  const count = Number(msg.advanced) || 0;
+  const skipped = Number(msg.skipped) || 0;
+  showMovePlanNotice(`Next round: ${count} ${count === 1 ? 'character' : 'characters'}${skipped ? `, ${skipped} skipped` : ''}`, 4000);
+  refreshCombatControl();
+}
+
+// GM: the pending state changed. Player: this player's own standing changed.
+function onRoundPending(msg) {
+  if (role === 'gm') { session.roundPending = msg.pending; refreshCombatControl(); }
+  else { session.roundPending = msg.view; showRoundCard(msg.view); }
+}
+
+function onRoundCancelled() {
+  session.roundPending = null;
+  if (role === 'gm') { showMovePlanNotice('Next round cancelled', 3000); refreshCombatControl(); }
+  else { showRoundCard(null); showMovePlanNotice('The DM cancelled the next round.', 4000); }
+}
+
+// A reload while a round is pending: state:full carries the pending view, so the card or the GM's
+// waiting line comes straight back (and a stale card goes if the round ended while we were away).
+function roundPendingOnStateFull() {
+  if (role === 'gm') refreshCombatControl();
+  else showRoundCard(session.roundPending ?? null);
+}
+
+// Players: the card. One at a time, fixed wording chosen by the player's own state ('waiting', 'holding'
+// or 'ready'), nothing from data. It never steals focus or blocks play.
 const roundCard = document.getElementById('roundCard');
-document.getElementById('roundCardOk')?.addEventListener('click', () => { roundCard.hidden = true; });
+const ROUND_CARD_TEXT = {
+  waiting: 'The DM wants to start the next round. Anything to do first?',
+  holding: "The DM knows you want to act. Press Ready when you're done.",
+  ready: "You're ready. Waiting for the DM and the others."
+};
+function showRoundCard(view) {
+  if (!roundCard) return;
+  roundCard.hidden = !view;
+  if (!view) return;
+  document.getElementById('roundCardText').textContent = ROUND_CARD_TEXT[view.state] ?? ROUND_CARD_TEXT.waiting;
+  document.getElementById('roundReadyBtn').hidden = view.state === 'ready';
+  document.getElementById('roundHoldBtn').hidden = view.state === 'holding';
+}
+async function answerRound(action) {
+  if (!sessionId) return;
+  try {
+    // The server decides who we are; the card itself updates from the round:pending message that follows.
+    await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/next-round/ready', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, pendingId: session.roundPending?.id }),
+    });
+  } catch { showMovePlanNotice("Couldn't reach the DM, try again.", 3000); }
+}
+document.getElementById('roundReadyBtn')?.addEventListener('click', () => { void answerRound('ready'); });
+document.getElementById('roundHoldBtn')?.addEventListener('click', () => { void answerRound('hold'); });
+
+// Players: the round has started. A short note replaces the card.
 function onRoundNext() {
   dropRepeatButton();
-  if (roundCard) roundCard.hidden = false;
+  session.roundPending = null;
+  showRoundCard(null);
+  showMovePlanNotice('New round', 3000);
 }
 
 // A new round makes any waiting free repeat stale: take the button off an open attack result.
@@ -3846,13 +3924,39 @@ function roomInfoHtml(roleLabel) {
 function combatControlHtml() {
   const active = !!session.encounterId;
   const statusLine = active ? `<div class="combat-encounter-id">Combat is active in this room.</div>` : '';
-  // The GM's Next round sits with the combat controls in every room (there is no initiative tracker).
-  const nextRoundHtml = `<button type="button" id="nextRoundBtn" class="secondary" ${nextRoundBusy ? 'disabled' : ''}>Next round</button>`;
   const gmButton = role !== 'gm' ? '' : (active
     ? `<button type="button" id="stopCombatBtn" class="secondary">Stop Combat</button>`
-    : `<button type="button" id="startCombatBtn">Start Combat</button>`) + nextRoundHtml;
+    : `<button type="button" id="startCombatBtn">Start Combat</button>`) + nextRoundHtml();
   if (!gmButton && !statusLine) return '';
   return `<div class="field" id="combatControl">${gmButton}${statusLine}</div>`;
+}
+
+// The GM's Next round (every room; there is no initiative tracker). While a round is pending it becomes
+// who we are waiting on, with Start now and Cancel. Names are escaped; "wants to act" marks a Hold on.
+function nextRoundHtml() {
+  const pending = session.roundPending;
+  if (!pending) return `<button type="button" id="nextRoundBtn" class="secondary" ${nextRoundBusy ? 'disabled' : ''}>Next round</button>`;
+  const names = [...pending.waiting.map((p) => escapeHtml(p.name)), ...pending.holding.map((p) => `<span class="round-hold">${escapeHtml(p.name)} (wants to act)</span>`)];
+  const line = names.length ? `Next round: waiting on ${names.join(', ')}` : 'Next round: waiting for players to come back';
+  const ready = pending.ready.length ? ` <span style="color:#999;">(${pending.ready.length} ready)</span>` : '';
+  return `<div class="round-pending-line">${line}${ready}</div>`
+    + `<div class="round-pending-actions"><button type="button" id="startRoundNowBtn" ${nextRoundBusy ? 'disabled' : ''}>Start now</button>`
+    + `<button type="button" id="cancelRoundBtn" class="secondary" ${nextRoundBusy ? 'disabled' : ''}>Cancel</button></div>`;
+}
+
+// Redraws just the combat control from the server's state (no sidebar rebuild) and rewires its buttons.
+function refreshCombatControl() {
+  const el = document.getElementById('combatControl');
+  if (!el || role !== 'gm' || !session) return;
+  el.outerHTML = combatControlHtml();
+  wireCombatControl();
+}
+function wireCombatControl() {
+  document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
+  document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+  document.getElementById('nextRoundBtn')?.addEventListener('click', () => { void postNextRound('request'); });
+  document.getElementById('startRoundNowBtn')?.addEventListener('click', () => { void postNextRound('start'); });
+  document.getElementById('cancelRoundBtn')?.addEventListener('click', () => { void postNextRound('cancel'); });
 }
 
 function combatLogHtml() {
@@ -4369,9 +4473,7 @@ function markerListHtml(isGm) {
 }
 
 function wireGmSidebar() {
-  document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
-  document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
-  document.getElementById('nextRoundBtn')?.addEventListener('click', () => { void nextRound(); });
+  wireCombatControl();
   wireSessionNotesControls();
 
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // POST /vtt/api/session/[id]/next-round: the GM's table-wide round. Database, services and the live
 // store are mocked: this checks who may call it, the order, who is skipped and who hears about it.
+// Nobody is connected here, so a request processes straight away (the waiting is in vttNextRoundFlow.test.ts).
 
 const advance = vi.fn();
 const emit = vi.fn();
@@ -12,6 +13,8 @@ const live = new Map<string, any>();
 
 vi.mock('$vtt/store.js', () => ({
   get sessions() { return live; },
+  socketsBySession: new Map(),
+  registerReleaseHook: () => {},
   broadcast: (_id: string, build: (recipient: any) => unknown) => {
     for (const role of ['gm', 'player']) { const payload = build({ role }); if (payload) sent.push({ role, payload }); }
   }
@@ -28,7 +31,8 @@ vi.mock('$lib/server/services/turn-state', () => ({
 }));
 
 const route = await import('../../routes/vtt/api/session/[id]/next-round/+server');
-const post = () => route.POST({ locals: { user: { id: 'gm1' } }, params: { id: 'r1' } } as any);
+const post = (body: unknown = { action: 'request' }) =>
+  route.POST({ locals: { user: { id: 'gm1' } }, params: { id: 'r1' }, request: new Request('http://x', { method: 'POST', body: JSON.stringify(body) }) } as any);
 
 beforeEach(() => {
   advance.mockReset().mockResolvedValue(undefined);
@@ -97,10 +101,13 @@ describe('next-round route', () => {
     expect(moves.find((m) => m.role === 'player')!.payload.updates.map((u: any) => u.tokenId)).not.toContain('h');
   });
 
-  it('players get a detail-free round:next, the GM does not', async () => {
+  it('players get a detail-free round:next, the GM gets round:done with the views', async () => {
     await post();
     const nudges = sent.filter((entry) => entry.payload.type === 'round:next');
     expect(nudges.map((entry) => entry.role)).toEqual(['player']);
     expect(nudges[0].payload).toEqual({ type: 'round:next' });
+    const done = sent.filter((entry) => entry.payload.type === 'round:done');
+    expect(done.map((entry) => entry.role)).toEqual(['gm']);
+    expect(Object.keys(done[0].payload.views)).toEqual(['c1', 'c2', 'c3']);
   });
 });

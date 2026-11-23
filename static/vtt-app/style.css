@@ -467,6 +467,11 @@ body {
 #roundCard { position: fixed; top: 56px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 6px; background: #2a2d36; border: 1px solid #ffb300; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
 #roundCard[hidden] { display: none; }
 #roundCard button { margin: 0; padding: 4px 12px; width: auto; }
+#roundCard button[hidden] { display: none; }
+.round-pending-line { font-size: 12px; color: #ddd; margin: 6px 0; }
+.round-pending-line .round-hold { color: #ffb300; }
+#combatControl .round-pending-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+@media (pointer: coarse) { #combatControl .round-pending-actions button { min-height: 44px; } }
 @media (pointer: coarse) { #roundCard button { min-height: 44px; min-width: 44px; } }
 #overworldBanner { position: fixed; top: 52px; left: 50%; transform: translateX(-50%); z-index: 450; max-width: 92vw; display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 6px; background: #2a2d36; border: 1px solid #4a7fff; color: #eee; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.4); }
 #overworldBanner[hidden] { display: none; }

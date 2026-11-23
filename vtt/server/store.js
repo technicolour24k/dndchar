@@ -1,6 +1,7 @@
 // @ts-nocheck - plain untyped JS by design (see vtt/README.md); shared as-is
 // between the SvelteKit route bundle, the Vite dev plugin, and server.js.
 import crypto from 'node:crypto';
+import { roundPendingFor } from './roundState.js';
 
 // Excludes 0/O/1/I to avoid ambiguity when a room code is read aloud/typed.
 const ROOM_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -396,7 +397,8 @@ export function shouldPlayerSeeMarker(marker, playerId) {
 // broadcast that includes token/marker data. GM always gets the unfiltered
 // session; playerId is required to resolve per-player marker ownership.
 export function filterSessionForRole(session, role, playerId) {
-  if (role === 'gm') return session;
+  // The pending round (unit 12) is stored raw on the session; every recipient gets a per-role view of it.
+  if (role === 'gm') return session.roundPending ? { ...session, roundPending: roundPendingFor(session, 'gm', null) } : session;
 
   // Phase 10: a GM-hidden map is a hard gate ahead of all other filtering -
   // players get nothing map-related (no image/video, no tokens, no markers)
@@ -405,7 +407,7 @@ export function filterSessionForRole(session, role, playerId) {
   // client can distinguish "no map set yet" from "map set but not revealed"
   // and show an accurate waiting message (see render() in main.js).
   if (session.map && !session.map.revealed) {
-    return { ...session, map: { revealed: false }, tokens: {}, markers: {}, ...ownForage(session, playerId), ...ownCost(session, playerId) };
+    return { ...session, map: { revealed: false }, tokens: {}, markers: {}, ...ownForage(session, playerId), ...ownCost(session, playerId), roundPending: roundPendingFor(session, role, playerId) };
   }
 
   const tokens = {};
@@ -419,7 +421,7 @@ export function filterSessionForRole(session, role, playerId) {
     if (shouldPlayerSeeMarker(marker, playerId)) markers[id] = marker;
   }
 
-  return { ...session, tokens, markers, ...ownForage(session, playerId), ...ownCost(session, playerId) };
+  return { ...session, tokens, markers, ...ownForage(session, playerId), ...ownCost(session, playerId), roundPending: roundPendingFor(session, role, playerId) };
 }
 
 // Sends a per-recipient payload to every socket in a session. buildPayload
