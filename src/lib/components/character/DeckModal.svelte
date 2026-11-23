@@ -3,7 +3,7 @@
   import { backdropPress } from '$lib/ui/backdropPress';
   import type { DrawView } from '$lib/types/decks';
   import {
-    cardTitle, choiceOptions, errorText, recentLine, resultLines, rollLines, statusTag, successLabel, taskLines
+    cardTitle, choiceOptions, errorText, recentLine, resultLines, rollLines, statusTag, successLabel, taskLine, taskLines
   } from '../../../../static/vtt-app/shared/deckView.js';
 
   // The character sheet's Decks popup (decks plan, unit 7): draw a card, pick the Ace's value, read the result,
@@ -132,7 +132,7 @@
 
     {#snippet drawCard(entry: DrawView)}
       <section class="roll-options-section deck-result">
-        <h3>{cardTitle(entry.card)} <span class="deck-badge" class:good={entry.success}>{successLabel(entry.success)}</span></h3>
+        <h3>{cardTitle(entry.card)} <span class="deck-badge" class:good={entry.success === true} class:neutral={entry.success == null}>{successLabel(entry.success)}</span></h3>
         {#if entry.outcome?.name}<p><strong>{entry.outcome.name}</strong>{#if entry.outcome.text}: {entry.outcome.text}{/if}</p>{/if}
         {#each rollLines(entry) as line}<p class="muted">{line}</p>{/each}
         {#if resultLines(entry).length}
@@ -148,7 +148,7 @@
     {:else if choosing}
       <!-- An Ace: nothing has been applied yet. Closing leaves it here to finish later. -->
       <section class="roll-options-section">
-        <h3>{cardTitle(choosing.card)} <span class="deck-badge" class:good={choosing.success}>{successLabel(choosing.success)}</span></h3>
+        <h3>{cardTitle(choosing.card)} <span class="deck-badge" class:good={choosing.success === true} class:neutral={choosing.success == null}>{successLabel(choosing.success)}</span></h3>
         <p>An Ace counts as 1 or 11. Pick one: nothing happens until you do.</p>
         {#each choiceOptions(choosing) as option (option.value)}
           <div class="deck-choice">
@@ -185,7 +185,7 @@
             {/if}
             {#if entry.status === 'resolved'}
               {#each entry.dmTasks.filter((task) => !task.done) as task (task.id)}
-                <p class="forage-warn">Waiting on the DM: {task.text}
+                <p class="forage-warn">{taskLine(task)}
                   {#if canManage}<button type="button" class="text-button" disabled={busy} onclick={() => taskDone(entry, task.id, true)}>Done</button>{/if}
                 </p>
               {/each}

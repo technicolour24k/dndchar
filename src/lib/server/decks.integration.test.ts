@@ -184,6 +184,36 @@ describe.skipIf(!enabled)('decks', () => {
       await decks.setDrawTaskDone({ userId: dmId, drawId: joker.draw.id, taskId: joker.draw.dmTasks[0].id, done: true });
       expect((await decks.listOpenDmTasks(dmId, campaignId)).some((t) => t.drawId === joker.draw.id)).toBe(false);
 
+      // Hidden joker outcomes (vtt-feedback unit 2): a black-backed Red Joker is a failure with a cursed item.
+      // The DM sees all of it; no player read carries the hidden text, even in the raw JSON.
+      const cursed = await draw(A, p1, 'black:joker_red');
+      expect(cursed.draw.success).toBe(false);
+      expect(cursed.draw.outcome.text).toBe('The party finds a cursed item.');
+      const playerReads = {
+        character: await decks.listDecksForCharacter(p1, A),
+        otherPlayer: await decks.listDecksForCharacter(p2, B),
+        campaign: await decks.listDrawsForCampaign(p2, campaignId),
+        answer: await decks.viewForUser(p1, cursed.draw)
+      };
+      for (const [name, read] of Object.entries(playerReads)) {
+        expect(JSON.stringify(read), name).not.toMatch(/cursed/i);
+        expect(JSON.stringify(read), name).not.toContain('playerText');
+      }
+      const shown = playerReads.character.recent.find((d) => d.id === cursed.draw.id)!;
+      expect(shown.success).toBeNull();
+      expect(shown.outcome.text).toBe('The party finds an item.');
+      expect(shown.dmTasks.map((t) => [t.text, t.done])).toEqual([['', false]]);
+      expect(playerReads.campaign.find((d) => d.id === cursed.draw.id)!.success).toBeNull();
+      // The DM reads the full text, and the stored draw is untouched.
+      expect((await decks.listOpenDmTasks(dmId, campaignId)).find((t) => t.drawId === cursed.draw.id)!.text).toBe('The party finds a cursed item');
+      const dmView = (await decks.listDrawsForCampaign(dmId, campaignId)).find((d) => d.id === cursed.draw.id)!;
+      expect(dmView.success).toBe(false);
+      expect(dmView.outcome.text).toBe('The party finds a cursed item.');
+      expect((await decks.viewForUser(dmId, cursed.draw)).dmTasks[0].text).toBe('The party finds a cursed item');
+      // An ordinary card is the same for everyone.
+      const plainDraw = (await decks.listDrawsForCampaign(p1, campaignId)).find((d) => d.card.id === 'gold:diamonds:4')!;
+      expect(plainDraw.success).toBe(true);
+
       // Two drawers on the same party at once: no deadlock, both sets of changes land.
       await resetAll();
       const both = await Promise.all([draw(A, p1, 'gold:diamonds:4'), draw(B, p2, 'gold:diamonds:5')]);

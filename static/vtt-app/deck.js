@@ -111,7 +111,8 @@ export function createDeck(deps) {
   // Draw card DOM, shared by the popup result and the toasts.
   // ---------------------------------------------------------------------------------------------
   function badge(success) {
-    return el('span', `deck-badge${success ? ' good' : ''}`, successLabel(success));
+    // success === null (a hidden joker) gets the neutral badge: not green, not red, and no result given away.
+    return el('span', `deck-badge${success === true ? ' good' : success == null ? ' neutral' : ''}`, successLabel(success));
   }
 
   function appendDrawDetails(parent, draw) {

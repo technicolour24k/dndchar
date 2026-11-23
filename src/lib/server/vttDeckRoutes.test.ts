@@ -4,7 +4,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // and that only resolved/undone draws are announced. Access itself is the service's job (decks.integration).
 const service = {
   drawCard: vi.fn(), chooseValue: vi.fn(), revertDraw: vi.fn(), setDrawTaskDone: vi.fn(),
-  listDecksForCharacter: vi.fn(), listDrawsForCampaign: vi.fn(), listOpenDmTasks: vi.fn()
+  listDecksForCharacter: vi.fn(), listDrawsForCampaign: vi.fn(), listOpenDmTasks: vi.fn(),
+  // The per-user filter. Passes the draw through unless a test says otherwise.
+  viewForUser: vi.fn()
 };
 const announceDeck = vi.fn();
 const announceDmTasks = vi.fn();
@@ -28,7 +30,7 @@ const locals = { user: { id: 'u1' } };
 const body = (value: unknown) => ({ json: async () => value });
 const draw = (status: string) => ({ id: U, campaignId: 'camp', status });
 
-beforeEach(() => { Object.values(service).forEach((fn) => fn.mockReset()); announceDeck.mockReset(); announceDmTasks.mockReset(); });
+beforeEach(() => { Object.values(service).forEach((fn) => fn.mockReset()); service.viewForUser.mockImplementation(async (_userId: string, view: unknown) => view); announceDeck.mockReset(); announceDmTasks.mockReset(); });
 
 describe('deck routes', () => {
   it('rejects bad input with 400 before touching the service', async () => {
@@ -72,6 +74,22 @@ describe('deck routes', () => {
     announceDeck.mockClear();
     await undo.POST({ locals, params: { id: U } } as any);
     expect(announceDeck).not.toHaveBeenCalled();
+  });
+
+  it('answers a draw and a choice with the per-user view, but announces the full draw', async () => {
+    const full = { ...draw('resolved'), outcome: { text: 'cursed' } };
+    const shown = { ...draw('resolved'), outcome: { text: 'generic' } };
+    service.viewForUser.mockResolvedValue(shown);
+    service.drawCard.mockResolvedValueOnce({ status: 'resolved', draw: full });
+    const res = await (await drawRoute.POST({ locals, request: body({ characterId: U, deckId: U }) } as any)).json();
+    expect(res.draw).toEqual(shown);
+    expect(JSON.stringify(res)).not.toContain('cursed');
+    expect(announceDeck).toHaveBeenLastCalledWith(full, 'drawn');
+    expect(service.viewForUser).toHaveBeenCalledWith('u1', full);
+    service.chooseValue.mockResolvedValueOnce(full);
+    const chosen = await (await choose.POST({ locals, params: { id: U }, request: body({ value: 11 }) } as any)).json();
+    expect(JSON.stringify(chosen)).not.toContain('cursed');
+    expect(announceDeck).toHaveBeenLastCalledWith(full, 'drawn');
   });
 
   it('never forwards client targets: draw passes only the user, character and deck', async () => {

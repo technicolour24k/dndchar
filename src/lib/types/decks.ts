@@ -34,7 +34,11 @@ export type DeckStep =
       type: 'condition'; conditionKey: string; params?: Record<string, string>; durationRounds?: number | null;
       target: DeckTarget; inverse?: { conditionKey?: string; negateParams?: boolean };
     }
-  | { type: 'dm_prompt'; text: string; inverseText?: string; target?: DeckTarget };
+  | {
+      type: 'dm_prompt'; text: string; inverseText?: string; target?: DeckTarget;
+      /** Non-DMs see "Waiting on the DM." instead of the task text. */
+      hideFromPlayers?: boolean;
+    };
 
 export type DeckRoll = { name: string; dice: string; per: 'once' | 'party_member' };
 
@@ -44,6 +48,10 @@ export type DeckOutcome = {
   name: string;
   text: string;
   inverseText?: string;
+  /** What non-DMs see instead of text / inverseText (success or failure). Presentation only. */
+  playerText?: string;
+  /** Non-DMs see neither Success nor Failure for this outcome. */
+  hideSuccess?: boolean;
   rolls?: DeckRoll[];
   steps: DeckStep[];
 };
@@ -87,24 +95,28 @@ export type PlannedLine = {
   detail?: string;
 };
 
-export type PlannedTask = { text: string; characterIds: string[] };
+export type PlannedTask = { text: string; characterIds: string[]; hidden?: boolean };
 
 export type PlannedRoll = { name: string; total: number; text: string };
 
 export type DrawPlan = {
   lines: PlannedLine[];
   tasks: PlannedTask[];
-  outcome: { id: string; name: string; text: string; rolls: PlannedRoll[] };
+  outcome: { id: string; name: string; text: string; rolls: PlannedRoll[]; playerText?: string; hideSuccess?: boolean };
 };
 
 /** Input to drawSummary: what was drawn and what it did. */
 export type DrawSummaryInput = {
   drawerId: string;
   card: Pick<DeckCard, 'label' | 'tags'>;
-  success: boolean;
+  /** null = hidden from this viewer (the line omits success/failure). */
+  success: boolean | null;
   chosenValue?: number | null;
   lines: PlannedLine[];
+  /** An empty text means a hidden task ("Waiting on the DM."). */
   tasks: Array<{ text: string }>;
+  /** Extra wording after the head, used for the player version of an outcome. */
+  text?: string;
 };
 
 // ---- Draw records (what the service stores and returns). Mechanics are never stored, only what was applied.
@@ -133,7 +145,11 @@ export type DrawResultLine = {
   note?: string;
 };
 
-export type DmTask = { id: string; text: string; characterIds: string[]; done: boolean; doneByUserId: string | null; doneAt: string | null };
+export type DmTask = {
+  id: string; text: string; characterIds: string[]; done: boolean; doneByUserId: string | null; doneAt: string | null;
+  /** Hidden from players: their view carries an empty text. */
+  hidden?: boolean;
+};
 
 export type DrawView = {
   id: string;
@@ -143,10 +159,11 @@ export type DrawView = {
   drawerCharacterId: string;
   drawerName: string;
   card: Pick<DeckCard, 'id' | 'label' | 'tags' | 'value' | 'valueOptions'>;
-  success: boolean;
+  /** null = hidden from this viewer (only the player view sets it). */
+  success: boolean | null;
   chosenValue: number | null;
   status: DrawStatus;
-  outcome: { id?: string; name?: string; text?: string; rolls?: PlannedRoll[] };
+  outcome: { id?: string; name?: string; text?: string; rolls?: PlannedRoll[]; playerText?: string; hideSuccess?: boolean };
   results: DrawResultLine[];
   dmTasks: DmTask[];
   createdAt: string;

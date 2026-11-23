@@ -1,7 +1,7 @@
 import { query } from '$lib/server/db';
 import { sessions, socketsBySession, broadcast, publish } from '$vtt/store.js';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { drawSummary } from '$lib/rules/decks';
+import { drawSummary, playerDrawView } from '$lib/rules/decks';
 import { listOpenDmTasks, recordTokenHpDeltas } from '$lib/server/services/decks';
 import { logRoll } from '$lib/server/services/rollLog';
 import { nudgeCharacterTokenHp } from '$lib/server/vttTokenHp';
@@ -30,18 +30,28 @@ function publicView(draw: DrawView) {
     drawerName: draw.drawerName, card: draw.card, success: draw.success, chosenValue: draw.chosenValue, status: draw.status,
     outcome: draw.outcome,
     results: draw.results.map((line) => ({ characterId: line.characterId, kind: line.kind, text: line.text, note: line.note })),
-    dmTasks: draw.dmTasks.map((task) => ({ id: task.id, text: task.text, done: task.done })),
+    // `hidden` stays so the client can word a blanked task ("Waiting on the DM.") without guessing.
+    dmTasks: draw.dmTasks.map((task) => ({ id: task.id, text: task.text, done: task.done, ...(task.hidden ? { hidden: true } : {}) })),
     revertNote: draw.revertNote
   };
 }
 
-/** The log wording: the summary headline plus what each line did, then what is waiting on the DM. */
-function logText(draw: DrawView, kind: AnnounceKind): string {
-  const head = drawSummary({ drawerId: draw.drawerCharacterId, card: draw.card, success: draw.success, chosenValue: draw.chosenValue, lines: [], tasks: [] },
+/**
+ * The log wording: the summary headline plus what each line did, then what is waiting on the DM.
+ * The log is public and persisted, so it is always built from the PLAYER view of the draw.
+ */
+function logText(full: DrawView, kind: AnnounceKind): string {
+  const draw = playerDrawView(full);
+  // The outcome sentence is only added for an outcome that has player wording (other cards keep the old line).
+  const text = full.outcome.playerText ? draw.outcome.text : undefined;
+  const head = drawSummary({ drawerId: draw.drawerCharacterId, card: draw.card, success: draw.success, chosenValue: draw.chosenValue, lines: [], tasks: [], text },
     { [draw.drawerCharacterId]: draw.drawerName });
   if (kind === 'undone') return `The DM undid this draw. ${head}${draw.revertNote ? ` ${draw.revertNote}` : ''}`;
   const lines = draw.results.map((line) => `${line.text}.${line.note ? ` (${line.note})` : ''}`);
-  const tasks = draw.dmTasks.filter((task) => !task.done).map((task) => `Waiting on the DM: ${task.text}.`);
+  const open = draw.dmTasks.filter((task) => !task.done);
+  // A hidden task has no text: say "Waiting on the DM." once, however many there are.
+  const tasks = open.filter((task) => task.text).map((task) => `Waiting on the DM: ${task.text}.`);
+  if (open.some((task) => !task.text)) tasks.push('Waiting on the DM.');
   return [head, ...lines, ...tasks].join(' ');
 }
 
@@ -95,12 +105,19 @@ export async function announceDeck(draw: DrawView, kind: AnnounceKind): Promise<
 
   if (roomCode) {
     await safely('roll log', () => logRoll(roomCode, logText(draw, kind), {
-      kind: kind === 'drawn' ? 'deck_draw' : 'deck_undo', drawId: draw.id, cardId: draw.card.id, success: draw.success
+      // The log details are public too, so success is the player value (null when hidden).
+      kind: kind === 'drawn' ? 'deck_draw' : 'deck_undo', drawId: draw.id, cardId: draw.card.id, success: playerDrawView(draw).success
     }));
     if (sessions.has(roomCode)) {
       await safely('broadcast', () => {
-        const view = publicView(draw);
-        broadcast(roomCode, () => kind === 'drawn' ? { type: 'deck:drawn', draw: view } : { type: 'deck:undone', drawId: draw.id, draw: view });
+        // GM sockets are campaign managers (the same trust the GM block relies on) and get the full text;
+        // every other socket, watchers included, gets the player wording. Built once each, not per socket.
+        const full = publicView(draw);
+        const shown = publicView(playerDrawView(draw));
+        broadcast(roomCode, (recipient: any) => {
+          const view = recipient.role === 'gm' ? full : shown;
+          return kind === 'drawn' ? { type: 'deck:drawn', draw: view } : { type: 'deck:undone', drawId: draw.id, draw: view };
+        });
       });
       if (draw.dmTasks.length) await announceDmTasks(roomCode, draw.campaignId);
     }

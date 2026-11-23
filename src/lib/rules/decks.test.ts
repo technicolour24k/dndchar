@@ -3,10 +3,10 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   applyCoin, applyHp, applyTempHp, cardSuccess, cardValue, drawSummary, evaluateAmount, findOutcome, matchesTags,
-  needsValueChoice, parseDeckRules, planDraw
+  needsValueChoice, parseDeckRules, planDraw, playerDrawView
 } from './decks';
 import { MYSTICAL_FATE_RULES } from './decks.fixture';
-import type { DeckCard, ExpandedDeckRules } from '$lib/types/decks';
+import type { DeckCard, DrawView, ExpandedDeckRules } from '$lib/types/decks';
 
 const parsed = parseDeckRules(MYSTICAL_FATE_RULES);
 const rules = parsed.rules as ExpandedDeckRules;
@@ -488,11 +488,96 @@ describe('parseDeckRules hardening', () => {
   });
 });
 
-describe('migration 048', () => {
-  it('embeds the same rules JSON as the fixture', () => {
-    const sql = fs.readFileSync(path.resolve('src/lib/server/db/migrations/048_seed_deck_of_mystical_fate.sql'), 'utf8');
-    const embedded = sql.match(/SELECT id, \$deck_rules\$([\s\S]*?)\$deck_rules\$::jsonb/);
-    expect(embedded).not.toBeNull();
-    expect(JSON.parse(embedded![1])).toEqual(JSON.parse(JSON.stringify(MYSTICAL_FATE_RULES)));
+const embeddedRules = (file: string) => {
+  const sql = fs.readFileSync(path.resolve('src/lib/server/db/migrations', file), 'utf8');
+  const embedded = sql.match(/(?:SELECT id,|SET rules_json =) \$deck_rules\$([\s\S]*?)\$deck_rules\$::jsonb/);
+  expect(embedded).not.toBeNull();
+  return JSON.parse(embedded![1]);
+};
+
+describe('migrations 048 and 051', () => {
+  it('048 still parses as a 108-card deck (it is history, not the current seed)', () => {
+    const old = parseDeckRules(embeddedRules('048_seed_deck_of_mystical_fate.sql'));
+    expect(old.errors).toEqual([]);
+    expect(old.rules!.cards).toHaveLength(108);
+  });
+
+  it('051 embeds the same rules JSON as the fixture', () => {
+    expect(embeddedRules('051_deck_fate_player_text.sql')).toEqual(JSON.parse(JSON.stringify(MYSTICAL_FATE_RULES)));
+  });
+
+  it('051 only touches the global seed', () => {
+    const sql = fs.readFileSync(path.resolve('src/lib/server/db/migrations/051_deck_fate_player_text.sql'), 'utf8');
+    expect(sql).toContain("c.scope = 'global'");
+    expect(sql).toContain("c.content_key = 'deck:mystical_fate'");
+  });
+});
+
+describe('player-facing text', () => {
+  const outcomeOf = (id: string) => rules.outcomes.find((o) => o.id === id)!;
+
+  it('the parser keeps playerText, hideSuccess and hideFromPlayers', () => {
+    const red = outcomeOf('red_joker');
+    expect(red.playerText).toBe('The party finds an item.');
+    expect(red.hideSuccess).toBe(true);
+    expect(red.steps[0]).toMatchObject({ type: 'dm_prompt', hideFromPlayers: true });
+    expect(outcomeOf('jack_hearts').playerText).toBeUndefined();
+  });
+
+  it('the parser rejects a non-boolean flag and over-long player text', () => {
+    const bad = (patch: object, stepPatch: object = {}) => parseDeckRules({
+      version: 1, cards: [], success: { rules: [], otherwise: 'success' },
+      outcomes: [{ id: 'o', when: {}, name: 'n', text: 't', ...patch, steps: [{ type: 'dm_prompt', text: 'p', ...stepPatch }] }]
+    });
+    expect(bad({ hideSuccess: 'yes' }).errors).toEqual(['outcomes[0].hideSuccess: must be true or false']);
+    expect(bad({}, { hideFromPlayers: 1 }).errors).toEqual(['outcomes[0].steps[0].hideFromPlayers: must be true or false']);
+    expect(bad({ playerText: 'x'.repeat(501) }).errors).toHaveLength(1);
+    expect(bad({ playerText: 'Hi', hideSuccess: false }, { hideFromPlayers: false }).errors).toEqual([]);
+  });
+
+  it('planDraw carries the player fields and marks hidden tasks', () => {
+    const red = draw('gold:joker_red');
+    expect(red.outcome).toMatchObject({ playerText: 'The party finds an item.', hideSuccess: true });
+    expect(red.tasks[0].hidden).toBe(true);
+    const black = draw('black:joker_red');
+    expect(black.outcome.text).toBe('The party finds a cursed item.');
+    expect(black.outcome.playerText).toBe('The party finds an item.');
+    expect(black.tasks[0]).toMatchObject({ text: 'The party finds a cursed item', hidden: true });
+    expect(draw('gold:hearts:2').outcome.playerText).toBeUndefined();
+  });
+
+  const viewOf = (id: string): DrawView => {
+    const plan = draw(id);
+    const c = card(id);
+    return {
+      id: 'd1', deckId: 'k', deckName: 'Deck', campaignId: 'c', drawerCharacterId: 'a', drawerName: 'Aria',
+      card: { id: c.id, label: c.label, tags: c.tags, value: c.value }, success: cardSuccess(rules, c), chosenValue: null,
+      status: 'resolved', outcome: plan.outcome, results: [],
+      dmTasks: plan.tasks.map((t, i) => ({ id: `t${i}`, text: t.text, characterIds: t.characterIds, done: false, doneByUserId: null, doneAt: null, ...(t.hidden ? { hidden: true } : {}) })),
+      createdAt: '', resolvedAt: '', revertedAt: null, revertNote: ''
+    };
+  };
+
+  it('playerDrawView hides the joker text, success and task text', () => {
+    const view = playerDrawView(viewOf('black:joker_red'));
+    expect(view.success).toBeNull();
+    expect(view.outcome.text).toBe('The party finds an item.');
+    expect(view.dmTasks[0]).toMatchObject({ id: 't0', text: '', done: false });
+    // Nothing of the hidden wording survives anywhere in the payload.
+    expect(JSON.stringify(view)).not.toMatch(/cursed/i);
+    expect(JSON.stringify(view)).not.toContain('playerText');
+  });
+
+  it('playerDrawView leaves a normal card alone', () => {
+    const view = viewOf('gold:hearts:2');
+    expect(playerDrawView(view)).toEqual(view);
+  });
+
+  it('drawSummary words a hidden joker without the result or the task text', () => {
+    const view = playerDrawView(viewOf('black:joker_red'));
+    const text = drawSummary({
+      drawerId: 'a', card: card('black:joker_red'), success: view.success, lines: [], tasks: view.dmTasks, text: view.outcome.text
+    }, names);
+    expect(text).toBe('Aria drew the Red Joker (black back). The party finds an item. Waiting on the DM.');
   });
 });

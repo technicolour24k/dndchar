@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cardTitle, choiceOptions, drawnTitle, errorText, gmTaskLine, lastDrawLine, undoneTitle, recentLine, resultLines, rollLines, statusTag, taskLines } from '../../../static/vtt-app/shared/deckView.js';
+import { cardTitle, choiceOptions, drawnTitle, errorText, gmTaskLine, lastDrawLine, undoneTitle, recentLine, resultLines, rollLines, statusTag, successLabel, taskLine, taskLines } from '../../../static/vtt-app/shared/deckView.js';
 
 const draw: any = {
   drawerName: 'Aria', success: false, chosenValue: null, status: 'resolved',
@@ -41,5 +41,20 @@ describe('deckView', () => {
     expect(undoneTitle(draw)).toBe("The DM undid Aria's draw of the 3 of Clubs");
     expect(gmTaskLine({ cardLabel: 'Red Joker', text: 'The party gains a high-powered magic item' })).toBe('Red Joker: The party gains a high-powered magic item');
     expect(lastDrawLine(draw)).toBe('Last draw: Aria drew the 3 of Clubs - gold back (failure)');
+  });
+  it('words a hidden result (success null) without giving anything away', () => {
+    const hidden = { ...draw, success: null, card: { label: 'Red Joker', tags: { back: 'black' } }, dmTasks: [{ text: '', done: false, hidden: true }, { text: '', done: false, hidden: true }] };
+    expect(successLabel(null)).toBe('Up to the DM');
+    expect(successLabel(true)).toBe('Success');
+    expect(recentLine(hidden)).toBe('Aria drew the Red Joker - black back');
+    expect(drawnTitle({ ...hidden, outcome: { name: 'Red Joker' } })).toBe('Aria drew the Red Joker - black back: Red Joker');
+    expect(lastDrawLine(hidden)).toBe('Last draw: Aria drew the Red Joker - black back');
+    for (const line of [recentLine(hidden), drawnTitle(hidden), lastDrawLine(hidden)]) expect(line).not.toMatch(/success|failure/i);
+  });
+  it('words hidden tasks as one "Waiting on the DM." line, and keeps the text of ordinary tasks', () => {
+    expect(taskLine({ text: '', done: false })).toBe('Waiting on the DM.');
+    expect(taskLine({ text: 'Pick one', done: false })).toBe('Waiting on the DM: Pick one');
+    const two = { dmTasks: [{ text: '' }, { text: '' }, { text: 'Pick one' }, { text: 'Pick one' }] };
+    expect(taskLines(two)).toEqual(['Waiting on the DM.', 'Waiting on the DM: Pick one']);
   });
 });

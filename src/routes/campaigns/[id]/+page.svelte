@@ -458,7 +458,7 @@
               <li>
                 <div class="deck-draw-body">
                   <strong>{draw.drawerName}</strong> drew the {cardTitle(draw.card)}
-                  {#if draw.status !== 'cancelled' && draw.status !== 'choosing'}<span class="badge">{successLabel(draw.success)}</span>{/if}
+                  {#if draw.status !== 'cancelled' && draw.status !== 'choosing'}<span class="badge" class:badge-muted={draw.success == null}>{successLabel(draw.success)}</span>{/if}
                   {#if statusTag(draw)}<span class="badge badge-muted">{statusTag(draw)}</span>{/if}
                   <span class="muted">{draw.deckName} - {when(draw.createdAt)}</span>
                   {#if draw.status === 'resolved' || draw.status === 'reverted'}

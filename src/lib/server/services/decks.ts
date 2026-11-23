@@ -8,7 +8,7 @@ import { applyCharacterEffect } from '$lib/server/services/effects';
 import { primeSheetAc } from '$lib/server/vttTokenAc';
 import { collectConditionKeys, summariseDeck, type DeckSummary } from '$lib/rules/deckAdmin';
 import {
-  applyCoin, applyHp, applyTempHp, cardSuccess, cardValue, describeLine, needsValueChoice, parseDeckRules, planDraw, type RollDie
+  applyCoin, applyHp, applyTempHp, cardSuccess, cardValue, describeLine, needsValueChoice, parseDeckRules, planDraw, playerDrawView, type RollDie
 } from '$lib/rules/decks';
 import type {
   DeckCard, DeckCoin, DmTask, DrawResultLine, DrawStatus, DrawView, ExpandedDeckRules, PlannedLine
@@ -83,6 +83,24 @@ function toView(row: any): DrawView {
   };
 }
 
+// Who sees what. A campaign manager (DM, co-DM, site admin) gets the full view; everyone else gets the player
+// wording (playerDrawView): generic outcome text, no success/failure where hidden, hidden task text blanked.
+// Every view that leaves the service for a non-DM goes through here, so a leak would need a path that skips it.
+
+/** One access lookup for a whole list. */
+async function viewsFor(userId: string, campaignId: string, views: DrawView[]): Promise<DrawView[]> {
+  const access = await getCampaignAccess({ query }, userId, campaignId);
+  return access?.canManage ? views : views.map(playerDrawView);
+}
+
+/**
+ * One draw as this user may see it. The routes use it on what drawCard / chooseValue return (those stay full,
+ * because announceDeck needs the full draw to give the GM sockets the full text).
+ */
+export async function viewForUser(userId: string, view: DrawView): Promise<DrawView> {
+  return (await viewsFor(userId, view.campaignId, [view]))[0];
+}
+
 async function loadDrawRow(client: pg.PoolClient | { query: typeof query }, drawId: string, lock = false): Promise<any | null> {
   if (!isUuid(drawId)) return null;
   const result = await (client as any).query(`${DRAW_SELECT} WHERE d.id = $1 ${lock ? 'FOR UPDATE OF d' : ''}`, [drawId]);
@@ -100,10 +118,14 @@ async function previewsFor(view: DrawView): Promise<Record<string, string>> {
   const previews: Record<string, string> = {};
   for (const option of card.valueOptions ?? []) {
     const plan = planDraw({
-      rules: deck.rules, card: card as DeckCard, success: view.success, chosenValue: option, drawerId: view.drawerCharacterId,
+      rules: deck.rules, card: card as DeckCard, success: view.success as boolean, chosenValue: option, drawerId: view.drawerCharacterId,
       partyIds: party, rollDie: () => 1
     });
-    previews[String(option)] = [...plan.lines.map((line) => describeLine(line, names)), ...plan.tasks.map((task) => task.text)].join('. ') || plan.outcome.text;
+    // Player wording: previews reach non-DMs, so a hidden task reads "Waiting on the DM" and the outcome fallback is playerText.
+    previews[String(option)] = [
+      ...plan.lines.map((line) => describeLine(line, names)),
+      ...plan.tasks.map((task) => (task.hidden ? 'Waiting on the DM' : task.text))
+    ].join('. ') || plan.outcome.playerText || plan.outcome.text;
   }
   return previews;
 }
@@ -132,7 +154,9 @@ export async function listDecksForCharacter(userId: string, characterId: string)
   const choosing = choosingRow ? toView(choosingRow) : null;
   if (choosing) choosing.previews = await previewsFor(choosing);
   const recent = (await query<any>(`${DRAW_SELECT} WHERE d.campaign_id = $1 AND d.status <> 'cancelled' ORDER BY d.created_at DESC LIMIT 5`, [campaignId])).rows.map(toView);
-  return { decks, choosing, recent };
+  // One filtered list, then split back out, so the access lookup happens once.
+  const shown = await viewsFor(userId, campaignId, choosing ? [choosing, ...recent] : recent);
+  return { decks, choosing: choosing ? shown[0] : null, recent: choosing ? shown.slice(1) : shown };
 }
 
 // ---------------------------------------------------------------- drawing
@@ -196,8 +220,8 @@ export async function drawCard(input: { userId: string; characterId: string; dec
     });
   } catch (error) {
     // The partial unique index is the real guard against two simultaneous Ace draws.
-    if ((error as any)?.code === '23505') throw new DeckError('choosing', 'Finish the card you drew first.', await currentChoosing(characterId));
-    if (error instanceof DeckError && error.code === 'choosing') throw new DeckError('choosing', error.message, await currentChoosing(characterId));
+    if ((error as any)?.code === '23505') throw new DeckError('choosing', 'Finish the card you drew first.', await currentChoosing(userId, characterId));
+    if (error instanceof DeckError && error.code === 'choosing') throw new DeckError('choosing', error.message, await currentChoosing(userId, characterId));
     throw error;
   }
   const draw = toView((await loadDrawRow({ query }, drawId))!);
@@ -210,12 +234,13 @@ async function primeParty(campaignId: string, drawerId: string): Promise<void> {
   try { await primeSheetAc(await partyIds({ query }, campaignId, drawerId)); } catch (error) { console.error('[decks] AC prime failed', error); }
 }
 
-async function currentChoosing(characterId: string): Promise<DrawView | undefined> {
+/** The undecided draw that goes out with a 409, in this user's wording (it is serialised to the browser). */
+async function currentChoosing(userId: string, characterId: string): Promise<DrawView | undefined> {
   const row = (await query<any>(`${DRAW_SELECT} WHERE d.drawer_character_id = $1 AND d.status = 'choosing'`, [characterId])).rows[0];
   if (!row) return undefined;
   const view = toView(row);
   view.previews = await previewsFor(view);
-  return view;
+  return viewForUser(userId, view);
 }
 
 /** The Ace: the drawer picks 1 or 11. Resolves against the stored card and the deck's current rules. */
@@ -287,7 +312,10 @@ async function resolveDraw(client: pg.PoolClient, drawId: string, chosenValue: n
     rules: deck.rules, card, success: row.success, chosenValue, drawerId: row.drawer_character_id, partyIds: state.partyIds, rollDie: deps.rollDie ?? secureDie
   });
   const results: DrawResultLine[] = [];
-  const tasks: DmTask[] = plan.tasks.map((task) => ({ id: crypto.randomUUID(), text: task.text, characterIds: task.characterIds, done: false, doneByUserId: null, doneAt: null }));
+  const tasks: DmTask[] = plan.tasks.map((task) => ({
+    id: crypto.randomUUID(), text: task.text, characterIds: task.characterIds, done: false, doneByUserId: null, doneAt: null,
+    ...(task.hidden ? { hidden: true } : {})
+  }));
   const addTask = (text: string, characterIds: string[]) => tasks.push({ id: crypto.randomUUID(), text, characterIds, done: false, doneByUserId: null, doneAt: null });
 
   for (const line of plan.lines) {
@@ -482,7 +510,7 @@ export async function listDrawsForCampaign(userId: string, campaignId: string, o
   if (!access?.canView) throw new DeckError('forbidden', 'Campaign not found.');
   const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
   const result = await query<any>(`${DRAW_SELECT} WHERE d.campaign_id = $1 ORDER BY d.created_at DESC LIMIT $2`, [campaignId, limit]);
-  return result.rows.map(toView);
+  return viewsFor(userId, campaignId, result.rows.map(toView));
 }
 
 export type OpenDmTask = { drawId: string; taskId: string; text: string; characterIds: string[]; cardLabel: string; deckName: string; createdAt: string };
@@ -787,9 +815,12 @@ async function dryRunCore(owner: DeckOwner, input: { id: string; cardId: string;
     lines: [
       `${card.label}: ${success ? 'success' : 'failure'}${choose ? ` (counted as ${value})` : ''}`,
       `Outcome: ${plan.outcome.name}. ${plan.outcome.text}`,
+      // So a DM authoring a copy can check what the players will see.
+      ...(plan.outcome.playerText ? [`Players see: ${plan.outcome.playerText}`] : []),
+      ...(plan.outcome.hideSuccess ? ['Players see no success or failure.'] : []),
       ...plan.outcome.rolls.map((roll) => `Roll ${roll.name}: ${roll.text}`),
       ...plan.lines.map((line) => describeLine(line, TEST_PARTY) + (line.detail ? ` (${line.detail})` : '')),
-      ...plan.tasks.map((task) => `Waiting on the DM: ${task.text}`)
+      ...plan.tasks.map((task) => `Waiting on the DM: ${task.text}${task.hidden ? ' (players see "Waiting on the DM.")' : ''}`)
     ]
   };
 }

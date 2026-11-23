@@ -9,18 +9,27 @@ export function cardTitle(card) {
   return `${card?.label ?? 'A card'}${back ? ` - ${back} back` : ''}`;
 }
 
+/** null means this viewer is not told the result (a hidden joker), so it reads as the DM's call. */
 export function successLabel(success) {
+  if (success == null) return 'Up to the DM';
   return success ? 'Success' : 'Failure';
 }
+
 
 /** One line per applied change, with any clamp note: "Aria loses 3 AC for 10 rounds". */
 export function resultLines(draw) {
   return (draw?.results ?? []).map((line) => (line.note ? `${line.text} (${line.note})` : line.text));
 }
 
-/** What is still waiting on the DM (open tasks only, or every task when `all`). */
+/** One task in words. A hidden task has empty text (the server blanked it), so it just says "Waiting on the DM.". */
+export function taskLine(task) {
+  return task?.text ? `Waiting on the DM: ${task.text}` : 'Waiting on the DM.';
+}
+
+/** What is still waiting on the DM (open tasks only, or every task when `all`). Hidden tasks collapse into one line. */
 export function taskLines(draw, all = false) {
-  return (draw?.dmTasks ?? []).filter((task) => all || !task.done).map((task) => `Waiting on the DM: ${task.text}`);
+  const lines = (draw?.dmTasks ?? []).filter((task) => all || !task.done).map(taskLine);
+  return lines.filter((line, index) => lines.indexOf(line) === index);
 }
 
 /** The roll breakdowns, e.g. "party_roll: 4 + 7 + 2 = 13". */
@@ -42,15 +51,17 @@ export function statusTag(draw) {
   return '';
 }
 
-/** A one-line recent draw: "Aria drew the 3 of Clubs - gold back: Failure". */
+/** A one-line recent draw: "Aria drew the 3 of Clubs - gold back: Failure" (no result part when it is hidden). */
 export function recentLine(draw) {
-  return `${draw.drawerName} drew the ${cardTitle(draw.card)}${draw.chosenValue != null ? ` (as ${draw.chosenValue})` : ''}: ${successLabel(draw.success)}`;
+  const result = draw.success == null ? '' : `: ${successLabel(draw.success)}`;
+  return `${draw.drawerName} drew the ${cardTitle(draw.card)}${draw.chosenValue != null ? ` (as ${draw.chosenValue})` : ''}${result}`;
 }
 
 /** The VTT toast headline: "Aria drew the 3 of Clubs - gold back - failure: Defender's Aura". */
 export function drawnTitle(draw) {
   const outcome = draw?.outcome?.name ? `: ${draw.outcome.name}` : '';
-  return `${draw?.drawerName} drew the ${cardTitle(draw?.card)} - ${successLabel(draw?.success).toLowerCase()}${outcome}`;
+  const result = draw?.success == null ? '' : ` - ${successLabel(draw.success).toLowerCase()}`;
+  return `${draw?.drawerName} drew the ${cardTitle(draw?.card)}${result}${outcome}`;
 }
 
 /** The VTT toast headline when the DM undoes a draw. */
@@ -65,7 +76,8 @@ export function gmTaskLine(task) {
 
 /** The GM's "last draw" line (the draw Undo applies to). */
 export function lastDrawLine(draw) {
-  return `Last draw: ${draw?.drawerName} drew the ${cardTitle(draw?.card)} (${successLabel(draw?.success).toLowerCase()})`;
+  const result = draw?.success == null ? '' : ` (${successLabel(draw.success).toLowerCase()})`;
+  return `Last draw: ${draw?.drawerName} drew the ${cardTitle(draw?.card)}${result}`;
 }
 
 /** Player-facing text for an error body from the deck endpoints. */

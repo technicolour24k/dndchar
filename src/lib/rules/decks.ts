@@ -1,6 +1,6 @@
 import type {
   CardTags, DeckCard, DeckOutcome, DeckStep, DeckTarget, DrawPlan, DrawSummaryInput, ExpandedDeckRules,
-  PlannedLine, PlannedRoll, PlannedTask
+  DrawView, PlannedLine, PlannedRoll, PlannedTask
 } from '$lib/types/decks';
 
 // Pure deck rules: parsing, tag matching, amount maths, outcome planning and the appliers.
@@ -188,6 +188,13 @@ function readText(raw: unknown, path: string, r: Reader): string {
   return raw;
 }
 
+/** An optional true/false field. Anything else is an error. */
+function readFlag(raw: unknown, path: string, r: Reader): boolean | undefined {
+  if (raw == null) return undefined;
+  if (typeof raw !== 'boolean') { r.errors.push(`${path}: must be true or false`); return undefined; }
+  return raw;
+}
+
 function readValue(raw: unknown, path: string, r: Reader): number | null {
   if (raw == null) return null;
   if (typeof raw !== 'number' || !Number.isInteger(raw) || Math.abs(raw) > DECK_LIMITS.amount) {
@@ -353,7 +360,11 @@ function readStep(raw: unknown, path: string, allowed: string[], r: Reader): Dec
     case 'dm_prompt': {
       const text = readText(raw.text, `${path}.text`, r);
       const inverseText = raw.inverseText == null ? undefined : readText(raw.inverseText, `${path}.inverseText`, r);
-      return { type: 'dm_prompt', text, ...(inverseText ? { inverseText } : {}), ...(raw.target != null ? { target: target(false) } : {}) };
+      const hideFromPlayers = readFlag(raw.hideFromPlayers, `${path}.hideFromPlayers`, r);
+      return {
+        type: 'dm_prompt', text, ...(inverseText ? { inverseText } : {}), ...(raw.target != null ? { target: target(false) } : {}),
+        ...(hideFromPlayers !== undefined ? { hideFromPlayers } : {})
+      };
     }
     default:
       r.errors.push(`${path}.type: unknown step type`);
@@ -394,9 +405,12 @@ function readOutcome(raw: unknown, index: number, r: Reader): DeckOutcome | null
     });
   }
   const inverseText = raw.inverseText == null ? undefined : readText(raw.inverseText, `${path}.inverseText`, r);
+  const playerText = raw.playerText == null ? undefined : readText(raw.playerText, `${path}.playerText`, r);
+  const hideSuccess = readFlag(raw.hideSuccess, `${path}.hideSuccess`, r);
   return {
     id: raw.id, when: readTags(raw.when ?? {}, `${path}.when`, r), name: readText(raw.name, `${path}.name`, r),
     text: readText(raw.text, `${path}.text`, r), ...(inverseText ? { inverseText } : {}),
+    ...(playerText ? { playerText } : {}), ...(hideSuccess !== undefined ? { hideSuccess } : {}),
     ...(rolls.length ? { rolls } : {}), steps
   };
 }
@@ -525,7 +539,10 @@ export function planDraw(input: PlanDrawInput): DrawPlan {
 
   for (const step of outcome.steps) {
     if (step.type === 'dm_prompt') {
-      tasks.push({ text: success ? step.text : (step.inverseText ?? `Inverted: ${step.text}`), characterIds: targets(step.target) });
+      tasks.push({
+        text: success ? step.text : (step.inverseText ?? `Inverted: ${step.text}`), characterIds: targets(step.target),
+        ...(step.hideFromPlayers ? { hidden: true } : {})
+      });
     } else if (step.type === 'condition') {
       const key = !success && step.inverse?.conditionKey ? step.inverse.conditionKey : step.conditionKey;
       const negate = !success && step.inverse?.negateParams !== false;
@@ -569,7 +586,14 @@ export function planDraw(input: PlanDrawInput): DrawPlan {
   }
 
   const shown = success ? outcome.text : (outcome.inverseText ?? `Inverted: ${outcome.text}`);
-  return { lines, tasks, outcome: { id: outcome.id, name: outcome.name, text: shown, rolls } };
+  return {
+    lines, tasks,
+    outcome: {
+      id: outcome.id, name: outcome.name, text: shown, rolls,
+      ...(outcome.playerText ? { playerText: outcome.playerText } : {}),
+      ...(outcome.hideSuccess ? { hideSuccess: true } : {})
+    }
+  };
 }
 
 // ---------------------------------------------------------------- pure appliers
@@ -634,14 +658,37 @@ export function describeLine(line: PlannedLine, names: Record<string, string>): 
   }
 }
 
-/** The roll-log line, e.g. "Thorne drew the 3 of Clubs (gold back): failure. Thorne loses 3 AC for 1 minute." */
+/**
+ * What a non-DM may see of a draw. Pure, so the server and the tests share it.
+ * The outcome text becomes the player wording, success may be hidden, and hidden task text is blanked
+ * (the task keeps its id, done flag and characters so the UI can still say "Waiting on the DM.").
+ */
+export function playerDrawView(view: DrawView): DrawView {
+  const { playerText, hideSuccess, ...outcome } = view.outcome;
+  return {
+    ...view,
+    success: hideSuccess ? null : view.success,
+    outcome: { ...outcome, ...(playerText ? { text: playerText } : {}) },
+    dmTasks: view.dmTasks.map((task) => (task.hidden ? { ...task, text: '' } : task))
+  };
+}
+
+/**
+ * The roll-log line, e.g. "Thorne drew the 3 of Clubs (gold back): failure. Thorne loses 3 AC for 1 minute."
+ * A null success leaves the result out, and an empty task text reads "Waiting on the DM." (said once).
+ */
 export function drawSummary(draw: DrawSummaryInput, names: Record<string, string>): string {
   const back = draw.card.tags.back ? ` (${draw.card.tags.back} back)` : '';
   const counted = draw.chosenValue != null ? `, counted as ${draw.chosenValue}` : '';
-  const head = `${names[draw.drawerId] ?? 'Someone'} drew the ${draw.card.label}${back}${counted}: ${draw.success ? 'success' : 'failure'}.`;
+  const result = draw.success == null ? '' : `: ${draw.success ? 'success' : 'failure'}`;
+  const head = `${names[draw.drawerId] ?? 'Someone'} drew the ${draw.card.label}${back}${counted}${result}.`;
+  const text = draw.text?.trim() ? [draw.text.trim().replace(/[^.!?]$/, '$&.')] : [];
+  const hiddenTask = draw.tasks.some((task) => !task.text);
   const parts = [
+    ...text,
     ...draw.lines.map((line) => `${describeLine(line, names)}.`),
-    ...draw.tasks.map((task) => `Waiting on the DM: ${task.text}.`)
+    ...draw.tasks.filter((task) => task.text).map((task) => `Waiting on the DM: ${task.text}.`),
+    ...(hiddenTask ? ['Waiting on the DM.'] : [])
   ];
   return [head, ...parts].join(' ');
 }

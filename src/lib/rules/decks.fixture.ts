@@ -1,6 +1,6 @@
 import type { DeckRules } from '$lib/types/decks';
 
-// The rules JSON for The Deck of Mystical Fate. Unit 4's seed migration (048) must match this.
+// The rules JSON for The Deck of Mystical Fate. Migration 051 (which updated 048's seed) must match this.
 // Outcome text is the user's verbatim wording; inverseText is the inverted wording (authored here).
 
 const SUIT_RANKS = [
@@ -53,12 +53,22 @@ export const MYSTICAL_FATE_RULES: DeckRules = {
     {
       id: 'red_joker', when: { kind: 'joker', colour: 'red' }, name: 'Red Joker',
       text: 'The party gains a high-powered magic item.', inverseText: 'The party finds a cursed item.',
-      steps: [{ type: 'dm_prompt', text: 'The party gains a high-powered magic item', inverseText: 'The party finds a cursed item' }]
+      // Players see only the generic wording, and neither Success nor Failure (a black-backed Red Joker
+      // would otherwise give away that the item is cursed). The DM sees the full text.
+      playerText: 'The party finds an item.', hideSuccess: true,
+      steps: [{
+        type: 'dm_prompt', text: 'The party gains a high-powered magic item', inverseText: 'The party finds a cursed item',
+        hideFromPlayers: true
+      }]
     },
     {
       id: 'black_joker', when: { kind: 'joker' }, name: 'Black Joker',
       text: 'The party gains a powerful ally.', inverseText: 'The party encounters a powerful enemy.',
-      steps: [{ type: 'dm_prompt', text: 'The party gains a powerful ally', inverseText: 'The party encounters a powerful enemy' }]
+      playerText: 'The party encounters someone.', hideSuccess: true,
+      steps: [{
+        type: 'dm_prompt', text: 'The party gains a powerful ally', inverseText: 'The party encounters a powerful enemy',
+        hideFromPlayers: true
+      }]
     },
     {
       id: 'jack_diamonds', when: { kind: 'royal', rank: 'j', suit: 'diamonds' }, name: 'Bounty of Fortune',
