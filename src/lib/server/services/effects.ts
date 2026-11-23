@@ -38,7 +38,8 @@ export async function applyCharacterEffect(
 
   const existing = await client.query<any>(`SELECT id FROM active_character_effects
     WHERE character_id=$1 AND container_id=$2 ORDER BY started_at DESC FOR UPDATE`, [characterId, containerId]);
-  const rounds = options.remainingRounds ?? effect.duration_rounds ?? null;
+  // A next_attack effect always has a cap, so a blank duration still ends after 10 rounds.
+  const rounds = options.remainingRounds ?? effect.duration_rounds ?? (effect.expiry_boundary === 'next_attack' ? 10 : null);
   const metadata = JSON.stringify({
     ...(options.metadata ?? {}),
     ...(options.params ? { params: options.params } : {}),
@@ -62,6 +63,20 @@ export async function applyCharacterEffect(
     [characterId, containerId, options.sourceContentInstanceId ?? null,
      options.sourceKey ?? null, rounds, effect.expiry_boundary, metadata, options.sourceCharacterId ?? null]);
   return { status: decision, effectId: containerId, name: effect.name, rowId: inserted.rows[0].id };
+}
+
+// Removes the character's "until next attack" effects whose row id is in `rowIds` (from
+// appliedEffectRowIds on the attack roll's advantage sources) and returns their names. Rows of other
+// characters, other boundaries or unknown ids are never touched.
+export async function consumeNextAttackEffects(client: pg.PoolClient, characterId: string, rowIds: string[]): Promise<string[]> {
+  const ids = rowIds.filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+  if (!ids.length) return [];
+  const removed = await client.query<{ name: string }>(
+    `WITH gone AS (
+       DELETE FROM active_character_effects WHERE character_id=$1 AND expiry_boundary='next_attack' AND id = ANY($2::uuid[])
+       RETURNING container_id)
+     SELECT cd.name FROM gone JOIN content_definitions cd ON cd.id=gone.container_id`, [characterId, ids]);
+  return removed.rows.map((row) => row.name);
 }
 
 export async function removeCharacterEffect(client: pg.PoolClient, characterId: string, containerId: string): Promise<number> {

@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { query } from '$lib/server/db';
+import { query, withTransaction } from '$lib/server/db';
+import { consumeNextAttackEffects } from '$lib/server/services/effects';
 import { getCharacterForRoll } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { payTurnActivation } from '$lib/server/services/catalogue';
@@ -10,7 +11,7 @@ import type { Activation } from '$lib/types/cost';
 import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { abilityMap, equippedAttackItems } from '$lib/rules/dnd5e';
 import { characterStatsFor } from '$lib/rules/characterStats';
-import { attackAgainstCandidatesFor, attackCandidatesFor, previewAdvantage, rollAttack } from '$lib/rules/attackRoll';
+import { appliedEffectRowIds, attackAgainstCandidatesFor, attackCandidatesFor, previewAdvantage, rollAttack } from '$lib/rules/attackRoll';
 import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAttackAdvantage';
 
 // Server-side attack roll for the VTT. The vanilla VTT client can't import $lib (no build step),
@@ -91,10 +92,15 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
   if (!gate.ok) return json(gate.body, { status: gate.status });
   try {
     const paid = await runWithGate(gate, (override) => payTurnActivation(locals.user!.id, characterId, activation, override));
+    // "Until your next attack" effects this roll counted are used up (only for a paid, authorised roll).
+    // A failure here must never turn a paid roll into an error: log it and carry on.
+    const usedUp = await withTransaction((client) => consumeNextAttackEffects(client, characterId, appliedEffectRowIds(result.advantageSources)))
+      .catch((consumeError) => { console.error('roll-attack: could not use up next-attack effects', consumeError); return [] as string[]; });
     emitRealtimeEvent('resource:changed', { characterId });
     const used = paid.paid.find((line) => line.pool === 'followup');
     return json({
       ...result,
+      ...(usedUp.length ? { attack: `${result.attack} - Advantage used up: ${usedUp.join(', ')}`, consumedEffects: usedUp } : {}),
       turn: { paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), usedFollowup: Boolean(used), followupsLeft: paid.turn.followups.map((f) => ({ cls: f.cls, label: f.label, remaining: f.remaining })), view: paid.turn }
     });
   } catch (error) {

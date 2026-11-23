@@ -15,7 +15,7 @@
   import { promptSpec, approvalErrorText, closedMessage, formForActivation, mineStep } from '../../../../static/vtt-app/shared/costApproval.js';
   import { abilityMap, abilityModifier, equippedAttackItems, equippedItems, hitDiceSummary, resolveCritThreshold, resolveD20Outcomes, resolveDeathSave, resolveExtraDiceRolls, resolveSpellDamage, resolvedAdditiveModifiers, resolvedNumericModifiers, totalLevel, visionBreakdown, type ModifierContext } from '$lib/rules/dnd5e';
   import {
-    adjustPrimaryDamageDice, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
+    adjustPrimaryDamageDice, appliedEffectRowIds, attackCandidatesFor, spellAttackCandidates, battleDamageBonuses as sharedBattleDamageBonuses, weaponToHitBonus, defaultRollChoices, poolSummary,
     rollAttack, rollDamage, rollWithModifiers, situationalAdvantageSources, type AttackPool, type RollChoices
   } from '$lib/rules/attackRoll';
   import { isDisplayOnlyCost } from '$lib/rules/cost';
@@ -1244,9 +1244,10 @@
   async function logRoll(
     label: string,
     result: { text: string; natural: number; total: number; pool?: AttackPool },
-    extras: { manualDamageDice?: number } = {}
+    extras: { manualDamageDice?: number; consumedEffectIds?: string[] } = {}
   ) {
-    if (!activeVttSessionId) return;
+    const consumed = extras.consumedEffectIds ?? [];
+    if (!activeVttSessionId && !consumed.length) return;
     const body = new FormData();
     body.set('label', label);
     body.set('total', String(result.total));
@@ -1262,7 +1263,10 @@
     }
     // INTERIM: manual damage-dice delta (weapon attacks).
     if (extras.manualDamageDice) body.set('manualDamageDice', String(extras.manualDamageDice));
+    // "Until your next attack" effects this roll counted: the server uses them up, then the sheet reloads.
+    for (const id of consumed) body.append('consumedEffectId', id);
     await fetch('?/logRoll', { method: 'POST', body }).catch(() => {});
+    if (consumed.length) await invalidate('app:character-sheet');
   }
 
   function showRollLogBreakdown(entry: { details: Record<string, unknown> }) {
@@ -1547,7 +1551,7 @@
     // Sheet attacks now log like the other sheet rolls (once, here, after the panel).
     void logRoll(`${item.name || 'Attack'} attack`,
       { text: attackResult.attack, natural: attackResult.attackNatural, total: attackResult.attackTotal, pool: attackResult.attackPool },
-      { manualDamageDice: attackResult.manualDamageDice });
+      { manualDamageDice: attackResult.manualDamageDice, consumedEffectIds: appliedEffectRowIds(attackResult.advantageSources) });
   }
 
   // Per vtt-phase-3-magic-spec.md: the character sheet just displays what a spell resolves
@@ -1618,7 +1622,7 @@
           };
           void logRoll(`${spell.name} attack`,
             { text: attackRoll.text, natural: attackRoll.natural, total: attackRoll.total, pool: attackRoll.pool },
-            { manualDamageDice: dice.adjusted.applied });
+            { manualDamageDice: dice.adjusted.applied, consumedEffectIds: appliedEffectRowIds(attackRoll.advantageSources) });
         }
       };
       return;

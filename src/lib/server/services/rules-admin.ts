@@ -153,7 +153,9 @@ export async function saveEffect(userId: string, form: FormData) {
   if (!name) throw new Error('Effect name is required.');
   const durationType = String(form.get('durationType')||'variable');
   const description = String(form.get('description')||'');
-  const durationRounds = nullableInt(form.get('durationRounds'));
+  const expiryForDefault = String(form.get('expiryBoundary')||'round_end');
+  // 'Until next attack' effects are always capped: a blank duration defaults to 10 rounds.
+  const durationRounds = nullableInt(form.get('durationRounds')) ?? (expiryForDefault === 'next_attack' ? 10 : null);
   const requiresConcentration = form.get('requiresConcentration')==='on';
   const stackBehavior = String(form.get('stackBehavior')||'refresh');
   const expiryBoundary = String(form.get('expiryBoundary')||'round_end');

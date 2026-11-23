@@ -19,6 +19,8 @@ import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/ro
 import { getRoomGameSessionId, logSessionNote } from '$lib/server/services/gameSessions';
 import { sessions } from '$vtt/store.js';
 import { poolSummary } from '$lib/rules/attackRoll';
+import { consumeNextAttackEffects } from '$lib/server/services/effects';
+import { withTransaction } from '$lib/server/db';
 
 // db-traffic-reduction Phase 4: load() only carries what the sheet renders on every
 // view - versions (VersionList.svelte) and the Activity Log's Past Encounters/Past
@@ -341,6 +343,17 @@ export const actions = {
     const breakdown = String(form.get('breakdown') || '');
     const natural = Number(form.get('natural'));
     if (!label || !Number.isFinite(total)) return fail(400, { logRollError: 'Invalid roll.' });
+
+    // Weapon/spell attack rolls send the applied "until your next attack" effect rows they counted.
+    // Used up here (before the room check: it does not need a VTT room). Only someone who can act.
+    const consumeIds = form.getAll('consumedEffectId').map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)).slice(0, 20);
+    if (consumeIds.length) {
+      try {
+        await assertCanActForCharacter({ query }, locals.user!.id, params.id);
+        const used = await withTransaction((client) => consumeNextAttackEffects(client, params.id, consumeIds));
+        if (used.length) emitRealtimeEvent('resource:changed', { characterId: params.id });
+      } catch { /* not allowed or nothing to consume: the roll itself is unaffected */ }
+    }
 
     // Optional d20 pool fields (older clients don't send them, and get today's plain message).
     // Anything out of range is dropped rather than rejected: the pool only words the log line.

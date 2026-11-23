@@ -128,7 +128,7 @@ export async function advanceEncounterTurn(userId: string, encounterId: string):
     if (next === 0) {
       const characterIds = participants.rows.map((row: any) => row.character_id).filter(Boolean);
       await client.query(`UPDATE active_character_effects SET remaining_rounds=GREATEST(0,remaining_rounds-1)
-        WHERE character_id=ANY($1::uuid[]) AND remaining_rounds IS NOT NULL AND expiry_boundary='round_end'`, [characterIds]);
+        WHERE character_id=ANY($1::uuid[]) AND remaining_rounds IS NOT NULL AND expiry_boundary IN ('round_end','next_attack')`, [characterIds]);
       await client.query(`DELETE FROM active_character_effects WHERE character_id=ANY($1::uuid[]) AND remaining_rounds=0`, [characterIds]);
       await client.query(`UPDATE character_content_resources r SET current_value=max_value
         FROM content_resource_definitions d, character_content_instances i

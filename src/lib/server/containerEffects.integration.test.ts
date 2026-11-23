@@ -173,6 +173,69 @@ describe.skipIf(!enabled)('active effects on containers', () => {
     }
   });
 
+  it('uses up "until your next attack" effects only when the roll counted them, and caps them by rounds', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^[|]$/g, '')) || target.searchParams.has('host')) {
+      throw new Error('Refusing to run: database is not local.');
+    }
+    const { query, withTransaction } = await import('$lib/server/db');
+    const { applyCharacterEffect, consumeNextAttackEffects } = await import('./services/effects');
+    const { createCharacter, getCharacterForRoll } = await import('./services/characters');
+    const { advanceCharacterRound } = await import('./services/catalogue');
+    const { rollWithModifiers, appliedEffectRowIds, spellAttackCandidates } = await import('$lib/rules/attackRoll');
+    const tag = `zznext${crypto.randomBytes(4).toString('hex')}`;
+    const userId = (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Next', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    try {
+      const characterId = await createCharacter(userId, 'Next');
+      const otherId = await createCharacter(userId, 'Other');
+      const modifierId = (await query<{ id: string }>(
+        `SELECT id FROM modifier_definitions WHERE target='attack_roll.all' AND modifier_type='advantage' AND NOT is_archived LIMIT 1`)).rows[0]?.id;
+      expect(modifierId, 'needs the seeded attack_roll.all advantage modifier').toBeTruthy();
+      const conditionId = (await query<{ id: string }>(
+        `INSERT INTO content_definitions (content_key, content_type, name, stack_behavior, duration_rounds, expiry_boundary)
+         VALUES ($1, 'condition', 'IT Strike', 'stack', 10, 'next_attack') RETURNING id`, [`condition:${tag}`])).rows[0].id;
+      await query(`INSERT INTO content_modifier_links (content_id, modifier_id, activation_type) VALUES ($1, $2, 'manual')`, [conditionId, modifierId]);
+      const apply = (who: string) => withTransaction((client) => applyCharacterEffect(client, who, conditionId));
+      const row = (await apply(characterId)).rowId!;
+      const otherRow = (await apply(otherId)).rowId!;
+      expect((await query<any>(`SELECT expiry_boundary FROM active_character_effects WHERE id=$1`, [row])).rows[0].expiry_boundary).toBe('next_attack');
+
+      const roll = async (disabledSourceIds: string[] = []) => {
+        const character = (await getCharacterForRoll(characterId))!;
+        return rollWithModifiers(character.modifierSources, 0, spellAttackCandidates, [], undefined,
+          { context: { classes: character.classes, attackType: 'spell', ability: 'int' }, disabledSourceIds });
+      };
+      const first = await roll();
+      expect(first.pool.size).toBe(2); // advantage: two dice
+      expect(appliedEffectRowIds(first.advantageSources)).toEqual([row]);
+
+      // An unticked source is not applied, so nothing is consumed.
+      const unticked = await roll(first.advantageSources.map((s) => s.id));
+      expect(unticked.pool.size).toBe(1);
+      expect(appliedEffectRowIds(unticked.advantageSources)).toEqual([]);
+      expect(await withTransaction((client) => consumeNextAttackEffects(client, characterId, []))).toEqual([]);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [row])).rows).toHaveLength(1);
+
+      // Another character's row id, or a bad id, never consumes anything of that character.
+      expect(await withTransaction((client) => consumeNextAttackEffects(client, characterId, [otherRow, 'nope']))).toEqual([]);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [otherRow])).rows).toHaveLength(1);
+
+      // The counted source is used up, and a second roll has no advantage.
+      expect(await withTransaction((client) => consumeNextAttackEffects(client, characterId, appliedEffectRowIds(first.advantageSources)))).toEqual(['IT Strike']);
+      expect((await roll()).pool.size).toBe(1);
+
+      // Never attacking: ten round ticks cap it.
+      for (let i = 0; i < 9; i += 1) await advanceCharacterRound(userId, otherId);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [otherRow])).rows).toHaveLength(1);
+      await advanceCharacterRound(userId, otherId);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [otherRow])).rows).toHaveLength(0);
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`condition:${tag}`]);
+    }
+  });
+
   it('counts a condition once for the spell-slot bonus when it is both active and granted', async () => {
     const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
     if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^[|]$/g, '')) || target.searchParams.has('host')) {

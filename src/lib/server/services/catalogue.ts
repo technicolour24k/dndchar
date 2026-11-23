@@ -612,7 +612,7 @@ export async function advanceCharacterRound(userId: string, characterId: string)
       ON CONFLICT (character_id) DO UPDATE SET round_number = character_combat_clocks.round_number + 1,
         turn_number = 1, updated_at = now()`, [characterId]);
     await client.query(`UPDATE active_character_effects SET remaining_rounds = GREATEST(0, remaining_rounds - 1)
-      WHERE character_id = $1 AND remaining_rounds IS NOT NULL AND expiry_boundary = 'round_end'`, [characterId]);
+      WHERE character_id = $1 AND remaining_rounds IS NOT NULL AND expiry_boundary IN ('round_end','next_attack')`, [characterId]);
     await client.query(`DELETE FROM active_character_effects WHERE character_id = $1 AND remaining_rounds = 0`, [characterId]);
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
       FROM content_resource_definitions d, character_content_instances i WHERE r.resource_definition_id = d.id

@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { query } from '$lib/server/db';
+import { query, withTransaction } from '$lib/server/db';
+import { consumeNextAttackEffects } from '$lib/server/services/effects';
 import { getCharacter } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { castCharacterSpellDetailed, getPreparedSpellDamageSource } from '$lib/server/services/catalogue';
@@ -10,7 +11,7 @@ import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCos
 import { activationFromCastForm } from '$lib/server/vttCostApproval';
 import { resolveCritThreshold, resolveD20Outcomes, resolveSpellDamage, totalLevel } from '$lib/rules/dnd5e';
 import { characterStatsFor, resolveSpellcastingAbility } from '$lib/rules/characterStats';
-import { adjustPrimaryDamageDice, previewAdvantage, rollDamage, rollWithModifiers, spellAttackAgainstCandidates, spellAttackCandidates } from '$lib/rules/attackRoll';
+import { adjustPrimaryDamageDice, appliedEffectRowIds, previewAdvantage, rollDamage, rollWithModifiers, spellAttackAgainstCandidates, spellAttackCandidates } from '$lib/rules/attackRoll';
 import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAttackAdvantage';
 
 
@@ -111,6 +112,7 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
 
   let attack: Awaited<ReturnType<typeof rollWithModifiers>> | undefined;
   let outcomes: string[] = [];
+  let usedUp: string[] = [];
   if (spell.resolutionType === 'attack') {
     // Re-read after the cast (on_cast effects may have changed the sheet), but the target/token
     // sources were already gathered above, before the slot was spent.
@@ -129,6 +131,11 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     const critThreshold = resolveCritThreshold(character.modifierSources, { attackType: 'spell' });
     outcomes = resolveD20Outcomes(rolled.natural, critThreshold);
     attack = rolled;
+    // "Until your next attack" effects this roll counted are used up (only attack rolls, not saves).
+    // A failure here must never turn a paid cast into an error: log it and carry on.
+    usedUp = await withTransaction((client) => consumeNextAttackEffects(client, characterId, appliedEffectRowIds(rolled.advantageSources)))
+      .catch((consumeError) => { console.error('roll-spell: could not use up next-attack effects', consumeError); return [] as string[]; });
+    if (usedUp.length) emitRealtimeEvent('resource:changed', { characterId });
   }
 
   const profile = resolveSpellDamage(spell, {
@@ -152,7 +159,8 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     manualDamageDice: adjusted.applied,
     attackPool: attack?.pool,
     advantageSources: attack?.advantageSources,
-    attack: attack?.text,
+    attack: attack ? (usedUp.length ? `${attack.text} - Advantage used up: ${usedUp.join(', ')}` : attack.text) : undefined,
+    consumedEffects: usedUp.length ? usedUp : undefined,
     attackTotal: attack?.total,
     attackNatural: attack?.natural,
     outcomes,

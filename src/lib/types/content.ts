@@ -6,7 +6,7 @@ export type ActivationType = 'carried' | 'equipped' | 'attuned' | 'on_use' | 'ma
 export type RechargePeriod = 'short_rest' | 'long_rest' | 'dawn' | 'round' | 'encounter' | 'manual';
 export type DurationType = 'instant' | 'rounds' | 'encounter' | 'concentration' | 'indefinite' | 'permanent';
 export type StackBehavior = 'refresh' | 'stack' | 'reject';
-export type ExpiryBoundary = 'turn_start' | 'turn_end' | 'round_end' | 'manual';
+export type ExpiryBoundary = 'turn_start' | 'turn_end' | 'round_end' | 'manual' | 'next_attack';
 
 /** Structured cost entry - one pool and how much of it is consumed. */
 export type ContainerCostEntry = {
