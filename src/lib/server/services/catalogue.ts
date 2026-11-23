@@ -3,6 +3,7 @@ import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/se
 import { query, withTransaction } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
+import { readEffectMetadata, substituteParams } from '$lib/rules/effectParams';
 import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
@@ -749,8 +750,21 @@ async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: stri
           OR (l.activation_type='attuned' AND inventory.attuned))
     ) SELECT COALESCE(sum(CASE WHEN value_expression ~ '^-?[0-9]+$' THEN value_expression::integer ELSE 0 END),0)::text AS bonus
     FROM modifier_values WHERE target='spell_slots.highest.max' AND modifier_type='bonus'`, [characterId]);
+  // Applied effects whose link expression has {name} placeholders: the query above skips them (not an integer),
+  // so each instance is substituted from its own metadata params and added here.
+  const parameterised = await client.query<{ value_expression: string; metadata_json: unknown }>(
+    `SELECT l.value_override_expression AS value_expression, a.metadata_json
+     FROM active_character_effects a JOIN content_definitions cd ON cd.id=a.container_id AND cd.content_type='condition'
+     JOIN content_modifier_links l ON l.content_id=a.container_id JOIN modifier_definitions m ON m.id=l.modifier_id
+     WHERE a.character_id=$1 AND m.target='spell_slots.highest.max' AND m.modifier_type='bonus'
+       AND l.value_override_expression LIKE '%{%'`, [characterId]);
+  let paramBonus = 0;
+  for (const row of parameterised.rows) {
+    const text = substituteParams(row.value_expression, readEffectMetadata(row.metadata_json).params).trim();
+    if (/^-?\d+$/.test(text)) paramBonus += Number(text);
+  }
   const highestIndex = standard.findLastIndex((maximum) => maximum > 0);
-  if (highestIndex >= 0) standard[highestIndex] = Math.max(0, standard[highestIndex] + (Number(bonusResult.rows[0]?.bonus) || 0));
+  if (highestIndex >= 0) standard[highestIndex] = Math.max(0, standard[highestIndex] + (Number(bonusResult.rows[0]?.bonus) || 0) + paramBonus);
   await client.query(`DELETE FROM character_spell_slots WHERE character_id = $1 AND slot_type = 'standard'
     AND NOT (slot_level = ANY($2::int[]))`, [characterId, standard.map((value, index) => value ? index + 1 : 0).filter(Boolean)]);
   for (let index = 0; index < standard.length; index += 1) {

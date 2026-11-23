@@ -5,6 +5,7 @@ import { readStatOverrides, type StatOverrides } from '$lib/rules/characterStats
 import { getCombatClock, listCharacterContent, listSpellSlots, syncCharacterSpellSlots } from '$lib/server/services/catalogue';
 import { resolveCharacterModifierSources } from '$lib/server/services/rule-engine';
 import { applyCharacterEffect } from '$lib/server/services/effects';
+import { readEffectMetadata, substituteParams } from '$lib/rules/effectParams';
 import { getActiveEncounterForCharacter } from '$lib/server/services/encounters';
 import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
@@ -704,6 +705,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
   );
   await restoreStructuredContent(client, characterId, snapshot);
   await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
+  // Restored effects keep metadata_json (params, label) but not source_character_id: snapshots don't store it (accepted).
   for (const row of snapshot.active_effects ?? []) {
     await client.query(`INSERT INTO active_character_effects(character_id,container_id,remaining_rounds,metadata_json,
       source_content_instance_id,expiry_boundary,application_key,source_key)
@@ -1001,14 +1003,14 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
   const definitions = await listEffectDefinitions(true);
   const byId = new Map(definitions.map((d) => [d.id, d]));
   try {
-    const active = await query<{ id: string; container_id: string; remaining_rounds: number | null }>(
+    const active = await query<{ id: string; container_id: string; remaining_rounds: number | null; metadata_json: unknown }>(
       `-- Direct active effects (primary: container_id)
-       SELECT id::text, container_id::text AS container_id, remaining_rounds
+       SELECT id::text, container_id::text AS container_id, remaining_rounds, metadata_json
        FROM active_character_effects
        WHERE character_id=$1 AND container_id IS NOT NULL
        UNION ALL
        -- Conditions granted by active content instances
-       SELECT 'content:' || i.id || ':' || cg.id, cg.granted_content_id::text, NULL
+       SELECT 'content:' || i.id || ':' || cg.id, cg.granted_content_id::text, NULL, NULL::jsonb
        FROM character_content_instances i
        JOIN content_definitions c ON c.id=i.content_id
        JOIN content_grants cg ON cg.source_content_id=i.content_id
@@ -1017,7 +1019,7 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
          AND cg.activation_type IN ('carried','equipped','attuned','manual')
        UNION ALL
        -- Conditions granted by equipped/carried inventory items
-       SELECT 'item:' || inv.id || ':' || cg.id, cg.granted_content_id::text, NULL
+       SELECT 'item:' || inv.id || ':' || cg.id, cg.granted_content_id::text, NULL, NULL::jsonb
        FROM character_inventory_items inv
        JOIN content_grants cg ON cg.source_content_id=inv.source_content_id
        JOIN content_definitions granted ON granted.id=cg.granted_content_id AND granted.content_type='condition'
@@ -1028,7 +1030,7 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
        )
        UNION ALL
        -- Conditions granted transitively (item grants a content, that content grants a condition)
-       SELECT 'grant:' || inv.id || ':' || cg2.id, cg2.granted_content_id::text, NULL
+       SELECT 'grant:' || inv.id || ':' || cg2.id, cg2.granted_content_id::text, NULL, NULL::jsonb
        FROM character_inventory_items inv
        JOIN content_grants cg1 ON cg1.source_content_id=inv.source_content_id
        JOIN content_grants cg2 ON cg2.source_content_id=cg1.granted_content_id
@@ -1045,11 +1047,14 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
       .map((row) => {
         const definition = byId.get(row.container_id);
         if (!definition) return null;
+        // Applied-instance params/label (e.g. a deck card's AC value): show the label and the resolved value.
+        const { params, sourceLabel } = readEffectMetadata(row.metadata_json);
+        const hasParams = Object.keys(params).length > 0;
         return {
           id: row.id,
           effectId: definition.id,
           effectKey: definition.key,
-          name: definition.name,
+          name: sourceLabel ? `${definition.name} (${sourceLabel})` : definition.name,
           sourceType: definition.sourceType,
           sourceName: definition.sourceName,
           description: definition.description,
@@ -1058,7 +1063,13 @@ async function getActiveEffects(characterId: string): Promise<CharacterDetail['a
           isCondition: definition.isCondition,
           isSelectable: definition.isSelectable,
           remainingRounds: row.remaining_rounds,
-          modifiers: definition.modifiers
+          modifiers: hasParams
+            ? definition.modifiers.map((m) => ({
+              ...m,
+              valueExpression: substituteParams(m.valueExpression, params),
+              valueOverrideExpression: substituteParams(m.valueOverrideExpression, params)
+            }))
+            : definition.modifiers
         };
       })
       .filter((effect): effect is CharacterDetail['activeEffects'][number] => Boolean(effect));
