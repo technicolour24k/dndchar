@@ -16,6 +16,11 @@ import { characterProfile, loadTurnContext, lockTurnRow, writeTurnRow } from '$l
 // restCharacter, newBattle, advanceCharacterTurn and advanceCharacterRound (catalogue.ts, via
 // lockTurnState), reviewOverride's undo and refillCharacterPools (resource-pools.ts) all follow it.
 // A new multi-source writer must too.
+// Decks (services/decks.ts) lock the affected `characters` rows in ascending id, then their hp / temp_hp
+// character_resources rows: the whole-sheet Save's order (characters row, then resources). They take no turn state.
+// Known, pre-existing inversion: the action engine's coin step locks resources (hp) before the characters row (coin)
+// inside one cast, the opposite of the sheet Save and of decks. A true collision is theoretical; Postgres aborts
+// one of the two transactions cleanly (deadlock error) rather than hanging.
 //
 // The one way anything is paid at activation (sheet and VTT). Reads the activated Container's
 // cost_json (or the content type's default, which copies the old procedural behaviour exactly),

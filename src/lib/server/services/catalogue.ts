@@ -36,7 +36,7 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
       FROM content_definitions c
       LEFT JOIN spell_definitions s ON s.content_id = c.id
       LEFT JOIN item_definitions i ON i.content_id = c.id
-      WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1)
+      WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1) AND c.content_type <> 'deck'
         AND ($2 = '' OR c.name ILIKE '%' || $2 || '%')
       ORDER BY c.source_kind = 'srd' DESC, c.name ASC
       LIMIT 300
@@ -285,6 +285,8 @@ export async function addContentToCharacter(userId: string, characterId: string,
     if (!visible.rowCount) throw new Error('Catalogue entry not found.');
     const definition = await client.query<any>(`SELECT c.content_type, c.name, i.* FROM content_definitions c
       LEFT JOIN item_definitions i ON i.content_id = c.id WHERE c.id = $1`, [contentId]);
+    // Decks are shared campaign items (drawn via the deck service), never character content.
+    if (definition.rows[0]?.content_type === 'deck') throw new Error('Decks cannot be added to a character.');
     if (definition.rows[0]?.content_type === 'item') {
       await insertCatalogueItem(client, characterId, contentId, 1);
       return;

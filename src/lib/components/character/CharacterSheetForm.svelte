@@ -332,7 +332,7 @@
   let selectedExhaustionLevel = $state(0);
   let selectedSavingThrowProficiencies = $state<AbilityKey[]>([]);
   let selectedSkillProficiencies = $state<string[]>([]);
-  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '' });
+  let selectedCatalogue = $state<Record<ContentType, string>>({ item: '', spell: '', feat: '', class_feature: '', condition: '', action: '', deck: '' });
   let contentBusy = $state(false);
   let turnOpen = $state(false); // the "Actions this turn" panel
   let modifierSearch = $state('');

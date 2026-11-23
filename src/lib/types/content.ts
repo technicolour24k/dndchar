@@ -1,6 +1,6 @@
 import type { AbilityKey } from '$lib/types/character';
 
-export type ContentType = 'item' | 'spell' | 'feat' | 'class_feature' | 'condition' | 'action';
+export type ContentType = 'item' | 'spell' | 'feat' | 'class_feature' | 'condition' | 'action' | 'deck';
 export type ContainerActivationType = 'passive' | 'triggered' | 'active_use';
 export type ActivationType = 'carried' | 'equipped' | 'attuned' | 'on_use' | 'manual';
 export type RechargePeriod = 'short_rest' | 'long_rest' | 'dawn' | 'round' | 'encounter' | 'manual';

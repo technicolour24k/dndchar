@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   applyCoin, applyHp, applyTempHp, cardSuccess, cardValue, drawSummary, evaluateAmount, findOutcome, matchesTags,
@@ -483,5 +485,14 @@ describe('parseDeckRules hardening', () => {
     expect(matchesTags({ constructor: 'x' }, { constructor: 'x' })).toBe(false);
     // Inherited properties on the card's tags are not matches either.
     expect(matchesTags({ toString: 'x' }, { suit: 'hearts' })).toBe(false);
+  });
+});
+
+describe('migration 048', () => {
+  it('embeds the same rules JSON as the fixture', () => {
+    const sql = fs.readFileSync(path.resolve('src/lib/server/db/migrations/048_seed_deck_of_mystical_fate.sql'), 'utf8');
+    const embedded = sql.match(/SELECT id, \$deck_rules\$([\s\S]*?)\$deck_rules\$::jsonb/);
+    expect(embedded).not.toBeNull();
+    expect(JSON.parse(embedded![1])).toEqual(JSON.parse(JSON.stringify(MYSTICAL_FATE_RULES)));
   });
 });

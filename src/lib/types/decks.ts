@@ -106,3 +106,52 @@ export type DrawSummaryInput = {
   lines: PlannedLine[];
   tasks: Array<{ text: string }>;
 };
+
+// ---- Draw records (what the service stores and returns). Mechanics are never stored, only what was applied.
+
+export type DrawStatus = 'choosing' | 'resolved' | 'reverted' | 'cancelled';
+
+/** One change that was ACTUALLY applied (clamps included). Undo reverses exactly this. */
+export type DrawResultLine = {
+  characterId: string;
+  kind: PlannedLineKind;
+  coin?: DeckCoin;
+  /** The planned signed amount (conditions: 0). */
+  requested: number;
+  before: number;
+  after: number;
+  /** hp lines only: temp HP before/after (damage is absorbed by temp HP first). */
+  tempBefore?: number;
+  tempAfter?: number;
+  /** condition lines: the active_character_effects row, and what was applied. */
+  effectRowId?: string;
+  conditionKey?: string;
+  /** Planned wording, e.g. "Thorne loses 3 AC for 1 minute". */
+  text: string;
+  tokenHpDelta?: number;
+  note?: string;
+};
+
+export type DmTask = { id: string; text: string; characterIds: string[]; done: boolean; doneByUserId: string | null; doneAt: string | null };
+
+export type DrawView = {
+  id: string;
+  deckId: string;
+  deckName: string;
+  campaignId: string;
+  drawerCharacterId: string;
+  drawerName: string;
+  card: Pick<DeckCard, 'id' | 'label' | 'tags' | 'value' | 'valueOptions'>;
+  success: boolean;
+  chosenValue: number | null;
+  status: DrawStatus;
+  outcome: { id?: string; name?: string; text?: string; rolls?: PlannedRoll[] };
+  results: DrawResultLine[];
+  dmTasks: DmTask[];
+  createdAt: string;
+  resolvedAt: string | null;
+  revertedAt: string | null;
+  revertNote: string;
+  /** Only while choosing: the effect of each option, so the player can pick. */
+  previews?: Record<string, string>;
+};
