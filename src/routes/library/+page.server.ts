@@ -16,6 +16,8 @@ import type { ContentType } from '$lib/types/content';
 // The action names mirror createContentAdminPage so the shared editor component works unchanged.
 
 export const load: PageServerLoad = async ({ locals, url }) => {
+  // Decks have their own page (unit E): their editor is the rules JSON one, not the item/spell/feat editor.
+  if (url.searchParams.get('type') === 'deck') throw redirect(303, '/library/decks');
   const tab = parseLibraryTab(url.searchParams.get('type'));
   return loadLibraryPage(locals.user!.id, tab, url.searchParams.get('content') || '', url.searchParams.get('from') || '');
 };

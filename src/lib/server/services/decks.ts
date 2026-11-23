@@ -3,7 +3,7 @@ import type pg from 'pg';
 import { query, withTransaction } from '$lib/server/db';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
 import { getCampaignAccess, getCharacterAccess, isUuid } from '$lib/server/services/access';
-import { loadCampaignLibraries } from '$lib/server/services/library';
+import { loadCampaignLibraries, loadLibraryActor } from '$lib/server/services/library';
 import { applyCharacterEffect } from '$lib/server/services/effects';
 import { primeSheetAc } from '$lib/server/vttTokenAc';
 import { collectConditionKeys, summariseDeck, type DeckSummary } from '$lib/rules/deckAdmin';
@@ -536,26 +536,49 @@ export async function listAvailableDecks(campaignId: string): Promise<Array<{ id
   return result.rows;
 }
 
-export type ManagedDeckRow = { id: string; name: string; archived: boolean; cardCount: number | null; enabled: boolean; invalid: boolean };
+export type ManagedDeckRow = {
+  id: string; name: string; archived: boolean; cardCount: number | null; enabled: boolean; invalid: boolean;
+  /** Library decks only: whose library it is, whether that is the viewer's own, and whether it is switched on here. */
+  ownerName: string | null; mine: boolean; libraryOn: boolean;
+};
 
-/** The deck management page's lists: this campaign's own decks, and the global decks (read-only, copyable). */
-export async function listDecksForManagement(userId: string, campaignId: string): Promise<{ own: ManagedDeckRow[]; global: ManagedDeckRow[] }> {
+/**
+ * The deck management page's lists: this campaign's own decks, the global decks (read-only, copyable) and decks from
+ * libraries (read-only, referenced, never copied: only Enable/Disable). A library deck already attached is always
+ * listed, even if its library is now off, so the DM can disable it. `canSaveToLibrary` shows the Save button.
+ */
+export async function listDecksForManagement(userId: string, campaignId: string): Promise<{ own: ManagedDeckRow[]; global: ManagedDeckRow[]; library: ManagedDeckRow[]; canSaveToLibrary: boolean }> {
   await requireManage(userId, campaignId, { write: false });
+  const owners = (await loadCampaignLibraries({ query }, campaignId)).enabledOwnerIds;
   const result = await query<any>(
-    `SELECT c.id, c.name, c.is_archived, d.rules_json, c.campaign_id, COALESCE(cd.is_enabled, false) AS enabled
+    `SELECT c.id, c.name, c.is_archived, c.scope, c.owner_user_id, u.display_name AS owner_name, d.rules_json,
+            COALESCE(cd.is_enabled, false) AS enabled
      FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
+     LEFT JOIN users u ON u.id = c.owner_user_id AND c.scope = 'personal'
      LEFT JOIN campaign_decks cd ON cd.deck_content_id = c.id AND cd.campaign_id = $1
-     WHERE c.content_type = 'deck' AND (${DECK_VISIBLE_SQL('$1', "'{}'")} OR cd.deck_content_id IS NOT NULL) ORDER BY c.is_archived, c.name`, [campaignId]);
-  // A deck already attached is always listed (so the DM can disable it), even a library deck whose library is now off.
-  // Until the library unit gives those their own list they show with the global decks.
+     WHERE c.content_type = 'deck' AND (${DECK_VISIBLE_SQL('$1', '$2')} OR (cd.deck_content_id IS NOT NULL AND ${IN_USE_SQL}))
+     ORDER BY c.is_archived, c.name`, [campaignId, owners]);
   const rows = result.rows.map((row) => {
     const parsed = parseDeckRules(row.rules_json);
     return {
-      owned: row.campaign_id !== null,
-      row: { id: row.id, name: row.name, archived: row.is_archived, cardCount: parsed.rules?.cards.length ?? null, enabled: row.enabled, invalid: !parsed.rules } as ManagedDeckRow
+      scope: row.scope as string,
+      archivedAndOff: Boolean(row.is_archived) && !row.enabled,
+      row: {
+        id: row.id, name: row.name, archived: row.is_archived, cardCount: parsed.rules?.cards.length ?? null, enabled: row.enabled, invalid: !parsed.rules,
+        ownerName: row.scope === 'personal' ? (row.owner_name ?? 'someone') : null,
+        mine: row.scope === 'personal' && row.owner_user_id === userId,
+        libraryOn: row.scope === 'personal' && owners.includes(row.owner_user_id)
+      } as ManagedDeckRow
     };
   });
-  return { own: rows.filter((entry) => entry.owned).map((entry) => entry.row), global: rows.filter((entry) => !entry.owned && !entry.row.archived).map((entry) => entry.row) };
+  const actor = await loadLibraryActor({ query }, userId);
+  return {
+    own: rows.filter((entry) => entry.scope === 'campaign').map((entry) => entry.row),
+    global: rows.filter((entry) => entry.scope === 'global' && !entry.row.archived).map((entry) => entry.row),
+    // An archived library deck that is not attached is not worth listing; an attached one is, so it can be disabled.
+    library: rows.filter((entry) => entry.scope === 'personal' && !entry.archivedAndOff).map((entry) => entry.row),
+    canSaveToLibrary: actor.canAuthorMechanics
+  };
 }
 
 export type AdminDeck = {
@@ -564,13 +587,30 @@ export type AdminDeck = {
   cards: Array<{ id: string; label: string; needsValue: boolean }>;
 };
 
-/** A deck OWNED BY this campaign, for the editor. A global or another campaign's deck is not found. */
-export async function getOwnDeck(userId: string, campaignId: string, deckId: string): Promise<AdminDeck | null> {
-  await requireManage(userId, campaignId, { write: false });
+// ---------------------------------------------------------------- shared editing core (campaign decks and personal decks)
+// A deck is edited the same way wherever it lives; only WHO MAY EDIT IT differs. So the write functions below take a
+// DeckOwner (the ownership the deck must have, checked as part of every query) and the public wrappers do the access check:
+//   campaign decks: canManage on that campaign (requireManage);
+//   personal decks: the owner, and for anything that writes rules, mechanics rights (requirePersonal).
+
+type DeckOwner = { kind: 'campaign'; campaignId: string } | { kind: 'personal'; userId: string };
+
+/** SQL condition (alias `c`) that matches only decks with this ownership. `param` is the placeholder holding the owner's id. */
+const ownedBy = (owner: DeckOwner, param: string) =>
+  owner.kind === 'campaign' ? `c.campaign_id = ${param}` : `(c.scope = 'personal' AND c.owner_user_id = ${param})`;
+const ownerId = (owner: DeckOwner) => (owner.kind === 'campaign' ? owner.campaignId : owner.userId);
+
+/** Personal decks: rules are mechanics, so writing them is DM/admin only (checked per write, not remembered). */
+async function requirePersonal(userId: string, opts: { write: boolean }): Promise<void> {
+  const actor = await loadLibraryActor({ query }, userId);
+  if (opts.write && !actor.canAuthorMechanics) throw new DeckError('forbidden', 'Decks are for DMs and admins, because their rules count as mechanics.');
+}
+
+async function getDeckCore(owner: DeckOwner, deckId: string): Promise<AdminDeck | null> {
   if (!isUuid(deckId)) return null;
   const result = await query<any>(
     `SELECT c.id, c.name, c.description, c.is_archived, d.rules_json FROM content_definitions c
-     JOIN deck_definitions d ON d.content_id = c.id WHERE c.id = $1 AND c.content_type = 'deck' AND c.campaign_id = $2`, [deckId, campaignId]);
+     JOIN deck_definitions d ON d.content_id = c.id WHERE c.id = $1 AND c.content_type = 'deck' AND ${ownedBy(owner, '$2')}`, [deckId, ownerId(owner)]);
   const row = result.rows[0];
   if (!row) return null;
   const parsed = parseDeckRules(row.rules_json);
@@ -582,33 +622,46 @@ export async function getOwnDeck(userId: string, campaignId: string, deckId: str
   };
 }
 
+/** A deck OWNED BY this campaign, for the editor. A global, library or another campaign's deck is not found. */
+export async function getOwnDeck(userId: string, campaignId: string, deckId: string): Promise<AdminDeck | null> {
+  await requireManage(userId, campaignId, { write: false });
+  return getDeckCore({ kind: 'campaign', campaignId }, deckId);
+}
+
 /** An empty deck: it parses (with a "no cards" warning) so it can be saved and filled in. */
 const EMPTY_RULES = { version: 1, cards: [], success: { rules: [], otherwise: 'failure' }, outcomes: [] };
 const slugOf = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'deck';
 
-async function insertOwnDeck(client: pg.PoolClient, userId: string, campaignId: string, name: string, description: string, rules: unknown): Promise<string> {
+/** Inserts a deck row for an owner. Campaign decks are scope 'campaign' (creator recorded); personal ones are scope 'personal' with a library key. */
+async function insertDeck(client: pg.PoolClient, owner: DeckOwner, actorUserId: string, name: string, description: string, rules: unknown): Promise<string> {
   // A random suffix keeps keys unique even for two decks created in the same millisecond.
-  const key = `deck:${slugOf(name)}:${crypto.randomBytes(5).toString('hex')}`;
+  const suffix = crypto.randomBytes(5).toString('hex');
+  const key = owner.kind === 'personal' ? `library:${owner.userId}:deck:${slugOf(name)}:${suffix}` : `deck:${slugOf(name)}:${suffix}`;
+  const campaignId = owner.kind === 'campaign' ? owner.campaignId : null;
   const created = await client.query<{ id: string }>(
     `INSERT INTO content_definitions (content_key, content_type, name, description, source_kind, owner_user_id, activation_type, requires_concentration, stack_behavior, metadata_json, scope, campaign_id)
-     VALUES ($1, 'deck', $2, $3, 'homebrew', $4, 'passive', false, 'stack', '{}'::jsonb, 'campaign', $5) RETURNING id`,
-    [key, name, description, userId, campaignId]);
+     VALUES ($1, 'deck', $2, $3, 'homebrew', $4, 'passive', false, 'stack', '{}'::jsonb, $5, $6) RETURNING id`,
+    [key, name, description, actorUserId, owner.kind, campaignId]);
   // deck_definitions.campaign_id is now an unread mirror of content_definitions.campaign_id (migration 050); keep it in step.
   await client.query('INSERT INTO deck_definitions (content_id, rules_json, campaign_id) VALUES ($1, $2::jsonb, $3)', [created.rows[0].id, JSON.stringify(rules), campaignId]);
   return created.rows[0].id;
 }
 
-export async function createDeck(input: { userId: string; campaignId: string; name: string; description: string }): Promise<string> {
-  await requireManage(input.userId, input.campaignId, { write: true });
-  const name = input.name.trim();
+async function createDeckCore(owner: DeckOwner, userId: string, nameIn: string, descriptionIn: string): Promise<string> {
+  const name = nameIn.trim();
   if (!name) throw new DeckError('bad_input', 'Name is required.');
   if (name.length > 120) throw new DeckError('bad_input', 'Name is too long (120 characters at most).');
-  const id = await withTransaction((client) => insertOwnDeck(client, input.userId, input.campaignId, name, input.description.trim().slice(0, 5000), EMPTY_RULES));
+  return withTransaction((client) => insertDeck(client, owner, userId, name, descriptionIn.trim().slice(0, 5000), EMPTY_RULES));
+}
+
+export async function createDeck(input: { userId: string; campaignId: string; name: string; description: string }): Promise<string> {
+  await requireManage(input.userId, input.campaignId, { write: true });
+  const id = await createDeckCore({ kind: 'campaign', campaignId: input.campaignId }, input.userId, input.name, input.description);
   invalidateReferenceData('createDeck');
   return id;
 }
 
-/** Copies a GLOBAL deck into the campaign as an editable deck named "X (copy)". Another campaign's deck can't be copied. */
+/** Copies a GLOBAL deck into the campaign as an editable deck named "X (copy)". Library and other campaigns' decks can't be copied. */
 export async function copyDeckToCampaign(input: { userId: string; campaignId: string; sourceId: string }): Promise<string> {
   await requireManage(input.userId, input.campaignId, { write: true });
   if (!isUuid(input.sourceId)) throw new DeckError('bad_input', 'Pick a deck to copy.');
@@ -617,7 +670,7 @@ export async function copyDeckToCampaign(input: { userId: string; campaignId: st
      WHERE c.id = $1 AND c.content_type = 'deck' AND c.scope = 'global' AND NOT c.is_archived`, [input.sourceId])).rows[0];
   if (!source) throw new DeckError('not_found', 'Deck not found.');
   const name = `${source.name} (copy)`.slice(0, 120);
-  const id = await withTransaction((client) => insertOwnDeck(client, input.userId, input.campaignId, name, source.description, source.rules_json));
+  const id = await withTransaction((client) => insertDeck(client, { kind: 'campaign', campaignId: input.campaignId }, input.userId, name, source.description, source.rules_json));
   invalidateReferenceData('copyDeck');
   return id;
 }
@@ -625,12 +678,11 @@ export async function copyDeckToCampaign(input: { userId: string; campaignId: st
 export type SaveDeckResult = { ok: true; warnings: string[] } | { ok: false; errors: string[] };
 
 /**
- * Validates and saves an OWN deck's name, description and rules JSON. Nothing is written when there is any error:
+ * Validates and saves an owned deck's name, description and rules JSON. Nothing is written when there is any error:
  * bad JSON, a parser error, or a condition key that is not a live GLOBAL condition (the apply path only finds global
- * ones; campaign or homebrew conditions wait for the homebrew library). Warnings save.
+ * ones; campaign or homebrew conditions wait for the library conditions unit). Warnings save.
  */
-export async function updateDeck(input: { userId: string; campaignId: string; id: string; name: string; description: string; rulesText: string }): Promise<SaveDeckResult> {
-  await requireManage(input.userId, input.campaignId, { write: true });
+async function saveDeckCore(owner: DeckOwner, input: { id: string; name: string; description: string; rulesText: string }): Promise<SaveDeckResult> {
   if (!isUuid(input.id)) return { ok: false, errors: ['Deck not found.'] };
   const errors: string[] = [];
   const name = input.name.trim();
@@ -659,8 +711,8 @@ export async function updateDeck(input: { userId: string; campaignId: string; id
   }
   if (errors.length) return { ok: false, errors };
   const saved = await withTransaction(async (client) => {
-    // The ownership check is part of the write: only a deck owned by this campaign matches.
-    const owned = await client.query(`SELECT 1 FROM content_definitions WHERE id = $1 AND content_type = 'deck' AND campaign_id = $2 FOR UPDATE`, [input.id, input.campaignId]);
+    // The ownership check is part of the write: only a deck with this ownership matches.
+    const owned = await client.query(`SELECT 1 FROM content_definitions c WHERE c.id = $1 AND c.content_type = 'deck' AND ${ownedBy(owner, '$2')} FOR UPDATE`, [input.id, ownerId(owner)]);
     if (!owned.rows.length) return false;
     await client.query(`UPDATE content_definitions SET name = $2, description = $3, updated_at = now() WHERE id = $1 AND content_type = 'deck'`,
       [input.id, name, input.description.trim().slice(0, 5000)]);
@@ -672,26 +724,34 @@ export async function updateDeck(input: { userId: string; campaignId: string; id
   return { ok: true, warnings };
 }
 
-/** Archive or restore one of the campaign's OWN decks (never deleted: draws reference it). */
-export async function toggleDeckArchived(input: { userId: string; campaignId: string; id: string; archived: boolean }): Promise<boolean> {
+export async function updateDeck(input: { userId: string; campaignId: string; id: string; name: string; description: string; rulesText: string }): Promise<SaveDeckResult> {
   await requireManage(input.userId, input.campaignId, { write: true });
-  if (!isUuid(input.id)) return false;
+  return saveDeckCore({ kind: 'campaign', campaignId: input.campaignId }, input);
+}
+
+/** Archive or restore an owned deck (never deleted: draws reference it). */
+async function toggleArchivedCore(owner: DeckOwner, id: string, archived: boolean): Promise<boolean> {
+  if (!isUuid(id)) return false;
   const result = await query(
     `UPDATE content_definitions c SET is_archived = $3, updated_at = now() FROM deck_definitions d
-     WHERE c.id = $1 AND d.content_id = c.id AND c.content_type = 'deck' AND c.campaign_id = $2`, [input.id, input.campaignId, input.archived]);
+     WHERE c.id = $1 AND d.content_id = c.id AND c.content_type = 'deck' AND ${ownedBy(owner, '$2')}`, [id, ownerId(owner), archived]);
   invalidateReferenceData('toggleDeckArchived');
   return (result.rowCount ?? 0) > 0;
 }
 
+export async function toggleDeckArchived(input: { userId: string; campaignId: string; id: string; archived: boolean }): Promise<boolean> {
+  await requireManage(input.userId, input.campaignId, { write: true });
+  return toggleArchivedCore({ kind: 'campaign', campaignId: input.campaignId }, input.id, input.archived);
+}
+
 const TEST_PARTY: Record<string, string> = { a: 'Aria', b: 'Brom', c: 'Cass' };
 
-/** "Test draw": plans a chosen card of an OWN deck against a fake three-member party. Nothing is written. */
-export async function dryRunDraw(input: { userId: string; campaignId: string; id: string; cardId: string; success: 'auto' | 'success' | 'failure'; value?: number | null }): Promise<{ lines: string[]; error?: string }> {
-  await requireManage(input.userId, input.campaignId, { write: false });
+/** "Test draw": plans a chosen card of an owned deck against a fake three-member party. Nothing is written. */
+async function dryRunCore(owner: DeckOwner, input: { id: string; cardId: string; success: 'auto' | 'success' | 'failure'; value?: number | null }): Promise<{ lines: string[]; error?: string }> {
   if (!isUuid(input.id)) return { lines: [], error: 'Deck not found.' };
   const result = await query<any>(
     `SELECT d.rules_json FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
-     WHERE c.id = $1 AND c.content_type = 'deck' AND c.campaign_id = $2`, [input.id, input.campaignId]);
+     WHERE c.id = $1 AND c.content_type = 'deck' AND ${ownedBy(owner, '$2')}`, [input.id, ownerId(owner)]);
   if (!result.rows.length) return { lines: [], error: 'Deck not found.' };
   const parsed = parseDeckRules(result.rows[0].rules_json);
   if (!parsed.rules) return { lines: [], error: `The saved rules are invalid: ${parsed.errors[0]}` };
@@ -710,4 +770,74 @@ export async function dryRunDraw(input: { userId: string; campaignId: string; id
       ...plan.tasks.map((task) => `Waiting on the DM: ${task.text}`)
     ]
   };
+}
+
+export async function dryRunDraw(input: { userId: string; campaignId: string; id: string; cardId: string; success: 'auto' | 'success' | 'failure'; value?: number | null }): Promise<{ lines: string[]; error?: string }> {
+  await requireManage(input.userId, input.campaignId, { write: false });
+  return dryRunCore({ kind: 'campaign', campaignId: input.campaignId }, input);
+}
+
+// ---------------------------------------------------------------- personal decks (the /library/decks page)
+// A personal deck belongs to its author's library. It is REFERENCED, never copied, wherever a DM enables it (so an
+// edit reaches every campaign using it), and it can only be enabled where the DM has switched that library on.
+
+export type PersonalDeckRow = { id: string; name: string; archived: boolean; cardCount: number | null; invalid: boolean; enabledIn: number };
+
+/** The user's own library decks (archived ones included, so they can be restored). */
+export async function listPersonalDecks(userId: string): Promise<PersonalDeckRow[]> {
+  await requirePersonal(userId, { write: false });
+  const result = await query<any>(
+    `SELECT c.id, c.name, c.is_archived, d.rules_json,
+            (SELECT count(*) FROM campaign_decks cd WHERE cd.deck_content_id = c.id)::int AS enabled_in
+     FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
+     WHERE c.content_type = 'deck' AND ${ownedBy({ kind: 'personal', userId }, '$1')} ORDER BY c.is_archived, c.name`, [userId]);
+  return result.rows.map((row) => {
+    const parsed = parseDeckRules(row.rules_json);
+    return { id: row.id, name: row.name, archived: row.is_archived, cardCount: parsed.rules?.cards.length ?? null, invalid: !parsed.rules, enabledIn: row.enabled_in };
+  });
+}
+
+/** One of the user's own library decks for the editor; anyone else's is not found. */
+export async function getPersonalDeck(userId: string, deckId: string): Promise<AdminDeck | null> {
+  await requirePersonal(userId, { write: false });
+  return getDeckCore({ kind: 'personal', userId }, deckId);
+}
+
+export async function createPersonalDeck(input: { userId: string; name: string; description: string }): Promise<string> {
+  await requirePersonal(input.userId, { write: true });
+  const id = await createDeckCore({ kind: 'personal', userId: input.userId }, input.userId, input.name, input.description);
+  invalidateReferenceData('createPersonalDeck');
+  return id;
+}
+
+export async function updatePersonalDeck(input: { userId: string; id: string; name: string; description: string; rulesText: string }): Promise<SaveDeckResult> {
+  await requirePersonal(input.userId, { write: true });
+  return saveDeckCore({ kind: 'personal', userId: input.userId }, input);
+}
+
+/** Archiving only takes a deck out of use, so it needs ownership, not mechanics rights. Campaigns that enabled it stop drawing. */
+export async function togglePersonalDeckArchived(input: { userId: string; id: string; archived: boolean }): Promise<boolean> {
+  return toggleArchivedCore({ kind: 'personal', userId: input.userId }, input.id, input.archived);
+}
+
+export async function dryRunPersonalDraw(input: { userId: string; id: string; cardId: string; success: 'auto' | 'success' | 'failure'; value?: number | null }): Promise<{ lines: string[]; error?: string }> {
+  return dryRunCore({ kind: 'personal', userId: input.userId }, input);
+}
+
+/**
+ * "Save to my library": makes a personal copy of one of the campaign's OWN decks, so it can be enabled in other
+ * campaigns (by reference). An explicit DM action, never done automatically. The campaign deck is left as it is and
+ * the two are independent afterwards. Needs canManage here and mechanics rights.
+ */
+export async function saveDeckToLibrary(input: { userId: string; campaignId: string; deckId: string }): Promise<string> {
+  await requireManage(input.userId, input.campaignId, { write: true });
+  await requirePersonal(input.userId, { write: true });
+  if (!isUuid(input.deckId)) throw new DeckError('bad_input', 'Pick a deck.');
+  const source = (await query<any>(
+    `SELECT c.name, c.description, d.rules_json FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
+     WHERE c.id = $1 AND c.content_type = 'deck' AND ${ownedBy({ kind: 'campaign', campaignId: input.campaignId }, '$2')}`, [input.deckId, input.campaignId])).rows[0];
+  if (!source) throw new DeckError('not_found', 'Deck not found.');
+  const id = await withTransaction((client) => insertDeck(client, { kind: 'personal', userId: input.userId }, input.userId, source.name, source.description, source.rules_json));
+  invalidateReferenceData('saveDeckToLibrary');
+  return id;
 }

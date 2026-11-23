@@ -15,7 +15,7 @@ class MockDeckError extends Error { constructor(public code: string, message: st
 const deckSvc = {
   DeckError: MockDeckError,
   createDeck: vi.fn(), copyDeckToCampaign: vi.fn(), updateDeck: vi.fn(), toggleDeckArchived: vi.fn(), dryRunDraw: vi.fn(),
-  getOwnDeck: vi.fn(), listDecksForManagement: vi.fn()
+  getOwnDeck: vi.fn(), listDecksForManagement: vi.fn(), setCampaignDeck: vi.fn(), saveDeckToLibrary: vi.fn()
 };
 vi.mock('$lib/server/services/decks', () => deckSvc);
 
@@ -49,7 +49,7 @@ describe('/campaigns/[id]/decks load', () => {
   it('gives a DM the lists and the selected deck', async () => {
     getCampaignAccess.mockResolvedValue({ canManage: true, archived: false });
     query.mockResolvedValue({ rows: [{ name: 'Camp' }] });
-    deckSvc.listDecksForManagement.mockResolvedValue({ own: [], global: [] });
+    deckSvc.listDecksForManagement.mockResolvedValue({ own: [], global: [], library: [], canSaveToLibrary: true });
     deckSvc.getOwnDeck.mockResolvedValue({ id: 'd1' });
     const out: any = await load('?deck=d1');
     expect(deckSvc.listDecksForManagement).toHaveBeenCalledWith(ME, CAMPAIGN);
@@ -86,6 +86,22 @@ describe('/campaigns/[id]/decks actions', () => {
     expect(deckSvc.updateDeck).toHaveBeenCalledWith({ userId: ME, campaignId: CAMPAIGN, id: 'd1', name: 'n', description: 'd', rulesText: '{x' });
     deckSvc.updateDeck.mockResolvedValue({ ok: true, warnings: ['w'] });
     expect(await run(page.actions.save, { id: 'd1', name: 'n', description: 'd', rulesText: '{}' })).toEqual({ saved: 'd1', warnings: ['w'] });
+  });
+
+  it('setEnabled and saveToLibrary forward the user and URL campaign, and map errors', async () => {
+    deckSvc.setCampaignDeck.mockResolvedValue(undefined);
+    expect(await run(page.actions.setEnabled, { deckId: 'lib1', enabled: '1', campaignId: 'forged' })).toEqual({ enabledChanged: true });
+    expect(deckSvc.setCampaignDeck).toHaveBeenCalledWith({ userId: ME, campaignId: CAMPAIGN, deckId: 'lib1', enabled: true });
+    await run(page.actions.setEnabled, { deckId: 'lib1', enabled: '0' });
+    expect(deckSvc.setCampaignDeck).toHaveBeenLastCalledWith({ userId: ME, campaignId: CAMPAIGN, deckId: 'lib1', enabled: false });
+    deckSvc.setCampaignDeck.mockRejectedValue(new MockDeckError('not_found', 'Deck not found.'));
+    expect(((await run(page.actions.setEnabled, { deckId: 'x', enabled: '1' })) as any).status).toBe(404);
+
+    deckSvc.saveDeckToLibrary.mockResolvedValue('personal1');
+    expect(await run(page.actions.saveToLibrary, { id: 'd1' })).toEqual({ savedToLibrary: 'personal1' });
+    expect(deckSvc.saveDeckToLibrary).toHaveBeenCalledWith({ userId: ME, campaignId: CAMPAIGN, deckId: 'd1' });
+    deckSvc.saveDeckToLibrary.mockRejectedValue(new MockDeckError('forbidden', 'Decks are for DMs and admins.'));
+    expect(((await run(page.actions.saveToLibrary, { id: 'd1' })) as any).status).toBe(403);
   });
 
   it('archive and test draw forward the campaign scope', async () => {

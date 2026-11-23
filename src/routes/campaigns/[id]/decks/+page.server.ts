@@ -3,13 +3,16 @@ import type { Actions, PageServerLoad } from './$types';
 import { query } from '$lib/server/db';
 import { getCampaignAccess } from '$lib/server/services/access';
 import {
-  copyDeckToCampaign, createDeck, DeckError, dryRunDraw, getOwnDeck, listDecksForManagement, toggleDeckArchived, updateDeck
+  copyDeckToCampaign, createDeck, DeckError, dryRunDraw, getOwnDeck, listDecksForManagement, saveDeckToLibrary, setCampaignDeck,
+  toggleDeckArchived, updateDeck
 } from '$lib/server/services/decks';
 
 // The campaign's deck management page (decks plan, unit 9b): the first "campaign admin" page. Admin pages are for
 // globals; this one controls what is specific to ONE campaign. A deck a DM creates is owned by the campaign.
 // Global decks are read-only here and can be copied into the campaign. Access is canManage (DM / co-DM, plus the
 // site-admin override), checked here and again in every service call. Writes on an archived campaign are refused.
+// Library decks (a member's, once the DM switches that library on) are referenced, never copied: here they only get
+// Turn on / Turn off. "Save to my library" is the explicit way to share one of this campaign's decks elsewhere.
 
 export const load: PageServerLoad = async ({ params, locals, url }) => {
   const userId = locals.user!.id;
@@ -76,6 +79,25 @@ export const actions: Actions = {
     }));
     if (!result.ok) return result.failure;
     return result.value ? { archivedChanged: true } : fail(404, { error: 'Deck not found.' });
+  },
+
+  // Turns a global, own or library deck on or off for the table. setCampaignDeck re-checks canManage and that the deck is
+  // visible here (a library deck of a library that is off can be turned OFF but not on).
+  setEnabled: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attemptDeck(() => setCampaignDeck({
+      userId: locals.user!.id, campaignId: params.id, deckId: String(form.get('deckId') ?? ''), enabled: form.get('enabled') === '1'
+    }));
+    if (!result.ok) return result.failure;
+    return { enabledChanged: true };
+  },
+
+  // Makes a personal copy of one of this campaign's own decks (needs mechanics rights). Stays on the page and links to it.
+  saveToLibrary: async ({ request, params, locals }) => {
+    const form = await request.formData();
+    const result = await attemptDeck(() => saveDeckToLibrary({ userId: locals.user!.id, campaignId: params.id, deckId: String(form.get('id') ?? '') }));
+    if (!result.ok) return result.failure;
+    return { savedToLibrary: result.value };
   },
 
   // Plans one card against a fake party using the SAVED rules. Writes nothing.
