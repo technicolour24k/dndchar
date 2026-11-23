@@ -43,7 +43,7 @@
           <p class="muted">
             {#if !member.counts}Contents are shown once the DM switches this library on.{:else if member.counts.total === 0}Nothing in their library yet.{:else}{plural(member.counts.item, 'item')}, {plural(member.counts.spell, 'spell')}, {plural(member.counts.feat, 'feat or feature')}.{/if}
           </p>
-          {#if data.canManage && member.uses}<p class="muted">{plural(member.uses, 'use')} in this campaign.</p>{/if}
+          {#if data.canManage}<p class="muted">{member.uses ? `${plural(member.uses, 'use')} in this campaign.` : 'Nothing of theirs is in use here yet, so there is nothing to keep a copy of.'}</p>{/if}
         </div>
         <div class="library-member-actions">
           <a class="button-link" href="/catalogue?campaign={data.campaignId}&owner={member.userId}">View</a>
@@ -53,12 +53,11 @@
               <input type="hidden" name="enabled" value={member.enabled ? '0' : '1'} />
               <button type="submit">{member.enabled ? 'Switch off' : 'Switch on'}</button>
             </form>
-            {#if member.uses}
-              <form method="POST" action="?/keepCampaignCopy" use:enhance={({ cancel }) => { if (!confirm(`Copy everything of ${member.displayName}'s that this campaign uses into the campaign. Their later edits or archives won't affect those uses. New uses can still pick from their library while it's enabled.`)) cancel(); }}>
-                <input type="hidden" name="ownerUserId" value={member.userId} />
-                <button type="submit">Keep a campaign copy</button>
-              </form>
-            {/if}
+            <!-- Always shown so DMs can find it; disabled until something of theirs is actually in use here. -->
+            <form method="POST" action="?/keepCampaignCopy" use:enhance={({ cancel }) => { if (!confirm(`Copy everything of ${member.displayName}'s that this campaign uses into the campaign. Their later edits or archives won't affect those uses. New uses can still pick from their library while it's enabled.`)) cancel(); }}>
+              <input type="hidden" name="ownerUserId" value={member.userId} />
+              <button type="submit" disabled={!member.uses} title={member.uses ? undefined : 'Nothing of theirs is in use in this campaign yet'}>Keep a campaign copy</button>
+            </form>
           {/if}
         </div>
       </li>
