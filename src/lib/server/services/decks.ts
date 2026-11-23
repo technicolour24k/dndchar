@@ -458,3 +458,19 @@ export async function listOpenDmTasks(userId: string, campaignId: string): Promi
     deckName: row.deck_name, createdAt: new Date(row.created_at).toISOString()
   })));
 }
+
+/**
+ * Stores the HP delta that was nudged onto a live VTT token (results[index].tokenHpDeltas, by token id), so an undo can reverse
+ * exactly that. Accepted tiny window: an undo that lands between the commit and this write finds no stored delta and
+ * leaves the tokens alone (the DM can nudge by hand). Written after the draw commits (the VTT is not part of the transaction), and only on a resolved draw.
+ */
+export async function recordTokenHpDeltas(drawId: string, deltas: Array<{ index: number; deltas: Record<string, number> }>): Promise<void> {
+  if (!deltas.length || !isUuid(drawId)) return;
+  await withTransaction(async (client) => {
+    const row = await loadDrawRow(client, drawId, true);
+    if (!row || row.status !== 'resolved') return;
+    const results: DrawResultLine[] = row.results ?? [];
+    for (const { index, deltas: perToken } of deltas) if (results[index] && results[index].kind === 'hp') results[index].tokenHpDeltas = perToken;
+    await client.query('UPDATE deck_draws SET results = $2::jsonb WHERE id = $1', [drawId, JSON.stringify(results)]);
+  });
+}

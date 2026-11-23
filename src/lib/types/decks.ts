@@ -128,7 +128,8 @@ export type DrawResultLine = {
   conditionKey?: string;
   /** Planned wording, e.g. "Thorne loses 3 AC for 1 minute". */
   text: string;
-  tokenHpDelta?: number;
+  /** hp lines: what each live VTT token (by token id) actually took, so undo reverses each by its own amount. */
+  tokenHpDeltas?: Record<string, number>;
   note?: string;
 };
 
