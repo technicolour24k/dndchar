@@ -3,10 +3,21 @@
   import type { AdminContentRecord } from '$lib/server/services/content-admin';
   import CostEditor from './CostEditor.svelte';
 
-  let { data, form, title, description, createType, allowedTypes }:{
+  import type { Snippet } from 'svelte';
+
+  // mode: 'admin' = the /admin pages (global content, everything shown). 'library' = a user's own homebrew on /library:
+  // no raw key line and no "Existing Action" form, the Q3 hidden flag and a holders note. 'campaign' = a campaign's
+  // copies (unit G): no create form. canAuthorMechanics false hides every rules control (bonuses, damage, cost,
+  // attachments), leaving descriptive fields only. extraQuery (library pages) keeps ?type= and ?from= on every link
+  // and form action; top is an optional block rendered under the heading (tabs, banners).
+  let { data, form, title, description, createType, allowedTypes, mode = 'admin', canAuthorMechanics = true, extraQuery = '', notice = '', top }:{
     data:any; form:any; title:string; description:string; createType:ContentType;
-    allowedTypes:ContentType[];
+    allowedTypes:ContentType[]; mode?:'admin'|'library'|'campaign'; canAuthorMechanics?:boolean; extraQuery?:string; notice?:string; top?:Snippet;
   }=$props();
+  // Admin pages keep the plain "?/name" action URLs. Library pages carry their query along (and the selected entry,
+  // so a failed save re-renders the same entry): "?type=feat&content=<id>&/update".
+  const act=(name:string)=>extraQuery?`?${extraQuery}&${selected?`content=${selected.id}&`:''}/${name}`:`?/${name}`;
+  const entryHref=(id:string)=>`?${extraQuery?extraQuery+'&':''}content=${id}`;
   const selected=$derived(data.content.find((entry:AdminContentRecord)=>entry.id===data.selectedContentId) as AdminContentRecord|undefined);
   // An on_use Spend Item step already pays the item's quantity (see CostEditor's warning).
   const hasSpendItemStep=$derived(data.actions.some((action:any)=>action.triggerType==='on_use'&&action.steps.some((step:any)=>step.type==='spend_item')));
@@ -28,7 +39,8 @@
 
 </script>
 
-<section class="page-head admin-page-intro"><div><p class="eyebrow">Administration</p><h1>{title}</h1><p>{description}</p></div></section>
+<section class="page-head admin-page-intro"><div><p class="eyebrow">{mode==='admin'?'Administration':mode==='library'?'Homebrew library':'Campaign homebrew'}</p><h1>{title}</h1><p>{description}</p></div></section>
+{@render top?.()}
 {#if form?.error}<p class="form-error">{form.error}</p>{/if}
 {#if form?.saved}<p class="form-success">Catalogue entry updated.</p>{/if}
 
@@ -36,7 +48,7 @@
   <aside class="panel stack content-selector-panel admin-library-panel">
     <div class="panel-head"><h2>{title.replace(' Library','')}</h2><span class="muted">{data.content.length}</span></div>
     <label class="admin-search-field"><span class="sr-only">Search library</span><input bind:value={librarySearch} placeholder={`Search ${title.toLowerCase()}...`}/></label>
-    <details class="admin-create-disclosure"><summary>+ New {createType.replace('_',' ')}</summary><form method="POST" action="?/create" class="stack admin-form">
+    {#if mode!=='campaign'}<details class="admin-create-disclosure"><summary>+ New {createType.replace('_',' ')}</summary><form method="POST" action={act('create')} class="stack admin-form">
       <h3>Create {createType.replace('_',' ')}</h3>
       {#if allowedTypes.length > 1}
         <label>Type<select name="contentType">{#each allowedTypes as type}<option value={type}>{type.replace('_',' ')}</option>{/each}</select></label>
@@ -44,12 +56,12 @@
       <label>Name<input name="name" required/></label>
       <label>Description<textarea name="description"></textarea></label>
       <button type="submit">Create Entry</button>
-    </form></details>
+    </form></details>{/if}
     <div class="admin-library-list">
       {#each filteredContent as entry}
-        <a href={`?content=${entry.id}`} class="admin-library-item" class:active={entry.id===data.selectedContentId}>
+        <a href={entryHref(entry.id)} class="admin-library-item" class:active={entry.id===data.selectedContentId}>
           <span class="admin-library-icon" aria-hidden="true">{entry.type==='spell'?'✦':entry.type==='item'?'◆':'★'}</span>
-          <span><strong>{entry.name}</strong><small>{entry.type.replace('_',' ')} · {entry.sourceKind}{entry.isArchived?' · archived':''}</small></span>
+          <span><strong>{entry.name}</strong><small>{entry.type.replace('_',' ')}{mode==='admin'?` · ${entry.sourceKind}`:''}{data.hidden?.[entry.id]?' · hidden':''}{entry.isArchived?' · archived':''}</small></span>
           <span class="admin-library-arrow" aria-hidden="true">›</span>
         </a>
       {:else}<p class="muted">No matching entries.</p>{/each}
@@ -58,15 +70,15 @@
 
   <section class="panel stack content-editor-panel">
     {#if selected}
-      <div class="panel-head"><div><p class="eyebrow">{selected.type.replace('_',' ')} / {selected.sourceKind}</p><h2>{selected.name}</h2></div><span class="status-chip">{selected.isArchived?'Archived':'Available'}</span></div>
-      <form method="POST" action="?/update" class="stack">
+      <div class="panel-head"><div><p class="eyebrow">{selected.type.replace('_',' ')}{mode==='admin'?` / ${selected.sourceKind}`:''}</p><h2>{selected.name}</h2></div><span class="status-chip">{selected.isArchived?'Archived':'Available'}</span></div>
+      <form method="POST" action={act('update')} class="stack">
         <input type="hidden" name="contentId" value={selected.id}/>
         <label>Name<input name="name" value={selected.name} required/></label>
         <label>Description<textarea name="description">{selected.description}</textarea></label>
         {#if selected.type==='item'}
           <div class="mini-grid"><label>Category<select name="category"><option value="weapon" selected={selected.category==='weapon'}>Weapon</option><option value="armor" selected={selected.category==='armor'}>Armor</option><option value="shield" selected={selected.category==='shield'}>Shield</option><option value="focus" selected={selected.category==='focus'}>Spell Focus</option><option value="consumable" selected={selected.category==='consumable'}>Consumable</option><option value="tool" selected={selected.category==='tool'}>Tool</option><option value="gear" selected={selected.category==='gear'}>Adventuring Gear</option><option value="treasure" selected={selected.category==='treasure'}>Treasure</option></select></label><label>Equipment Type<select name="equipmentType">{#each ['item','simple melee','simple ranged','martial melee','martial ranged','light armor','medium armor','heavy armor','shield','adventuring gear','tool','spell focus'] as type}<option value={type} selected={selected.equipmentType===type}>{type}</option>{/each}</select></label></div>
-          <div class="mini-grid"><label>AC Bonus<input name="acBonus" type="number" value={selected.acBonus}/></label><label>To Hit<input name="toHitBonus" type="number" value={selected.toHitBonus}/></label><label>Damage Bonus<input name="damageBonus" type="number" value={selected.damageBonus}/></label><label>Ability<select name="attackAbility">{#each ['str','dex','con','int','wis','cha'] as ability}<option value={ability} selected={selected.attackAbility===ability}>{ability.toUpperCase()}</option>{/each}</select></label></div>
-          <label>Damage Rolls<input name="damageRolls" value={selected.damageRolls} placeholder="1d8 + 1d4"/></label>
+          {#if canAuthorMechanics}<div class="mini-grid"><label>AC Bonus<input name="acBonus" type="number" value={selected.acBonus}/></label><label>To Hit<input name="toHitBonus" type="number" value={selected.toHitBonus}/></label><label>Damage Bonus<input name="damageBonus" type="number" value={selected.damageBonus}/></label><label>Ability<select name="attackAbility">{#each ['str','dex','con','int','wis','cha'] as ability}<option value={ability} selected={selected.attackAbility===ability}>{ability.toUpperCase()}</option>{/each}</select></label></div>
+          <label>Damage Rolls<input name="damageRolls" value={selected.damageRolls} placeholder="1d8 + 1d4"/></label>{/if}
           <label class="inline"><input name="requiresAttunement" type="checkbox" checked={selected.requiresAttunement}/> Requires Attunement</label>
         {:else if selected.type==='spell'}
           <div class="mini-grid"><label>Level<select name="spellLevel">{#each Array.from({length:10},(_,index)=>index) as level}<option value={level} selected={selected.spellLevel===level}>{level===0?'Cantrip':level}</option>{/each}</select></label><label>School<select name="school">{#each ['Abjuration','Conjuration','Divination','Enchantment','Evocation','Illusion','Necromancy','Transmutation'] as school}<option value={school} selected={selected.school===school}>{school}</option>{/each}</select></label></div>
@@ -77,6 +89,7 @@
           <label>Classes<select name="classes" multiple size="6">{#each ['Bard','Cleric','Druid','Paladin','Ranger','Sorcerer','Warlock','Wizard'] as className}<option value={className} selected={selected.classes.includes(className)}>{className}</option>{/each}</select></label>
           <div class="actions"><label class="inline"><input name="ritual" type="checkbox" checked={selected.ritual}/> Ritual</label><label class="inline"><input name="concentration" type="checkbox" checked={selected.concentration}/> Concentration</label></div>
 
+          {#if canAuthorMechanics}
           <h3>Damage</h3>
           <div class="mini-grid">
             <label>Resolution<select name="resolutionType"><option value="attack" selected={selected.resolutionType==='attack'}>Attack Roll</option><option value="save" selected={selected.resolutionType==='save'}>Saving Throw</option><option value="auto" selected={selected.resolutionType==='auto'}>Automatic (no roll)</option></select></label>
@@ -95,25 +108,30 @@
             <label>Tiers - character level (cantrip)<input name="scalingTiers" value={(selected.scaling?.tiers||[5,11,17]).join(',')} placeholder="5,11,17"/></label>
           </div>
           <label>Extra Dice per Slot Level Above Minimum (leveled/upcast)<input name="scalingExtraDicePerSlotLevel" value={selected.scaling?.extraDicePerSlotLevel||''} placeholder="1d6"/></label>
+          {/if}
         {/if}
-        {#key selected.id}<CostEditor initial={selected.costJson} contentType={selected.type} spellLevel={selected.spellLevel} castingTime={selected.castingTime} {hasSpendItemStep} pools={data.pools} counters={data.resources.map((resource:any)=>({key:resource.key,label:resource.label}))}/>{/key}
-        <p class="muted">Key: {selected.key}</p>
-        <div class="button-row"><button type="submit">Save Entry</button><button type="submit" formaction="?/archive" class="danger">{selected.isArchived?'Restore':'Archive'}</button></div>
+        {#if canAuthorMechanics}{#key selected.id}<CostEditor initial={selected.costJson} contentType={selected.type} spellLevel={selected.spellLevel} castingTime={selected.castingTime} {hasSpendItemStep} pools={data.pools} counters={data.resources.map((resource:any)=>({key:resource.key,label:resource.label}))}/>{/key}{/if}
+        {#if mode!=='admin'}<label class="inline"><input name="hiddenFromPlayers" type="checkbox" checked={Boolean(data.hidden?.[selected.id])}/> Keep out of other players' search (only you, the campaign's DM and admins can find it)</label>{/if}
+        {#if mode==='admin'}<p class="muted">Key: {selected.key}</p>{/if}
+        {#if mode==='library'&&data.holders}<p class="muted holders-note">Held by {data.holders.characters} character{data.holders.characters===1?'':'s'}, in {data.holders.findTables} find table{data.holders.findTables===1?'':'s'}, enabled in {data.holders.campaigns} campaign{data.holders.campaigns===1?'':'s'}, used by {data.holders.decks} deck{data.holders.decks===1?'':'s'}. Changes apply everywhere it is used.</p>{/if}
+        {#if notice}<p class="muted">{notice}</p>{/if}
+        <div class="button-row"><button type="submit">Save Entry</button><button type="submit" formaction={act('archive')} class="danger">{selected.isArchived?'Restore':'Archive'}</button></div>
       </form>
-      <div class="content-rule-summary">
+      {#if canAuthorMechanics}<div class="content-rule-summary">
         <button type="button" class:active={attachmentTab==='modifiers'} onclick={()=>attachmentTab='modifiers'}>Modifiers <strong>{data.attachedModifiers.length}</strong></button>
         <button type="button" class:active={attachmentTab==='effects'} onclick={()=>attachmentTab='effects'}>Effects <strong>{data.attachedEffects.length}</strong></button>
         <button type="button" class:active={attachmentTab==='actions'} onclick={()=>attachmentTab='actions'}>Actions <strong>{data.actions.length}</strong></button>
         {#if selected.type==='item'}<button type="button" class:active={attachmentTab==='spells'} onclick={()=>attachmentTab='spells'}>Spell Grants <strong>{data.spellAccess.length}</strong></button><button type="button" class:active={attachmentTab==='features'} onclick={()=>attachmentTab='features'}>Features <strong>{data.grants.length}</strong></button>{/if}
-      </div>
-    {:else}<p class="muted">Create or import an entry to begin.</p>{/if}
+      </div>{/if}
+    {:else}<p class="muted">{mode==='admin'?'Create or import an entry to begin.':mode==='library'?'Nothing here yet. Use "+ New" to make your first entry.':'No entry selected.'}</p>{/if}
   </section>
 
+  {#if canAuthorMechanics}
   <section class="panel stack modifier-attachment-panel">
     <div class="attachment-tab-bar" role="tablist">{#each attachmentTabs as tab}<button type="button" class:active={attachmentTab===tab[0]} onclick={()=>attachmentTab=tab[0]}>{tab[1]}</button>{/each}</div>
     {#if selected && attachmentTab==='modifiers'}
       <div class="panel-head"><div><h2>Add Modifier</h2><p class="muted">Attach a reusable mechanical rule.</p></div><span>{data.attachedModifiers.length}</span></div>
-      <form method="POST" action="?/attachModifier" class="stack admin-form">
+      <form method="POST" action={act('attachModifier')} class="stack admin-form">
         <input type="hidden" name="contentId" value={selected.id}/>
         <label>Modifier<select name="modifierId">{#each data.modifiers as modifier}<option value={modifier.id}>{modifierLabel(modifier)}</option>{/each}</select></label>
         <div class="mini-grid"><label>Availability<select name="activationType">{#if selected.type==='item'}<option value="carried">Carried</option><option value="equipped">Equipped</option><option value="attuned">Attuned</option>{:else if selected.type==='spell'}<option value="known">Known</option><option value="prepared">Prepared</option><option value="manual">Active</option>{:else}<option value="manual">Active</option>{/if}</select></label><label>Entry-specific Value<input name="valueOverrideExpression" placeholder="Optional, e.g. 2 or 1d4"/></label></div>
@@ -122,19 +140,19 @@
       </form>
     <div class="admin-list attachment-list">
       {#each data.attachedModifiers as modifier}
-        <article class="admin-row modifier-summary-row"><div><strong>{modifier.targetLabel} / {modifier.modifierType}{modifier.valueExpression?` / ${modifier.valueExpression}`:''}</strong><p class="muted">{modifier.activationType}{modifier.conditionExpression?` / if ${modifier.conditionExpression}`:''}</p></div><form method="POST" action="?/detachModifier"><input type="hidden" name="contentId" value={selected?.id||''}/><input type="hidden" name="linkId" value={modifier.id}/><button type="submit" class="compact-button danger">Remove</button></form></article>
+        <article class="admin-row modifier-summary-row"><div><strong>{modifier.targetLabel} / {modifier.modifierType}{modifier.valueExpression?` / ${modifier.valueExpression}`:''}</strong><p class="muted">{modifier.activationType}{modifier.conditionExpression?` / if ${modifier.conditionExpression}`:''}</p></div><form method="POST" action={act('detachModifier')}><input type="hidden" name="contentId" value={selected?.id||''}/><input type="hidden" name="linkId" value={modifier.id}/><button type="submit" class="compact-button danger">Remove</button></form></article>
       {:else}<p class="muted">No modifiers attached to this entry.</p>{/each}
     </div>{/if}
     {#if selected && attachmentTab==='effects'}
       <h2>Effects</h2><p class="muted">Named states with duration, expiry, or other lifecycle behavior.</p>
-      <form method="POST" action="?/attachEffect" class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><label>Effect<select name="effectId">{#each data.effects as effect}<option value={effect.id}>{effect.name} ({effect.sourceType})</option>{/each}</select></label><label>Activation<select name="activationType">{#if selected.type==='item'}<option value="carried">Carried</option><option value="equipped">Equipped</option><option value="attuned">Attuned</option><option value="on_use">On Use</option>{:else}<option value="manual">Active</option><option value="on_use">On Cast / Use</option>{/if}</select></label><button>Attach Effect</button></form>
-      <div class="admin-list compact attachment-list">{#each data.attachedEffects as effect}<article class="admin-row"><div><strong>{effect.name}</strong><p class="muted">{effect.activationType} · {effect.durationType}</p></div><form method="POST" action="?/detachEffect"><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="linkId" value={effect.id}/><button class="compact-button danger">Remove</button></form></article>{:else}<p class="muted">No Effects attached.</p>{/each}</div>
+      <form method="POST" action={act('attachEffect')} class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><label>Effect<select name="effectId">{#each data.effects as effect}<option value={effect.id}>{effect.name} ({effect.sourceType})</option>{/each}</select></label><label>Activation<select name="activationType">{#if selected.type==='item'}<option value="carried">Carried</option><option value="equipped">Equipped</option><option value="attuned">Attuned</option><option value="on_use">On Use</option>{:else}<option value="manual">Active</option><option value="on_use">On Cast / Use</option>{/if}</select></label><button>Attach Effect</button></form>
+      <div class="admin-list compact attachment-list">{#each data.attachedEffects as effect}<article class="admin-row"><div><strong>{effect.name}</strong><p class="muted">{effect.activationType} · {effect.durationType}</p></div><form method="POST" action={act('detachEffect')}><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="linkId" value={effect.id}/><button class="compact-button danger">Remove</button></form></article>{:else}<p class="muted">No Effects attached.</p>{/each}</div>
     {/if}
     {#if selected && attachmentTab==='actions'}
       <h2>Actions</h2>
       <p class="muted">Reusable immediate resolutions such as healing, damage, spending resources, or applying Effects.</p>
-      <form method="POST" action="?/attachAction" class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><label>Existing Action<select name="actionId">{#each data.actionCandidates as action}<option value={action.id}>{action.name}</option>{/each}</select></label><label>Trigger<select name="triggerType"><option value="on_use">On Use</option><option value="manual">Manual</option>{#if selected.type==='spell'}<option value="on_cast">On Cast</option>{/if}</select></label><button>Attach Existing Action</button></form>
-      <form method="POST" action="?/addResourceAction" class="stack admin-form">
+      {#if mode==='admin'}<form method="POST" action={act('attachAction')} class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><label>Existing Action<select name="actionId">{#each data.actionCandidates as action}<option value={action.id}>{action.name}</option>{/each}</select></label><label>Trigger<select name="triggerType"><option value="on_use">On Use</option><option value="manual">Manual</option>{#if selected.type==='spell'}<option value="on_cast">On Cast</option>{/if}</select></label><button>Attach Existing Action</button></form>{/if}
+      <form method="POST" action={act('addResourceAction')} class="stack admin-form">
         <input type="hidden" name="contentId" value={selected.id}/>
         <label>Action<select name="actionId"><option value="">Create or reuse this entry's default Action</option>{#each data.actions as action}<option value={action.id}>{action.name}</option>{/each}</select></label>
         <label>Step Type<select name="stepType" bind:value={actionStepType}><option value="resource_change">Change Resource</option><option value="damage">Roll Damage</option><option value="healing">Roll Healing</option><option value="apply_effect">Apply Effect</option><option value="remove_effect">Remove Effect</option><option value="spend_resource">Spend Content Resource</option><option value="spend_item">Spend Item Quantity</option><option value="roll_output">Roll Output</option></select></label>
@@ -153,21 +171,27 @@
         <label>Label<input name="actionLabel" placeholder="Optional, e.g. Healing draught"/></label>
         <button>Add Action Step</button>
       </form>
-      <div class="admin-list compact attachment-list">{#each data.actions as action}<article class="admin-row action-summary"><div><strong>{action.name}</strong><p class="muted">{action.triggerType.replace('_',' ')} · {action.steps.length} steps</p>{#each action.steps as step}<p>{step.label||step.type.replace('_',' ')}{step.valueExpression?`: ${step.valueExpression}`:''}</p>{/each}</div><div class="stack">{#each action.steps as step}<form method="POST" action="?/removeResourceAction"><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="actionId" value={step.id}/><button class="compact-button danger">Remove Step</button></form>{/each}<form method="POST" action="?/detachAction"><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="linkId" value={action.linkId}/><button class="compact-button danger">Detach Action</button></form></div></article>{:else}<p class="muted">No Actions attached.</p>{/each}</div>
+      <div class="admin-list compact attachment-list">{#each data.actions as action}<article class="admin-row action-summary"><div><strong>{action.name}</strong><p class="muted">{action.triggerType.replace('_',' ')} · {action.steps.length} steps</p>{#each action.steps as step}<p>{step.label||step.type.replace('_',' ')}{step.valueExpression?`: ${step.valueExpression}`:''}</p>{/each}</div><div class="stack">{#each action.steps as step}<form method="POST" action={act('removeResourceAction')}><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="actionId" value={step.id}/><button class="compact-button danger">Remove Step</button></form>{/each}<form method="POST" action={act('detachAction')}><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="linkId" value={action.linkId}/><button class="compact-button danger">Detach Action</button></form></div></article>{:else}<p class="muted">No Actions attached.</p>{/each}</div>
     {/if}
     {#if selected && attachmentTab==='resources' && (selected.type==='item'||selected.type==='feat'||selected.type==='class_feature')}
       <h2>Charges, Uses &amp; Recharge</h2>
-      <form method="POST" action="?/addResource" class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><div class="mini-grid"><label>Counter Key<input name="resourceKey" required/></label><label>Label<input name="resourceLabel" required/></label></div><label>Maximum<select name="maxValueExpression"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="proficiency_bonus">Proficiency Bonus</option><option value="ability_modifier">Ability Modifier</option><option value="level">Character Level</option></select></label><label>Recharge<select name="rechargePeriod"><option value="short_rest">Short Rest</option><option value="long_rest">Long Rest</option><option value="dawn">Dawn</option><option value="round">Round</option><option value="encounter">Encounter</option><option value="manual">Manual</option></select></label><button>Add Counter</button></form>
+      <form method="POST" action={act('addResource')} class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><div class="mini-grid"><label>Counter Key<input name="resourceKey" required/></label><label>Label<input name="resourceLabel" required/></label></div><label>Maximum<select name="maxValueExpression"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="proficiency_bonus">Proficiency Bonus</option><option value="ability_modifier">Ability Modifier</option><option value="level">Character Level</option></select></label><label>Recharge<select name="rechargePeriod"><option value="short_rest">Short Rest</option><option value="long_rest">Long Rest</option><option value="dawn">Dawn</option><option value="round">Round</option><option value="encounter">Encounter</option><option value="manual">Manual</option></select></label><button>Add Counter</button></form>
       <div class="admin-list compact">{#each data.resources as resource}<article class="admin-row"><div><strong>{resource.label}</strong><p class="muted">{resource.maxValueExpression} / {resource.rechargePeriod.replace('_',' ')}</p></div></article>{/each}</div>
     {/if}
     {#if selected?.type==='item' && attachmentTab==='features'}
       <h2>Granted Feats & Features</h2>
-      <form method="POST" action="?/grantContent" class="stack admin-form"><input type="hidden" name="sourceContentId" value={selected.id}/><label>Granted Content<select name="grantedContentId">{#each data.grantCandidates as candidate}<option value={candidate.id}>{candidate.name} ({candidate.type.replace('_',' ')})</option>{/each}</select></label><label>Activation<select name="activationType"><option value="equipped">Equipped</option><option value="attuned">Attuned</option><option value="carried">Carried</option><option value="on_use">On Use</option><option value="manual">Manual</option></select></label><button>Attach Grant</button></form>
+      <form method="POST" action={act('grantContent')} class="stack admin-form"><input type="hidden" name="sourceContentId" value={selected.id}/><label>Granted Content<select name="grantedContentId">{#each data.grantCandidates as candidate}<option value={candidate.id}>{candidate.name} ({candidate.type.replace('_',' ')})</option>{/each}</select></label><label>Activation<select name="activationType"><option value="equipped">Equipped</option><option value="attuned">Attuned</option><option value="carried">Carried</option><option value="on_use">On Use</option><option value="manual">Manual</option></select></label><button>Attach Grant</button></form>
       <div class="admin-list compact">{#each data.grants as grant}<article class="admin-row"><div><strong>{grant.name}</strong><p class="muted">{grant.type.replace('_',' ')} / {grant.activationType}</p></div></article>{/each}</div>
     {/if}
     {#if selected?.type==='item' && attachmentTab==='spells'}
-      <h2>Granted Spells</h2><form method="POST" action="?/addSpellAccess" class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><label>Spell<select name="spellContentId">{#each data.spellCandidates as spell}<option value={spell.id}>{spell.name}</option>{/each}</select></label><div class="mini-grid"><label>Access<select name="accessType"><option value="charges">Item Charges</option><option value="limited_free">Limited Free Use</option><option value="at_will">At Will</option><option value="character_slots">Character Spell Slots</option></select></label><label>Availability<select name="availabilityType"><option value="equipped">Equipped</option><option value="attuned">Attuned</option><option value="carried">Carried</option></select></label></div><label>Charge Resource<select name="resourceDefinitionId"><option value="">None</option>{#each data.resources as resource}<option value={resource.id}>{resource.label}</option>{/each}</select></label><div class="mini-grid"><label>Cost<input name="resourceCostExpression" value="1"/></label><label>Cast Level<select name="castLevelMode"><option value="spell_level">Spell Level</option><option value="fixed">Fixed</option><option value="charges_spent">Charges Spent</option><option value="selected_slot">Selected Slot</option></select></label></div><label>Fixed Cast Level<input name="fixedCastLevel" type="number" min="0" max="9"/></label><div class="mini-grid"><label>Save DC<select name="saveDcMode"><option value="character">Character</option><option value="fixed">Fixed</option></select></label><label>Fixed DC<input name="fixedSaveDc" type="number"/></label><label>Attack Bonus<select name="spellAttackMode"><option value="character">Character</option><option value="fixed">Fixed</option></select></label><label>Fixed Bonus<input name="fixedSpellAttackBonus" type="number"/></label></div><button>Grant Spell</button></form>
-      <div class="admin-list compact">{#each data.spellAccess as access}<article class="admin-row"><div><strong>{access.spellName}</strong><p class="muted">{access.accessType.replace('_',' ')} · {access.availabilityType}</p></div><form method="POST" action="?/removeSpellAccess"><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="accessId" value={access.id}/><button class="compact-button danger">Remove</button></form></article>{:else}<p class="muted">No Spells granted.</p>{/each}</div>
+      <h2>Granted Spells</h2><form method="POST" action={act('addSpellAccess')} class="stack admin-form"><input type="hidden" name="contentId" value={selected.id}/><label>Spell<select name="spellContentId">{#each data.spellCandidates as spell}<option value={spell.id}>{spell.name}</option>{/each}</select></label><div class="mini-grid"><label>Access<select name="accessType"><option value="charges">Item Charges</option><option value="limited_free">Limited Free Use</option><option value="at_will">At Will</option><option value="character_slots">Character Spell Slots</option></select></label><label>Availability<select name="availabilityType"><option value="equipped">Equipped</option><option value="attuned">Attuned</option><option value="carried">Carried</option></select></label></div><label>Charge Resource<select name="resourceDefinitionId"><option value="">None</option>{#each data.resources as resource}<option value={resource.id}>{resource.label}</option>{/each}</select></label><div class="mini-grid"><label>Cost<input name="resourceCostExpression" value="1"/></label><label>Cast Level<select name="castLevelMode"><option value="spell_level">Spell Level</option><option value="fixed">Fixed</option><option value="charges_spent">Charges Spent</option><option value="selected_slot">Selected Slot</option></select></label></div><label>Fixed Cast Level<input name="fixedCastLevel" type="number" min="0" max="9"/></label><div class="mini-grid"><label>Save DC<select name="saveDcMode"><option value="character">Character</option><option value="fixed">Fixed</option></select></label><label>Fixed DC<input name="fixedSaveDc" type="number"/></label><label>Attack Bonus<select name="spellAttackMode"><option value="character">Character</option><option value="fixed">Fixed</option></select></label><label>Fixed Bonus<input name="fixedSpellAttackBonus" type="number"/></label></div><button>Grant Spell</button></form>
+      <div class="admin-list compact">{#each data.spellAccess as access}<article class="admin-row"><div><strong>{access.spellName}</strong><p class="muted">{access.accessType.replace('_',' ')} · {access.availabilityType}</p></div><form method="POST" action={act('removeSpellAccess')}><input type="hidden" name="contentId" value={selected.id}/><input type="hidden" name="accessId" value={access.id}/><button class="compact-button danger">Remove</button></form></article>{:else}<p class="muted">No Spells granted.</p>{/each}</div>
     {/if}
   </section>
+  {:else if mode==='library'}
+  <section class="panel stack modifier-attachment-panel">
+    <h2>Rules</h2>
+    <p class="muted">Your entries are descriptive: a name, a description and the details above. Bonuses, damage, costs, charges and other rules are added by a DM or admin. If you need them, ask your DM to build the entry for you.</p>
+  </section>
+  {/if}
 </div>

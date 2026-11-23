@@ -17,13 +17,14 @@ export type AdminContentRecord={id:string;type:ContentType;name:string;descripti
 // nothing is selected (e.g. an empty library). Default is global, so existing /admin pages offer global entries only.
 type CandidateSource={scope:'global'|'personal'|'campaign';ownerUserId:string|null;campaignId:string|null};
 
-export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource}={}){
+// `opts.ownerUserId` narrows the entry list to one user's personal library (the /library page); omitted = everything (/admin).
+export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource;ownerUserId?:string}={}){
   const content=await query<any>(`SELECT c.*,s.spell_level,s.school,s.casting_time,s.spell_range,s.components,s.duration,
     s.ritual,s.concentration,s.classes,s.resolution_type,s.damage_type,s.base_dice,s.save_ability,s.save_effect,s.scaling_json,
     i.category,i.equipment_type,i.requires_attunement,i.ac_bonus,i.to_hit_bonus,
     i.damage_bonus,i.attack_ability,i.damage_rolls FROM content_definitions c
     LEFT JOIN spell_definitions s ON s.content_id=c.id LEFT JOIN item_definitions i ON i.content_id=c.id
-    WHERE c.content_type=ANY($1::text[]) ORDER BY c.is_archived,c.name`,[types]);
+    WHERE c.content_type=ANY($1::text[]) AND ($2::uuid IS NULL OR (c.scope='personal' AND c.owner_user_id=$2::uuid)) ORDER BY c.is_archived,c.name`,[types,opts.ownerUserId??null]);
   const records=content.rows.map(mapContent);const selectedContentId=records.some((entry)=>entry.id===selectedId)?selectedId:records[0]?.id||'';
   const modifiers=await query<any>(`SELECT m.id,m.target,m.modifier_type,COALESCE(m.default_value_expression,'') AS default_value_expression,
     COALESCE(m.label,'') AS label,COALESCE(t.label,m.target) AS target_label,COALESCE(t.runtime_supported,false) AS runtime_supported
@@ -172,7 +173,7 @@ function mapContent(row:any):AdminContentRecord{return{id:row.id,type:row.conten
 // Builds spell_definitions.scaling_json from the admin form's plain inputs - a
 // "Scales?" kind select gates which pair of fields is read, so authoring a
 // non-scaling spell (most saves/debuffs) just leaves both blank -> {}.
-function parseSpellScaling(form:FormData):Record<string,unknown>{
+export function parseSpellScaling(form:FormData):Record<string,unknown>{
   const kind=String(form.get('scalingKind')||'none');
   if(kind==='cantrip')return{kind,extraDice:String(form.get('scalingExtraDice')||''),
     tiers:String(form.get('scalingTiers')||'').split(',').map((value)=>Number(value.trim())).filter((value)=>Number.isFinite(value)&&value>0)};
@@ -184,7 +185,7 @@ function parseSpellScaling(form:FormData):Record<string,unknown>{
 // Returns undefined when the posted cost equals what is stored (nothing to re-validate or write, so an
 // entry whose cost uses a since-archived pool can still be saved), null for "use the default".
 const MAX_COST_JSON_LENGTH=4000,MAX_COST_LINES=20;
-async function readAdminCost(client:{query:(text:string,params?:any[])=>Promise<{rows:any[]}>},contentId:string,contentType:string,raw:string):Promise<CostEntry[]|null|undefined>{
+export async function readAdminCost(client:{query:(text:string,params?:any[])=>Promise<{rows:any[]}>},contentId:string,contentType:string,raw:string):Promise<CostEntry[]|null|undefined>{
   const stored=(await client.query('SELECT cost_json FROM content_definitions WHERE id=$1',[contentId])).rows[0]?.cost_json??null;
   if(!raw.trim())return stored===null?undefined:null;
   if(raw.length>MAX_COST_JSON_LENGTH)throw new Error('That cost is too long.');

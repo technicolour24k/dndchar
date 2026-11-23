@@ -29,6 +29,7 @@
         <a href="/dashboard">Dashboard</a>
         <a href="/characters">Characters</a>
         <a href="/catalogue">Catalogue</a>
+        <a href="/library">Homebrew</a>
         <a href="/campaigns">Campaigns</a>
         <a href="/encounters">Encounters</a>
         <a href="/creatures">Creatures</a>
