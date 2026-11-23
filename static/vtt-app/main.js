@@ -34,6 +34,7 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'characterId',
   'ac',
   'knownAc',
+  'sheetAc',
   'saves',
   'actions',
   'spellSlots',

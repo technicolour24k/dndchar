@@ -5,6 +5,7 @@ import { drawSummary } from '$lib/rules/decks';
 import { listOpenDmTasks, recordTokenHpDeltas } from '$lib/server/services/decks';
 import { logRoll } from '$lib/server/services/rollLog';
 import { nudgeCharacterTokenHp } from '$lib/server/vttTokenHp';
+import { followSheetAc } from '$lib/server/vttTokenAc';
 import type { DrawView } from '$lib/types/decks';
 
 // What happens AFTER a deck draw or undo has committed: the roll-log line, the table broadcast, a content-free
@@ -66,7 +67,11 @@ export async function announceDeck(draw: DrawView, kind: AnnounceKind): Promise<
   const roomCode = room?.rows[0]?.room_code ?? null;
   const characterIds = Array.from(new Set([draw.drawerCharacterId, ...draw.results.map((line) => line.characterId)]));
 
-  // HP first, so the tokens are right before anything tells the clients to look. A draw nudges by the sheet's
+  // AC first (awaited, so the token has moved before the toast lands rather than after the debounce).
+  const acIds = Array.from(new Set(draw.results.filter((line) => line.kind === 'condition' && line.effectRowId).map((line) => line.characterId)));
+  if (acIds.length && roomCode && sessions.has(roomCode)) await safely('ac follow', () => followSheetAc(acIds));
+
+  // HP, so the tokens are right before anything tells the clients to look. A draw nudges by the sheet's
   // applied HP change and remembers what each token really took; an undo reverses each by its own stored amount.
   // Everything here runs after the commit, so none of it may throw out of this function.
   if (roomCode && sessions.has(roomCode)) {

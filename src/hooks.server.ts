@@ -52,7 +52,8 @@ async function handleRequest({ event, resolve }: Parameters<Handle>[0]) {
     event.url.pathname.startsWith('/api/websocket') ||
     event.url.pathname === '/vtt/api/log' ||
     event.url.pathname === '/vtt/api/roll-log' ||
-    event.url.pathname === '/vtt/api/damage-taken';
+    event.url.pathname === '/vtt/api/damage-taken' ||
+    event.url.pathname === '/vtt/api/token-ac-prime';
   if (!event.locals.user && !publicRoutes.has(event.url.pathname) && !bypassesUserAuth) {
     // Remember where they were going (GET only, a POST can't be replayed) so login can send them
     // back, e.g. to an invite link. safeNext re-validates it on the way out of login.

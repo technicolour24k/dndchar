@@ -99,6 +99,29 @@ describe.skipIf(!enabled)('deck routes and announcements', () => {
       expect(gmSent.map((m) => m.type)).toContain('deck:undone');
       expect((await undo(dmId)).status).toBe(409);
 
+      // Token AC follows the sheet by delta (unit 5b): a failed 3 of clubs is -3 AC on the drawer's token (with a
+      // manual +2 on top), it comes back when the effect expires, and again when an undo removes it.
+      const { characterStatsFor } = await import('$lib/rules/characterStats');
+      const { getCharacterForRoll } = await import('./services/characters');
+      const { advanceCharacterRound } = await import('./services/catalogue');
+      const { followSheetAc } = await import('./vttTokenAc');
+      const sheetAc = async () => characterStatsFor((await getCharacterForRoll(A))!).armorClass.value;
+      const base = await sheetAc();
+      session.tokens.pc.ac = base + 2; // a GM's manual offset
+      session.tokens.pc.sheetAc = base;
+      const failed = await decks.drawCard({ userId: p1, characterId: A, deckId, deps: { cardId: 'gold:clubs:3', rollDie: () => 1 } });
+      expect(failed.draw.success).toBe(false);
+      await announceDeck(failed.draw, 'drawn');
+      expect(session.tokens.pc.ac).toBe(base + 2 - 3);
+      for (let i = 0; i < 10; i += 1) await advanceCharacterRound(p1, A);
+      await followSheetAc([A]);
+      expect(session.tokens.pc.ac).toBe(base + 2);
+      const failed2 = await decks.drawCard({ userId: p1, characterId: A, deckId, deps: { cardId: 'gold:clubs:3', rollDie: () => 1 } });
+      await announceDeck(failed2.draw, 'drawn');
+      expect(session.tokens.pc.ac).toBe(base + 2 - 3);
+      expect((await undoRoute.POST({ locals: { user: { id: dmId } }, params: { id: failed2.draw.id } } as any)).status).toBe(200);
+      expect(session.tokens.pc.ac).toBe(base + 2);
+
       // An Ace waits for a choice: 409 for a second draw (with the draw), 400 for a bad value, 200 for a good one.
       const ace = await decks.drawCard({ userId: p2, characterId: B, deckId, deps: { cardId: 'gold:hearts:A' } });
       expect(ace.status).toBe('choosing');

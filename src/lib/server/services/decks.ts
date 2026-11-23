@@ -4,6 +4,7 @@ import { query, withTransaction } from '$lib/server/db';
 import { cachedReference } from '$lib/server/cache/referenceData';
 import { getCampaignAccess, getCharacterAccess, isUuid } from '$lib/server/services/access';
 import { applyCharacterEffect } from '$lib/server/services/effects';
+import { primeSheetAc } from '$lib/server/vttTokenAc';
 import {
   applyCoin, applyHp, applyTempHp, cardSuccess, cardValue, describeLine, needsValueChoice, parseDeckRules, planDraw, type RollDie
 } from '$lib/rules/decks';
@@ -165,6 +166,8 @@ export async function drawCard(input: { userId: string; characterId: string; dec
   const deck = await loadDeck(deckId);
   if (!deck) throw new DeckError('not_found', 'Deck not found.');
 
+  // Tokens with no AC baseline get one from the pre-draw AC, so they still follow this draw's AC change.
+  await primeParty(campaignId, characterId);
   const card = pickCard(deck.rules, input.deps?.cardId);
   const success = cardSuccess(deck.rules, card);
   const status: DrawStatus = needsValueChoice(card) ? 'choosing' : 'resolved';
@@ -197,6 +200,11 @@ export async function drawCard(input: { userId: string; characterId: string; dec
   return { status: draw.status === 'choosing' ? 'choosing' : 'resolved', draw };
 }
 
+/** Unit 5b step 0. Best effort: a failure here must never stop a draw. */
+async function primeParty(campaignId: string, drawerId: string): Promise<void> {
+  try { await primeSheetAc(await partyIds({ query }, campaignId, drawerId)); } catch (error) { console.error('[decks] AC prime failed', error); }
+}
+
 async function currentChoosing(characterId: string): Promise<DrawView | undefined> {
   const row = (await query<any>(`${DRAW_SELECT} WHERE d.drawer_character_id = $1 AND d.status = 'choosing'`, [characterId])).rows[0];
   if (!row) return undefined;
@@ -211,6 +219,7 @@ export async function chooseValue(input: { userId: string; drawId: string; value
   if (!row) throw new DeckError('not_found', 'Draw not found.');
   const access = await getCharacterAccess({ query }, input.userId, row.drawer_character_id);
   if (!access || !access.canAct) throw new DeckError('forbidden', 'Draw not found.');
+  await primeParty(row.campaign_id, row.drawer_character_id);
   await withTransaction(async (client) => {
     const locked = await loadDrawRow(client, input.drawId, true);
     if (!locked || locked.status !== 'choosing') throw new DeckError('not_choosing', 'This draw has already been decided.');

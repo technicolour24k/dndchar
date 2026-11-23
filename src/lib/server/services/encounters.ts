@@ -109,12 +109,13 @@ export async function addEncounterParticipant(userId: string, encounterId: strin
       AND c.id=i.character_id AND c.owner_user_id=$2 AND d.recharge_period='encounter'`, [characterId, userId]);
 }
 
-export async function advanceEncounterTurn(userId: string, encounterId: string): Promise<void> {
-  await withTransaction(async (client) => {
+/** Returns the characters whose effects were ticked, so the caller can tell the realtime layer (token AC follows expiry). */
+export async function advanceEncounterTurn(userId: string, encounterId: string): Promise<string[]> {
+  return withTransaction(async (client) => {
     const encounter = await client.query<any>('SELECT * FROM encounters WHERE id=$1 AND owner_user_id=$2 FOR UPDATE', [encounterId, userId]);
     if (!encounter.rowCount) throw new Error('Encounter not found.');
     const participants = await client.query<any>('SELECT * FROM encounter_participants WHERE encounter_id=$1 ORDER BY initiative DESC, sort_order', [encounterId]);
-    if (!participants.rowCount) return;
+    if (!participants.rowCount) return [];
     const previous = encounter.rows[0].current_turn_index;
     const next = (previous + 1) % participants.rows.length;
     const newRound = encounter.rows[0].round_number + (next === 0 ? 1 : 0);
@@ -137,5 +138,8 @@ export async function advanceEncounterTurn(userId: string, encounterId: string):
     }
     await client.query(`DELETE FROM active_character_effects WHERE remaining_rounds=0 AND character_id=ANY($1::uuid[])`,
       [participants.rows.map((row: any) => row.character_id).filter(Boolean)]);
+    const ticked = new Set<string>([previousCharacterId, nextCharacterId].filter(Boolean));
+    if (next === 0) for (const row of participants.rows) if (row.character_id) ticked.add(row.character_id);
+    return Array.from(ticked);
   });
 }
