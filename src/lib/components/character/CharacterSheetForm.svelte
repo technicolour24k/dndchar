@@ -176,6 +176,12 @@
     sourceContentId: item.sourceContentId ?? null, attuned: item.attuned ?? false, damageRolls: item.damageRolls,
     effects: item.effects, notes: item.notes
   }))));
+  // Same idea for HP, temp HP and coin (a deck draw or the VTT can change them while this sheet is open): Save
+  // only writes the ones the inputs show differently from this baseline. The inputs render from the same props.
+  const resourceBaselineJson = $derived(JSON.stringify({
+    hp: hp.currentValue, tempHp: tempHp.currentValue, currencyCp: meta('currencyCp'), currencySp: meta('currencySp'),
+    currencyEp: meta('currencyEp'), currencyGp: meta('currencyGp'), currencyPp: meta('currencyPp')
+  }));
   const equippedInventoryRows = $derived(equippedItems(inventoryRows));
   const backpackInventoryRows = $derived(
     inventoryRows.filter((item) => item.location !== 'equipped' && item.location !== 'misc' && !item.equipped)
@@ -2044,6 +2050,7 @@
   onchange={markUnsavedIfSheetField}
 >
   <input name="inventoryBaseline" type="hidden" value={inventoryBaselineJson} />
+  <input name="resourceBaseline" type="hidden" value={resourceBaselineJson} />
   <input name="sheetVersion" type="hidden" value={sheetToken} />
   {#if staleSheet}
     <div class="panel stale-sheet-banner" role="alert">

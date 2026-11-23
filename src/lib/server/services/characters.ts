@@ -378,7 +378,7 @@ export class StaleSheetError extends Error {
 // this shipped) skips the check.
 export async function updateCharacter(userId: string, characterId: string, form: FormData, summary: string): Promise<number> {
   const resources = parseResources(form);
-  const newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
+  let newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null;
   let previousHp: number | null = null;
   let characterName = '';
 
@@ -394,14 +394,29 @@ export async function updateCharacter(userId: string, characterId: string, form:
     // change can be reported as a delta ("takes 12 damage") rather than just
     // an absolute overwrite - see the combat-log write below.
     const prevHpRow = await client.query<{ current_value: number }>(
-      `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'hp'`,
+      `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'hp' FOR UPDATE`,
       [characterId]
     );
     previousHp = prevHpRow.rows[0]?.current_value ?? null;
+    // The two reads above lock the hp / temp_hp rows (FOR UPDATE, after the characters row, the usual order): the
+    // action engine and rests write these rows without locking the characters row, so the lock is what keeps the
+    // value we preserve from changing before we write.
+    // Typing a value equal to the stale baseline counts as unedited (indistinguishable from not touching it; accepted).
+    // Decks unit 6: HP, temp HP and coin are also changed from outside the sheet (a deck draw, the VTT), so a
+    // value the user did not edit keeps whatever the database holds now instead of the sheet's stale copy.
+    // No baseline posted (an old tab, a script) = the old behaviour, everything posted is written.
+    const resourceBaseline = parseResourceBaseline(form);
+    if (resourceBaseline) {
+      const prevTempRow = await client.query<{ current_value: number }>(
+        `SELECT current_value FROM character_resources WHERE character_id = $1 AND resource_key = 'temp_hp' FOR UPDATE`, [characterId]);
+      keepUneditedResources(resources, resourceBaseline, { hp: previousHp, tempHp: prevTempRow.rows[0]?.current_value ?? null });
+      newHp = resources.find((r) => r.key === 'hp')?.currentValue ?? null; // so an unedited HP is never logged as a change
+    }
     characterName = String(form.get('name') || '').trim() || 'A character';
 
     const overrides = parseStatOverridesField(form);
-    const metadataPatch = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
+    const metadataPatch: Record<string, unknown> = { ...parseMetadata(form), ...(overrides !== undefined ? { statOverrides: overrides } : {}) };
+    if (resourceBaseline) keepUneditedCoins(metadataPatch, resourceBaseline);
 
     const updated = await client.query<{ sheet_version: number }>(
       `
@@ -1210,6 +1225,54 @@ const INVENTORY_SAVE_FIELDS: Array<[column: string, read: (row: InventoryItem) =
   ['source_content_id', (row) => row.sourceContentId || null],
   ['attuned', (row) => !!row.attuned]
 ];
+
+/**
+ * What the sheet showed for HP, temp HP and coin when it loaded (hidden field resourceBaseline, posted with Save).
+ * A posted value equal to its baseline was not edited by the user. Null when missing or malformed.
+ */
+export type ResourceBaseline = { hp?: number; tempHp?: number; coins: Record<string, string> };
+const COIN_FIELDS = ['currencyCp', 'currencySp', 'currencyEp', 'currencyGp', 'currencyPp'];
+
+function parseResourceBaseline(form: FormData): ResourceBaseline | null {
+  const raw = form.get('resourceBaseline');
+  if (typeof raw !== 'string' || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const coins: Record<string, string> = {};
+    for (const field of COIN_FIELDS) if (parsed[field] !== undefined) coins[field] = String(parsed[field]).trim();
+    return {
+      hp: Number.isFinite(Number(parsed.hp)) && parsed.hp !== undefined ? Number(parsed.hp) : undefined,
+      tempHp: Number.isFinite(Number(parsed.tempHp)) && parsed.tempHp !== undefined ? Number(parsed.tempHp) : undefined,
+      coins
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mutates the parsed resources: an HP / temp HP the user did not edit (posted equals baseline) takes the
+ * database's current value. A missing database row keeps the posted value (nothing to preserve).
+ */
+export function keepUneditedResources(
+  resources: CharacterResource[], baseline: ResourceBaseline, db: { hp: number | null; tempHp: number | null }
+): void {
+  const hp = resources.find((r) => r.key === 'hp');
+  if (hp && baseline.hp !== undefined && hp.currentValue === baseline.hp && db.hp !== null) hp.currentValue = db.hp;
+  const temp = resources.find((r) => r.key === 'temp_hp');
+  if (temp && baseline.tempHp !== undefined && temp.currentValue === baseline.tempHp && db.tempHp !== null) {
+    temp.currentValue = db.tempHp;
+    temp.maxValue = db.tempHp; // temp HP has no cap of its own (parseResources mirrors current into max)
+  }
+}
+
+/** Drops each coin field the user did not edit from the metadata patch, so the stored (possibly newer) value stays. */
+export function keepUneditedCoins(patch: Record<string, unknown>, baseline: ResourceBaseline): void {
+  for (const field of COIN_FIELDS) {
+    if (field in baseline.coins && String(patch[field] ?? '').trim() === baseline.coins[field]) delete patch[field];
+  }
+}
 
 /**
  * The inventory the sheet had loaded when the user pressed Save (hidden field inventoryBaseline).
