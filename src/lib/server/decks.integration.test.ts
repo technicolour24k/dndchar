@@ -236,3 +236,129 @@ describe.skipIf(!enabled)('decks', () => {
     }
   });
 });
+
+// Campaign deck authoring (decks unit 9b): campaign-owned decks, copy of a global deck, ownership walls,
+// validate-before-save, archive, test draw, enable.
+describe.skipIf(!enabled)('campaign deck authoring', () => {
+  it('creates, copies, validates, saves, archives and test-draws campaign decks', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (target.searchParams.has('host') || !['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, ''))) {
+      throw new Error('Refusing to run: DATABASE_URL is not a local database.');
+    }
+    const { query } = await import('$lib/server/db');
+    const decks = await import('./services/decks');
+    const tag = `zzauthor${crypto.randomBytes(4).toString('hex')}`;
+    const newUser = async (suffix: string) => (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT', 'x') RETURNING id`, [`${tag}${suffix}@example.invalid`])).rows[0].id;
+    const dm1 = await newUser('-dm1');
+    const dm2 = await newUser('-dm2');
+    const player = await newUser('-p');
+    const newCampaign = async (name: string, dm: string) => {
+      const id = (await query<{ id: string }>('INSERT INTO campaigns (name, invite_code, room_code) VALUES ($1, $2, $3) RETURNING id', [`${tag} ${name}`, code(10), code(8)])).rows[0].id;
+      await query('INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1, $2, $3)', [id, dm, 'dm']);
+      return id;
+    };
+    const c1 = await newCampaign('one', dm1);
+    const c2 = await newCampaign('two', dm2);
+    await query('INSERT INTO campaign_members (campaign_id, user_id, role) VALUES ($1, $2, $3)', [c1, player, 'player']);
+    const created: string[] = [];
+    try {
+      const seedId = (await query<{ id: string }>(`SELECT id FROM content_definitions WHERE content_key = 'deck:mystical_fate' AND owner_user_id IS NULL`)).rows[0].id;
+      const seedBefore = JSON.stringify((await query<any>('SELECT rules_json FROM deck_definitions WHERE content_id = $1', [seedId])).rows[0].rules_json);
+
+      // A player can't manage decks at all.
+      await expect(decks.createDeck({ userId: player, campaignId: c1, name: 'x', description: '' })).rejects.toMatchObject({ code: 'forbidden' });
+      await expect(decks.listDecksForManagement(player, c1)).rejects.toMatchObject({ code: 'forbidden' });
+
+      // Create: an empty skeleton owned by the campaign, listed for c1 only.
+      const deckId = await decks.createDeck({ userId: dm1, campaignId: c1, name: `${tag} deck`, description: 'Test' });
+      created.push(deckId);
+      const fresh = await decks.getOwnDeck(dm1, c1, deckId);
+      expect(fresh?.errors).toEqual([]);
+      expect(fresh?.warnings.join(' ')).toMatch(/no cards/);
+      expect((await decks.listDecksForManagement(dm1, c1)).own.map((row) => row.id)).toContain(deckId);
+      expect((await decks.listDecksForManagement(dm2, c2)).own.map((row) => row.id)).not.toContain(deckId);
+      // Global decks are listed read-only; the seed is there.
+      expect((await decks.listDecksForManagement(dm1, c1)).global.map((row) => row.id)).toContain(seedId);
+
+      // The other campaign's DM cannot see, edit, archive, test or enable it (forged ids look like missing decks).
+      expect(await decks.getOwnDeck(dm2, c2, deckId)).toBeNull();
+      expect(await decks.updateDeck({ userId: dm2, campaignId: c2, id: deckId, name: 'hijack', description: '', rulesText: '{}' })).toMatchObject({ ok: false });
+      expect(await decks.toggleDeckArchived({ userId: dm2, campaignId: c2, id: deckId, archived: true })).toBe(false);
+      expect((await decks.dryRunDraw({ userId: dm2, campaignId: c2, id: deckId, cardId: 'c1', success: 'auto' })).error).toBeTruthy();
+      await expect(decks.setCampaignDeck({ userId: dm2, campaignId: c2, deckId, enabled: true })).rejects.toMatchObject({ code: 'not_found' });
+      await expect(decks.setCampaignDeck({ userId: dm1, campaignId: c1, deckId: 'not-a-uuid', enabled: true })).rejects.toMatchObject({ code: 'bad_input' });
+      expect((await decks.listAvailableDecks(c2)).map((row) => row.id)).not.toContain(deckId);
+      expect((await decks.listAvailableDecks(c1)).map((row) => row.id)).toContain(deckId);
+
+      const rules = (extra: object) => JSON.stringify({
+        version: 1, cards: [{ id: 'c1', label: 'Test Card', tags: { kind: 'x' }, value: 3 }],
+        success: { rules: [], otherwise: 'success' }, ...extra
+      });
+      const base = { userId: dm1, campaignId: c1, id: deckId, name: `${tag} deck`, description: 'd' };
+      const withCondition = (conditionKey: string) => rules({
+        outcomes: [{ id: 'o', when: {}, name: 'O', text: 't', steps: [{ type: 'condition', conditionKey, params: { value: '{value}' }, durationRounds: 10, target: 'drawer' }] }]
+      });
+      // Bad JSON, a parser error, a missing key, and a non-global condition are refused, and nothing is written.
+      expect(await decks.updateDeck({ ...base, rulesText: '{nope' })).toMatchObject({ ok: false });
+      expect(await decks.updateDeck({ ...base, rulesText: JSON.stringify({ version: 2 }) })).toMatchObject({ ok: false });
+      const missing = await decks.updateDeck({ ...base, rulesText: withCondition('condition:nope_zz') });
+      expect(missing.ok).toBe(false);
+      expect(JSON.stringify(missing)).toMatch(/condition:nope_zz/);
+      const ownedKey = `condition:${tag}_owned`;
+      await query(
+        `INSERT INTO content_definitions (content_key, content_type, name, description, source_kind, owner_user_id, activation_type, requires_concentration, stack_behavior, metadata_json)
+         VALUES ($1, 'condition', 'Owned', '', 'homebrew', $2, 'passive', false, 'stack', '{}'::jsonb)`, [ownedKey, dm1]);
+      expect((await decks.updateDeck({ ...base, rulesText: withCondition(ownedKey) })).ok).toBe(false);
+      expect((await decks.getOwnDeck(dm1, c1, deckId))?.summary?.cardCount).toBe(0);
+
+      // A good save (with a seeded global condition) lands, and the test draw plans it without writing.
+      const good = await decks.updateDeck({ ...base, name: `${tag} renamed`, rulesText: withCondition('condition:deck_fate_ac') });
+      expect(good.ok).toBe(true);
+      const saved = await decks.getOwnDeck(dm1, c1, deckId);
+      expect(saved?.name).toBe(`${tag} renamed`);
+      expect(saved?.summary?.cardCount).toBe(1);
+      const dry = await decks.dryRunDraw({ userId: dm1, campaignId: c1, id: deckId, cardId: 'c1', success: 'failure' });
+      expect(dry.error).toBeUndefined();
+      expect(dry.lines.join('\n')).toMatch(/Aria loses 3 AC/);
+
+      // Enable on its own campaign; archive hides it from the add list and refuses enabling; restore brings it back.
+      await decks.setCampaignDeck({ userId: dm1, campaignId: c1, deckId, enabled: true });
+      expect((await decks.listCampaignDecks(c1)).map((row) => row.id)).toContain(deckId);
+      await decks.setCampaignDeck({ userId: dm1, campaignId: c1, deckId, enabled: false });
+      expect(await decks.toggleDeckArchived({ userId: dm1, campaignId: c1, id: deckId, archived: true })).toBe(true);
+      expect((await decks.listAvailableDecks(c1)).map((row) => row.id)).not.toContain(deckId);
+      await expect(decks.setCampaignDeck({ userId: dm1, campaignId: c1, deckId, enabled: true })).rejects.toMatchObject({ code: 'bad_input' });
+      expect(await decks.toggleDeckArchived({ userId: dm1, campaignId: c1, id: deckId, archived: false })).toBe(true);
+
+      // A global deck is read-only: not editable, not archivable, but copyable into the campaign.
+      expect(await decks.getOwnDeck(dm1, c1, seedId)).toBeNull();
+      expect((await decks.updateDeck({ ...base, id: seedId, rulesText: rules({ outcomes: [] }) })).ok).toBe(false);
+      expect(await decks.toggleDeckArchived({ userId: dm1, campaignId: c1, id: seedId, archived: true })).toBe(false);
+      const copyId = await decks.copyDeckToCampaign({ userId: dm1, campaignId: c1, sourceId: seedId });
+      created.push(copyId);
+      const copy = await decks.getOwnDeck(dm1, c1, copyId);
+      expect(copy?.name).toBe('The Deck of Mystical Fate (copy)');
+      expect(copy?.summary?.cardCount).toBe(108);
+      // Editing the copy leaves the original untouched.
+      expect((await decks.updateDeck({ ...base, id: copyId, name: 'Edited copy', rulesText: rules({ outcomes: [] }) })).ok).toBe(true);
+      expect(JSON.stringify((await query<any>('SELECT rules_json FROM deck_definitions WHERE content_id = $1', [seedId])).rows[0].rules_json)).toBe(seedBefore);
+      // Another campaign's deck can't be copied.
+      await expect(decks.copyDeckToCampaign({ userId: dm2, campaignId: c2, sourceId: deckId })).rejects.toMatchObject({ code: 'not_found' });
+
+      // An archived campaign refuses every write (a DM loses canManage; the site-admin override hits the explicit check).
+      await query('UPDATE campaigns SET is_archived = true WHERE id = $1', [c1]);
+      await expect(decks.createDeck({ userId: dm1, campaignId: c1, name: 'late', description: '' })).rejects.toMatchObject({ code: 'forbidden' });
+      await expect(decks.setCampaignDeck({ userId: dm1, campaignId: c1, deckId: seedId, enabled: true })).rejects.toMatchObject({ code: 'forbidden' });
+    } finally {
+      await query('DELETE FROM campaign_decks WHERE campaign_id = ANY($1::uuid[])', [[c1, c2]]);
+      for (const id of created) {
+        await query('DELETE FROM deck_definitions WHERE content_id = $1', [id]);
+        await query('DELETE FROM content_definitions WHERE id = $1', [id]);
+      }
+      await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`condition:${tag}_owned`]);
+      await query('DELETE FROM campaigns WHERE id = ANY($1::uuid[])', [[c1, c2]]);
+      await query('DELETE FROM users WHERE email LIKE $1', [`${tag}%`]);
+    }
+  });
+});
