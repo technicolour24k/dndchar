@@ -17,14 +17,16 @@ export type AdminContentRecord={id:string;type:ContentType;name:string;descripti
 // nothing is selected (e.g. an empty library). Default is global, so existing /admin pages offer global entries only.
 type CandidateSource={scope:'global'|'personal'|'campaign';ownerUserId:string|null;campaignId:string|null};
 
-// `opts.ownerUserId` narrows the entry list to one user's personal library (the /library page); omitted = everything (/admin).
-export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource;ownerUserId?:string}={}){
+// `opts.ownerUserId` narrows the entry list to one user's personal library (the /library page); `opts.campaignId` to one campaign's
+// own entries, i.e. its forked copies (/campaigns/[id]/homebrew); omitted = everything (/admin).
+export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource;ownerUserId?:string;campaignId?:string}={}){
   const content=await query<any>(`SELECT c.*,s.spell_level,s.school,s.casting_time,s.spell_range,s.components,s.duration,
     s.ritual,s.concentration,s.classes,s.resolution_type,s.damage_type,s.base_dice,s.save_ability,s.save_effect,s.scaling_json,
     i.category,i.equipment_type,i.requires_attunement,i.ac_bonus,i.to_hit_bonus,
     i.damage_bonus,i.attack_ability,i.damage_rolls FROM content_definitions c
     LEFT JOIN spell_definitions s ON s.content_id=c.id LEFT JOIN item_definitions i ON i.content_id=c.id
-    WHERE c.content_type=ANY($1::text[]) AND ($2::uuid IS NULL OR (c.scope='personal' AND c.owner_user_id=$2::uuid)) ORDER BY c.is_archived,c.name`,[types,opts.ownerUserId??null]);
+    WHERE c.content_type=ANY($1::text[]) AND ($2::uuid IS NULL OR (c.scope='personal' AND c.owner_user_id=$2::uuid))
+    AND ($3::uuid IS NULL OR (c.scope='campaign' AND c.campaign_id=$3::uuid)) ORDER BY c.is_archived,c.name`,[types,opts.ownerUserId??null,opts.campaignId??null]);
   const records=content.rows.map(mapContent);const selectedContentId=records.some((entry)=>entry.id===selectedId)?selectedId:records[0]?.id||'';
   const modifiers=await query<any>(`SELECT m.id,m.target,m.modifier_type,COALESCE(m.default_value_expression,'') AS default_value_expression,
     COALESCE(m.label,'') AS label,COALESCE(t.label,m.target) AS target_label,COALESCE(t.runtime_supported,false) AS runtime_supported

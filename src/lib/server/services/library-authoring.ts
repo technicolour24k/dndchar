@@ -115,7 +115,7 @@ const ABILITIES = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
  * carrying `acBonus` or `costJson` is simply dropped by splitLibraryFields + this check, so those columns keep
  * whatever they had (0 and NULL for anything they made).
  */
-async function applyFields(client: Queryable, actor: LibraryActor, id: string, type: ContentType, form: FormData): Promise<void> {
+export async function applyFields(client: Queryable, actor: LibraryActor, id: string, type: ContentType, form: FormData): Promise<void> {
   const { descriptive, mechanics } = splitLibraryFields(type, formToRecord(form));
   const name = String(descriptive.name ?? '').trim();
   if (!name) throw new Error('Name is required.');

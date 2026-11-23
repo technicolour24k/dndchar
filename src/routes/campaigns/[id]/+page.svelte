@@ -104,6 +104,9 @@
 {#if form?.error}
   <p class="form-error">{form.error}</p>
 {/if}
+{#if form?.forkNote}
+  <p class="form-success">{form.forkNote} They are under Campaign copies.</p>
+{/if}
 
 <div class="campaign-layout">
   <div class="campaign-main">
@@ -376,6 +379,7 @@
           <h2>Homebrew</h2>
           <span class="campaign-row-links">
             <a class="button-link compact-link deck-button" href="/catalogue?campaign={campaign.id}">Campaign homebrew</a>
+            {#if access.canManage}<a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/homebrew">Campaign copies</a>{/if}
             <a class="button-link compact-link deck-button" href="/library">Make homebrew</a>
           </span>
         </div>

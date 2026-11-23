@@ -11,6 +11,7 @@ import { logCombatEvent } from '$lib/server/services/combatLog';
 import { assertCanEditCharacter, getCharacterAccess, type CharacterAccess } from '$lib/server/services/access';
 import { cachedReference } from '$lib/server/cache/referenceData';
 import { resolveCharacterScope } from '$lib/server/services/library';
+import { loadCampaignCopyMap, type CopyMap } from '$lib/server/services/libraryFork';
 import { isVisibleForNewUse, type VisibleScope } from '$lib/library/rules';
 import { costSummary, parseCostJson } from '$lib/rules/cost';
 import { getCharacterPools, listPoolDefinitions, poolContextFor } from '$lib/server/services/resource-pools';
@@ -530,7 +531,8 @@ export async function restoreCharacterVersion(userId: string, characterId: strin
   });
 }
 
-async function createVersionWithClient(client: pg.PoolClient, characterId: string, userId: string, summary: string): Promise<void> {
+// Exported for the fork tests, which need a snapshot taken at a known moment.
+export async function createVersionWithClient(client: pg.PoolClient, characterId: string, userId: string, summary: string): Promise<void> {
   const snapshot = await buildSnapshot(client, characterId);
   await client.query(
     `
@@ -591,6 +593,10 @@ async function buildSnapshot(client: pg.PoolClient, characterId: string): Promis
 }
 
 async function applySnapshot(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot): Promise<void> {
+  // Snapshots keep the ORIGINAL ids and keys (history is never rewritten). Inside a campaign that holds campaign copies of
+  // a leaver's library (homebrew library fork, unit G) the restored character lands on the copies instead, so a restore
+  // cannot pull the campaign back onto the original. Outside such a campaign the originals still resolve.
+  const copies = await loadCampaignCopyMap(client, characterId);
   const character = snapshot.character ?? {};
   const restoredClasses = snapshot.classes?.length
     ? snapshot.classes
@@ -674,7 +680,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       damageBonus: Number(row.damage_bonus) || 0,
       attackAbility: abilityKeys.includes(row.attack_ability as AbilityKey) ? (row.attack_ability as AbilityKey) : 'str',
       proficient: row.proficient ?? true,
-      sourceContentId: row.source_content_id || null,
+      sourceContentId: (row.source_content_id && copies.ids.get(row.source_content_id)) || row.source_content_id || null,
       attuned: row.attuned || false,
       damageRolls: row.damage_rolls || '',
       effects: row.effects || '',
@@ -712,7 +718,7 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
   for(const row of snapshot.inventory_resources??[]){await client.query(`INSERT INTO character_inventory_resources
     (id,inventory_item_id,resource_definition_id,current_value,max_value)
     SELECT $1,$2,$3,$4,$5 WHERE EXISTS(SELECT 1 FROM character_inventory_items WHERE id=$2)
-      AND EXISTS(SELECT 1 FROM content_resource_definitions WHERE id=$3)`,[row.id,row.inventory_item_id,row.resource_definition_id,row.current_value,row.max_value]);}
+      AND EXISTS(SELECT 1 FROM content_resource_definitions WHERE id=$3)`,[row.id,row.inventory_item_id,copies.resources.get(row.resource_definition_id) ?? row.resource_definition_id,row.current_value,row.max_value]);}
   await replaceProficiencies(
     client,
     characterId,
@@ -721,30 +727,34 @@ async function applySnapshot(client: pg.PoolClient, characterId: string, snapsho
       key: row.proficiency_key || ''
     }))
   );
-  await restoreStructuredContent(client, characterId, snapshot);
+  await restoreStructuredContent(client, characterId, snapshot, copies);
   await client.query('DELETE FROM active_character_effects WHERE character_id=$1',[characterId]);
   // Restored effects keep metadata_json (params, label) but not source_character_id: snapshots don't store it (accepted).
   for (const row of snapshot.active_effects ?? []) {
+    // The key is stored without its "condition:" prefix (an anchored strip); a copy has the same shape, so it is looked up the same way.
+    const effectKey = (copies.keys.get('condition:' + row.effect_key) ?? 'condition:' + row.effect_key).replace(/^condition:/, '');
     await client.query(`INSERT INTO active_character_effects(character_id,container_id,remaining_rounds,metadata_json,
       source_content_instance_id,expiry_boundary,application_key,source_key)
       SELECT $1,cd.id,$2,$3,$4,$5,COALESCE($6::uuid,gen_random_uuid()),$7
       FROM content_definitions cd
       WHERE cd.content_type='condition' AND cd.content_key='condition:'||$8`,
       [characterId,row.remaining_rounds??null,JSON.stringify(row.metadata_json||{}),row.source_content_instance_id||null,
-        row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,row.effect_key]);
+        row.expiry_boundary||'round_end',row.application_key||null,row.source_key||null,effectKey]);
   }
   await setExhaustionLevel(client, characterId, Number(snapshot.exhaustion?.exhaustion_level) || 0);
 }
 
-async function restoreStructuredContent(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot): Promise<void> {
+async function restoreStructuredContent(client: pg.PoolClient, characterId: string, snapshot: CharacterSnapshot, copies: CopyMap): Promise<void> {
   await client.query('DELETE FROM character_content_instances WHERE character_id = $1', [characterId]);
   for (const row of snapshot.content_instances ?? []) {
-    const contentExists = await client.query('SELECT id FROM content_definitions WHERE id = $1', [row.content_id]);
+    const contentId = copies.ids.get(row.content_id) ?? row.content_id;
+    const contentExists = await client.query('SELECT id FROM content_definitions WHERE id = $1', [contentId]);
     if (!contentExists.rowCount) continue;
     await client.query(`INSERT INTO character_content_instances
       (id, character_id, content_id, source_class_id, is_known, is_prepared, is_active, custom_name, notes, metadata_json, created_at)
-      VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,COALESCE($10,now()))`,
-      [row.id, characterId, row.content_id, row.is_known, row.is_prepared, row.is_active, row.custom_name,
+      VALUES ($1,$2,$3,NULL,$4,$5,$6,$7,$8,$9,COALESCE($10,now()))
+      ON CONFLICT (character_id, content_id) DO NOTHING`,
+      [row.id, characterId, contentId, row.is_known, row.is_prepared, row.is_active, row.custom_name,
         row.notes || '', JSON.stringify(row.metadata_json || {}), row.created_at]);
   }
   for (const row of snapshot.content_resources ?? []) {
@@ -752,7 +762,7 @@ async function restoreStructuredContent(client: pg.PoolClient, characterId: stri
       (id, character_content_id, resource_definition_id, current_value, max_value)
       SELECT $1,$2,$3,$4,$5 WHERE EXISTS (SELECT 1 FROM character_content_instances WHERE id=$2)
         AND EXISTS (SELECT 1 FROM content_resource_definitions WHERE id=$3)`,
-      [row.id, row.character_content_id, row.resource_definition_id, row.current_value, row.max_value]);
+      [row.id, row.character_content_id, copies.resources.get(row.resource_definition_id) ?? row.resource_definition_id, row.current_value, row.max_value]);
   }
   await client.query('DELETE FROM character_spell_slots WHERE character_id = $1', [characterId]);
   for (const row of snapshot.spell_slots ?? []) {
@@ -1171,6 +1181,9 @@ async function replaceResources(client: pg.PoolClient, characterId: string, reso
 
 // Upserts one posted inventory row (insert, or update when the id already belongs to this
 // character). Shared by the full replace below and by the changes-only Save.
+// source_content_id is written on INSERT only. It is not user-editable, and a fork (homebrew library, unit G)
+// re-points it from a leaver's library entry to the campaign's copy, so a stale open sheet must never put the old
+// id back when it saves.
 async function upsertInventoryRow(client: pg.PoolClient, characterId: string, row: InventoryItem, sortOrder: number): Promise<void> {
   await client.query(
     `
@@ -1182,7 +1195,7 @@ async function upsertInventoryRow(client: pg.PoolClient, characterId: string, ro
         ac_bonus=EXCLUDED.ac_bonus, to_hit_bonus=EXCLUDED.to_hit_bonus, damage_bonus=EXCLUDED.damage_bonus,
         attack_ability=EXCLUDED.attack_ability, proficient=EXCLUDED.proficient, damage_rolls=EXCLUDED.damage_rolls,
         effects=EXCLUDED.effects, notes=EXCLUDED.notes, sort_order=EXCLUDED.sort_order,
-        source_content_id=EXCLUDED.source_content_id, attuned=EXCLUDED.attuned
+        attuned=EXCLUDED.attuned
       WHERE character_inventory_items.character_id = EXCLUDED.character_id
     `,
     [
@@ -1245,7 +1258,7 @@ const INVENTORY_SAVE_FIELDS: Array<[column: string, read: (row: InventoryItem) =
   ['damage_rolls', (row) => row.damageRolls || ''],
   ['effects', (row) => row.effects || ''],
   ['notes', (row) => row.notes || ''],
-  ['source_content_id', (row) => row.sourceContentId || null],
+  // source_content_id is deliberately not here: see upsertInventoryRow.
   ['attuned', (row) => !!row.attuned]
 ];
 
@@ -1404,16 +1417,22 @@ async function replaceProficiencies(
 
 async function replaceActiveEffects(client: pg.PoolClient, characterId: string, effectKeys: string[]): Promise<void> {
   const uniqueKeys = [...new Set(effectKeys.map((key) => key.trim()).filter(Boolean))];
+  // A held condition is kept when its key was posted, OR when it is a campaign copy of a condition whose key was posted
+  // (homebrew library fork, unit G): a sheet that was open before the fork still lists the ORIGINAL key, and saving it
+  // must not take the re-pointed copy off the character.
   await client.query(`DELETE FROM active_character_effects active WHERE character_id=$1
     AND NOT EXISTS (SELECT 1 FROM content_definitions cd WHERE cd.id=active.container_id AND cd.content_type='condition'
-      AND cd.content_key=ANY($2::text[]))`,
+      AND (cd.content_key=ANY($2::text[])
+        OR cd.forked_from_content_id IN (SELECT id FROM content_definitions WHERE content_type='condition' AND content_key=ANY($2::text[]))))`,
     [characterId, uniqueKeys.map((key) => 'condition:' + key)]);
   let scope: VisibleScope | null = null; // worked out only if a NEW homebrew condition is being applied
   for (const key of uniqueKeys) {
     const effect=await client.query<any>(`SELECT id, scope, owner_user_id, campaign_id FROM content_definitions WHERE content_type='condition'
       AND content_key='condition:'||$1 AND is_archived=false`,[key]);
     if(effect.rowCount){
-      const active=await client.query('SELECT 1 FROM active_character_effects WHERE character_id=$1 AND container_id=$2',[characterId,effect.rows[0].id]);
+      // Already held, as itself or as a campaign copy of it (see the DELETE above).
+      const active=await client.query(`SELECT 1 FROM active_character_effects a JOIN content_definitions cd ON cd.id=a.container_id
+        WHERE a.character_id=$1 AND (cd.id=$2 OR cd.forked_from_content_id=$2)`,[characterId,effect.rows[0].id]);
       if(active.rowCount) continue;
       // A new application must be a condition this character may be offered (a forged key of someone else's library is skipped).
       const found = effect.rows[0];

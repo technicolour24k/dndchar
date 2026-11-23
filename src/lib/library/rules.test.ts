@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  canAuthorMechanics, canReference, catalogueSourceLabel, enabledLibraryOwners, forageSourceLabel, isVisibleForNewUse, planFork,
-  splitLibraryFields, ForkPlanError, MEMBER_LIBRARY_DEFAULT_ENABLED,
+  canAuthorMechanics, canReference, catalogueSourceLabel, describeFork, enabledLibraryOwners, forageSourceLabel, forkContentKey,
+  isVisibleForNewUse, planFork, remapRulesKeys, splitLibraryFields, ForkPlanError, MEMBER_LIBRARY_DEFAULT_ENABLED,
   type EntryFacts, type ForkEntry, type ForkInput, type VisibleScope
 } from './rules';
+import type { ContentType } from '$lib/types/content';
 
 const DM = 'user-dm';
 const BOB = 'user-bob';
@@ -191,7 +192,8 @@ describe('planFork', () => {
   it('rewrites deck condition keys to the copies', () => {
     const cond = mk('cond', 'condition', { key: `condition:homebrew:${BOB}:burning:1` });
     const plan = planFork(input({ entries: [cond, mk('deck', 'deck')], roots: ['deck'], edges: [{ from: 'deck', to: 'cond' }] }));
-    expect(plan.keyRemap[cond.key]).toBe(`fork:${C1}:cond`);
+    // A condition copy keeps the "condition:" prefix (snapshots and restore look conditions up by it).
+    expect(plan.keyRemap[cond.key]).toBe(`condition:fork:${C1}:cond`);
   });
 
   it('keeps archived originals archived on the copy', () => {
@@ -228,6 +230,31 @@ describe('planFork', () => {
     }));
     expect(second.copies).toEqual([]);
     expect(second.idRemap).toEqual(first.idRemap);
+  });
+});
+
+describe('fork keys, deck key rewriting and the summary line', () => {
+  it('builds deterministic keys, with the condition prefix only on conditions', () => {
+    expect(forkContentKey(C1, 'x', 'item')).toBe(`fork:${C1}:x`);
+    expect(forkContentKey(C1, 'x', 'condition')).toBe(`condition:fork:${C1}:x`);
+    // The anchored strip the sheet uses gives back a key the lookup ('condition:' || key) resolves.
+    expect(forkContentKey(C1, 'x', 'condition').replace(/^condition:/, '')).toBe(`fork:${C1}:x`);
+  });
+
+  it('rewrites only exact key strings, deeply, without changing the input', () => {
+    const rules = { outcomes: [{ steps: [{ type: 'condition', conditionKey: 'condition:library:u:burn:1' }, { text: 'condition:library:u:burn:1 is mentioned' }] }] };
+    const out = remapRulesKeys(rules, { 'condition:library:u:burn:1': 'condition:fork:c:id' }) as typeof rules;
+    expect(out.outcomes[0].steps[0]).toEqual({ type: 'condition', conditionKey: 'condition:fork:c:id' });
+    expect(out.outcomes[0].steps[1]).toEqual({ text: 'condition:library:u:burn:1 is mentioned' });
+    expect(rules.outcomes[0].steps[0]).toEqual({ type: 'condition', conditionKey: 'condition:library:u:burn:1' });
+  });
+
+  it('describes a fork in plain words', () => {
+    expect(describeFork('Bob', [])).toBe("Nothing new to copy from Bob's library.");
+    expect(describeFork('Bob', [{ type: 'action' }])).toBe("Nothing new to copy from Bob's library.");
+    const many = [{ type: 'item' }, { type: 'item' }, { type: 'item' }, { type: 'deck' }, { type: 'condition' }, { type: 'condition' }, { type: 'action' }] as Array<{ type: ContentType }>;
+    expect(describeFork('Bob', many)).toBe("Kept campaign copies of 3 items, 1 deck and 2 conditions from Bob's library.");
+    expect(describeFork('Bob', [{ type: 'spell' }])).toBe("Kept campaign copies of 1 spell from Bob's library.");
   });
 });
 

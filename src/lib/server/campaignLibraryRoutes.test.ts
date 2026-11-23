@@ -17,6 +17,11 @@ vi.mock('$lib/server/services/library', () => ({
   setCampaignLibrary: (...a: unknown[]) => setCampaignLibrary(...a)
 }));
 
+const keepCampaignCopy = vi.fn();
+vi.mock('$lib/server/services/campaigns', () => ({ keepCampaignCopy: (...a: unknown[]) => keepCampaignCopy(...a) }));
+const announceFork = vi.fn();
+vi.mock('$lib/server/libraryForkAnnounce', () => ({ announceFork: (...a: unknown[]) => announceFork(...a) }));
+
 const page = await import('../../routes/campaigns/[id]/library/+page.server');
 const { CampaignError } = await import('$lib/server/campaignError');
 
@@ -63,5 +68,39 @@ describe('/campaigns/[id]/library setLibrary', () => {
     const result: any = await post({ ownerUserId: OWNER, enabled: '1' });
     expect(result.status).toBe(400);
     expect(result.data.error).toContain('archived');
+  });
+});
+
+describe('/campaigns/[id]/library keepCampaignCopy (homebrew library unit G)', () => {
+  const press = (fields: Record<string, string> = { ownerUserId: OWNER }) =>
+    (page.actions as any).keepCampaignCopy({ request: { formData: async () => new URLSearchParams(fields) }, params: { id: CAMPAIGN }, locals });
+  const fork = { ownerName: 'Bob', copies: [{ type: 'item', name: 'Sword' }, { type: 'item', name: 'Axe' }], reused: 1, skipped: [], touchedCharacterIds: [] };
+
+  it('refuses a player with 403 and a stranger with 404, without forking anything', async () => {
+    getCampaignAccess.mockResolvedValue({ canView: true, canManage: false, archived: false });
+    await expect(press()).rejects.toMatchObject({ status: 403 });
+    getCampaignAccess.mockResolvedValue(null);
+    await expect(press()).rejects.toMatchObject({ status: 404 });
+    expect(keepCampaignCopy).not.toHaveBeenCalled();
+    expect(announceFork).not.toHaveBeenCalled();
+  });
+
+  it('lets a DM (or the admin override) press it using the URL campaign, then announces and summarises', async () => {
+    getCampaignAccess.mockResolvedValue({ canView: true, canManage: true, archived: false });
+    keepCampaignCopy.mockResolvedValue({ roomCode: 'ROOM', fork });
+    const result: any = await press();
+    expect(keepCampaignCopy).toHaveBeenCalledWith(ME, CAMPAIGN, OWNER);
+    expect(announceFork).toHaveBeenCalledWith(fork, 'ROOM');
+    expect(result.forked).toBe("Kept campaign copies of 2 items from Bob's library.");
+    expect(result.reused).toBe(1);
+  });
+
+  it('turns a refusal (archived campaign, non-member owner, failed fork) into an inline error and announces nothing', async () => {
+    getCampaignAccess.mockResolvedValue({ canView: true, canManage: true, archived: true });
+    keepCampaignCopy.mockRejectedValue(new CampaignError('This campaign is archived.'));
+    const result: any = await press();
+    expect(result.status).toBe(400);
+    expect(result.data.error).toContain('archived');
+    expect(announceFork).not.toHaveBeenCalled();
   });
 });

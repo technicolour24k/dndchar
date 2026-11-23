@@ -7,6 +7,7 @@ import {
   type EntryFacts, type VisibleScope
 } from '$lib/library/rules';
 import type { ContentType } from '$lib/types/content';
+import { countLibraryUsesInCampaign } from '$lib/server/services/libraryFork';
 
 // Server side of the homebrew library (plans/dndchar/homebrew-library, unit A). These helpers load the facts and
 // hand them to the pure rules in $lib/library/rules.ts. Remember the core rule: visibility gates NEW USE only.
@@ -250,6 +251,11 @@ export type CampaignLibraryMember = {
    * null when the library is off and the viewer is neither a manager nor the owner (matches the View link's 404).
    */
   counts: { item: number; spell: number; feat: number; total: number } | null;
+  /**
+   * Places in this campaign that still point at the member's library (held items, known spells, applied conditions,
+   * enabled decks, forage entries, deck rules). Managers only (null otherwise). 0 means nothing to keep a copy of.
+   */
+  uses: number | null;
 };
 
 /**
@@ -279,7 +285,14 @@ export async function loadCampaignLibraryPage(db: Queryable, userId: string, cam
     userId: row.user_id, displayName: row.display_name, role: row.role,
     enabled: libraries.enabledOwnerIds.includes(row.user_id),
     counts: libraries.enabledOwnerIds.includes(row.user_id) || access.canManage || row.user_id === userId
-      ? { item: row.items, spell: row.spells, feat: row.feats, total: row.items + row.spells + row.feats } : null
+      ? { item: row.items, spell: row.spells, feat: row.feats, total: row.items + row.spells + row.feats } : null,
+    uses: null
   }));
-  return { campaignId, campaignName: campaign.name as string, archived: access.archived, canManage: access.canManage, members };
+  // The use counts are for managers: they drive the Keep a campaign copy button.
+  if (access.canManage) for (const member of members) member.uses = await countLibraryUsesInCampaign(db, campaignId, member.userId);
+  // Campaign copies made by forks (not the internal action containers), for the link to /campaigns/[id]/homebrew.
+  const copies = (await db.query(
+    `SELECT count(*)::int AS n FROM content_definitions
+     WHERE scope = 'campaign' AND campaign_id = $1 AND forked_from_content_id IS NOT NULL AND content_type <> 'action'`, [campaignId])).rows[0].n as number;
+  return { campaignId, campaignName: campaign.name as string, archived: access.archived, canManage: access.canManage, members, copies };
 }

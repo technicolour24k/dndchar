@@ -1,6 +1,8 @@
 import { error, fail, redirect, type ActionFailure } from '@sveltejs/kit';
 import { attempt } from '$lib/server/campaignAction';
 import { emitRealtimeEvent } from '$lib/server/realtime';
+import { announceFork } from '$lib/server/libraryForkAnnounce';
+import { describeFork } from '$lib/library/rules';
 import { leaveState, memberControls } from '$lib/server/campaignControls';
 import { countActiveFindTables } from '$lib/server/services/forage';
 import { listUnreviewedOverrides, reviewOverride } from '$lib/server/services/resource-pools';
@@ -121,6 +123,8 @@ export const actions = {
     const result = await attempt(() => removeMember(locals.user!.id, params.id, String(form.get('userId') || '')));
     if (result.ok) {
       kickFromCampaignRoom(result.value?.roomCode, result.value?.targetUserId, 'removed_from_campaign');
+      // Their homebrew the campaign still uses was copied into campaign copies in the same transaction (unit G).
+      if (result.value?.fork) announceFork(result.value.fork, result.value.roomCode);
       // Fire and forget: never throws, never delays or fails the action (see voiceEject.ts).
       void ejectFromCampaignVoice(params.id, result.value?.targetUserId);
       if (result.value?.targetUserId) dropUserPreviews(params.id, result.value.targetUserId);
@@ -129,13 +133,17 @@ export const actions = {
       // Their characters left the campaign, so their tokens leave the live map.
       await pruneDepartedCharacterTokens();
     }
-    return result.ok ? { saved: 'removed' } : result.failure;
+    // The DM sees what was kept, once, in place.
+    const fork = result.ok ? result.value?.fork : null;
+    if (!result.ok) return result.failure;
+    return fork && fork.copies.length ? { saved: 'removed', forkNote: describeFork(fork.ownerName, fork.copies) } : { saved: 'removed' };
   },
 
   leave: async ({ params, locals }) => {
     const result = await attempt(() => leaveCampaign(locals.user!.id, params.id));
     if (!result.ok) return result.failure;
     kickFromCampaignRoom(result.value?.roomCode, locals.user!.id, 'removed_from_campaign');
+    if (result.value.fork) announceFork(result.value.fork, result.value.roomCode);
     void ejectFromCampaignVoice(params.id, locals.user!.id);
     dropUserPreviews(params.id, locals.user!.id);
     await syncGmSeats(params.id, result.value?.roomCode);

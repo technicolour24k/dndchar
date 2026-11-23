@@ -113,7 +113,7 @@
         {#if canAuthorMechanics}{#key selected.id}<CostEditor initial={selected.costJson} contentType={selected.type} spellLevel={selected.spellLevel} castingTime={selected.castingTime} {hasSpendItemStep} pools={data.pools} counters={data.resources.map((resource:any)=>({key:resource.key,label:resource.label}))}/>{/key}{/if}
         {#if mode!=='admin'}<label class="inline"><input name="hiddenFromPlayers" type="checkbox" checked={Boolean(data.hidden?.[selected.id])}/> Keep out of other players' search (only you, the campaign's DM and admins can find it)</label>{/if}
         {#if mode==='admin'}<p class="muted">Key: {selected.key}</p>{/if}
-        {#if mode==='library'&&data.holders}<p class="muted holders-note">Held by {data.holders.characters} character{data.holders.characters===1?'':'s'}, in {data.holders.findTables} find table{data.holders.findTables===1?'':'s'}, enabled in {data.holders.campaigns} campaign{data.holders.campaigns===1?'':'s'}, used by {data.holders.decks} deck{data.holders.decks===1?'':'s'}. Changes apply everywhere it is used.</p>{/if}
+        {#if mode!=='admin'&&data.holders}<p class="muted holders-note">Held by {data.holders.characters} character{data.holders.characters===1?'':'s'}, in {data.holders.findTables} find table{data.holders.findTables===1?'':'s'}, enabled in {data.holders.campaigns} campaign{data.holders.campaigns===1?'':'s'}, used by {data.holders.decks} deck{data.holders.decks===1?'':'s'}. Changes apply everywhere it is used.</p>{/if}
         {#if notice}<p class="muted">{notice}</p>{/if}
         <div class="button-row"><button type="submit">Save Entry</button><button type="submit" formaction={act('archive')} class="danger">{selected.isArchived?'Restore':'Archive'}</button></div>
       </form>

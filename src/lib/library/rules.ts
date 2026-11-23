@@ -229,6 +229,47 @@ export type ForkPlan = {
 export class ForkPlanError extends Error {}
 
 /**
+ * The key of a campaign copy. Deterministic (campaign + original), so a fork is idempotent.
+ * Conditions keep the "condition:" prefix, because snapshots and restore store and look up conditions by their key
+ * with that prefix stripped (an anchored regexp, never a bare REPLACE). Everything else is plain "fork:<campaign>:<original>".
+ */
+export function forkContentKey(campaignId: string, originalId: string, type: ContentType): string {
+  return `${type === 'condition' ? 'condition:' : ''}fork:${campaignId}:${originalId}`;
+}
+
+/**
+ * Rewrites condition keys inside deck rules (any JSON). A string that is exactly an original key becomes its copy's
+ * key; everything else is returned as it was. Returns a new value and never changes the input.
+ */
+export function remapRulesKeys(value: unknown, keyRemap: Record<string, string>): unknown {
+  if (typeof value === 'string') return Object.prototype.hasOwnProperty.call(keyRemap, value) ? keyRemap[value] : value;
+  if (Array.isArray(value)) return value.map((item) => remapRulesKeys(item, keyRemap));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, remapRulesKeys(item, keyRemap)]));
+  }
+  return value;
+}
+
+const FORK_SUMMARY_NAMES: Partial<Record<ContentType, [string, string]>> = {
+  item: ['item', 'items'], spell: ['spell', 'spells'], feat: ['feat', 'feats'], class_feature: ['class feature', 'class features'],
+  condition: ['condition', 'conditions'], deck: ['deck', 'decks']
+};
+
+/** "Kept campaign copies of 3 items, 1 deck and 2 conditions from Bob's library." Actions are plumbing, so they are not counted. */
+export function describeFork(ownerName: string, copies: Array<{ type: ContentType }>): string {
+  const counts = new Map<string, number>();
+  for (const copy of copies) {
+    const names = FORK_SUMMARY_NAMES[copy.type];
+    if (!names) continue;
+    counts.set(copy.type, (counts.get(copy.type) ?? 0) + 1);
+  }
+  const parts = [...counts.entries()].map(([type, n]) => `${n} ${FORK_SUMMARY_NAMES[type as ContentType]![n === 1 ? 0 : 1]}`);
+  if (!parts.length) return `Nothing new to copy from ${ownerName}'s library.`;
+  const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+  return `Kept campaign copies of ${list} from ${ownerName}'s library.`;
+}
+
+/**
  * Works out what a fork would copy and how everything maps across, without touching anything.
  * The set is the roots plus everything reachable from them through references, restricted to the owner's own personal
  * entries (another owner's entries, and global ones, are referenced as they are). It only ever adds: there is no
@@ -280,7 +321,7 @@ export function planFork(input: ForkInput): ForkPlan {
       continue;
     }
     const copyId = input.newId();
-    const copyKey = `fork:${input.campaignId}:${id}`;
+    const copyKey = forkContentKey(input.campaignId, id, original.type);
     plan.copies.push({ originalId: id, copyId, copyKey, type: original.type, name: original.name, isArchived: original.isArchived });
     plan.idRemap[id] = copyId;
     plan.keyRemap[original.key] = copyKey;
