@@ -3426,3 +3426,6 @@ button.compact-button.active {
 .deck-sheet .deck-recent { margin-top: 12px; }
 .deck-sheet .deck-recent-row { border-top: 1px solid var(--border, #444); padding: 6px 0; }
 .deck-sheet .deck-recent-row p { margin: 2px 0; }
+
+/* Homebrew library (unit D): the campaign page's link groups. */
+.campaign-row-links { display: flex; flex-wrap: wrap; gap: 8px; }

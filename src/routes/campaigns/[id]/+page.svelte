@@ -370,11 +370,24 @@
     {/if}
     {#if form?.reviewed}<p class="muted">{form.reviewed}</p>{/if}
 
+    {#if !archived}
+      <section class="panel campaign-box">
+        <div class="campaign-row">
+          <h2>Homebrew</h2>
+          <span class="campaign-row-links">
+            <a class="button-link compact-link deck-button" href="/catalogue?campaign={campaign.id}">Campaign homebrew</a>
+            <a class="button-link compact-link deck-button" href="/library">Make homebrew</a>
+          </span>
+        </div>
+        <p class="muted">What this campaign can use, and your own library.{access.canManage ? " The Libraries button in the Decks box switches members' libraries on." : ''}</p>
+      </section>
+    {/if}
+
     {#if !archived && showDecks}
       <section class="panel campaign-box">
         <div class="campaign-row">
           <h2>Decks</h2>
-          {#if access.canManage}<a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/decks">Manage decks</a>{/if}
+          {#if access.canManage}<span class="campaign-row-links"><a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/decks">Manage decks</a> <a class="button-link compact-link deck-button" href="/campaigns/{campaign.id}/library">Libraries</a></span>{/if}
         </div>
         {#if data.decks.length === 0}
           <p class="muted">{access.canManage ? 'No decks on this campaign yet. Add one below, or create your own under Manage decks, and players can draw from it on their sheets and at the table.' : 'This campaign has no decks yet.'}</p>

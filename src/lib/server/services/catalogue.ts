@@ -1,5 +1,4 @@
 import type pg from 'pg';
-import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/services/action-containers';
 import { query, withTransaction } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter, isUuid } from '$lib/server/services/access';
 import { assertReferenceAllowed, assertVisibleForNewUse, resolveVisibleScope, visibleScopeSql } from '$lib/server/services/library';
@@ -20,16 +19,12 @@ import type { Activation } from '$lib/types/cost';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
 import type { CharacterContentInstance, ContentDefinition, ContentType, RechargePeriod, SpellSlot } from '$lib/types/content';
 
-const contentTypes = new Set<ContentType>(['item', 'spell', 'feat', 'class_feature', 'condition', 'action']);
 const rechargePeriods = new Set<RechargePeriod>(['short_rest', 'long_rest', 'dawn', 'round', 'encounter', 'manual']);
-
-function slug(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'content';
-}
 
 // Read-only browse list. Limited to what `scope` may be offered (default: global plus the viewer's own library), so
 // another user's private homebrew never shows here.
-export async function listCatalogue(userId: string, type?: ContentType, search = '', scope?: VisibleScope): Promise<ContentDefinition[]> {
+// `ownerUserId` narrows to one member's personal entries in SQL, so the row cap below can't cut them off.
+export async function listCatalogue(userId: string, type?: ContentType, search = '', scope?: VisibleScope, ownerUserId?: string): Promise<ContentDefinition[]> {
   const visible = visibleScopeSql('c', scope ?? await resolveVisibleScope({ query }, userId), 3);
   const result = await query<any>(
     `
@@ -46,10 +41,11 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
       WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1) AND c.content_type <> 'deck'
         AND ($2 = '' OR c.name ILIKE '%' || $2 || '%')
         AND ${visible.sql}
-      ORDER BY c.source_kind = 'srd' DESC, c.name ASC
+        AND ($${visible.params.length + 3}::uuid IS NULL OR (c.scope = 'personal' AND c.owner_user_id = $${visible.params.length + 3}::uuid))
+      ORDER BY (c.source_kind = 'srd') ASC, c.name ASC
       LIMIT 300
     `,
-    [type || null, search.trim(), ...visible.params]
+    [type || null, search.trim(), ...visible.params, ownerUserId ?? null]
   );
 
   const ids = result.rows.map((row: any) => row.id);
@@ -146,99 +142,10 @@ export async function getCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
   return cachedReference('catalogue-index', loadCatalogueIndex, { ttlMs: 24 * 60 * 60 * 1000 });
 }
 
-export async function createHomebrewContent(userId: string, form: FormData): Promise<string> {
-  const type = String(form.get('contentType') || '') as ContentType;
-  const name = String(form.get('name') || '').trim();
-  if (!contentTypes.has(type) || !name) throw new Error('A valid content type and name are required.');
 
-  const id = await withTransaction(async (client) => {
-    const key = `custom:${userId}:${type}:${slug(name)}:${Date.now()}`;
-    const created = await client.query<{ id: string }>(
-      `INSERT INTO content_definitions
-       (content_key, content_type, name, description, source_kind, owner_user_id, metadata_json)
-       VALUES ($1, $2, $3, $4, 'homebrew', $5, $6) RETURNING id`,
-      [key, type, name, String(form.get('description') || ''), userId, JSON.stringify({})]
-    );
-    const id = created.rows[0].id;
-    if (type === 'spell') {
-      await client.query(
-        `INSERT INTO spell_definitions
-         (content_id, spell_level, school, casting_time, spell_range, components, duration, ritual, concentration, classes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [id, Math.min(9, Math.max(0, Number(form.get('spellLevel')) || 0)), String(form.get('school') || ''),
-          String(form.get('castingTime') || ''), String(form.get('range') || ''), String(form.get('components') || ''),
-          String(form.get('duration') || ''), form.get('ritual') === 'on', form.get('concentration') === 'on',
-          String(form.get('classes') || '').split(',').map((value) => value.trim()).filter(Boolean)]
-      );
-    }
-    if (type === 'item') {
-      await client.query(
-        `INSERT INTO item_definitions
-         (content_id, category, equipment_type, requires_attunement, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, damage_rolls)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [id, String(form.get('category') || 'gear'), String(form.get('equipmentType') || 'item'),
-          form.get('requiresAttunement') === 'on', Number(form.get('acBonus')) || 0, Number(form.get('toHitBonus')) || 0,
-          Number(form.get('damageBonus')) || 0, String(form.get('attackAbility') || 'str'), String(form.get('damageRolls') || '')]
-      );
-    }
-    return id;
-  });
-  invalidateReferenceData('createHomebrewContent');
-  return id;
-}
 
-export async function setContentArchived(userId:string,contentId:string,isAdmin=false):Promise<void>{
-  const result=await query(`UPDATE content_definitions SET is_archived=NOT is_archived,updated_at=now()
-    WHERE id=$1 AND ($2::boolean OR owner_user_id=$3) RETURNING id`,[contentId,isAdmin,userId]);
-  if(!result.rowCount)throw new Error('Catalogue entry not found or not editable.');
-  invalidateReferenceData('setContentArchived');
-}
 
-export async function updateOwnedContent(userId:string,form:FormData):Promise<void>{
-  const result=await query(`UPDATE content_definitions SET name=$3,description=$4,updated_at=now()
-    WHERE id=$1 AND owner_user_id=$2 AND source_kind='homebrew'`,[String(form.get('contentId')||''),userId,
-    String(form.get('name')||'').trim(),String(form.get('description')||'').trim()]);
-  if(!result.rowCount)throw new Error('Homebrew entry not found or not editable.');
-  invalidateReferenceData('updateOwnedContent');
-}
 
-export async function attachEffectToContent(form: FormData): Promise<void> {
-  const contentId = String(form.get('contentId') || '');
-  const effectId = String(form.get('effectId') || '');
-  const activationType = String(form.get('activationType') || 'manual');
-  // effectId is the condition container id. content_grants is the only write.
-  await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
-    SELECT $1, cd.id, $3 FROM content_definitions cd WHERE cd.id=$2 AND cd.content_type='condition'
-    ON CONFLICT DO NOTHING`,
-    [contentId, effectId, activationType]);
-  invalidateReferenceData('attachEffectToContent');
-}
-
-export async function attachEffectToOwnedContent(userId: string, form: FormData): Promise<void> {
-  const contentId = String(form.get('contentId') || '');
-  const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
-  if (!owned.rowCount) throw new Error('Private homebrew content not found.');
-  await assertReferenceAllowed({ query }, contentId, String(form.get('effectId') || ''));
-  if (String(form.get('activationType') || 'manual') === 'on_use') {
-    await withTransaction(async (client) => {
-      const content = await client.query<any>('SELECT name, owner_user_id FROM content_definitions WHERE id=$1', [contentId]);
-      const actionContainerId = await findOrCreateActionContainer(client, contentId, 'on_use', `Use ${content.rows[0].name}`,
-        `Actions for ${content.rows[0].name}`, content.rows[0].owner_user_id);
-      await linkActionContainer(client, contentId, actionContainerId, 'on_use');
-      const effectId = String(form.get('effectId') || '');
-      // effectId is the condition container id; the step carries it as effect_container_id.
-      await client.query(`INSERT INTO action_steps(container_id,step_type,operation,effect_container_id,label,sort_order)
-        SELECT $1,'apply_effect','apply',effect.id,effect.name,
-          COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE container_id=$1),0)
-        FROM content_definitions effect WHERE effect.id=$2 AND effect.content_type='condition'
-          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE container_id=$1 AND step_type='apply_effect' AND effect_container_id=$2)`,
-        [actionContainerId, effectId]);
-    });
-    invalidateReferenceData('attachEffectToOwnedContent');
-    return;
-  }
-  await attachEffectToContent(form);
-}
 
 export async function addContentResourceDefinition(form: FormData): Promise<void> {
   const contentId = String(form.get('contentId') || '');
@@ -270,18 +177,7 @@ export async function grantContentFromContent(form: FormData): Promise<void> {
   invalidateReferenceData('grantContentFromContent');
 }
 
-export async function addOwnedContentResourceDefinition(userId: string, form: FormData): Promise<void> {
-  const contentId = String(form.get('contentId') || '');
-  const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
-  if (!owned.rowCount) throw new Error('Private homebrew content not found.');
-  await addContentResourceDefinition(form);
-}
 
-export async function listEffectsForLinking(userId?: string): Promise<Array<{ id: string; name: string }>> {
-  const result = await query<{ id: string; name: string }>(`SELECT id, name FROM content_definitions
-    WHERE content_type='condition' AND is_archived=false ORDER BY name`);
-  return result.rows;
-}
 
 // Inserts one new inventory row for an item Container (copying its item fields) and starts its
 // resources. Shared by the sheet's catalogue add (quantity 1) and forage's finds (stacking falls

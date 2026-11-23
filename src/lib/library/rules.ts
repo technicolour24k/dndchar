@@ -154,6 +154,21 @@ export function catalogueSourceLabel(entry: {
   return entry.sourceKind === 'srd' ? 'SRD' : 'Homebrew';
 }
 
+/**
+ * The label on a find table entry (DM view). Global items have none. A personal item says whose library it came from,
+ * or that the library is not enabled here any more (it still works: visibility gates new use only).
+ */
+export function forageSourceLabel(entry: {
+  scope: LibraryScope;
+  ownerName: string | null;
+  ownerEnabled: boolean;
+  forkedFromOwnerName: string | null;
+}): string {
+  if (entry.scope === 'global') return '';
+  if (entry.scope === 'campaign') return catalogueSourceLabel({ sourceKind: 'homebrew', scope: 'campaign', ownerName: null, forkedFromOwnerName: entry.forkedFromOwnerName });
+  return entry.ownerEnabled ? `From ${entry.ownerName ?? 'someone'}'s library` : 'From a library not enabled here';
+}
+
 // ---------------------------------------------------------------- fork planner
 
 /** Largest set the fork will copy in one go. Above this something is badly wrong, so it refuses. */

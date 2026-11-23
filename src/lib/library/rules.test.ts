@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  canAuthorMechanics, canReference, catalogueSourceLabel, enabledLibraryOwners, isVisibleForNewUse, planFork,
+  canAuthorMechanics, canReference, catalogueSourceLabel, enabledLibraryOwners, forageSourceLabel, isVisibleForNewUse, planFork,
   splitLibraryFields, ForkPlanError, MEMBER_LIBRARY_DEFAULT_ENABLED,
   type EntryFacts, type ForkEntry, type ForkInput, type VisibleScope
 } from './rules';
@@ -228,5 +228,16 @@ describe('planFork', () => {
     }));
     expect(second.copies).toEqual([]);
     expect(second.idRemap).toEqual(first.idRemap);
+  });
+});
+
+describe('forageSourceLabel', () => {
+  it('labels find table entries by where the item came from', () => {
+    const base = { ownerName: 'Bob', ownerEnabled: true, forkedFromOwnerName: null };
+    expect(forageSourceLabel({ ...base, scope: 'global' })).toBe('');
+    expect(forageSourceLabel({ ...base, scope: 'personal' })).toBe("From Bob's library");
+    expect(forageSourceLabel({ ...base, scope: 'personal', ownerEnabled: false })).toBe('From a library not enabled here');
+    expect(forageSourceLabel({ ...base, scope: 'campaign', forkedFromOwnerName: 'Bob' })).toBe("Campaign copy (from Bob's library)");
+    expect(forageSourceLabel({ ...base, scope: 'campaign' })).toBe('Campaign');
   });
 });

@@ -7,6 +7,7 @@ import {
   updateLibraryEntry
 } from '$lib/server/services/library-authoring';
 import { query } from '$lib/server/db';
+import { isUuid } from '$lib/server/services/access';
 import type { ContentType } from '$lib/types/content';
 
 // The personal homebrew library (plans/dndchar/homebrew-library, unit C). Everyone has one. Anyone can write
@@ -23,7 +24,7 @@ export const load: PageServerLoad = async ({ locals, url }) => {
 async function backTo(id: string, from: string): Promise<string> {
   const row = (await query<{ content_type: ContentType }>('SELECT content_type FROM content_definitions WHERE id = $1', [id])).rows[0];
   const params = new URLSearchParams({ type: row ? tabForType(row.content_type) : 'item', content: id });
-  if (from) params.set('from', from);
+  if (isUuid(from)) params.set('from', from);
   return `/library?${params}`;
 }
 

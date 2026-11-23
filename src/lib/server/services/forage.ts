@@ -7,7 +7,8 @@ import {
 } from '$lib/rules/forage';
 import { insertCatalogueItem } from '$lib/server/services/catalogue';
 import { isCampaignDm } from '$lib/server/services/access';
-import { assertVisibleForNewUse, resolveVisibleScope } from '$lib/server/services/library';
+import { assertVisibleForNewUse, loadCampaignLibraries, resolveVisibleScope } from '$lib/server/services/library';
+import { forageSourceLabel, type LibraryScope } from '$lib/library/rules';
 import type {
   FindLine, FindMode, FindResult, FindStatus, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
 } from '$lib/types/forage';
@@ -107,9 +108,27 @@ export async function listFindTables(actor: ForageActor): Promise<FindTable[]> {
   return result.rows.map(mapTable);
 }
 
+// Authoring view: each entry also says where its item came from (see forageSourceLabel). Works out "enabled" from
+// the table's campaign, so an item from a library that has since been switched off reads "not enabled here".
 export async function getFindTableEntries(tableId: string): Promise<FindTableEntry[]> {
-  const result = await query<EntryRow>(`${ENTRY_SELECT} WHERE e.find_table_id = $1 ORDER BY e.sort_order, c.name`, [tableId]);
-  return result.rows.map(mapEntry);
+  const result = await query<EntryRow & { scope: LibraryScope; owner_user_id: string | null; owner_name: string | null; fork_name: string | null; table_campaign: string }>(
+    `SELECT e.find_table_id, e.item_id, c.name AS item_name, i.category AS item_category, e.chance, e.qty_die,
+            e.sort_order, c.is_archived AS item_archived, c.scope, c.owner_user_id, u.display_name AS owner_name,
+            c.metadata_json->'fork'->>'fromOwnerName' AS fork_name, t.campaign_id AS table_campaign
+     FROM find_table_entries e
+     JOIN find_tables t ON t.id = e.find_table_id
+     JOIN content_definitions c ON c.id = e.item_id
+     LEFT JOIN item_definitions i ON i.content_id = c.id
+     LEFT JOIN users u ON u.id = c.owner_user_id
+     WHERE e.find_table_id = $1 ORDER BY e.sort_order, c.name`, [tableId]);
+  if (!result.rows.length) return [];
+  const { enabledOwnerIds } = await loadCampaignLibraries({ query }, result.rows[0].table_campaign);
+  return result.rows.map((row) => ({
+    ...mapEntry(row),
+    sourceLabel: forageSourceLabel({
+      scope: row.scope, ownerName: row.owner_name, ownerEnabled: row.owner_user_id !== null && enabledOwnerIds.includes(row.owner_user_id), forkedFromOwnerName: row.fork_name
+    })
+  }));
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

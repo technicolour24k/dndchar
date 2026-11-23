@@ -219,3 +219,50 @@ export function visibleScopeSql(alias: string, scope: VisibleScope, firstParam: 
         AND (NOT ${alias}.hidden_from_players OR ${alias}.owner_user_id = ANY($${hiddenOwners}::uuid[]))))`;
   return { sql, params: [scope.campaignId, scope.ownerIds, scope.hiddenOkOwnerIds, scope.hiddenOkCampaign] };
 }
+
+// ---------------------------------------------------------------- campaign library page (unit D)
+
+export type CampaignLibraryMember = {
+  userId: string;
+  displayName: string;
+  role: string;
+  /** Switched on by the DM (no settings row = off). */
+  enabled: boolean;
+  /**
+   * Live (not archived) personal entries by tab. Hidden-from-players entries are counted for managers only.
+   * null when the library is off and the viewer is neither a manager nor the owner (matches the View link's 404).
+   */
+  counts: { item: number; spell: number; feat: number; total: number } | null;
+};
+
+/**
+ * The members of a campaign with the state of each one's library. Anyone who can view the campaign may read it;
+ * only canManage gets the switches (the route checks that). Returns null when the viewer cannot see the campaign.
+ */
+export async function loadCampaignLibraryPage(db: Queryable, userId: string, campaignId: string) {
+  const access = isUuid(campaignId) ? await getCampaignAccess(db, userId, campaignId) : null;
+  if (!access?.canView) return null;
+  const campaign = (await db.query('SELECT name FROM campaigns WHERE id = $1', [campaignId])).rows[0];
+  if (!campaign) return null;
+  const libraries = await loadCampaignLibraries(db, campaignId);
+  const rows = await db.query(
+    `SELECT m.user_id, m.role, u.display_name,
+       count(c.id) FILTER (WHERE c.content_type = 'item')::int AS items,
+       count(c.id) FILTER (WHERE c.content_type = 'spell')::int AS spells,
+       count(c.id) FILTER (WHERE c.content_type IN ('feat', 'class_feature'))::int AS feats
+     FROM campaign_members m
+     JOIN users u ON u.id = m.user_id
+     LEFT JOIN content_definitions c ON c.scope = 'personal' AND c.owner_user_id = m.user_id AND NOT c.is_archived
+       AND c.content_type IN ('item', 'spell', 'feat', 'class_feature') AND (NOT c.hidden_from_players OR $2::boolean OR c.owner_user_id = $3::uuid)
+     WHERE m.campaign_id = $1
+     GROUP BY m.user_id, m.role, u.display_name
+     ORDER BY CASE m.role WHEN 'dm' THEN 0 WHEN 'co_dm' THEN 1 ELSE 2 END, lower(u.display_name)`,
+    [campaignId, access.canManage, userId]);
+  const members: CampaignLibraryMember[] = rows.rows.map((row) => ({
+    userId: row.user_id, displayName: row.display_name, role: row.role,
+    enabled: libraries.enabledOwnerIds.includes(row.user_id),
+    counts: libraries.enabledOwnerIds.includes(row.user_id) || access.canManage || row.user_id === userId
+      ? { item: row.items, spell: row.spells, feat: row.feats, total: row.items + row.spells + row.feats } : null
+  }));
+  return { campaignId, campaignName: campaign.name as string, archived: access.archived, canManage: access.canManage, members };
+}

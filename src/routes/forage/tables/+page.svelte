@@ -153,6 +153,7 @@
                   <strong>{entry.itemName}</strong>
                   <small class="muted">{entry.itemCategory}</small>
                   {#if entry.itemArchived}<span class="status-chip">Archived item</span>{/if}
+                  {#if entry.sourceLabel}<span class="status-chip">{entry.sourceLabel}</span>{/if}
                 </span>
                 <label class="forage-entry-field"><span class="forage-entry-label">Chance</span>
                   <select name="chance" disabled={!canEdit}>
