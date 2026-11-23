@@ -3409,3 +3409,20 @@ button.compact-button.active {
 .cast-lines { list-style: none; margin: 0.4rem 0; padding: 0; display: grid; gap: 0.15rem; }
 .cast-lines .short { color: var(--danger, #e06c6c); }
 .spell-picker-cost { font-size: 0.75em; color: #8a8; }
+
+/* Decks popup (decks unit 7). Reuses the forage-sheet field/warn/error/actions look. */
+.deck-sheet .forage-field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+.deck-sheet .forage-field select { min-height: 44px; width: 100%; }
+.deck-sheet .forage-warn { color: #ffb300; font-size: 13px; }
+.deck-sheet .forage-error { color: var(--danger); font-size: 13px; margin: 8px 0; }
+.deck-sheet .forage-actions { flex-wrap: wrap; margin-top: 10px; }
+.deck-sheet .text-button { min-height: 44px; padding: 0 8px; }
+.deck-sheet .deck-badge { margin-left: 6px; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; color: #111; background: var(--danger); }
+.deck-sheet .deck-badge.good { background: #ffb300; }
+.deck-sheet .deck-lines { margin: 8px 0; padding-left: 18px; }
+.deck-sheet .deck-choice { display: grid; gap: 4px; margin: 8px 0; }
+.deck-sheet .deck-choice button { min-height: 44px; }
+.deck-sheet .deck-description { white-space: pre-wrap; }
+.deck-sheet .deck-recent { margin-top: 12px; }
+.deck-sheet .deck-recent-row { border-top: 1px solid var(--border, #444); padding: 6px 0; }
+.deck-sheet .deck-recent-row p { margin: 2px 0; }

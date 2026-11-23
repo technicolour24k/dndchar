@@ -8,8 +8,10 @@
   import CatalogueSearch from '$lib/components/character/CatalogueSearch.svelte';
   import RollOptionsModal, { type AttackChoice } from '$lib/components/character/RollOptionsModal.svelte';
   import ForageModal from '$lib/components/character/ForageModal.svelte';
+  import DeckModal from '$lib/components/character/DeckModal.svelte';
   import { readOnlyLock } from '$lib/ui/readOnlyLock';
   import { forageBadgeText, forageUnavailableReason, forageUnavailableText, haulDecision } from '../../../../static/vtt-app/shared/forageView.js';
+  import { CHANGED_NOTE } from '../../../../static/vtt-app/shared/deckView.js';
   import type { ForageMine } from '$lib/types/forage';
   import CostRequestPrompt from './CostRequestPrompt.svelte';
   import { promptSpec, approvalErrorText, closedMessage, formForActivation, mineStep } from '../../../../static/vtt-app/shared/costApproval.js';
@@ -272,6 +274,36 @@
     } else {
       void invalidate('app:character-sheet');
     }
+  }
+
+  // Decks (decks plan, unit 7). The button shows when the character is in a campaign with an enabled deck and the
+  // viewer can act for it (owner or campaign DM; never a read-only viewer or the admin override).
+  const deckActor = $derived(!readOnly && !!character.campaignId && !!access && (access.isOwner || access.isCampaignDm));
+  let decksOpen = $state(false);
+  let campaignDecks = $state<Array<{ id: string; name: string; description: string }>>([]);
+  let deckRefreshTick = $state(0);
+  // A draw changed this sheet while it has unsaved edits: say so instead of reloading under the user's hands.
+  // The changes-only Save (unit 6) keeps the draw's HP, temp HP and coin, so the note is true.
+  let deckChangedNote = $state(false);
+  const deckCharacterId = $derived(character.id);
+  $effect(() => {
+    const id = deckCharacterId;
+    if (!id || !deckActor) { campaignDecks = []; return; }
+    untrack(() => void refreshDecks(id));
+  });
+  async function refreshDecks(id: string) {
+    try {
+      const response = await fetch(`/vtt/api/decks?characterId=${encodeURIComponent(id)}`);
+      if (!response.ok || id !== character.id) return;
+      campaignDecks = ((await response.json()) as { decks?: typeof campaignDecks }).decks ?? [];
+    } catch {
+      // Offline: the button just stays as it was.
+    }
+  }
+  // After a draw (here or elsewhere, via deck:ping): reload only when nothing is unsaved.
+  function deckLanded() {
+    if (hasUnsavedChanges) deckChangedNote = true;
+    else void invalidate('app:character-sheet');
   }
 
   // With no room, nothing else will fetch it for the badge. (In a room the subscription's first resync
@@ -1182,6 +1214,7 @@
         refreshActivityStatus();
         void refreshForage();
         void refreshCost();
+        if (decksOpen) deckRefreshTick += 1;
         fetchRollLogSince(sessionId, rollLogEntries.at(-1)?.id);
         if (liveEncounterId) fetchCombatLogSince(liveEncounterId, combatLogEntries.at(-1)?.id);
       },
@@ -1196,6 +1229,11 @@
           // Detail-free nudge (it carries no user id): fetch our own cost-request state, which only ever
           // holds this user's request for this character.
           untrack(() => void refreshCost());
+        } else if (msg.type === 'deck:ping') {
+          // Content-free: just the character ids a draw touched. Only our own sheet matters.
+          if (Array.isArray(msg.characterIds) && (msg.characterIds as string[]).includes(character.id)) {
+            untrack(() => { deckRefreshTick += 1; deckLanded(); });
+          }
         } else if (msg.type === 'forage:ping' && msg.playerId === character.ownerUserId) {
           // A detail-free nudge: fetch the private state over the authenticated endpoint. untrack so
           // nothing read in here can become a dependency of this effect (Review 3).
@@ -1390,7 +1428,7 @@
     } catch {
       // Non-JSON error page (e.g. a 500) - treat as a failed save.
     }
-    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; }
+    if (ok) { hasUnsavedChanges = false; haulWaitingForSave = false; deckChangedNote = false; }
     staleSheet = stale;
     saveStatus = ok ? 'Saved' : stale ? 'Not saved' : 'Save failed';
     return ok;
@@ -1996,6 +2034,7 @@
     // The safe choice (cancel / withdraw) is what Escape picks on the cost prompt.
     if (costPrompt && costPrompt.stage === 'prompt') { void chooseCost(promptSpec(costPrompt.mode).escape); return; }
     if (forageOpen) { forageOpen = false; return; }
+    if (decksOpen) { decksOpen = false; return; }
     if (rollOptions) { rollOptions = null; return; }
     if (rollResult) { rollResult = null; return; }
     if (simpleRollResult) { simpleRollResult = null; return; }
@@ -2037,7 +2076,7 @@
       // depends('app:character-sheet') rather than also re-running unrelated layout loads.
       await update({ reset: false, invalidateAll: false });
       if (result.type === 'success') {
-        hasUnsavedChanges = false; haulWaitingForSave = false; staleSheet = false;
+        hasUnsavedChanges = false; haulWaitingForSave = false; deckChangedNote = false; staleSheet = false;
         const next = (result.data as { sheetVersion?: number } | undefined)?.sheetVersion;
         if (typeof next === 'number') sheetToken = next;
       }
@@ -2133,6 +2172,9 @@
               <span class="save-state" class:unsaved={hasUnsavedChanges}>{saveStatus}</span>
               {#if haulWaitingForSave && hasUnsavedChanges}
                 <span class="forage-pending-note">Your find will appear when you save.</span>
+              {/if}
+              {#if deckChangedNote && hasUnsavedChanges}
+                <span class="forage-pending-note">{CHANGED_NOTE}</span>
               {/if}
               {#if result?.saved}
                 <span class="save-state good">Saved</span>
@@ -2346,6 +2388,9 @@
                   <span>Forage</span>{#if forageBadge}<span class="forage-status-badge">{forageBadge}</span>{/if}
                   {#if forageOff}<span class="forage-unavailable-note">{forageUnavailableText(forageOff)}</span>{/if}
                 </button>
+              {/if}
+              {#if deckActor && campaignDecks.length}
+                <button type="button" class="text-button" onclick={() => (decksOpen = true)}><span>Decks</span></button>
               {/if}
             </div>
           </div>
@@ -3130,6 +3175,17 @@
       onRefresh={refreshForage}
       onHaul={() => haulLanded()}
       onClose={() => (forageOpen = false)}
+    />
+  {/if}
+
+  {#if decksOpen && deckActor}
+    <DeckModal
+      characterId={character.id}
+      decks={campaignDecks}
+      canManage={!!access?.isCampaignDm}
+      refreshTick={deckRefreshTick}
+      onChanged={deckLanded}
+      onClose={() => (decksOpen = false)}
     />
   {/if}
 
