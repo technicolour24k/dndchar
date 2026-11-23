@@ -305,6 +305,12 @@ async function repointUses(db: ForkDb, campaignId: string, plan: ForkPlan, summa
   const ids = pairs(plan.idRemap);
   const resources = pairs(plan.resourceRemap);
   const count = (kind: string, n: number) => { if (n) summary.repointed[kind] = (summary.repointed[kind] ?? 0) + n; };
+  // Rows the NOT EXISTS guards skipped are the ones still pointing at an original after the UPDATE. They keep working
+  // (the original still resolves), so this only reports them, as the known-spell skip above does.
+  const reportLeft = async (sql: string, what: string, why: string) => {
+    const left = (await db.query(sql, [campaignId, ids.from, ids.to])).rows[0]?.n ?? 0;
+    if (left) summary.skipped.push(`${left} ${what}${left === 1 ? '' : 's'} stayed on the original because ${why}.`);
+  };
 
   // Known spells, feats and features. Same instance id, so preparation, notes and counters stay with it.
   const instances = await db.query(
@@ -319,6 +325,8 @@ async function repointUses(db: ForkDb, campaignId: string, plan: ForkPlan, summa
   if (movable.length) {
     const instanceIds = movable.map((row) => row.id);
     // Counters first (lock order), then the instance rows.
+    // Known quirk: this only remaps counters that point at the original. If the original gained a counter after the first
+    // fork, the moved instance's counter for it keeps pointing at the original's resource (the copy has no matching row).
     await db.query('SELECT id FROM character_content_resources WHERE character_content_id = ANY($1::uuid[]) ORDER BY id FOR UPDATE', [instanceIds]);
     await db.query(
       `UPDATE character_content_resources r SET resource_definition_id = m.copy_id
@@ -368,6 +376,8 @@ async function repointUses(db: ForkDb, campaignId: string, plan: ForkPlan, summa
      WHERE d.campaign_id = $1 AND d.deck_content_id = m.orig_id
        AND NOT EXISTS (SELECT 1 FROM campaign_decks y WHERE y.campaign_id = d.campaign_id AND y.deck_content_id = m.copy_id)`, [campaignId, ids.from, ids.to]);
   count('enabled decks', decks.rowCount ?? 0);
+  await reportLeft(`SELECT count(*)::int AS n FROM campaign_decks d JOIN unnest($2::uuid[], $3::uuid[]) AS m(orig_id, copy_id) ON m.orig_id = d.deck_content_id WHERE d.campaign_id = $1`,
+    'enabled deck', 'the campaign already enables the copy');
 
   // Forage entries (the key is (table, item), same care).
   const forage = await db.query(
@@ -376,6 +386,9 @@ async function repointUses(db: ForkDb, campaignId: string, plan: ForkPlan, summa
      WHERE t.id = f.find_table_id AND t.campaign_id = $1 AND f.item_id = m.orig_id
        AND NOT EXISTS (SELECT 1 FROM find_table_entries y WHERE y.find_table_id = f.find_table_id AND y.item_id = m.copy_id)`, [campaignId, ids.from, ids.to]);
   count('forage entries', forage.rowCount ?? 0);
+  await reportLeft(`SELECT count(*)::int AS n FROM find_table_entries f JOIN find_tables t ON t.id = f.find_table_id
+    JOIN unnest($2::uuid[], $3::uuid[]) AS m(orig_id, copy_id) ON m.orig_id = f.item_id WHERE t.campaign_id = $1`,
+    'forage entry', 'the table already has the copy');
 
   // References FROM the campaign's own entries (the copies and its authored decks) to the owner's entries.
   const grants = await db.query(
@@ -394,6 +407,10 @@ async function repointUses(db: ForkDb, campaignId: string, plan: ForkPlan, summa
     `UPDATE action_steps st SET effect_container_id = m.copy_id
      FROM content_definitions s, unnest($2::uuid[], $3::uuid[]) AS m(orig_id, copy_id)
      WHERE s.id = st.container_id AND s.scope = 'campaign' AND s.campaign_id = $1 AND st.effect_container_id = m.orig_id`, [campaignId, ids.from, ids.to]);
+  await reportLeft(`SELECT count(*)::int AS n FROM content_grants g JOIN content_definitions s ON s.id = g.source_content_id AND s.scope = 'campaign' AND s.campaign_id = $1
+    JOIN unnest($2::uuid[], $3::uuid[]) AS m(orig_id, copy_id) ON m.orig_id = g.granted_content_id`, 'grant on a campaign entry', 'it already grants the copy');
+  await reportLeft(`SELECT count(*)::int AS n FROM content_spell_access a JOIN content_definitions s ON s.id = a.owner_content_id AND s.scope = 'campaign' AND s.campaign_id = $1
+    JOIN unnest($2::uuid[], $3::uuid[]) AS m(orig_id, copy_id) ON m.orig_id = a.spell_content_id`, 'spell access on a campaign entry', 'it already has access to the copy');
   count('references from campaign entries', (grants.rowCount ?? 0) + (access.rowCount ?? 0) + (steps.rowCount ?? 0));
 
   // Condition keys in the campaign's decks' rules. Rewritten only when something changes, so a DM's other edits stay.

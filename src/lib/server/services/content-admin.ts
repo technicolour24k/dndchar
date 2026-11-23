@@ -4,29 +4,33 @@ import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/se
 import { parseCostJson, validateCostEntries } from '$lib/rules/cost';
 import type { CostEntry } from '$lib/types/cost';
 import type { ContentType } from '$lib/types/content';
-import { assertReferenceAllowed, loadCampaignLibraries } from '$lib/server/services/library';
+import { assertReferenceAllowed, loadCampaignLibraries, loadLibraryActor } from '$lib/server/services/library';
 import { canReference, type EntryFacts } from '$lib/library/rules';
 
 export type AdminContentRecord={id:string;type:ContentType;name:string;description:string;key:string;sourceKind:string;
   isArchived:boolean;spellLevel:number|null;school:string;castingTime:string;range:string;components:string;duration:string;
   ritual:boolean;concentration:boolean;classes:string[];category:string;equipmentType:string;requiresAttunement:boolean;
   acBonus:number;toHitBonus:number;damageBonus:number;attackAbility:string;damageRolls:string;
-  resolutionType:string;damageType:string;baseDice:string;saveAbility:string;saveEffect:string;scaling:any;costJson:CostEntry[]|null};
+  resolutionType:string;damageType:string;baseDice:string;saveAbility:string;saveEffect:string;scaling:any;costJson:CostEntry[]|null;
+  scope?:'global'|'personal'|'campaign';ownerName?:string;campaignName?:string};
 
 // The scope a candidate list is offered for: the selected entry's own scope/owner/campaign, or `opts.source` when
 // nothing is selected (e.g. an empty library). Default is global, so existing /admin pages offer global entries only.
 type CandidateSource={scope:'global'|'personal'|'campaign';ownerUserId:string|null;campaignId:string|null};
 
 // `opts.ownerUserId` narrows the entry list to one user's personal library (the /library page); `opts.campaignId` to one campaign's
-// own entries, i.e. its forked copies (/campaigns/[id]/homebrew); omitted = everything (/admin).
-export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource;ownerUserId?:string;campaignId?:string}={}){
+// own entries, i.e. its forked copies (/campaigns/[id]/homebrew); omitted = everything (/admin). `opts.scope` is the /admin
+// ?scope= filter (global|personal|campaign; anything else = all).
+export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource;ownerUserId?:string;campaignId?:string;scope?:string}={}){
   const content=await query<any>(`SELECT c.*,s.spell_level,s.school,s.casting_time,s.spell_range,s.components,s.duration,
     s.ritual,s.concentration,s.classes,s.resolution_type,s.damage_type,s.base_dice,s.save_ability,s.save_effect,s.scaling_json,
     i.category,i.equipment_type,i.requires_attunement,i.ac_bonus,i.to_hit_bonus,
-    i.damage_bonus,i.attack_ability,i.damage_rolls FROM content_definitions c
+    i.damage_bonus,i.attack_ability,i.damage_rolls,u.display_name AS owner_name,camp.name AS campaign_name FROM content_definitions c
     LEFT JOIN spell_definitions s ON s.content_id=c.id LEFT JOIN item_definitions i ON i.content_id=c.id
+    LEFT JOIN users u ON u.id=c.owner_user_id LEFT JOIN campaigns camp ON camp.id=c.campaign_id
     WHERE c.content_type=ANY($1::text[]) AND ($2::uuid IS NULL OR (c.scope='personal' AND c.owner_user_id=$2::uuid))
-    AND ($3::uuid IS NULL OR (c.scope='campaign' AND c.campaign_id=$3::uuid)) ORDER BY c.is_archived,c.name`,[types,opts.ownerUserId??null,opts.campaignId??null]);
+    AND ($3::uuid IS NULL OR (c.scope='campaign' AND c.campaign_id=$3::uuid)) AND ($4::text IS NULL OR c.scope=$4::text)
+    ORDER BY c.is_archived,c.name`,[types,opts.ownerUserId??null,opts.campaignId??null,['global','personal','campaign'].includes(opts.scope||'')?opts.scope:null]);
   const records=content.rows.map(mapContent);const selectedContentId=records.some((entry)=>entry.id===selectedId)?selectedId:records[0]?.id||'';
   const modifiers=await query<any>(`SELECT m.id,m.target,m.modifier_type,COALESCE(m.default_value_expression,'') AS default_value_expression,
     COALESCE(m.label,'') AS label,COALESCE(t.label,m.target) AS target_label,COALESCE(t.runtime_supported,false) AS runtime_supported
@@ -67,7 +71,7 @@ export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{s
     ORDER BY is_archived,sort_order,label`,[selectedContentId]);
   const spellAccess=selectedContentId?await query<any>(`SELECT access.*,spell.name AS spell_name FROM content_spell_access access
     JOIN content_definitions spell ON spell.id=access.spell_content_id WHERE access.owner_content_id=$1 ORDER BY access.sort_order,spell.name`,[selectedContentId]):{rows:[]};
-  return{content:records,selectedContentId,modifiers:modifiers.rows.map((row:any)=>({id:row.id,target:row.target,targetLabel:row.target_label,
+  return{content:records,selectedContentId,scopeFilter:['global','personal','campaign'].includes(opts.scope||'')?opts.scope:'',modifiers:modifiers.rows.map((row:any)=>({id:row.id,target:row.target,targetLabel:row.target_label,
     modifierType:row.modifier_type,defaultValueExpression:row.default_value_expression,label:row.label,runtimeSupported:row.runtime_supported})),
     attachedModifiers:attached.rows.map((row:any)=>({id:row.id,activationType:row.activation_type,target:row.target,targetLabel:row.target_label,
       modifierType:row.modifier_type,valueExpression:row.value_expression,conditionExpression:row.condition_expression,priority:row.priority})),
@@ -78,6 +82,43 @@ export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{s
     grantCandidates:referable(grantCandidates.rows).map((row:any)=>({id:row.id,name:row.name,type:row.content_type})),
     pools:pools.rows.map((row:any)=>({key:row.pool_key,label:row.label})),
     spellCandidates:referable(spellCandidates.rows).map((row:any)=>({id:row.id,name:row.name})),spellAccess:spellAccess.rows.map(mapSpellAccess)};
+}
+
+// Promote a personal item/spell/feat/class feature to global (admin only, one way, keeps the id). Its own action
+// containers go with it. Refused while it references any other personal entry, because a global entry may only
+// reference global ones (canReference). Held copies are untouched: the id doesn't change, only who can pick it.
+// The owner is cleared so the entry reads as plain global everywhere ("owner_user_id IS NULL" is global in the deck code),
+// and the Q3 "hidden from players" flag is dropped because it only exists on personal and campaign entries.
+export async function promoteContentToGlobal(adminUserId:string,form:FormData){
+  const id=String(form.get('contentId')||'');
+  const result=await withTransaction(async(client)=>{
+    if(!(await loadLibraryActor(client,adminUserId)).isAdmin)throw new Error('Only admins can promote entries to global.');
+    const found=await client.query<{content_type:ContentType;scope:string;owner_user_id:string|null;name:string}>(
+      'SELECT content_type,scope,owner_user_id,name FROM content_definitions WHERE id=$1 FOR UPDATE',[id]);
+    const entry=found.rows[0];
+    if(!entry)throw new Error('Catalogue entry not found.');
+    if(entry.scope!=='personal')throw new Error('Only personal library entries can be promoted.');
+    if(!['item','spell','feat','class_feature'].includes(entry.content_type))throw new Error('Only items, spells, feats and class features can be promoted.');
+    // The entry plus the action containers it owns: these move together, so references between them are fine.
+    const own=await client.query<{id:string}>(
+      `SELECT $1::uuid AS id UNION SELECT l.action_container_id FROM content_action_links l
+       JOIN content_definitions a ON a.id=l.action_container_id WHERE l.content_id=$1 AND a.scope='personal' AND a.owner_user_id=$2`,[id,entry.owner_user_id]);
+    const ids=own.rows.map((row)=>row.id);
+    const personalRefs=await client.query<{name:string}>(
+      `SELECT t.name FROM content_definitions t WHERE t.scope<>'global' AND t.id<>ALL($1::uuid[]) AND t.id IN (
+         SELECT granted_content_id FROM content_grants WHERE source_content_id=ANY($1::uuid[])
+         UNION SELECT spell_content_id FROM content_spell_access WHERE owner_content_id=ANY($1::uuid[])
+         UNION SELECT effect_container_id FROM action_steps WHERE container_id=ANY($1::uuid[]) AND effect_container_id IS NOT NULL
+         UNION SELECT action_container_id FROM content_action_links WHERE content_id=ANY($1::uuid[])) LIMIT 5`,[ids]);
+    if(personalRefs.rowCount)throw new Error(`${entry.name} references personal entries (${personalRefs.rows.map((row)=>row.name).join(', ')}). Promote or detach those first.`);
+    await client.query(
+      `UPDATE content_definitions SET scope='global',owner_user_id=NULL,hidden_from_players=false,updated_at=now(),
+         metadata_json=metadata_json||jsonb_build_object('promoted',jsonb_build_object('fromOwnerUserId',$2::text,'at',now()))
+       WHERE id=ANY($1::uuid[])`,[ids,entry.owner_user_id]);
+    return id;
+  });
+  invalidateReferenceData('promoteContentToGlobal');
+  return result;
 }
 
 export async function createAdminContent(userId:string,type:ContentType,form:FormData){const name=String(form.get('name')||'').trim();if(!name)throw new Error('Name is required.');
@@ -171,7 +212,7 @@ export async function removeSpellAccess(form:FormData){const id=String(form.get(
 function groupActions(rows:any[]){const map=new Map<string,any>();for(const row of rows){const action=map.get(row.id)||{id:row.id,linkId:row.link_id,name:row.name,description:row.description,triggerType:row.trigger_type,steps:[]};if(row.step_id)action.steps.push({id:row.step_id,type:row.step_type,operation:row.operation,targetType:row.target_type,targetKey:row.target_key,valueExpression:row.value_expression,effectId:row.effect_id,targetMode:row.target_mode,label:row.label,sortOrder:row.sort_order});map.set(row.id,action);}return[...map.values()];}
 function mapSpellAccess(row:any){return{id:row.id,spellContentId:row.spell_content_id,spellName:row.spell_name,accessType:row.access_type,availabilityType:row.availability_type,resourceDefinitionId:row.resource_definition_id,resourceCostExpression:row.resource_cost_expression,castLevelMode:row.cast_level_mode,fixedCastLevel:row.fixed_cast_level,saveDcMode:row.save_dc_mode,fixedSaveDc:row.fixed_save_dc,spellAttackMode:row.spell_attack_mode,fixedSpellAttackBonus:row.fixed_spell_attack_bonus};}
 function mapContent(row:any):AdminContentRecord{return{id:row.id,type:row.content_type,name:row.name,description:row.description,key:row.content_key,sourceKind:row.source_kind,isArchived:row.is_archived,spellLevel:row.spell_level,school:row.school||'',castingTime:row.casting_time||'',range:row.spell_range||'',components:row.components||'',duration:row.duration||'',ritual:Boolean(row.ritual),concentration:Boolean(row.concentration),classes:row.classes||[],category:row.category||'gear',equipmentType:row.equipment_type||'item',requiresAttunement:Boolean(row.requires_attunement),acBonus:row.ac_bonus||0,toHitBonus:row.to_hit_bonus||0,damageBonus:row.damage_bonus||0,attackAbility:row.attack_ability||'str',damageRolls:row.damage_rolls||'',
-  resolutionType:row.resolution_type||'attack',damageType:row.damage_type||'',baseDice:row.base_dice||'',saveAbility:row.save_ability||'dex',saveEffect:row.save_effect||'half',scaling:row.scaling_json||{},costJson:Array.isArray(row.cost_json)?row.cost_json:null};}
+  resolutionType:row.resolution_type||'attack',damageType:row.damage_type||'',baseDice:row.base_dice||'',saveAbility:row.save_ability||'dex',saveEffect:row.save_effect||'half',scaling:row.scaling_json||{},costJson:Array.isArray(row.cost_json)?row.cost_json:null,scope:row.scope,ownerName:row.owner_name||'',campaignName:row.campaign_name||''};}
 // Builds spell_definitions.scaling_json from the admin form's plain inputs - a
 // "Scales?" kind select gates which pair of fields is read, so authoring a
 // non-scaling spell (most saves/debuffs) just leaves both blank -> {}.

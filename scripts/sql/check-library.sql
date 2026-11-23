@@ -20,7 +20,8 @@ WHERE parent.scope IS DISTINCT FROM action.scope
 
 -- Unforked leavers: uses by a campaign of a personal entry whose owner is no longer a member of that campaign.
 -- Must be 0 rows once the fork on leave ships (its repair script fixes any left over). Covers characters' items,
--- known content, applied effects, enabled decks and find table items.
+-- known content, applied effects, enabled decks, find table items and condition keys inside campaign deck rules
+-- (the same set loadUses in services/libraryFork.ts reads).
 WITH uses AS (
   SELECT ch.campaign_id, i.source_content_id AS content_id
     FROM character_inventory_items i JOIN characters ch ON ch.id = i.character_id
@@ -38,6 +39,13 @@ WITH uses AS (
   UNION
   SELECT t.campaign_id, fe.item_id
     FROM find_table_entries fe JOIN find_tables t ON t.id = fe.find_table_id
+  UNION
+  -- Condition keys in a campaign deck's rules are stored by content_key, so match the quoted key in the rules text.
+  SELECT deck.campaign_id, cond.id
+    FROM content_definitions deck JOIN deck_definitions dd ON dd.content_id = deck.id
+    JOIN content_definitions cond ON cond.content_type = 'condition' AND cond.scope = 'personal'
+     AND position('"' || cond.content_key || '"' in dd.rules_json::text) > 0
+    WHERE deck.scope = 'campaign' AND deck.campaign_id IS NOT NULL
 )
 SELECT DISTINCT u.campaign_id, c.content_key, c.owner_user_id
 FROM uses u JOIN content_definitions c ON c.id = u.content_id

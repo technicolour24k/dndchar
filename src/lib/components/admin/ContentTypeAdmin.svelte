@@ -16,8 +16,12 @@
   }=$props();
   // Admin pages keep the plain "?/name" action URLs. Library pages carry their query along (and the selected entry,
   // so a failed save re-renders the same entry): "?type=feat&content=<id>&/update".
-  const act=(name:string)=>extraQuery?`?${extraQuery}&${selected?`content=${selected.id}&`:''}/${name}`:`?/${name}`;
-  const entryHref=(id:string)=>`?${extraQuery?extraQuery+'&':''}content=${id}`;
+  const act=(name:string)=>extraQuery?`?${extraQuery}&${selected?`content=${selected.id}&`:''}/${name}`:`?${mode==='admin'&&data.scopeFilter?`scope=${data.scopeFilter}&`:''}/${name}`;
+  // /admin only: the ?scope= filter (unit I) is kept on entry links. Everything else uses extraQuery.
+  const scopeFilter=$derived(mode==='admin'?String(data.scopeFilter||''):'');
+  const entryHref=(id:string)=>`?${extraQuery?extraQuery+'&':''}${scopeFilter?`scope=${scopeFilter}&`:''}content=${id}`;
+  // "personal / Bob" or "campaign / Campaign name", shown on /admin rows so non-global entries stand out.
+  const scopeLabel=(entry:AdminContentRecord)=>entry.scope==='personal'?`personal / ${entry.ownerName||'unknown'}`:entry.scope==='campaign'?`campaign / ${entry.campaignName||'unknown'}`:'';
   const selected=$derived(data.content.find((entry:AdminContentRecord)=>entry.id===data.selectedContentId) as AdminContentRecord|undefined);
   // An on_use Spend Item step already pays the item's quantity (see CostEditor's warning).
   const hasSpendItemStep=$derived(data.actions.some((action:any)=>action.triggerType==='on_use'&&action.steps.some((step:any)=>step.type==='spend_item')));
@@ -48,6 +52,7 @@
   <aside class="panel stack content-selector-panel admin-library-panel">
     <div class="panel-head"><h2>{title.replace(' Library','')}</h2><span class="muted">{data.content.length}</span></div>
     <label class="admin-search-field"><span class="sr-only">Search library</span><input bind:value={librarySearch} placeholder={`Search ${title.toLowerCase()}...`}/></label>
+    {#if mode==='admin'}<nav class="button-row" aria-label="Filter by scope">{#each [['','All'],['global','Global'],['personal','Personal'],['campaign','Campaign']] as [value,label]}<a href={value?`?scope=${value}`:'?'} class="status-chip" class:active={scopeFilter===value} aria-current={scopeFilter===value?'true':undefined}>{label}</a>{/each}</nav>{/if}
     {#if mode!=='campaign'}<details class="admin-create-disclosure"><summary>+ New {createType.replace('_',' ')}</summary><form method="POST" action={act('create')} class="stack admin-form">
       <h3>Create {createType.replace('_',' ')}</h3>
       {#if allowedTypes.length > 1}
@@ -61,7 +66,7 @@
       {#each filteredContent as entry}
         <a href={entryHref(entry.id)} class="admin-library-item" class:active={entry.id===data.selectedContentId}>
           <span class="admin-library-icon" aria-hidden="true">{entry.type==='spell'?'✦':entry.type==='item'?'◆':'★'}</span>
-          <span><strong>{entry.name}</strong><small>{entry.type.replace('_',' ')}{mode==='admin'?` · ${entry.sourceKind}`:''}{data.hidden?.[entry.id]?' · hidden':''}{entry.isArchived?' · archived':''}</small></span>
+          <span><strong>{entry.name}</strong><small>{entry.type.replace('_',' ')}{mode==='admin'?` · ${entry.sourceKind}`:''}{mode==='admin'&&scopeLabel(entry)?` · ${scopeLabel(entry)}`:''}{data.hidden?.[entry.id]?' · hidden':''}{entry.isArchived?' · archived':''}</small></span>
           <span class="admin-library-arrow" aria-hidden="true">›</span>
         </a>
       {:else}<p class="muted">No matching entries.</p>{/each}
@@ -70,7 +75,7 @@
 
   <section class="panel stack content-editor-panel">
     {#if selected}
-      <div class="panel-head"><div><p class="eyebrow">{selected.type.replace('_',' ')}{mode==='admin'?` / ${selected.sourceKind}`:''}</p><h2>{selected.name}</h2></div><span class="status-chip">{selected.isArchived?'Archived':'Available'}</span></div>
+      <div class="panel-head"><div><p class="eyebrow">{selected.type.replace('_',' ')}{mode==='admin'?` / ${selected.sourceKind}`:''}</p><h2>{selected.name}</h2></div>{#if mode==='admin'&&scopeLabel(selected)}<span class="status-chip">{scopeLabel(selected)}</span>{/if}<span class="status-chip">{selected.isArchived?'Archived':'Available'}</span></div>
       <form method="POST" action={act('update')} class="stack">
         <input type="hidden" name="contentId" value={selected.id}/>
         <label>Name<input name="name" value={selected.name} required/></label>
@@ -117,6 +122,7 @@
         {#if notice}<p class="muted">{notice}</p>{/if}
         <div class="button-row"><button type="submit">Save Entry</button><button type="submit" formaction={act('archive')} class="danger">{selected.isArchived?'Restore':'Archive'}</button></div>
       </form>
+      {#if mode==='admin'&&selected.scope==='personal'&&['item','spell','feat','class_feature'].includes(selected.type)}<form method="POST" action={act('promote')} class="stack admin-form" onsubmit={(event)=>{if(!confirm('Promote to global? Everyone will be able to add it, and this cannot be undone. Copies already held are unchanged.'))event.preventDefault();}}><input type="hidden" name="contentId" value={selected.id}/><p class="muted">Personal entry by {selected.ownerName||'unknown'}. Promoting makes it global for everyone (one way).</p><button type="submit">Promote to global</button></form>{/if}
       {#if canAuthorMechanics}<div class="content-rule-summary">
         <button type="button" class:active={attachmentTab==='modifiers'} onclick={()=>attachmentTab='modifiers'}>Modifiers <strong>{data.attachedModifiers.length}</strong></button>
         <button type="button" class:active={attachmentTab==='effects'} onclick={()=>attachmentTab='effects'}>Effects <strong>{data.attachedEffects.length}</strong></button>
