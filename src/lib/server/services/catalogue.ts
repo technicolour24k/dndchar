@@ -532,7 +532,10 @@ export async function getCombatClock(characterId: string): Promise<{ roundNumber
   return { roundNumber: result.rows[0].round_number, turnNumber: result.rows[0].turn_number };
 }
 
-export async function advanceCharacterRound(userId: string, characterId: string): Promise<void> {
+// tickTurnEffects: the VTT GM's Next round has no initiative tracker, so it also counts down the
+// turn_start / turn_end effects by one. The sheet's own Next Round passes nothing and is unchanged.
+export async function advanceCharacterRound(userId: string, characterId: string, options: { tickTurnEffects?: boolean } = {}): Promise<void> {
+  const boundaries = options.tickTurnEffects ? ['round_end', 'next_attack', 'turn_start', 'turn_end'] : ['round_end', 'next_attack'];
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
     await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
@@ -540,7 +543,7 @@ export async function advanceCharacterRound(userId: string, characterId: string)
       ON CONFLICT (character_id) DO UPDATE SET round_number = character_combat_clocks.round_number + 1,
         turn_number = 1, updated_at = now()`, [characterId]);
     await client.query(`UPDATE active_character_effects SET remaining_rounds = GREATEST(0, remaining_rounds - 1)
-      WHERE character_id = $1 AND remaining_rounds IS NOT NULL AND expiry_boundary IN ('round_end','next_attack')`, [characterId]);
+      WHERE character_id = $1 AND remaining_rounds IS NOT NULL AND expiry_boundary = ANY($2::text[])`, [characterId, boundaries]);
     await client.query(`DELETE FROM active_character_effects WHERE character_id = $1 AND remaining_rounds = 0`, [characterId]);
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
       FROM content_resource_definitions d, character_content_instances i WHERE r.resource_definition_id = d.id

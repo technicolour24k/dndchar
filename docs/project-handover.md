@@ -875,7 +875,7 @@ Deploy note (decks and homebrew library)
 
 The user runs every prod step themselves. A session never touches .env.prod or Neon.
 
-1. Apply migrations 046-050 in order with npm run db:migrate:prod BEFORE deploying (046-049 are next-attack expiry, deck schema, the Deck of Mystical Fate seed and campaign-owned decks; 050 is the homebrew library).
+1. Apply migrations 046-051 in order with npm run db:migrate:prod BEFORE deploying (046-049 are next-attack expiry, deck schema, the Deck of Mystical Fate seed and campaign-owned decks; 050 is the homebrew library; 051 is the joker player-facing text on the global Mystical Fate seed). Old code simply ignores 051's new fields, so the order is safe either way.
 2. Deploy library units D-G together (campaign library page, decks, personal conditions, fork on leave). Library content becomes usable in campaigns from D, so a member leaving before G is live would leave references to their library behind.
 3. Then repair anyone who left in between. Dry run first, then for real:
    npx tsx --env-file=.env.prod scripts/fork-former-members.ts --dry-run --allow-remote

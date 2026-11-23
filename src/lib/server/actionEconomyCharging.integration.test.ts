@@ -22,7 +22,7 @@ describe.skipIf(!enabled)('the cost engine charges the turn', () => {
     const { query, withTransaction } = await import('$lib/server/db');
     const { createCharacter, getCharacter } = await import('./services/characters');
     const { createCampaign, addCharacterToCampaign, setCampaignActionEconomy } = await import('./services/campaigns');
-    const { castCharacterSpell, castCharacterSpellDetailed, useInventoryCatalogueItem, advanceCharacterTurn, restCharacter, newBattle } = await import('./services/catalogue');
+    const { castCharacterSpell, castCharacterSpellDetailed, useInventoryCatalogueItem, advanceCharacterTurn, advanceCharacterRound, restCharacter, newBattle } = await import('./services/catalogue');
     const { CostShortfallError, FollowupGoneError, payActivationCost } = await import('./services/cost-engine');
     const { reviewOverride } = await import('./services/resource-pools');
     const tag = `zzchg${crypto.randomBytes(4).toString('hex')}`;
@@ -392,6 +392,21 @@ describe.skipIf(!enabled)('the cost engine charges the turn', () => {
       await expect(castDetailed(mage, mageBall, { slotLevel: '5', followup: 'require' })).rejects.toBeInstanceOf(FollowupGoneError);
       expect(await slot(mage, 5)).toBe(1);
       expect(await left(mage)).toEqual({ attack: 1, utility: 2 });
+
+      // ---- the VTT's Next round also ticks turn-based effects; the sheet's own Next Round does not ------
+      const tick = await mkCharacter('Ticker');
+      const effectRow = async (boundary: string) => {
+        const effect = (await query<{ id: string }>(
+          `INSERT INTO effect_definitions (effect_key, name, source_type, duration_type) VALUES ($1,$2,'custom','rounds') RETURNING id`, [`${tag}${n++}`, `IT ${boundary}`])).rows[0].id;
+        await query(`INSERT INTO active_character_effects (character_id, effect_id, remaining_rounds, expiry_boundary) VALUES ($1,$2,5,$3)`, [tick, effect, boundary]);
+        return async () => (await query<any>(`SELECT remaining_rounds FROM active_character_effects WHERE character_id=$1 AND effect_id=$2`, [tick, effect])).rows[0]?.remaining_rounds;
+      };
+      const roundEffect = await effectRow('round_end');
+      const turnEffect = await effectRow('turn_start');
+      await advanceCharacterRound(userId, tick); // the sheet's Next Round: round effects only
+      expect([await roundEffect(), await turnEffect()]).toEqual([4, 5]);
+      await advanceCharacterRound(userId, tick, { tickTurnEffects: true }); // the VTT GM's Next round: both
+      expect([await roundEffect(), await turnEffect()]).toEqual([3, 4]);
 
       // The turn row is the first lock: casts racing long rests never deadlock.
       const racer = await mkCharacter('Racer');

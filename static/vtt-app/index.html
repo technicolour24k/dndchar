@@ -53,6 +53,11 @@
   </div>
   <!-- A passing message that doesn't block play (e.g. "The DM has taken the GM seat."). -->
   <div id="campaignBanner" hidden></div>
+  <!-- "Next round" card for players: passing, never blocks play, stays until dismissed. -->
+  <div id="roundCard" role="status" hidden>
+    <span>Next round, tell the DM if there's something you want to do</span>
+    <button type="button" id="roundCardOk" class="secondary">OK</button>
+  </div>
   <!-- "New map" banner when a DM shares an overworld map (campaign tables only). -->
   <div id="overworldBanner" hidden></div>
   <!-- Full-screen overworld (campaign tables only): an iframe is added on open and removed on close. -->

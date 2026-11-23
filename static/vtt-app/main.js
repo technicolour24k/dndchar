@@ -1012,6 +1012,11 @@ function handleMessage(msg) {
       costApproval.onPing();
       break;
 
+    // The GM called the next round (players only; the GM presses the button).
+    case 'round:next':
+      onRoundNext();
+      break;
+
     // A DM shared an overworld map (campaign tables only).
     case 'overworld:granted':
       overworld.onGranted(msg);
@@ -3620,6 +3625,52 @@ async function resetAllTurns() {
   } catch { /* movement was reset over the socket; actions follow on the next sync */ }
 }
 
+// GM "Next round": the server advances every character on the map (round and turn effects tick, spent
+// actions and follow-ups clear) and resets every token's movement (broadcast to the room). This pushes the
+// fresh turn copies onto the tokens, like Reset all. A 409 too_soon (a double click) is ignored quietly.
+let nextRoundBusy = false;
+async function nextRound() {
+  if (!sessionId || nextRoundBusy) return;
+  nextRoundBusy = true;
+  document.getElementById('nextRoundBtn')?.setAttribute('disabled', '');
+  dropRepeatButton(); // an Extra Attack button on an open result is no longer valid
+  try {
+    const res = await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/next-round', { method: 'POST' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (body.error !== 'too_soon') showMovePlanNotice("Couldn't start the next round.", 4000);
+      return;
+    }
+    for (const token of Object.values(session.tokens)) {
+      const view = token.characterId && body.views?.[token.characterId];
+      if (view) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: view });
+    }
+    const count = Number(body.advanced) || 0;
+    const skipped = Number(body.skipped) || 0;
+    showMovePlanNotice(`Next round: ${count} ${count === 1 ? 'character' : 'characters'}${skipped ? `, ${skipped} skipped` : ''}`, 4000);
+  } catch {
+    showMovePlanNotice("Couldn't start the next round.", 4000);
+  } finally {
+    nextRoundBusy = false;
+    document.getElementById('nextRoundBtn')?.removeAttribute('disabled');
+  }
+}
+
+// Players: a passing card when the GM calls the next round. It never blocks play and stays until dismissed.
+// One card at a time (a second round:next just shows it again). The text is fixed, nothing from data.
+const roundCard = document.getElementById('roundCard');
+document.getElementById('roundCardOk')?.addEventListener('click', () => { roundCard.hidden = true; });
+function onRoundNext() {
+  dropRepeatButton();
+  if (roundCard) roundCard.hidden = false;
+}
+
+// A new round makes any waiting free repeat stale: take the button off an open attack result.
+function dropRepeatButton() {
+  lastAttack = null;
+  document.getElementById('attackRepeatBtn')?.remove();
+}
+
 // Sidebar Dash button: a dash with no move behind it (just adds speed to this turn's movement).
 function dashButtonClicked(tokenId) {
   const token = session?.tokens[tokenId];
@@ -3795,9 +3846,11 @@ function roomInfoHtml(roleLabel) {
 function combatControlHtml() {
   const active = !!session.encounterId;
   const statusLine = active ? `<div class="combat-encounter-id">Combat is active in this room.</div>` : '';
-  const gmButton = role !== 'gm' ? '' : active
+  // The GM's Next round sits with the combat controls in every room (there is no initiative tracker).
+  const nextRoundHtml = `<button type="button" id="nextRoundBtn" class="secondary" ${nextRoundBusy ? 'disabled' : ''}>Next round</button>`;
+  const gmButton = role !== 'gm' ? '' : (active
     ? `<button type="button" id="stopCombatBtn" class="secondary">Stop Combat</button>`
-    : `<button type="button" id="startCombatBtn">Start Combat</button>`;
+    : `<button type="button" id="startCombatBtn">Start Combat</button>`) + nextRoundHtml;
   if (!gmButton && !statusLine) return '';
   return `<div class="field" id="combatControl">${gmButton}${statusLine}</div>`;
 }
@@ -4318,6 +4371,7 @@ function markerListHtml(isGm) {
 function wireGmSidebar() {
   document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
   document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+  document.getElementById('nextRoundBtn')?.addEventListener('click', () => { void nextRound(); });
   wireSessionNotesControls();
 
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
