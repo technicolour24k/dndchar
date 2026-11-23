@@ -3425,6 +3425,12 @@ button.compact-button.active {
 .deck-sheet .deck-choice { display: grid; gap: 4px; margin: 8px 0; }
 .deck-sheet .deck-choice button { min-height: 44px; }
 .deck-sheet .deck-description { white-space: pre-wrap; }
+/* One row per deck (matches the VTT popup): 14px on a mouse, 44px on touch. */
+.deck-sheet .deck-row { display: flex; align-items: center; gap: 6px; font-size: 14px; border: 1px solid var(--border, #444); border-radius: 6px; padding: 6px 10px; margin-bottom: 4px; }
+.deck-sheet .deck-row-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.deck-sheet .deck-row button { font-size: 14px; padding: 4px 10px; }
+.deck-sheet .deck-description { margin: 0 0 8px; padding: 0 10px; font-size: 14px; }
+@media (pointer: coarse) { .deck-sheet .deck-row button { min-height: 44px; min-width: 44px; } }
 .deck-sheet .deck-recent { margin-top: 12px; }
 .deck-sheet .deck-recent-row { border-top: 1px solid var(--border, #444); padding: 6px 0; }
 .deck-sheet .deck-recent-row p { margin: 2px 0; }

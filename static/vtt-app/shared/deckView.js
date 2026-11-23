@@ -80,6 +80,30 @@ export function lastDrawLine(draw) {
   return `Last draw: ${draw?.drawerName} drew the ${cardTitle(draw?.card)}${result}`;
 }
 
+/** The sticky GM toast headline for a draw that leaves the DM something to do: "Waiting on you: Red Joker: <task>". */
+export function waitingOnYouTitle(draw) {
+  const open = (draw?.dmTasks ?? []).filter((task) => !task.done && task.text).map((task) => task.text);
+  return `Waiting on you: ${draw?.card?.label ?? 'Card'}${open.length ? `: ${open.join('; ')}` : ''}`;
+}
+
+/** What to store when the GM dismisses the Deck box (or re-dismisses it after an undo): the draw and tasks seen now. */
+export function hiddenState(last, tasks) {
+  return { lastDrawId: last?.id ?? null, taskIds: (tasks ?? []).map((task) => task.taskId ?? task.id) };
+}
+
+/**
+ * Is the GM's Deck box dismissed? `storedRaw` is what localStorage held (a JSON string, or null/garbage).
+ * It stays hidden only while nothing NEW has arrived: the last draw is the one that was dismissed, and every
+ * open task was already there. A new draw or a new task shows it again; ticking a task off or an undo never does.
+ */
+export function deckBlockHidden(storedRaw, last, tasks) {
+  let stored;
+  try { stored = JSON.parse(storedRaw); } catch { return false; }
+  if (!stored || typeof stored !== 'object' || !Array.isArray(stored.taskIds)) return false;
+  if ((last?.id ?? null) !== (stored.lastDrawId ?? null)) return false;
+  return (tasks ?? []).every((task) => stored.taskIds.includes(task.taskId ?? task.id));
+}
+
 /** Player-facing text for an error body from the deck endpoints. */
 export function errorText(error) {
   switch (error) {

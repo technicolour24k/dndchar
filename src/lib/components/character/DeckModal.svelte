@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import { backdropPress } from '$lib/ui/backdropPress';
   import type { DrawView } from '$lib/types/decks';
   import {
@@ -45,14 +44,17 @@
     }
   }
 
-  let deckId = $state(untrack(() => decks[0]?.id ?? ''));
+  // Decks whose (?) description is showing. A Set in $state would not notice add/delete, so it is replaced on toggle.
+  let aboutOpen = $state<string[]>([]);
+  function toggleAbout(id: string) {
+    aboutOpen = aboutOpen.includes(id) ? aboutOpen.filter((entry) => entry !== id) : [...aboutOpen, id];
+  }
   let busy = $state(false);
   let loading = $state(true);
   let message = $state('');
   let choosing = $state<DrawView | null>(null);
   let result = $state<DrawView | null>(null);
   let recent = $state<DrawView[]>([]);
-  const deck = $derived(decks.find((entry) => entry.id === deckId) ?? decks[0] ?? null);
 
   // Only the latest load may write state: an older GET that returns after an action must not flip the modal back
   // (e.g. to the Ace screen after choose()). Every action bumps this too, so loads started before it are dropped.
@@ -73,10 +75,10 @@
     void load();
   });
 
-  async function draw() {
-    if (!deck || busy) return;
+  async function draw(deckId: string) {
+    if (busy) return;
     busy = true; loadSeq += 1; message = ''; result = null;
-    const { ok, status, data } = await api('POST', `${API}/draw`, { characterId, deckId: deck.id });
+    const { ok, status, data } = await api('POST', `${API}/draw`, { characterId, deckId });
     busy = false;
     if (ok) {
       if (data.status === 'choosing') choosing = data.draw; else { result = data.draw; onChanged(); }
@@ -158,18 +160,18 @@
         {/each}
       </section>
     {:else}
-      {#if decks.length > 1}
-        <label class="forage-field">Deck
-          <select bind:value={deckId}>{#each decks as entry (entry.id)}<option value={entry.id}>{entry.name}</option>{/each}</select>
-        </label>
-      {:else if deck}
-        <p><strong>{deck.name}</strong></p>
-      {/if}
-      {#if deck?.description}<details><summary>About this deck</summary><p class="muted deck-description">{deck.description}</p></details>{/if}
+      <!-- One row per deck, like the VTT popup: the name, a (?) for the description, and Draw Card. -->
+      {#each decks as entry (entry.id)}
+        <div class="deck-row">
+          <span class="deck-row-name">{entry.name}</span>
+          {#if entry.description}
+            <button type="button" class="deck-about-btn" aria-label={`About ${entry.name}`} aria-expanded={aboutOpen.includes(entry.id)} onclick={() => toggleAbout(entry.id)}>(?)</button>
+          {/if}
+          <button type="button" class="deck-draw-btn" disabled={busy} onclick={() => draw(entry.id)}>Draw Card</button>
+        </div>
+        {#if entry.description && aboutOpen.includes(entry.id)}<p class="muted deck-description">{entry.description}</p>{/if}
+      {/each}
       {#if result}{@render drawCard(result)}{/if}
-      <div class="roll-options-actions forage-actions">
-        <button type="button" disabled={busy || !deck} onclick={draw}>{result ? 'Draw another card' : 'Draw a card'}</button>
-      </div>
     {/if}
 
     {#if message}<p class="forage-error" role="alert">{message}</p>{/if}

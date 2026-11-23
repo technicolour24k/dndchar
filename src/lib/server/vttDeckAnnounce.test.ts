@@ -90,7 +90,10 @@ describe('announceDeck privacy', () => {
       outcome: { id: 'number_hearts', name: 'Temporary vitality', text: 'Each party member gains the card\'s value in temporary HP.', rolls: [] }, dmTasks: []
     };
     await announceDeck(plain, 'drawn');
-    for (const m of sent.filter((entry) => JSON.parse(entry.raw).type === 'deck:drawn')) expect(JSON.parse(m.raw).draw.success).toBe(true);
+    const drawn = sent.filter((entry) => JSON.parse(entry.raw).type === 'deck:drawn');
+    // The GM socket always gets the deck:drawn frame (Unit 5 diagnosis: a missing DM toast is not a broadcast gap).
+    expect(drawn.map((m) => m.who).sort()).toEqual(['gm', 'player', 'watcher']);
+    for (const m of drawn) expect(JSON.parse(m.raw).draw.success).toBe(true);
     expect(logRoll.mock.calls[0][1]).toBe('Aria drew the 2 of Hearts (gold back): success.');
   });
 });

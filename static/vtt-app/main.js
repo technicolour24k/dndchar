@@ -3705,7 +3705,7 @@ function roomInfoHtml(roleLabel) {
   // Campaign tables get a slot at the top of the box for the voice controls (voice.mount moves the
   // one persistent dock node into it after every render). Quick rooms get none, so no voice there.
   const voiceSlot = campaignClient.active ? '<div id="voiceSlot"></div>' : '';
-  return `<div id="roomInfo">${voiceSlot}${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+  return `<div id="roomInfo">${voiceSlot}${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}${deck.roleLinkHtml()}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${overworld.buttonHtml()}
     ${combatControlHtml()}

@@ -1,10 +1,11 @@
 // VTT deck client (decks plan, unit 8). Plain unbundled JS, loaded by main.js. Mirrors forage.js's shape.
 //
 // Three surfaces:
-//   - the PLAYER popup (#deckModal), opened from a linked token card: pick a deck, draw, choose the Ace's
-//     value, read the result. Closing it never cancels anything (an undecided Ace resumes on reopen).
+//   - the PLAYER popup (#deckModal), opened from a linked token card: one row per deck with a (?) and a
+//     Draw Card button, choose the Ace's value, read the result. Closing it never cancels anything (an undecided Ace resumes on reopen).
 //   - TOASTS (#deckToasts) for everyone when a card is drawn or undone (deck:drawn / deck:undone).
-//   - the GM's sidebar block "Deck": open "waiting on the DM" tasks and the last draw with Undo.
+//   - the GM's sidebar block "Deck": open "waiting on the DM" tasks and the last draw with Undo. It can be
+//     dismissed (per browser) until something new arrives; a draw that leaves the DM a task gets a sticky toast.
 //
 // The server does every roll and decides everything; this only sends choices and shows what comes back.
 // SECURITY: card, outcome, character and task text is never put into innerHTML. Everything below is built
@@ -13,7 +14,7 @@
 
 import {
   cardTitle, choiceOptions, drawnTitle, errorText, gmTaskLine, lastDrawLine, recentLine, resultLines, rollLines, statusTag,
-  successLabel, taskLines, undoneTitle
+  successLabel, taskLines, undoneTitle, deckBlockHidden, hiddenState, waitingOnYouTitle
 } from './shared/deckView.js';
 
 const API = '/vtt/api/decks';
@@ -84,7 +85,7 @@ export function createDeck(deps) {
     return known || null;
   }
 
-  const buttonLabel = (known) => (known?.choosing ? 'Finish your card' : 'Draw a card');
+  const buttonLabel = (known) => (known?.choosing ? 'Decks: finish your card' : 'Decks');
 
   // The token-card button. Hidden until we know the character has an enabled deck, so campaigns without
   // decks (and Quick rooms) never see a dead button. The characterId is a uuid from our own session data,
@@ -93,7 +94,7 @@ export function createDeck(deps) {
     if (!token.characterId || token.type === 'prop' || !deps.isAccountLinked()) return '';
     const known = knownFor(token.characterId);
     const hidden = known && known.decks.length ? '' : ' hidden';
-    return `<button type="button" class="secondary deckBtn" data-deck-token="${deps.escapeHtml(token.id)}"${hidden}>${known ? deps.escapeHtml(buttonLabel(known)) : 'Draw a card'}</button>`;
+    return `<button type="button" class="secondary deckBtn" data-deck-token="${deps.escapeHtml(token.id)}"${hidden}>${known ? deps.escapeHtml(buttonLabel(known)) : 'Decks'}</button>`;
   }
 
   function refreshButtons() {
@@ -115,7 +116,7 @@ export function createDeck(deps) {
     return el('span', `deck-badge${success === true ? ' good' : success == null ? ' neutral' : ''}`, successLabel(success));
   }
 
-  function appendDrawDetails(parent, draw) {
+  function appendDrawDetails(parent, draw, opts = {}) {
     if (draw.outcome?.name) {
       const p = el('p');
       p.appendChild(el('strong', null, draw.outcome.name));
@@ -129,7 +130,8 @@ export function createDeck(deps) {
       for (const line of lines) list.appendChild(el('li', null, line));
       parent.appendChild(list);
     }
-    for (const line of taskLines(draw)) parent.appendChild(el('p', 'forage-warn', line));
+    // The sticky GM toast already names the open tasks in its headline.
+    if (!opts.skipTasks) for (const line of taskLines(draw)) parent.appendChild(el('p', 'forage-warn', line));
     if (draw.status === 'reverted') parent.appendChild(el('p', 'deck-muted', `Undone by the DM${draw.revertNote ? `: ${draw.revertNote}` : ''}`));
   }
 
@@ -138,11 +140,34 @@ export function createDeck(deps) {
   // rebuild never loses input). loadSeq drops stale GETs, exactly like the sheet's DeckModal.
   // ---------------------------------------------------------------------------------------------
   const pd = {
-    openAbout: false, openRecent: false, open: false, characterId: null, decks: [], deckId: '', loading: true, busy: false,
-    message: '', choosing: null, result: null, recent: [], loadSeq: 0, focusDraw: false
+    // aboutOpen: deck ids whose (?) description is showing (survives re-renders). focusDeckId: whose Draw Card
+    // button takes focus on the next render (the deck just drawn from, or the first on open).
+    aboutOpen: new Set(), openRecent: false, open: false, characterId: null, decks: [], loading: true, busy: false,
+    message: '', choosing: null, result: null, recent: [], loadSeq: 0, focusDeckId: null
   };
 
-  const currentDeck = () => pd.decks.find((entry) => entry.id === pd.deckId) || pd.decks[0] || null;
+  // One Combat-Actions-style row per deck: the name, a (?) that shows the description, and Draw Card.
+  function deckRow(entry) {
+    const wrap = el('div', 'deck-row-wrap');
+    const row = el('div', 'deck-row');
+    row.appendChild(el('span', 'deck-row-name', entry.name));
+    if (entry.description) {
+      const open = pd.aboutOpen.has(entry.id);
+      const about = button('(?)', 'secondary deck-about-btn', () => {
+        if (pd.aboutOpen.has(entry.id)) pd.aboutOpen.delete(entry.id); else pd.aboutOpen.add(entry.id);
+        render();
+      });
+      about.setAttribute('aria-label', `About ${entry.name}`);
+      about.setAttribute('aria-expanded', String(open));
+      row.appendChild(about);
+    }
+    const drawBtn = button('Draw Card', 'deck-draw-btn', () => draw(entry), pd.busy);
+    row.appendChild(drawBtn);
+    wrap.appendChild(row);
+    if (entry.description && pd.aboutOpen.has(entry.id)) wrap.appendChild(el('p', 'deck-muted deck-description', entry.description));
+    if (pd.focusDeckId === entry.id) { pd.focusDeckId = null; setTimeout(() => drawBtn.focus(), 0); }
+    return wrap;
+  }
 
   function render() {
     if (!pd.open) return;
@@ -170,29 +195,7 @@ export function createDeck(deps) {
       }
       body.appendChild(section);
     } else {
-      if (pd.decks.length > 1) {
-        const label = el('label', 'deck-field', 'Deck');
-        const select = el('select', 'forage-select');
-        for (const entry of pd.decks) {
-          const option = el('option', null, entry.name);
-          option.value = entry.id;
-          option.selected = entry.id === currentDeck()?.id;
-          select.appendChild(option);
-        }
-        select.addEventListener('change', () => { pd.deckId = select.value; render(); });
-        label.appendChild(select);
-        body.appendChild(label);
-      } else if (currentDeck()) {
-        body.appendChild(el('p', null, currentDeck().name)).style.fontWeight = '700';
-      }
-      if (currentDeck()?.description) {
-        const details = el('details', 'deck-about');
-        details.open = pd.openAbout; // survives re-renders
-        details.addEventListener('toggle', () => { pd.openAbout = details.open; });
-        details.appendChild(el('summary', null, 'About this deck'));
-        details.appendChild(el('p', 'deck-muted deck-description', currentDeck().description));
-        body.appendChild(details);
-      }
+      for (const entry of pd.decks) body.appendChild(deckRow(entry));
       if (pd.result) {
         const section = el('section', 'deck-section');
         const title = el('h3', null, `${cardTitle(pd.result.card)} `);
@@ -201,11 +204,6 @@ export function createDeck(deps) {
         appendDrawDetails(section, pd.result);
         body.appendChild(section);
       }
-      const actions = el('div', 'actions deck-actions');
-      const drawBtn = button(pd.result ? 'Draw another card' : 'Draw a card', 'deck-draw-btn', draw, pd.busy || !currentDeck());
-      actions.appendChild(drawBtn);
-      body.appendChild(actions);
-      if (pd.focusDraw) { pd.focusDraw = false; drawBtn.focus(); }
     }
 
     if (pd.message) {
@@ -241,7 +239,6 @@ export function createDeck(deps) {
     pd.loading = false;
     if (!res.ok) { pd.message = errorText(res.data?.error); render(); return; }
     pd.decks = res.data.decks || [];
-    if (!pd.decks.some((entry) => entry.id === pd.deckId)) pd.deckId = pd.decks[0]?.id || '';
     pd.choosing = res.data.choosing ?? null;
     pd.recent = res.data.recent || [];
     availability.set(availKey(characterId), { decks: pd.decks, choosing: pd.choosing, at: Date.now() });
@@ -249,8 +246,7 @@ export function createDeck(deps) {
     render();
   }
 
-  async function draw() {
-    const deck = currentDeck();
+  async function draw(deck) {
     if (!deck || pd.busy) return;
     pd.busy = true; pd.loadSeq += 1; pd.message = ''; pd.result = null; // busy is set before the first await
     render();
@@ -263,7 +259,9 @@ export function createDeck(deps) {
       pd.message = errorText(data?.error);
     }
     pd.busy = false;
+    pd.focusDeckId = deck.id; // keep the keyboard on the row just used
     render();
+    pd.focusDeckId = deck.id; // load() re-renders and replaces the button, so ask again for that render
     await load();
   }
 
@@ -282,10 +280,11 @@ export function createDeck(deps) {
     const token = deps.getSession()?.tokens?.[tokenId];
     if (!token?.characterId) return;
     Object.assign(pd, {
-      open: true, openAbout: false, openRecent: false, characterId: token.characterId, decks: availability.get(availKey(token.characterId))?.decks || [],
-      deckId: '', loading: true, busy: false, message: '', choosing: null, result: null, recent: [], focusDraw: true
+      open: true, aboutOpen: new Set(), openRecent: false, characterId: token.characterId,
+      decks: availability.get(availKey(token.characterId))?.decks || [],
+      loading: true, busy: false, message: '', choosing: null, result: null, recent: [], focusDeckId: null
     });
-    pd.deckId = pd.decks[0]?.id || '';
+    pd.focusDeckId = pd.decks[0]?.id || null;
     modal.classList.add('visible');
     deps.bringModalToFront(modal);
     render();
@@ -318,8 +317,13 @@ export function createDeck(deps) {
   // TOASTS: a dismissable card for everyone. The drawer's own open popup already shows the result,
   // so it is skipped there.
   // ---------------------------------------------------------------------------------------------
-  function showToast(titleText, draw, showDetails) {
+  function showToast(titleText, draw, showDetails, opts = {}) {
     const toast = el('div', 'deck-toast');
+    if (opts.sticky) {
+      toast.dataset.sticky = '1';
+      toast.dataset.drawId = String(draw.id);
+      toast.dataset.taskIds = (draw.dmTasks ?? []).filter((task) => !task.done).map((task) => task.id).join(',');
+    }
     toast.setAttribute('role', 'status');
     const head = el('div', 'deck-toast-head');
     head.appendChild(el('strong', null, titleText));
@@ -327,11 +331,13 @@ export function createDeck(deps) {
     dismiss.setAttribute('aria-label', 'Dismiss');
     head.appendChild(dismiss);
     toast.appendChild(head);
-    if (showDetails) appendDrawDetails(toast, draw);
+    if (opts.subtitle) toast.appendChild(el('p', 'deck-muted', opts.subtitle));
+    if (showDetails) appendDrawDetails(toast, draw, { skipTasks: opts.sticky });
     else if (draw.revertNote) toast.appendChild(el('p', 'deck-muted', draw.revertNote));
     toasts.appendChild(toast);
-    while (toasts.children.length > MAX_TOASTS) toasts.firstElementChild.remove();
-    setTimeout(() => toast.remove(), TOAST_MS);
+    // Over the limit: drop the oldest, but a sticky "waiting on you" toast outlives ordinary ones.
+    while (toasts.children.length > MAX_TOASTS) (toasts.querySelector('.deck-toast:not([data-sticky])') || toasts.firstElementChild).remove();
+    if (!opts.sticky) setTimeout(() => toast.remove(), TOAST_MS);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -340,10 +346,38 @@ export function createDeck(deps) {
   const gm = { campaignId: null, tasks: [], last: null, busy: false, message: '', loadSeq: 0 };
   const campaignId = () => deps.getCampaignId();
 
+  // Dismissing the Deck box is remembered per browser and campaign. Storage can be blocked or full, so every
+  // read and write is in a try/catch: if it fails the box simply shows.
+  const hiddenKey = () => `vtt_deckBlockHidden_${campaignId()}`;
+  function readHiddenRaw() {
+    try { return localStorage.getItem(hiddenKey()); } catch { return null; }
+  }
+  function writeHidden(value) {
+    try {
+      if (value) localStorage.setItem(hiddenKey(), JSON.stringify(value)); else localStorage.removeItem(hiddenKey());
+    } catch { /* storage unavailable: the box just keeps showing */ }
+  }
+  const blockHidden = () => deckBlockHidden(readHiddenRaw(), gm.last, gm.tasks);
+
+  function hideBlock() {
+    writeHidden(hiddenState(gm.last, gm.tasks));
+    refreshGmBlock();
+  }
+  function showBlock() {
+    writeHidden(null);
+    refreshGmBlock();
+  }
+
   function gmBlockNodes() {
     const nodes = [];
     if (!gm.tasks.length && !gm.last && !gm.message) return nodes;
-    nodes.push(el('h2', null, 'Deck'));
+    if (blockHidden()) return nodes;
+    const head = el('div', 'deck-gm-head');
+    head.appendChild(el('h2', null, 'Deck'));
+    const hide = button('X', 'secondary deck-gm-x', hideBlock);
+    hide.setAttribute('aria-label', 'Hide the Deck box');
+    head.appendChild(hide);
+    nodes.push(head);
     for (const task of gm.tasks) {
       const row = el('div', 'deck-gm-row');
       row.appendChild(el('span', 'deck-gm-text', gmTaskLine(task)));
@@ -368,9 +402,21 @@ export function createDeck(deps) {
     return '<div id="deckControl"></div>';
   }
 
+  // A one-word link at the end of the room info "Role:" line, only while the box is hidden and has something in it.
+  function roleLinkHtml() {
+    return deps.getRole() === 'gm' && campaignId() ? '<span id="deckRoleLink"></span>' : '';
+  }
+
   function refreshGmBlock() {
     const host = document.getElementById('deckControl');
     if (host) host.replaceChildren(...gmBlockNodes());
+    const link = document.getElementById('deckRoleLink');
+    if (link) {
+      // Whenever the box is hidden and has something in it (tasks, or a last draw to undo).
+      const show = (gm.tasks.length > 0 || gm.last) && blockHidden();
+      const label = gm.tasks.length ? `Deck (${gm.tasks.length})` : 'Deck';
+      link.replaceChildren(...(show ? [document.createTextNode(' '), button(label, 'deck-role-link', showBlock)] : []));
+    }
   }
 
   // The sidebar calls this after it rebuilds (deckControl is a fresh empty div each time).
@@ -379,8 +425,11 @@ export function createDeck(deps) {
     refreshButtons();
   }
 
-  async function loadGm() {
+  // keepHidden: an undo changes the last draw, which would count as "something new" and bring a dismissed box
+  // back. If the box was hidden before the reload, it is re-dismissed against what the reload found.
+  async function loadGm(keepHidden = false) {
     if (deps.getRole() !== 'gm' || !campaignId()) return;
+    const wasHidden = keepHidden && blockHidden();
     // A GM who moved to another campaign's room must never see the old room's tasks.
     if (gm.campaignId !== campaignId()) Object.assign(gm, { campaignId: campaignId(), tasks: [], last: null, message: '' });
     const seq = ++gm.loadSeq;
@@ -389,6 +438,7 @@ export function createDeck(deps) {
     if (seq !== gm.loadSeq) return;
     if (tasks.ok && Array.isArray(tasks.data.tasks)) gm.tasks = tasks.data.tasks;
     if (draws.ok && Array.isArray(draws.data.draws)) gm.last = draws.data.draws.find((entry) => entry.status === 'resolved') || null;
+    if (wasHidden) writeHidden(hiddenState(gm.last, gm.tasks));
     refreshGmBlock();
   }
 
@@ -412,7 +462,7 @@ export function createDeck(deps) {
     const { ok, data } = await api('POST', `${API}/draws/${encodeURIComponent(last.id)}/undo`);
     gm.busy = false;
     if (!ok) gm.message = errorText(data?.error);
-    await loadGm();
+    await loadGm(true);
     refreshGmBlock();
   }
 
@@ -431,7 +481,10 @@ export function createDeck(deps) {
     const draw = msg.draw;
     if (!draw) return;
     const mine = pd.open && pd.characterId === draw.drawerCharacterId;
-    if (!mine) showToast(drawnTitle(draw), draw, true);
+    // A draw that leaves the GM a task gets a toast that stays until closed. Everyone else's lasts 20 seconds.
+    const waiting = deps.getRole() === 'gm' && (draw.dmTasks ?? []).some((task) => !task.done);
+    if (waiting) showToast(waitingOnYouTitle(draw), draw, true, { sticky: true, subtitle: drawnTitle(draw) });
+    else if (!mine) showToast(drawnTitle(draw), draw, true);
     if (deps.getRole() === 'gm' && draw.status === 'resolved') { gm.last = draw; refreshGmBlock(); }
     // Another party member's draw changes the recent list in an open popup (not mid-action).
     if (pd.open && !pd.busy) load();
@@ -441,15 +494,25 @@ export function createDeck(deps) {
     const draw = msg.draw;
     if (!draw) return;
     showToast(undoneTitle(draw), draw, false);
-    if (deps.getRole() === 'gm') loadGm();
+    if (deps.getRole() === 'gm') {
+      // The undone draw's "Waiting on you" toast has nothing left to wait for.
+      toasts.querySelectorAll(`.deck-toast[data-draw-id="${CSS.escape(String(draw.id))}"]`).forEach((node) => node.remove());
+      loadGm(true);
+    }
     if (pd.open && !pd.busy) load();
   }
 
   function onTasks(msg) {
     if (deps.getRole() !== 'gm' || msg.campaignId !== campaignId() || !Array.isArray(msg.open)) return;
     gm.tasks = msg.open;
+    // A sticky toast goes once none of its tasks is open any more (marked Done, here or on the campaign page).
+    const open = new Set(msg.open.map((task) => task.taskId));
+    toasts.querySelectorAll('.deck-toast[data-sticky]').forEach((node) => {
+      const ids = (node.dataset.taskIds || '').split(',').filter(Boolean);
+      if (!ids.some((id) => open.has(id))) node.remove();
+    });
     refreshGmBlock();
   }
 
-  return { deckButtonHtml, deckControlHtml, afterSidebarRender, refreshButtons, onStateFull, onDrawn, onUndone, onTasks };
+  return { deckButtonHtml, deckControlHtml, roleLinkHtml, afterSidebarRender, refreshButtons, onStateFull, onDrawn, onUndone, onTasks };
 }
