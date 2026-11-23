@@ -1,7 +1,9 @@
 import type pg from 'pg';
 import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/services/action-containers';
 import { query, withTransaction } from '$lib/server/db';
-import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
+import { assertCanActForCharacter, assertCanEditCharacter, isUuid } from '$lib/server/services/access';
+import { assertReferenceAllowed, assertVisibleForNewUse, resolveVisibleScope, visibleScopeSql } from '$lib/server/services/library';
+import type { VisibleScope } from '$lib/library/rules';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
 import { readEffectMetadata, substituteParams } from '$lib/rules/effectParams';
 import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
@@ -25,7 +27,10 @@ function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'content';
 }
 
-export async function listCatalogue(userId: string, type?: ContentType, search = ''): Promise<ContentDefinition[]> {
+// Read-only browse list. Limited to what `scope` may be offered (default: global plus the viewer's own library), so
+// another user's private homebrew never shows here.
+export async function listCatalogue(userId: string, type?: ContentType, search = '', scope?: VisibleScope): Promise<ContentDefinition[]> {
+  const visible = visibleScopeSql('c', scope ?? await resolveVisibleScope({ query }, userId), 3);
   const result = await query<any>(
     `
       SELECT c.*, s.spell_level, s.school, s.casting_time, s.spell_range, s.components, s.duration,
@@ -40,10 +45,11 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
       LEFT JOIN users u ON u.id = c.owner_user_id
       WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1) AND c.content_type <> 'deck'
         AND ($2 = '' OR c.name ILIKE '%' || $2 || '%')
+        AND ${visible.sql}
       ORDER BY c.source_kind = 'srd' DESC, c.name ASC
       LIMIT 300
     `,
-    [type || null, search.trim()]
+    [type || null, search.trim(), ...visible.params]
   );
 
   const ids = result.rows.map((row: any) => row.id);
@@ -212,6 +218,7 @@ export async function attachEffectToOwnedContent(userId: string, form: FormData)
   const contentId = String(form.get('contentId') || '');
   const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
   if (!owned.rowCount) throw new Error('Private homebrew content not found.');
+  await assertReferenceAllowed({ query }, contentId, String(form.get('effectId') || ''));
   if (String(form.get('activationType') || 'manual') === 'on_use') {
     await withTransaction(async (client) => {
       const content = await client.query<any>('SELECT name, owner_user_id FROM content_definitions WHERE id=$1', [contentId]);
@@ -255,6 +262,8 @@ export async function addContentResourceDefinition(form: FormData): Promise<void
 }
 
 export async function grantContentFromContent(form: FormData): Promise<void> {
+  // Homebrew library: a global entry can't grant a personal one, and so on (see canReference).
+  await assertReferenceAllowed({ query }, String(form.get('sourceContentId') || ''), String(form.get('grantedContentId') || ''));
   await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
     VALUES ($1,$2,$3) ON CONFLICT (source_content_id, granted_content_id, activation_type) DO NOTHING`,
     [String(form.get('sourceContentId') || ''), String(form.get('grantedContentId') || ''), String(form.get('activationType') || 'equipped')]);
@@ -297,12 +306,15 @@ export async function insertCatalogueItem(client: pg.PoolClient, characterId: st
 export async function addContentToCharacter(userId: string, characterId: string, contentId: string): Promise<void> {
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
-    const visible = await client.query('SELECT id FROM content_definitions WHERE id=$1 AND is_archived=false', [contentId]);
-    if (!visible.rowCount) throw new Error('Catalogue entry not found.');
+    // Decks are shared campaign items (drawn via the deck service), never character content.
+    const kind = isUuid(contentId) ? await client.query<{ content_type: string }>('SELECT content_type FROM content_definitions WHERE id=$1', [contentId]) : { rows: [] };
+    if (kind.rows[0]?.content_type === 'deck') throw new Error('Decks cannot be added to a character.');
+    // Homebrew library: only entries this character may be OFFERED (global, its campaign's enabled libraries and
+    // copies, or its owner's library when it has no campaign), live, and of a character-content type. Uncached.
+    const scope = await resolveVisibleScope(client, userId, { characterId });
+    await assertVisibleForNewUse(client, contentId, scope, ['item', 'spell', 'feat', 'class_feature']);
     const definition = await client.query<any>(`SELECT c.content_type, c.name, i.* FROM content_definitions c
       LEFT JOIN item_definitions i ON i.content_id = c.id WHERE c.id = $1`, [contentId]);
-    // Decks are shared campaign items (drawn via the deck service), never character content.
-    if (definition.rows[0]?.content_type === 'deck') throw new Error('Decks cannot be added to a character.');
     if (definition.rows[0]?.content_type === 'item') {
       await insertCatalogueItem(client, characterId, contentId, 1);
       return;

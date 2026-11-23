@@ -1,5 +1,4 @@
 import { error, fail } from '@sveltejs/kit';
-import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { emitRealtimeEvent } from '$lib/server/realtime';
@@ -10,7 +9,8 @@ import { activationFromCastForm, parseActivation } from '$lib/server/vttCostAppr
 import { adjustCharacterPool } from '$lib/server/services/resource-pools';
 import { adjustTurnPool } from '$lib/server/services/turn-state';
 import { resetLiveTokenMovement } from '$lib/server/vttTurn';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, payTurnActivation, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, payTurnActivation, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { ContentNotAvailableError } from '$lib/server/services/library';
 import { attempt } from '$lib/server/campaignAction';
 import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
 import { addCharacterToCampaign, getCampaignByRoomCode, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
@@ -118,15 +118,13 @@ export const actions = {
   },
   addContent: async ({ request, params, locals }) => {
     const form = await request.formData();
-    await addContentToCharacter(locals.user!.id, params.id, String(form.get('contentId') || ''));
-    emitRealtimeEvent('character:updated', { characterId: params.id });
-    return { contentUpdated: true };
-  },
-  createHomebrew: async ({ request, params, locals }) => {
-    requireAdmin(locals.user);
-    const form = await request.formData();
-    const contentId = await createHomebrewContent(locals.user!.id, form);
-    await addContentToCharacter(locals.user!.id, params.id, contentId);
+    // A refused pick (not offered to this character, or the wrong type) is a plain 400; access failures still throw.
+    try {
+      await addContentToCharacter(locals.user!.id, params.id, String(form.get('contentId') || ''));
+    } catch (caught) {
+      if (caught instanceof ContentNotAvailableError) return fail(400, { error: caught.message });
+      throw caught;
+    }
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { contentUpdated: true };
   },

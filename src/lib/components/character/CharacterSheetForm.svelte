@@ -2495,7 +2495,7 @@
             </div>
           {/if}
           <div class="structured-section">
-            <div class="catalogue-add-row"><CatalogueSearch type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
+            <div class="catalogue-add-row"><CatalogueSearch characterId={character.id} type="spell" placeholder="Search spells..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.spell = id)} /><button type="button" disabled={!selectedCatalogue.spell || contentBusy} onclick={() => addSelectedContent('spell')}>Add</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=spell">Create Homebrew</a>{/if}</div>
             <div class="content-instance-list">
               {#each characterSpells as spell}
                 <article class="content-instance-row"><div><strong>{spell.name}</strong>{#if spell.cost?.summary}<span class="cost-chip" title="Cost to cast">{spell.cost.summary}</span>{/if}<span class="muted">Level {spell.spellLevel ?? 0}{spell.grantedBy?` · granted by ${spell.grantedBy}`:''}{spellDamageSummary(spell)?` · ${spellDamageSummary(spell)}`:''}</span></div><div class="actions">{#if spellDamageSummary(spell)}<button type="button" class="compact-button dice-button" onclick={() => rollSpellDamage(spell)}>{spell.spellDamage?.resolutionType === 'attack' ? 'Roll Attack' : 'Roll Damage'}</button>{/if}<button type="button" disabled={!spell.isPrepared} onclick={() => openCast(spell)}>Cast</button>{#if spell.hasResourceActions}<button type="button" onclick={() => triggerContentResourceAction(spell.id,spell.name)}>Use Actions</button>{/if}{#if !spell.grantedBy}<button type="button" class:active={spell.isPrepared} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: !spell.isPrepared, isActive: spell.isActive, notes: spell.notes })}>{spell.isPrepared ? 'Prepared' : 'Prepare'}</button><button type="button" class:active={spell.isActive} onclick={() => runContentAction('contentState', { instanceId: spell.id, isKnown: true, isPrepared: spell.isPrepared, isActive: !spell.isActive, notes: spell.notes })}>{spell.isActive ? 'Effect Active' : 'Activate Effect'}</button><button type="button" class="danger" onclick={() => runContentAction('removeContent', { instanceId: spell.id })}>Remove</button>{/if}</div></article>
@@ -2537,7 +2537,7 @@
       <div class="panel-head"><h2>Structured Features</h2>{#if isAdmin}<a href="/catalogue">Create Homebrew</a>{/if}</div>
       {#each [['class_feature', 'Class Feature'], ['feat', 'Feat']] as option}
         <div class="catalogue-add-row">
-          <CatalogueSearch type={option[0] as ContentType} placeholder={`Search ${option[1].toLowerCase()}s...`} disabled={contentBusy} onPick={(id) => (selectedCatalogue[option[0] as ContentType] = id)} />
+          <CatalogueSearch characterId={character.id} type={option[0] as ContentType} placeholder={`Search ${option[1].toLowerCase()}s...`} disabled={contentBusy} onPick={(id) => (selectedCatalogue[option[0] as ContentType] = id)} />
           <button type="button" disabled={!selectedCatalogue[option[0] as ContentType] || contentBusy} onclick={() => addSelectedContent(option[0] as ContentType)}>Add</button>
         </div>
       {/each}
@@ -2562,7 +2562,7 @@
   <div class="sheet-readonly" use:readOnlyLock={readOnly}>
     <section class="panel catalogue-add-panel">
       <div><h2>Item Catalogue</h2><p class="muted">Add an SRD or private homebrew item, or continue using free-form entries.</p></div>
-      <div class="catalogue-add-row"><CatalogueSearch type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
+      <div class="catalogue-add-row"><CatalogueSearch characterId={character.id} type="item" placeholder="Search items..." disabled={contentBusy} onPick={(id) => (selectedCatalogue.item = id)} /><button type="button" disabled={!selectedCatalogue.item || contentBusy} onclick={() => addSelectedContent('item')}>Add Item</button>{#if isAdmin}<a class="compact-button" href="/catalogue?type=item">Create Homebrew</a>{:else}<button type="button" class="compact-button" onclick={() => (simpleItemOpen = true)}>Quick Add</button>{/if}</div>
     </section>
     <section class="inventory-layout">
       <section class="panel stack inventory-section">

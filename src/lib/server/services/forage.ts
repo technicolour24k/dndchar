@@ -7,6 +7,7 @@ import {
 } from '$lib/rules/forage';
 import { insertCatalogueItem } from '$lib/server/services/catalogue';
 import { isCampaignDm } from '$lib/server/services/access';
+import { assertVisibleForNewUse, resolveVisibleScope } from '$lib/server/services/library';
 import type {
   FindLine, FindMode, FindResult, FindStatus, FindTable, FindTableEntry, ForageCatalogue, ForageCatalogueTable, ForageCheck
 } from '$lib/types/forage';
@@ -231,6 +232,10 @@ export async function addFindTableEntry(actor: ForageActor, form: FormData): Pro
   );
   if (!item.rowCount) throw new Error('That is not an item.');
   if (item.rows[0].is_archived) throw new Error('That item is archived and cannot be added.');
+  // Homebrew library: only items this table's campaign may be OFFERED (global, enabled libraries, its own copies).
+  // Items already on the table keep working whatever happens to the library (this gates new additions only).
+  const tableCampaign = (await query<{ campaign_id: string }>('SELECT campaign_id FROM find_tables WHERE id = $1', [tableId])).rows[0].campaign_id;
+  await assertVisibleForNewUse({ query }, itemId, await resolveVisibleScope({ query }, actor.id, { campaignId: tableCampaign }), ['item']);
 
   // Never overwrite a tuned entry: a repeat add is refused (edit it in the entries list instead).
   const added = await query(

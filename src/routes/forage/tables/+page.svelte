@@ -189,7 +189,7 @@
           <h3>Add item</h3>
           <input type="hidden" name="tableId" value={selected.id} />
           <input type="hidden" name="itemId" value={newItemId} />
-          <CatalogueSearch type="item" placeholder="Search items..." onPick={(id) => { newItemId = id; }} />
+          <CatalogueSearch campaignId={selected.campaignId} type="item" placeholder="Search items..." onPick={(id) => { newItemId = id; }} />
           <div class="mini-grid">
             <label>Chance
               <select name="chance">

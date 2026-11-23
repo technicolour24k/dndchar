@@ -15,6 +15,9 @@ import type { ContentType } from '$lib/types/content';
 // Every function takes a `db` (the pool or a transaction client) so the checks can run inside the same
 // transaction as the write they guard.
 
+/** The entry exists but is not offered to this viewer (or is the wrong type). Actions turn this into a 400, not a crash. */
+export class ContentNotAvailableError extends CampaignError {}
+
 /** Where a visible scope is worked out from: a character's campaign, a campaign, or just the viewer (their own pages). */
 export type ScopeTarget = { characterId?: string; campaignId?: string };
 
@@ -127,7 +130,7 @@ async function loadFacts(db: Queryable, contentId: string): Promise<FactsRow | n
 export async function assertVisibleForNewUse(db: Queryable, contentId: string, scope: VisibleScope, expectedTypes?: ContentType[]): Promise<EntryFacts> {
   const facts = await loadFacts(db, contentId);
   if (!facts || (expectedTypes && !expectedTypes.includes(facts.type)) || !isVisibleForNewUse(facts, scope)) {
-    throw new CampaignError('Catalogue entry not found.');
+    throw new ContentNotAvailableError('Catalogue entry not found.');
   }
   return facts;
 }
@@ -199,4 +202,20 @@ export async function setCampaignLibrary(userId: string, campaignId: string, own
      ON CONFLICT (campaign_id, owner_user_id) DO UPDATE SET is_enabled = EXCLUDED.is_enabled, updated_by_user_id = EXCLUDED.updated_by_user_id, updated_at = now()`,
     [campaignId, ownerUserId, enabled, userId]);
   invalidateReferenceData('library:setting');
+}
+
+// ---------------------------------------------------------------- SQL form of the visible set
+
+/**
+ * The same rule as isVisibleForNewUse, as a SQL predicate, for list queries (not archived is the caller's job).
+ * `alias` is the content_definitions alias; `firstParam` is the number of the first of the FOUR parameters this uses.
+ * Append `params` to the query's parameter list at that position.
+ */
+export function visibleScopeSql(alias: string, scope: VisibleScope, firstParam: number): { sql: string; params: unknown[] } {
+  const [campaign, owners, hiddenOwners, hiddenCampaign] = [firstParam, firstParam + 1, firstParam + 2, firstParam + 3];
+  const sql = `(${alias}.scope = 'global'
+    OR (${alias}.scope = 'campaign' AND ${alias}.campaign_id = $${campaign}::uuid AND (NOT ${alias}.hidden_from_players OR $${hiddenCampaign}::boolean))
+    OR (${alias}.scope = 'personal' AND ${alias}.owner_user_id = ANY($${owners}::uuid[])
+        AND (NOT ${alias}.hidden_from_players OR ${alias}.owner_user_id = ANY($${hiddenOwners}::uuid[]))))`;
+  return { sql, params: [scope.campaignId, scope.ownerIds, scope.hiddenOkOwnerIds, scope.hiddenOkCampaign] };
 }

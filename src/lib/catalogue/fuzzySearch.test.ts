@@ -84,6 +84,13 @@ describe('searchCatalogue', () => {
     expect(itemResults.map((r) => r.id)).toEqual(['fire-sword']);
   });
 
+  it('applies a visibility filter before the limit, so hidden entries never take a slot', () => {
+    const hidden = Array.from({ length: 5 }, (_, index) => entry(`Hidden Spell ${index}`, { id: `hidden-${index}`, scope: 'personal', ownerUserId: 'bob' }));
+    const shown = entry('Shown Spell', { id: 'shown' });
+    const results = searchCatalogue([...hidden, shown], 'spell', { limit: 1, visible: (candidate) => candidate.scope === 'global' });
+    expect(results.map((r) => r.id)).toEqual(['shown']);
+  });
+
   it('caps results at the given limit (default 20)', () => {
     const many = Array.from({ length: 30 }, (_, index) => entry(`Test Spell ${index}`, { id: `test-${index}` }));
     expect(searchCatalogue(many, 'test')).toHaveLength(20);

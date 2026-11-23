@@ -29,6 +29,8 @@ export type CatalogueIndexEntry = {
 export type CatalogueSearchOptions = {
   type?: ContentType;
   limit?: number;
+  /** Drops entries the viewer may not be offered (library scope). Applied before the limit, so a hidden entry never uses up a slot. */
+  visible?: (entry: CatalogueIndexEntry) => boolean;
 };
 
 const DEFAULT_LIMIT = 20;
@@ -130,7 +132,8 @@ export function searchCatalogue(
   options: CatalogueSearchOptions = {}
 ): CatalogueIndexEntry[] {
   const limit = options.limit ?? DEFAULT_LIMIT;
-  const typed = options.type ? entries.filter((entry) => entry.type === options.type) : entries;
+  const scoped = options.visible ? entries.filter(options.visible) : entries;
+  const typed = options.type ? scoped.filter((entry) => entry.type === options.type) : scoped;
 
   const normalisedQuery = normaliseText(query);
   if (!normalisedQuery) {

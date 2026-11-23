@@ -4,6 +4,8 @@ import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/se
 import { parseCostJson, validateCostEntries } from '$lib/rules/cost';
 import type { CostEntry } from '$lib/types/cost';
 import type { ContentType } from '$lib/types/content';
+import { assertReferenceAllowed, loadCampaignLibraries } from '$lib/server/services/library';
+import { canReference, type EntryFacts } from '$lib/library/rules';
 
 export type AdminContentRecord={id:string;type:ContentType;name:string;description:string;key:string;sourceKind:string;
   isArchived:boolean;spellLevel:number|null;school:string;castingTime:string;range:string;components:string;duration:string;
@@ -11,7 +13,11 @@ export type AdminContentRecord={id:string;type:ContentType;name:string;descripti
   acBonus:number;toHitBonus:number;damageBonus:number;attackAbility:string;damageRolls:string;
   resolutionType:string;damageType:string;baseDice:string;saveAbility:string;saveEffect:string;scaling:any;costJson:CostEntry[]|null};
 
-export async function loadContentAdmin(types:ContentType[],selectedId=''){
+// The scope a candidate list is offered for: the selected entry's own scope/owner/campaign, or `opts.source` when
+// nothing is selected (e.g. an empty library). Default is global, so existing /admin pages offer global entries only.
+type CandidateSource={scope:'global'|'personal'|'campaign';ownerUserId:string|null;campaignId:string|null};
+
+export async function loadContentAdmin(types:ContentType[],selectedId='',opts:{source?:CandidateSource}={}){
   const content=await query<any>(`SELECT c.*,s.spell_level,s.school,s.casting_time,s.spell_range,s.components,s.duration,
     s.ritual,s.concentration,s.classes,s.resolution_type,s.damage_type,s.base_dice,s.save_ability,s.save_effect,s.scaling_json,
     i.category,i.equipment_type,i.requires_attunement,i.ac_bonus,i.to_hit_bonus,
@@ -28,7 +34,13 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     COALESCE(link.condition_expression,'') AS condition_expression,link.priority
     FROM content_modifier_links link JOIN modifier_definitions m ON m.id=link.modifier_id
     LEFT JOIN modifier_targets t ON t.target_key=m.target WHERE link.content_id=$1 ORDER BY link.sort_order,link.priority,target_label`,[selectedContentId]):{rows:[]};
-  const effects=await query<any>(`SELECT id,name,COALESCE(metadata_json->>'sourceType',source_kind) AS source_type FROM content_definitions
+  // Homebrew library: candidate lists (conditions, actions, grants, spells) only offer what the selected entry may
+  // reference (canReference). Held or already-attached rows below are NOT filtered: visibility gates new use only.
+  const selectedRecord=content.rows.find((row:any)=>row.id===selectedContentId);
+  const source:CandidateSource=selectedRecord?{scope:selectedRecord.scope,ownerUserId:selectedRecord.owner_user_id,campaignId:selectedRecord.campaign_id}:opts.source??{scope:'global',ownerUserId:null,campaignId:null};
+  const enabledOwnerIds=source.scope==='campaign'&&source.campaignId?(await loadCampaignLibraries({query},source.campaignId)).enabledOwnerIds:[];
+  const referable=(rows:any[])=>rows.filter((row)=>canReference(source,{scope:row.scope,ownerUserId:row.owner_user_id,campaignId:row.campaign_id,hiddenFromPlayers:row.hidden_from_players,isArchived:false,type:row.content_type??row.type} as EntryFacts,enabledOwnerIds));
+  const effects=await query<any>(`SELECT id,name,content_type,scope,owner_user_id,campaign_id,hidden_from_players,COALESCE(metadata_json->>'sourceType',source_kind) AS source_type FROM content_definitions
     WHERE content_type='condition' AND is_archived=false ORDER BY name`);
   const attachedEffects=selectedContentId?await query<any>(`SELECT link.id,link.granted_content_id AS effect_id,link.activation_type,effect.name,
       COALESCE(effect.metadata_json->>'legacyDurationType',effect.duration_type) AS duration_type
@@ -40,12 +52,12 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     step.target_mode,step.label,step.sort_order FROM content_action_links link
     JOIN content_definitions action ON action.id=link.action_container_id LEFT JOIN action_steps step ON step.container_id=action.id
     WHERE link.content_id=$1 ORDER BY link.sort_order,action.name,step.sort_order`,[selectedContentId]):{rows:[]};
-  const actionCandidates=await query<any>("SELECT id,name FROM content_definitions WHERE content_type='action' AND is_archived=false ORDER BY name");
+  const actionCandidates=await query<any>("SELECT id,name,content_type,scope,owner_user_id,campaign_id,hidden_from_players FROM content_definitions WHERE content_type='action' AND is_archived=false ORDER BY name");
   const resources=selectedContentId?await query<any>('SELECT id,resource_key,label,max_value_expression,recharge_period FROM content_resource_definitions WHERE content_id=$1 ORDER BY label',[selectedContentId]):{rows:[]};
   const grants=selectedContentId?await query<any>(`SELECT g.id,g.activation_type,c.name,c.content_type FROM content_grants g
     JOIN content_definitions c ON c.id=g.granted_content_id WHERE g.source_content_id=$1 AND c.content_type<>'condition' ORDER BY c.name`,[selectedContentId]):{rows:[]};
-  const grantCandidates=await query<any>(`SELECT id,name,content_type FROM content_definitions WHERE content_type IN('feat','class_feature') AND is_archived=false ORDER BY name`);
-  const spellCandidates=await query<any>(`SELECT id,name FROM content_definitions WHERE content_type='spell' AND is_archived=false ORDER BY name`);
+  const grantCandidates=await query<any>(`SELECT id,name,content_type,scope,owner_user_id,campaign_id,hidden_from_players FROM content_definitions WHERE content_type IN('feat','class_feature') AND is_archived=false ORDER BY name`);
+  const spellCandidates=await query<any>(`SELECT id,name,content_type,scope,owner_user_id,campaign_id,hidden_from_players FROM content_definitions WHERE content_type='spell' AND is_archived=false ORDER BY name`);
   // Active pools, plus any archived one the selected entry's stored cost still uses (shown as "(archived)").
   const pools=await query<any>(`SELECT pool_key,label||CASE WHEN is_archived THEN ' (archived)' ELSE '' END AS label FROM resource_pool_definitions
     WHERE NOT is_archived OR pool_key IN (SELECT line->>'pool' FROM content_definitions c, jsonb_array_elements(COALESCE(c.cost_json,'[]'::jsonb)) AS line WHERE c.id=NULLIF($1,'')::uuid)
@@ -56,13 +68,13 @@ export async function loadContentAdmin(types:ContentType[],selectedId=''){
     modifierType:row.modifier_type,defaultValueExpression:row.default_value_expression,label:row.label,runtimeSupported:row.runtime_supported})),
     attachedModifiers:attached.rows.map((row:any)=>({id:row.id,activationType:row.activation_type,target:row.target,targetLabel:row.target_label,
       modifierType:row.modifier_type,valueExpression:row.value_expression,conditionExpression:row.condition_expression,priority:row.priority})),
-    effects:effects.rows.map((row:any)=>({id:row.id,name:row.name,sourceType:row.source_type})),
+    effects:referable(effects.rows).map((row:any)=>({id:row.id,name:row.name,sourceType:row.source_type})),
     attachedEffects:attachedEffects.rows.map((row:any)=>({id:row.id,effectId:row.effect_id,name:row.name,activationType:row.activation_type,durationType:row.duration_type})),
-    actions:groupActions(actions.rows),actionCandidates:actionCandidates.rows,resources:resources.rows.map((row:any)=>({id:row.id,key:row.resource_key,label:row.label,maxValueExpression:row.max_value_expression,rechargePeriod:row.recharge_period})),
+    actions:groupActions(actions.rows),actionCandidates:referable(actionCandidates.rows).map((row:any)=>({id:row.id,name:row.name})),resources:resources.rows.map((row:any)=>({id:row.id,key:row.resource_key,label:row.label,maxValueExpression:row.max_value_expression,rechargePeriod:row.recharge_period})),
     grants:grants.rows.map((row:any)=>({id:row.id,name:row.name,type:row.content_type,activationType:row.activation_type})),
-    grantCandidates:grantCandidates.rows.map((row:any)=>({id:row.id,name:row.name,type:row.content_type})),
+    grantCandidates:referable(grantCandidates.rows).map((row:any)=>({id:row.id,name:row.name,type:row.content_type})),
     pools:pools.rows.map((row:any)=>({key:row.pool_key,label:row.label})),
-    spellCandidates:spellCandidates.rows,spellAccess:spellAccess.rows.map(mapSpellAccess)};
+    spellCandidates:referable(spellCandidates.rows).map((row:any)=>({id:row.id,name:row.name})),spellAccess:spellAccess.rows.map(mapSpellAccess)};
 }
 
 export async function createAdminContent(userId:string,type:ContentType,form:FormData){const name=String(form.get('name')||'').trim();if(!name)throw new Error('Name is required.');
@@ -104,6 +116,7 @@ export async function attachModifierToContent(form:FormData){const contentId=Str
 export async function detachContentModifier(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_modifier_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachContentModifier');return id;}
 
 export async function attachEffectToAdminContent(form:FormData){const id=String(form.get('contentId')||''),effectId=String(form.get('effectId')||''),activation=String(form.get('activationType')||'manual');
+  await assertReferenceAllowed({query},id,effectId);
   const result=await withTransaction(async client=>{if(activation!=='on_use'){await client.query(`INSERT INTO content_grants(source_content_id,granted_content_id,activation_type)
       SELECT $1,cd.id,$3 FROM content_definitions cd WHERE cd.id=$2 AND cd.content_type='condition' ON CONFLICT DO NOTHING`,[id,effectId,activation]);return id;}
     const content=await client.query<any>('SELECT name,owner_user_id FROM content_definitions WHERE id=$1',[id]);if(!content.rowCount)throw new Error('Content not found.');
@@ -135,14 +148,15 @@ export async function addContentResourceAction(form:FormData){const contentId=St
       VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,'')::uuid,$8,$9,COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE container_id=$1),0))`,
       [container,stepType,operation,target,key,expression,String(form.get('effectId')||''),String(form.get('targetMode')||'self'),String(form.get('actionLabel')||'').trim()]);return contentId;});
   invalidateReferenceData('addContentResourceAction');return result;}
-export async function removeContentResourceAction(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM action_steps WHERE id=$1',[String(form.get('actionId')||'')]);invalidateReferenceData('removeContentResourceAction');return id;}
+// Only deletes a step that belongs to an action container linked to the posted content (a forged step id removes nothing).
+export async function removeContentResourceAction(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM action_steps step WHERE step.id::text=$1 AND EXISTS(SELECT 1 FROM content_action_links link WHERE link.content_id::text=$2 AND link.action_container_id=step.container_id)',[String(form.get('actionId')||''),id]);invalidateReferenceData('removeContentResourceAction');return id;}
 
-export async function attachActionToContent(form:FormData){const id=String(form.get('contentId')||'');await query(`INSERT INTO content_action_links(content_id,action_container_id,trigger_type)
+export async function attachActionToContent(form:FormData){const id=String(form.get('contentId')||'');await assertReferenceAllowed({query},id,String(form.get('actionId')||''));await query(`INSERT INTO content_action_links(content_id,action_container_id,trigger_type)
   SELECT $1,action.id,$3 FROM content_definitions action WHERE action.id=$2 AND action.content_type='action'
   ON CONFLICT(content_id,action_container_id,trigger_type) DO NOTHING`,[id,String(form.get('actionId')||''),String(form.get('triggerType')||'manual')]);invalidateReferenceData('attachActionToContent');return id;}
 export async function detachActionFromContent(form:FormData){const id=String(form.get('contentId')||'');await query('DELETE FROM content_action_links WHERE id=$1 AND content_id=$2',[String(form.get('linkId')||''),id]);invalidateReferenceData('detachActionFromContent');return id;}
 
-export async function addSpellAccess(form:FormData){const owner=String(form.get('contentId')||'');await query(`INSERT INTO content_spell_access
+export async function addSpellAccess(form:FormData){const owner=String(form.get('contentId')||'');await assertReferenceAllowed({query},owner,String(form.get('spellContentId')||''));await query(`INSERT INTO content_spell_access
   (owner_content_id,spell_content_id,access_type,availability_type,resource_definition_id,resource_cost_expression,cast_level_mode,fixed_cast_level,save_dc_mode,fixed_save_dc,spell_attack_mode,fixed_spell_attack_bonus)
   VALUES($1,$2,$3,$4,NULLIF($5,'')::uuid,$6,$7,NULLIF($8,'')::int,$9,NULLIF($10,'')::int,$11,NULLIF($12,'')::int) ON CONFLICT(owner_content_id,spell_content_id,access_type) DO UPDATE SET
   availability_type=EXCLUDED.availability_type,resource_definition_id=EXCLUDED.resource_definition_id,resource_cost_expression=EXCLUDED.resource_cost_expression,
