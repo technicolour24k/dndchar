@@ -851,6 +851,26 @@ Consequence
 
 Do not accidentally build the website around the experimental 2d6 system. It is relevant only as evidence that the user may want broader system support eventually and dislikes unnecessarily rigid 5e assumptions.
 
+2.36 Page structure: admin pages are global, campaign admin pages are campaign-specific
+
+Decision (Rev 4 of the decks plan, 2026-11-23)
+
+- Admin pages (/admin/...) are for global content only: things every campaign shares.
+- Campaign admin pages control things specific to one campaign. The first is /campaigns/[id]/decks (a DM or co-DM creates, edits, copies and archives that campaign's own decks). Later examples: choosing which homebrew libraries a campaign has enabled.
+- Access to a campaign admin page is campaign management (DM / co-DM, plus the existing site-admin override), checked server-side in both load and actions.
+
+Known exception
+
+- Forage tables are campaign-specific but still live under /admin/forage. They are a candidate to move to a campaign admin page later. Not done yet.
+
+Consequence
+
+Put new campaign-specific controls on a campaign admin page, not under /admin. Decks a DM creates are owned by the campaign; global decks are seeded and read-only (copy into the campaign to edit).
+
+Deploy note
+
+Migrations 046-049 (next-attack expiry, deck schema, the Deck of Mystical Fate seed, campaign-owned decks) must be applied to production with npm run db:migrate:prod before deploying the decks work.
+
 ---
 
 3. DATA STRUCTURES / SCHEMAS (CONCEPTUAL ONLY)
