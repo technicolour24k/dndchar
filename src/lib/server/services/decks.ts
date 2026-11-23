@@ -59,7 +59,7 @@ export async function listCampaignDecks(campaignId: string, opts: { includeDisab
   const result = await query<any>(
     `SELECT c.id, c.name, c.description, c.is_archived, cd.is_enabled
      FROM campaign_decks cd JOIN content_definitions c ON c.id = cd.deck_content_id JOIN deck_definitions d ON d.content_id = c.id
-     WHERE cd.campaign_id = $1 AND (d.campaign_id IS NULL OR d.campaign_id = cd.campaign_id)
+     WHERE cd.campaign_id = $1 AND (c.campaign_id IS NULL OR c.campaign_id = cd.campaign_id)
        AND ($2::boolean OR (cd.is_enabled AND NOT c.is_archived)) ORDER BY c.name`,
     [campaignId, Boolean(opts.includeDisabled)]);
   return result.rows.map((row) => ({ id: row.id, name: row.name, description: row.description, archived: row.is_archived, enabled: row.is_enabled }));
@@ -165,7 +165,7 @@ export async function drawCard(input: { userId: string; characterId: string; dec
   const campaignId: string = character.campaign_id;
   const enabled = await query(
     `SELECT 1 FROM campaign_decks cd JOIN content_definitions c ON c.id = cd.deck_content_id JOIN deck_definitions d ON d.content_id = c.id
-     WHERE cd.campaign_id = $1 AND cd.deck_content_id = $2 AND cd.is_enabled AND NOT c.is_archived AND (d.campaign_id IS NULL OR d.campaign_id = cd.campaign_id)`, [campaignId, deckId]);
+     WHERE cd.campaign_id = $1 AND cd.deck_content_id = $2 AND cd.is_enabled AND NOT c.is_archived AND (c.campaign_id IS NULL OR c.campaign_id = cd.campaign_id)`, [campaignId, deckId]);
   if (!enabled.rows.length) throw new DeckError('not_enabled', 'That deck is not enabled for this campaign.');
   const deck = await loadDeck(deckId);
   if (!deck) throw new DeckError('not_found', 'Deck not found.');
@@ -446,7 +446,7 @@ export async function setCampaignDeck(input: { userId: string; campaignId: strin
   // A campaign can use only global decks and its own, never another campaign's (it looks like a missing deck).
   const deck = await query<{ is_archived: boolean }>(
     `SELECT c.is_archived FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
-     WHERE c.id = $1 AND c.content_type = 'deck' AND (d.campaign_id IS NULL OR d.campaign_id = $2)`, [input.deckId, input.campaignId]);
+     WHERE c.id = $1 AND c.content_type = 'deck' AND (c.campaign_id IS NULL OR c.campaign_id = $2)`, [input.deckId, input.campaignId]);
   if (!deck.rows.length) throw new DeckError('not_found', 'Deck not found.');
   if (input.enabled && deck.rows[0].is_archived) throw new DeckError('bad_input', 'That deck is archived.');
   await query(
@@ -494,15 +494,15 @@ export async function recordTokenHpDeltas(drawId: string, deltas: Array<{ index:
 }
 
 // ---------------------------------------------------------------- campaign deck authoring (unit 9b)
-// A deck a DM creates is OWNED BY THE CAMPAIGN (deck_definitions.campaign_id) and exists only there. Global decks
-// (campaign_id NULL, e.g. the seeded Deck of Mystical Fate) are read-only: a DM copies one into the campaign to edit
+// A deck a DM creates is OWNED BY THE CAMPAIGN (content_definitions.campaign_id, scope 'campaign') and exists only there. Global decks
+// (scope 'global', campaign_id NULL, e.g. the seeded Deck of Mystical Fate) are read-only: a DM copies one into the campaign to edit
 // it. Every function here checks canManage on the campaign (DM / co-DM, plus the site-admin override) and, for
 // writes, that the campaign is not archived and that the deck is one the campaign owns. Decks are archived, never deleted.
 
 const DECK_RULES_MAX_CHARS = 300_000;
 
 /** SQL fragment: a deck is usable by campaign $N when it is global or owned by that campaign. */
-const DECK_VISIBLE_SQL = (campaignParam: string) => `(d.campaign_id IS NULL OR d.campaign_id = ${campaignParam})`;
+const DECK_VISIBLE_SQL = (campaignParam: string) => `(c.campaign_id IS NULL OR c.campaign_id = ${campaignParam})`;
 
 async function requireManage(userId: string, campaignId: string, opts: { write: boolean }): Promise<void> {
   const access = await getCampaignAccess({ query }, userId, campaignId);
@@ -527,7 +527,7 @@ export type ManagedDeckRow = { id: string; name: string; archived: boolean; card
 export async function listDecksForManagement(userId: string, campaignId: string): Promise<{ own: ManagedDeckRow[]; global: ManagedDeckRow[] }> {
   await requireManage(userId, campaignId, { write: false });
   const result = await query<any>(
-    `SELECT c.id, c.name, c.is_archived, d.rules_json, d.campaign_id, COALESCE(cd.is_enabled, false) AS enabled
+    `SELECT c.id, c.name, c.is_archived, d.rules_json, c.campaign_id, COALESCE(cd.is_enabled, false) AS enabled
      FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
      LEFT JOIN campaign_decks cd ON cd.deck_content_id = c.id AND cd.campaign_id = $1
      WHERE c.content_type = 'deck' AND ${DECK_VISIBLE_SQL('$1')} ORDER BY c.is_archived, c.name`, [campaignId]);
@@ -553,7 +553,7 @@ export async function getOwnDeck(userId: string, campaignId: string, deckId: str
   if (!isUuid(deckId)) return null;
   const result = await query<any>(
     `SELECT c.id, c.name, c.description, c.is_archived, d.rules_json FROM content_definitions c
-     JOIN deck_definitions d ON d.content_id = c.id WHERE c.id = $1 AND c.content_type = 'deck' AND d.campaign_id = $2`, [deckId, campaignId]);
+     JOIN deck_definitions d ON d.content_id = c.id WHERE c.id = $1 AND c.content_type = 'deck' AND c.campaign_id = $2`, [deckId, campaignId]);
   const row = result.rows[0];
   if (!row) return null;
   const parsed = parseDeckRules(row.rules_json);
@@ -573,9 +573,10 @@ async function insertOwnDeck(client: pg.PoolClient, userId: string, campaignId: 
   // A random suffix keeps keys unique even for two decks created in the same millisecond.
   const key = `deck:${slugOf(name)}:${crypto.randomBytes(5).toString('hex')}`;
   const created = await client.query<{ id: string }>(
-    `INSERT INTO content_definitions (content_key, content_type, name, description, source_kind, owner_user_id, activation_type, requires_concentration, stack_behavior, metadata_json)
-     VALUES ($1, 'deck', $2, $3, 'homebrew', $4, 'passive', false, 'stack', '{}'::jsonb) RETURNING id`,
-    [key, name, description, userId]);
+    `INSERT INTO content_definitions (content_key, content_type, name, description, source_kind, owner_user_id, activation_type, requires_concentration, stack_behavior, metadata_json, scope, campaign_id)
+     VALUES ($1, 'deck', $2, $3, 'homebrew', $4, 'passive', false, 'stack', '{}'::jsonb, 'campaign', $5) RETURNING id`,
+    [key, name, description, userId, campaignId]);
+  // deck_definitions.campaign_id is now an unread mirror of content_definitions.campaign_id (migration 050); keep it in step.
   await client.query('INSERT INTO deck_definitions (content_id, rules_json, campaign_id) VALUES ($1, $2::jsonb, $3)', [created.rows[0].id, JSON.stringify(rules), campaignId]);
   return created.rows[0].id;
 }
@@ -596,7 +597,7 @@ export async function copyDeckToCampaign(input: { userId: string; campaignId: st
   if (!isUuid(input.sourceId)) throw new DeckError('bad_input', 'Pick a deck to copy.');
   const source = (await query<any>(
     `SELECT c.name, c.description, d.rules_json FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
-     WHERE c.id = $1 AND c.content_type = 'deck' AND d.campaign_id IS NULL AND NOT c.is_archived`, [input.sourceId])).rows[0];
+     WHERE c.id = $1 AND c.content_type = 'deck' AND c.campaign_id IS NULL AND NOT c.is_archived`, [input.sourceId])).rows[0];
   if (!source) throw new DeckError('not_found', 'Deck not found.');
   const name = `${source.name} (copy)`.slice(0, 120);
   const id = await withTransaction((client) => insertOwnDeck(client, input.userId, input.campaignId, name, source.description, source.rules_json));
@@ -642,7 +643,7 @@ export async function updateDeck(input: { userId: string; campaignId: string; id
   if (errors.length) return { ok: false, errors };
   const saved = await withTransaction(async (client) => {
     // The ownership check is part of the write: only a deck owned by this campaign matches.
-    const owned = await client.query(`SELECT 1 FROM deck_definitions WHERE content_id = $1 AND campaign_id = $2 FOR UPDATE`, [input.id, input.campaignId]);
+    const owned = await client.query(`SELECT 1 FROM content_definitions WHERE id = $1 AND content_type = 'deck' AND campaign_id = $2 FOR UPDATE`, [input.id, input.campaignId]);
     if (!owned.rows.length) return false;
     await client.query(`UPDATE content_definitions SET name = $2, description = $3, updated_at = now() WHERE id = $1 AND content_type = 'deck'`,
       [input.id, name, input.description.trim().slice(0, 5000)]);
@@ -660,7 +661,7 @@ export async function toggleDeckArchived(input: { userId: string; campaignId: st
   if (!isUuid(input.id)) return false;
   const result = await query(
     `UPDATE content_definitions c SET is_archived = $3, updated_at = now() FROM deck_definitions d
-     WHERE c.id = $1 AND d.content_id = c.id AND c.content_type = 'deck' AND d.campaign_id = $2`, [input.id, input.campaignId, input.archived]);
+     WHERE c.id = $1 AND d.content_id = c.id AND c.content_type = 'deck' AND c.campaign_id = $2`, [input.id, input.campaignId, input.archived]);
   invalidateReferenceData('toggleDeckArchived');
   return (result.rowCount ?? 0) > 0;
 }
@@ -673,7 +674,7 @@ export async function dryRunDraw(input: { userId: string; campaignId: string; id
   if (!isUuid(input.id)) return { lines: [], error: 'Deck not found.' };
   const result = await query<any>(
     `SELECT d.rules_json FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id
-     WHERE c.id = $1 AND c.content_type = 'deck' AND d.campaign_id = $2`, [input.id, input.campaignId]);
+     WHERE c.id = $1 AND c.content_type = 'deck' AND c.campaign_id = $2`, [input.id, input.campaignId]);
   if (!result.rows.length) return { lines: [], error: 'Deck not found.' };
   const parsed = parseDeckRules(result.rows[0].rules_json);
   if (!parsed.rules) return { lines: [], error: `The saved rules are invalid: ${parsed.errors[0]}` };

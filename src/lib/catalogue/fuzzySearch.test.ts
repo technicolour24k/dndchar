@@ -7,6 +7,12 @@ function entry(name: string, overrides: Partial<Omit<CatalogueIndexEntry, 'norma
     type: overrides.type ?? 'spell',
     name,
     sourceKind: overrides.sourceKind ?? 'srd',
+    scope: overrides.scope ?? 'global',
+    ownerUserId: overrides.ownerUserId ?? null,
+    ownerName: overrides.ownerName ?? null,
+    campaignId: overrides.campaignId ?? null,
+    hiddenFromPlayers: overrides.hiddenFromPlayers ?? false,
+    forkedFromOwnerName: overrides.forkedFromOwnerName ?? null,
     spellLevel: overrides.spellLevel ?? null
   });
 }

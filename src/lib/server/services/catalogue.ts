@@ -32,10 +32,12 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
         s.ritual, s.concentration, s.classes, s.higher_level,
         s.resolution_type, s.damage_type, s.base_dice, s.save_ability, s.save_effect, s.scaling_json,
         i.category, i.equipment_type, i.requires_attunement, i.ac_bonus, i.to_hit_bonus,
-        i.damage_bonus, i.attack_ability, i.damage_rolls
+        i.damage_bonus, i.attack_ability, i.damage_rolls,
+        u.display_name AS owner_name
       FROM content_definitions c
       LEFT JOIN spell_definitions s ON s.content_id = c.id
       LEFT JOIN item_definitions i ON i.content_id = c.id
+      LEFT JOIN users u ON u.id = c.owner_user_id
       WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1) AND c.content_type <> 'deck'
         AND ($2 = '' OR c.name ILIKE '%' || $2 || '%')
       ORDER BY c.source_kind = 'srd' DESC, c.name ASC
@@ -64,6 +66,11 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
     sourceKind: row.source_kind,
     sourceRef: row.source_ref || '',
     ownerUserId: row.owner_user_id,
+    scope: row.scope,
+    ownerName: row.owner_name ?? null,
+    campaignId: row.campaign_id ?? null,
+    hiddenFromPlayers: row.hidden_from_players ?? false,
+    forkedFromOwnerName: row.metadata_json?.fork?.fromOwnerName ?? null,
     isArchived: row.is_archived,
     isSystem: row.is_system ?? false,
     metadata: row.metadata_json || {},
@@ -106,9 +113,12 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
 // the admin "Reload catalogue" button - see admin/settings/+page.server.ts).
 async function loadCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
   const result = await query<any>(`
-    SELECT c.id, c.content_type, c.name, c.source_kind, s.spell_level
+    SELECT c.id, c.content_type, c.name, c.source_kind, s.spell_level,
+      c.scope, c.owner_user_id, c.campaign_id, c.hidden_from_players,
+      u.display_name AS owner_name, c.metadata_json->'fork'->>'fromOwnerName' AS forked_from_owner_name
     FROM content_definitions c
     LEFT JOIN spell_definitions s ON s.content_id = c.id
+    LEFT JOIN users u ON u.id = c.owner_user_id
     WHERE c.is_archived = false AND c.content_type IN ('spell', 'item', 'feat', 'class_feature')
   `);
   return result.rows.map((row: any) => buildIndexEntry({
@@ -116,6 +126,12 @@ async function loadCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
     type: row.content_type,
     name: row.name,
     sourceKind: row.source_kind,
+    scope: row.scope,
+    ownerUserId: row.owner_user_id ?? null,
+    ownerName: row.owner_name ?? null,
+    campaignId: row.campaign_id ?? null,
+    hiddenFromPlayers: row.hidden_from_players,
+    forkedFromOwnerName: row.forked_from_owner_name ?? null,
     spellLevel: row.spell_level ?? null
   }));
 }

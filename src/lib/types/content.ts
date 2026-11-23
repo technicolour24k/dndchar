@@ -1,6 +1,8 @@
 import type { AbilityKey } from '$lib/types/character';
 
 export type ContentType = 'item' | 'spell' | 'feat' | 'class_feature' | 'condition' | 'action' | 'deck';
+/** Who owns a definition: everyone (global), one user's library (personal), or one campaign (campaign). Migration 050. */
+export type LibraryScope = 'global' | 'personal' | 'campaign';
 export type ContainerActivationType = 'passive' | 'triggered' | 'active_use';
 export type ActivationType = 'carried' | 'equipped' | 'attuned' | 'on_use' | 'manual';
 export type RechargePeriod = 'short_rest' | 'long_rest' | 'dawn' | 'round' | 'encounter' | 'manual';
@@ -38,6 +40,15 @@ export type ContentDefinition = {
   sourceKind: 'srd' | 'homebrew';
   sourceRef: string;
   ownerUserId: string | null;
+  scope: LibraryScope;
+  /** The owning user's display name (personal scope), for labels. */
+  ownerName: string | null;
+  /** The owning campaign (campaign scope). */
+  campaignId: string | null;
+  /** "Keep out of players' search": only the owner, the campaign's DMs and admins are offered it. */
+  hiddenFromPlayers: boolean;
+  /** For a campaign copy forked on leave: whose library it came from. */
+  forkedFromOwnerName: string | null;
   isArchived: boolean;
   isSystem: boolean;
   metadata: Record<string, unknown>;

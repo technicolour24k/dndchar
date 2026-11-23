@@ -337,6 +337,10 @@ describe.skipIf(!enabled)('campaign deck authoring', () => {
       expect(await decks.toggleDeckArchived({ userId: dm1, campaignId: c1, id: seedId, archived: true })).toBe(false);
       const copyId = await decks.copyDeckToCampaign({ userId: dm1, campaignId: c1, sourceId: seedId });
       created.push(copyId);
+      // Migration 050: both made decks are campaign-scoped and agree with the deck_definitions mirror; the seed is global.
+      const scopes = (await query<any>(`SELECT c.id, c.scope, c.campaign_id, d.campaign_id AS mirror FROM content_definitions c JOIN deck_definitions d ON d.content_id = c.id WHERE c.id = ANY($1::uuid[])`, [[deckId, copyId, seedId]])).rows;
+      for (const id of [deckId, copyId]) expect(scopes.find((row) => row.id === id)).toMatchObject({ scope: 'campaign', campaign_id: c1, mirror: c1 });
+      expect(scopes.find((row) => row.id === seedId)).toMatchObject({ scope: 'global', campaign_id: null });
       const copy = await decks.getOwnDeck(dm1, c1, copyId);
       expect(copy?.name).toBe('The Deck of Mystical Fate (copy)');
       expect(copy?.summary?.cardCount).toBe(108);

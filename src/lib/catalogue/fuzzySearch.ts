@@ -4,7 +4,7 @@
 // plain tsx script later. No library: the index is small (about 1-2k rows), a linear scan is
 // well under 5ms, and the scoring rules below are simple enough not to need one.
 
-import type { ContentType } from '$lib/types/content';
+import type { ContentType, LibraryScope } from '$lib/types/content';
 
 /** One row of the in-memory catalogue index, precomputed once per refresh (24h TTL, or sooner
  * on an in-app content write, or the admin "Reload catalogue" button - see catalogue.ts). */
@@ -13,6 +13,12 @@ export type CatalogueIndexEntry = {
   type: ContentType;
   name: string;
   sourceKind: 'srd' | 'homebrew';
+  scope: LibraryScope;
+  ownerUserId: string | null;
+  ownerName: string | null;
+  campaignId: string | null;
+  hiddenFromPlayers: boolean;
+  forkedFromOwnerName: string | null;
   spellLevel: number | null;
   /** normaliseText(name), precomputed so a search doesn't redo it on every row every keystroke. */
   normalisedName: string;
