@@ -10,6 +10,7 @@ const reset = vi.fn();
 let access: any = { canAct: true, canEdit: true };
 
 class FakeShortfall extends Error { shortfalls = [{ label: 'Attack', needed: 1, available: 0 }]; }
+class FakeGone extends Error { constructor() { super('That free repeat is no longer available.'); } }
 
 vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: async (fn: any) => fn({}) }));
 vi.mock('$lib/server/realtime', () => ({ emitRealtimeEvent: vi.fn() }));
@@ -19,7 +20,7 @@ vi.mock('$lib/server/services/turn-state', () => ({
   adjustTurnPool: (...args: unknown[]) => adjust(...args), getTurnView: async () => ({ pools: [] }),
   resetTurnState: (...args: unknown[]) => reset(...args), lockTurnState: async () => {}
 }));
-vi.mock('$lib/server/services/cost-engine', () => ({ CostShortfallError: FakeShortfall }));
+vi.mock('$lib/server/services/cost-engine', () => ({ CostShortfallError: FakeShortfall, FollowupGoneError: FakeGone }));
 vi.mock('$lib/server/vttCostGate', () => ({
   openCostGate: (...args: unknown[]) => gateFn(...args),
   runWithGate: async (_gate: unknown, run: any) => run(null),
@@ -51,6 +52,22 @@ describe('turn route: pay', () => {
     const dash = await post({ action: 'pay', activation: { kind: 'dash', count: 2 } });
     expect(dash.status).toBe(200);
     expect(pay.mock.calls[1][2]).toEqual({ kind: 'dash', count: 2 });
+  });
+  it('an id-less attack answers with the follow-up fields, so the client can word it and offer the repeat', async () => {
+    pay.mockResolvedValue({ paid: [{ label: 'Extra Attack', pool: 'followup', delta: -1 }], turn: { pools: [], followups: [{ cls: 'melee', label: 'Extra Attack', remaining: 1 }] }, results: [] });
+    const res = await post({ action: 'pay', activation: { kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike' } });
+    expect(await res.json()).toMatchObject({ usedFollowup: true, followupCls: 'melee', followupsLeft: [{ cls: 'melee', remaining: 1 }] });
+    const dash = await post({ action: 'pay', activation: { kind: 'dash', count: 1 } });
+    expect((await dash.json()).followupCls).toBeNull();
+  });
+  it("accepts followup 'require' and turns a missing follow-up into a 409 followup_gone", async () => {
+    const activation = { kind: 'weapon_attack', inventoryId: null, label: 'Unarmed Strike', followup: 'require' };
+    await post({ action: 'pay', activation });
+    expect(pay.mock.calls[0][2]).toEqual(activation);
+    pay.mockRejectedValue(new FakeGone());
+    const res = await post({ action: 'pay', activation });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'followup_gone' });
   });
   it('refuses every other kind, including a weapon attack the sheet can pay itself', async () => {
     for (const activation of [

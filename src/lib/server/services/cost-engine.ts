@@ -39,6 +39,14 @@ export class CostShortfallError extends Error {
   }
 }
 
+// Thrown when a 'require' follow-up choice finds no follow-up to spend. Nothing has been paid.
+export class FollowupGoneError extends Error {
+  constructor() {
+    super('That free repeat is no longer available.');
+    this.name = 'FollowupGoneError';
+  }
+}
+
 // How a short activation is let through. Built by vttCostApproval.ts after it has checked who is allowed.
 export type CostOverride = {
   kind: 'dm_approved' | 'dm_self' | 'self_override';
@@ -170,7 +178,7 @@ function planChoices(activation: Activation, loaded: LoadedCost) {
   // spells to 'skip' (an echo is a deliberate choice, never a silent downgrade of a normal cast).
   const defaultChoice = activation.kind === 'weapon_attack' ? 'use' : 'skip';
   const choice = (activation.kind === 'spell' || activation.kind === 'spell_access' || activation.kind === 'weapon_attack' ? activation.followup : undefined) ?? defaultChoice;
-  return loaded.followup && choice === 'use' ? { ...slot, followupClass: loaded.followup.cls } : slot;
+  return loaded.followup && (choice === 'use' || choice === 'require') ? { ...slot, followupClass: loaded.followup.cls } : slot;
 }
 
 // The per-turn state an activation with a turn line works against (action economy). Read on the
@@ -284,10 +292,18 @@ export async function payActivationCost(
   client: pg.PoolClient, characterId: string, activation: Activation, options: { actorUserId: string; override?: CostOverride | null }
 ): Promise<PaidLine[]> {
   const loaded = await loadActivationCost(client, characterId, activation);
+  const required = 'followup' in activation && activation.followup === 'require';
   // Turn lines only: free unless one actually draws from the profile's pools. Takes no locks otherwise.
-  if (!loaded.entries.some((e) => !asTurnLine(e)) && !(await turnLinePays(client, characterId, loaded.entries))) return [];
+  // A required follow-up can't exist here (nothing draws from a pool), so it fails rather than pass as free.
+  if (!loaded.entries.some((e) => !asTurnLine(e)) && !(await turnLinePays(client, characterId, loaded.entries))) {
+    if (required) throw new FollowupGoneError();
+    return [];
+  }
   const { availability, counterRows, poolMax, turn } = await lockSources(client, characterId, loaded, true, await loadTurn(client, characterId, loaded, true));
   const plan = planCost(loaded.entries, availability, planChoices(activation, loaded));
+  // 'require' is "free repeat or nothing": checked before the shortfall and override logic so it can
+  // never fall through to paying the action (or asking the DM to let a short cost through).
+  if (required && !plan.lines.some((line) => line.payFrom?.pool === 'followup')) throw new FollowupGoneError();
   const override = plan.shortfalls.length ? options.override ?? null : null;
   if (plan.shortfalls.length && !override) throw new CostShortfallError(plan.shortfalls);
   const waived = Boolean(override?.waive);

@@ -10,7 +10,7 @@ import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
 import { createDeck } from './deck.js';
 import { createCostApproval } from './costApproval.js';
-import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, paidText, resetAllNote, turnChips } from './shared/actionEconomy.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, followupToSend, paidText, repeatOffer, resetAllNote, turnChips } from './shared/actionEconomy.js';
 import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
@@ -1665,6 +1665,7 @@ function closeAttackModal() {
     render();
   }
   pendingAttack = null;
+  lastAttack = null;
   dashHold = null;
 }
 
@@ -1894,12 +1895,13 @@ function attackRollExtras(sourceTokenId, targetId, options, preview) {
     advantage: { disabled: [...options.disabled], situationalAdvantage: options.adv, situationalDisadvantage: options.dis },
     manualDamageDice: options.damageDelta, // INTERIM
     // The action economy choices for a character's weapon attack (the server defaults match).
-    // A follow-up is only used when the card actually offered it (and it's still the choice);
-    // otherwise send 'skip', so a hidden/unknown follow-up is never spent silently.
-    ...(options.showTurn ? {
-      timing: options.timing,
-      followup: attackFollowup(options.turn, options.timing) && options.followup === 'use' ? 'use' : 'skip'
-    } : {}),
+    // followupToSend sends only a choice the player really made. With no turn view yet (the preview
+    // is still loading, or failed) it sends nothing, so the server's default ('use') applies and a
+    // waiting Extra Attack is spent rather than silently skipped. The server decides and pays.
+    ...(options.showTurn ? { timing: options.timing } : {}),
+    // A spell has no confirm-card choice, but the result button's repeat ('require') still goes through.
+    ...((options.showTurn || options.followup === 'require') && followupToSend(options.turn, options.timing, options.followup)
+      ? { followup: followupToSend(options.turn, options.timing, options.followup) } : {}),
   };
 }
 
@@ -1914,7 +1916,9 @@ async function loadAttackPreview(pending) {
     options.primaryDamageDice = preview.primaryDamageDice || '';
     if (preview.usesAttackRoll === false) options.showAdvantage = false;
     options.sources = (preview.sources || []).filter((src) => src.origin !== 'situational');
-    if (preview.turn) options.turn = preview.turn;
+    // roll-manual previews (Unarmed Strike, GM-added actions) carry no turn view, so fall back to the
+    // token's own display copy. It only decides whether the radio shows; the server decides what is paid.
+    options.turn = preview.turn ?? session.tokens[sourceTokenId]?.turn ?? null;
   } catch (err) {
     if (pendingAttack !== pending) return;
     console.warn('[VTT] advantage preview failed', err);
@@ -1991,6 +1995,12 @@ async function rollManualAction(action, extraBody = {}) {
 // The Error a roll route's non-OK answer becomes. A 409 'insufficient' keeps the whole body on
 // err.insufficient so resolveAttack can offer the ask-the-DM prompt instead of a dead end.
 function rollError(body, res) {
+  // A 'require' follow-up that was no longer there: nothing was spent.
+  if (body?.error === 'followup_gone') {
+    const gone = new Error(body.message || 'That free repeat is no longer available.');
+    gone.followupGone = true;
+    return gone;
+  }
   const refused = body?.error === 'approval_invalid' || body?.error === 'forbidden' || body?.error === 'wrong_room' || body?.error === 'not_in_room';
   const err = new Error(costShortfallText(body) || (refused ? costApprovalErrorText(body) : '') || body.error || ('roll request failed (' + res.status + ')'));
   if (isCostInsufficient(body)) err.insufficient = body;
@@ -2052,12 +2062,17 @@ async function rollPendingAction(action, source, extraBody = {}) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'pay', approvalId: extraBody.approvalId, override: extraBody.override, roomId: extraBody.roomId,
-          activation: { kind: 'weapon_attack', inventoryId: null, label: action.name, timing: extraBody.timing || 'action', followup: extraBody.followup === 'use' ? 'use' : 'skip' },
+          // followup is only sent when the player made a choice; otherwise the server default ('use') applies.
+          activation: { kind: 'weapon_attack', inventoryId: null, label: action.name, timing: extraBody.timing || 'action', ...(extraBody.followup ? { followup: extraBody.followup } : {}) },
         }),
       });
       const paidBody = await paid.json().catch(() => ({}));
       if (paid.status === 404) return rollManualAction(action, extraBody); // can't act for this character: rolls unpaid, as before
       if (!paid.ok) throw rollError(paidBody, paid);
+      // Keep what the turn route said was paid, so the result shows "Paid: 1 Attack" / "Extra Attack (N left)"
+      // and can offer the free repeat.
+      const manual = await rollManualAction(action, extraBody);
+      return { ...manual, turn: { paid: paidBody.paid, usedFollowup: paidBody.usedFollowup, followupCls: paidBody.followupCls, followupsLeft: paidBody.followupsLeft } };
     }
     return rollManualAction(action, extraBody);
   }
@@ -2113,6 +2128,11 @@ async function resolveAttack(costExtra = {}) {
       });
       return;
     }
+    if (err.followupGone && pendingAttack === pending) {
+      // The free repeat was used up or cleared (e.g. a new round) before the click: nothing was spent.
+      attackModalError(err.message);
+      return;
+    }
     console.error('[VTT] roll failed', err);
     attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
     return;
@@ -2129,9 +2149,13 @@ async function resolveAttack(costExtra = {}) {
   // no attack-roll concept in this simple model - both skip straight to the no-hidden-
   // value branch below, same as a save/auto spell already did.
   const usesAttackRoll = !isHeal && action.kind !== 'item' && (!isSpell || result.resolution === 'attack');
+  // The free repeat button (Extra Attack / a spell echo): only offered when the server says one is still
+  // waiting. A weapon repeats only as an Action-timed attack; a spell any intent.
+  const canRepeat = action.kind === 'item' || (!isSpell && (intent !== 'attack' || options.timing !== 'action')) ? null : repeatOffer(result.turn);
+  lastAttack = canRepeat ? { sourceTokenId, action, intent, targetId, targetName, options: cloneAttackOptions(options) } : null;
   renderAttackBreakdown(targetName, result, usesAttackRoll
     ? '<span class="attack-subtext">Resolving hit/miss…</span>'
-    : '<span class="attack-subtext">Loading…</span>');
+    : '<span class="attack-subtext">Loading…</span>', canRepeat);
   if (result.turn && paidText(result.turn)) {
     const paidEl = document.createElement('div');
     paidEl.className = 'attack-subtext';
@@ -2147,6 +2171,7 @@ async function resolveAttack(costExtra = {}) {
       if (awaitingAttackResult && awaitingAttackResult.targetId === targetId) {
         setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
         awaitingAttackResult = null;
+        enableRepeatButton();
       }
     }, 5000);
     awaitingAttackResult = { targetId, targetName, result, timeoutId };
@@ -2178,7 +2203,7 @@ async function resolveAttack(costExtra = {}) {
 // Renders the to-hit (if any) + damage breakdown (identical whichever roll
 // source), with a verdict slot filled once the server responds or (for
 // save/auto spells) once renderSpellResolutionControls wires its own prompt.
-function renderAttackBreakdown(targetName, result, verdictHtml) {
+function renderAttackBreakdown(targetName, result, verdictHtml, offer = null) {
   const hasAttackRoll = Boolean(result.attack);
   const saveLine = result.resolution === 'save'
     ? `<div class="attack-roll-block"><h4>Saving Throw</h4>DC ${result.saveDc} ${escapeHtml(String(result.saveAbility || '').toUpperCase())} — ${result.saveEffect === 'negate' ? 'no damage' : 'half damage'} on a success</div>`
@@ -2190,11 +2215,52 @@ function renderAttackBreakdown(targetName, result, verdictHtml) {
     ${saveLine}
     <div id="attackVerdict">${verdictHtml}</div>
     <div class="attack-roll-block"><h4>Damage${hasAttackRoll ? ' (on a hit)' : ''}</h4>${escapeHtml((result.damage || []).join('\n'))}</div>
+    <div class="attack-repeat-note attack-subtext" id="attackRepeatNote" role="status"></div>
     <div class="actions">
-      <button type="button" class="secondary" id="attackDoneBtn">Close</button>
+      ${offer ? `<button type="button" id="attackRepeatBtn" disabled>${escapeHtml(offer.label)} (${offer.remaining} left)</button>` : ''}
+      <button type="button" class="secondary" id="attackDoneBtn">Done</button>
     </div>
   `;
   document.getElementById('attackDoneBtn').addEventListener('click', closeAttackModal);
+  document.getElementById('attackRepeatBtn')?.addEventListener('click', repeatLastAttack);
+}
+
+// The free repeat (Extra Attack, a spell echo) stays disabled until this roll's verdict has landed, so the
+// next roll can't overlap the one still being applied.
+function enableRepeatButton() {
+  const button = document.getElementById('attackRepeatBtn');
+  if (button) button.disabled = false;
+}
+
+// A deep copy of the roll options, so the repeat reuses the same choices (unticked sources, situational
+// adv/dis, damage-dice delta) without sharing the Set the finished attack still holds.
+function cloneAttackOptions(options) {
+  return { ...options, sources: [...options.sources], disabled: new Set(options.disabled) };
+}
+
+// What the open result's repeat button runs: { sourceTokenId, action, intent, targetId, targetName, options }.
+let lastAttack = null;
+
+// The result's [Extra Attack] button: the same attack on the same target, straight away, with no confirm
+// card. It sends followup 'require', so the server either spends a waiting follow-up or answers
+// followup_gone with nothing spent. It never pays an action.
+function repeatLastAttack() {
+  const last = lastAttack;
+  if (!last) return;
+  const note = document.getElementById('attackRepeatNote');
+  if (!session.tokens[last.sourceTokenId] || !session.tokens[last.targetId]) {
+    if (note) note.textContent = 'That target is gone.';
+    return;
+  }
+  const options = cloneAttackOptions(last.options);
+  options.followup = 'require';
+  options.timing = 'action';
+  options.status = 'ready';
+  pendingAttack = { ...last, options, stage: 'confirm' };
+  send({ type: 'target:select', sourceTokenId: last.sourceTokenId, targetTokenIds: [last.targetId] });
+  currentTargetTokenIds = [last.targetId];
+  render();
+  resolveAttack();
 }
 
 function setAttackVerdict(html) {
@@ -2237,6 +2303,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent =
     if (awaitingSpellResult && awaitingSpellResult.targetId === targetId) {
       setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
       awaitingSpellResult = null;
+      enableRepeatButton();
     }
   }, 5000);
   awaitingSpellResult = { targetId, timeoutId };
@@ -2273,6 +2340,7 @@ function handleSpellResult(msg) {
       : `${msg.damageApplied} damage dealt`;
   const cls = msg.resolution === 'heal' ? 'hit' : (msg.damageApplied > 0 ? 'hit' : 'miss');
   setAttackVerdict(`<div class="attack-outcome ${cls}">${label}${damageTakenNote(msg)}</div>`);
+  enableRepeatButton();
 }
 
 // The damage_taken audit trail the server adds when the target is a PC whose modifiers changed the
@@ -2300,6 +2368,7 @@ function handleAttackResult(msg) {
   } else { cls = 'miss'; label = 'Miss'; }
 
   setAttackVerdict(`<div class="attack-outcome ${cls}">${label}${damageTakenNote(msg)}</div>`);
+  enableRepeatButton();
 }
 
 // Yellow highlight ring around every valid target while an action is armed (step 1's visible
@@ -5387,7 +5456,7 @@ function renderCombatActionsBody() {
     .join('');
   const turnFollowupsHtml = (token.turn?.followups || [])
     .filter((entry) => Number(entry.remaining) > 0)
-    .map((entry) => `<div class="mini-sheet-slot"><span class="mini-sheet-slot-label">${escapeHtml(entry.label)}: ${Number(entry.remaining) || 0} left</span></div>`)
+    .map((entry) => `<div class="mini-sheet-slot"><span class="mini-sheet-slot-label">${escapeHtml(entry.label)}: ${Number(entry.remaining) || 0} left - use it from the attack result</span></div>`)
     .join('');
 
   const itemsHtml = (token.items || []).length

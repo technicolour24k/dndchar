@@ -10,13 +10,14 @@ let access: any = { canAct: true };
 const view = { profileKey: 'attack_utility', pools: [{ key: 'attack', label: 'Attack', current: 2, max: 2 }], followups: [{ cls: 'melee', label: 'Extra Attack', remaining: 1 }] };
 
 class FakeShortfall extends Error { shortfalls = [{ label: 'Attack', needed: 1, available: 0 }]; }
+class FakeGone extends Error { constructor() { super('That free repeat is no longer available.'); } }
 
 vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: async (run: any) => run({}) }));
 vi.mock('$lib/server/services/effects', () => ({ consumeNextAttackEffects: (...args: unknown[]) => consume(...args) }));
 vi.mock('$lib/server/realtime', () => ({ emitRealtimeEvent: vi.fn() }));
 vi.mock('$lib/server/services/access', () => ({ getCharacterAccess: async () => access }));
 vi.mock('$lib/server/services/catalogue', () => ({ payTurnActivation: (...args: unknown[]) => pay(...args) }));
-vi.mock('$lib/server/services/cost-engine', () => ({ CostShortfallError: FakeShortfall }));
+vi.mock('$lib/server/services/cost-engine', () => ({ CostShortfallError: FakeShortfall, FollowupGoneError: FakeGone }));
 vi.mock('$lib/server/vttCostGate', () => ({
   openCostGate: (...args: unknown[]) => gateFn(...args),
   runWithGate: async (_gate: unknown, run: any) => run(null),
@@ -86,6 +87,18 @@ describe('roll-attack and the action economy', () => {
     expect(pay.mock.calls[0][2]).toEqual({ kind: 'weapon_attack', inventoryId: WEAPON, timing: 'bonus_action', followup: 'skip' });
     await post({ timing: 'sometime', followup: 'maybe' }); // junk falls back to the defaults
     expect(pay.mock.calls[1][2]).toEqual({ kind: 'weapon_attack', inventoryId: WEAPON, timing: 'action', followup: 'use' });
+  });
+  it("passes followup 'require' through, and says which follow-up class the attack uses", async () => {
+    const body = await (await post({ followup: 'require' })).json();
+    expect(pay.mock.calls[0][2]).toEqual({ kind: 'weapon_attack', inventoryId: WEAPON, timing: 'action', followup: 'require' });
+    expect(body.turn).toMatchObject({ usedFollowup: true, followupCls: 'melee' });
+    expect((await (await post({ timing: 'bonus_action' })).json()).turn.followupCls).toBeNull();
+  });
+  it("a 'require' with nothing waiting is a 409 followup_gone and returns no roll", async () => {
+    pay.mockRejectedValue(new FakeGone());
+    const res = await post({ followup: 'require' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'followup_gone', message: 'That free repeat is no longer available.' });
   });
   it('someone who cannot act for the character rolls unpaid, with turn null', async () => {
     access = { canAct: false };

@@ -7,7 +7,7 @@ import { payTurnActivation } from '$lib/server/services/catalogue';
 import { adjustTurnPool, getTurnView, resetTurnState, lockTurnState } from '$lib/server/services/turn-state';
 import { trimTurnView } from '$lib/server/vttTurn';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { CostShortfallError, FollowupGoneError } from '$lib/server/services/cost-engine';
 import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { parseActivation } from '$lib/server/vttCostApproval';
 
@@ -36,9 +36,17 @@ export const POST: RequestHandler = async ({ locals, params, request }) => {
     try {
       const paid = await runWithGate(gate, (override) => payTurnActivation(locals.user!.id, characterId, activation, override));
       emitRealtimeEvent('resource:changed', { characterId });
-      return json({ paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), view: paid.turn, turn: trimTurnView(paid.turn) });
+      // The same follow-up fields as roll-attack's `turn` (the trimmed view stays under `turn`, as for a dash),
+      // so the client can word "Paid: ..." / "Extra Attack (N left)" the same either way.
+      const used = paid.paid.find((line) => line.pool === 'followup');
+      const followupCls = activation.kind === 'weapon_attack' && (activation.timing ?? 'action') === 'action' ? 'melee' : null;
+      return json({
+        paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), view: paid.turn, turn: trimTurnView(paid.turn),
+        usedFollowup: Boolean(used), followupCls, followupsLeft: (paid.turn.followups ?? []).map((f) => ({ cls: f.cls, label: f.label, remaining: f.remaining }))
+      });
     } catch (error) {
       if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
+      if (error instanceof FollowupGoneError) return json({ error: 'followup_gone', message: error.message }, { status: 409 });
       return json({ error: error instanceof Error ? error.message : 'Could not pay for that.' }, { status: 400 });
     }
   }

@@ -479,6 +479,10 @@ body {
 .cost-error { color: #e57373; font-size: 13px; }
 .cost-note { color: #9aa0a6; font-size: 12px; margin: 6px 0 0; }
 #attackModalBody .actions button[data-cost-choice] { min-height: 44px; }
+/* The attack result's free-repeat button (Extra Attack / spell echo) and Done: 44px targets on touch. */
+.attack-repeat-note:empty { display: none; }
+.attack-repeat-note { color: #e57373; margin-top: 6px; }
+@media (pointer: coarse) { #attackModalBody .actions button { min-height: 44px; } }
 #costQueue { margin: 8px 0; }
 .cost-gm-card { border: 1px solid #5a4a2a; background: #2a2418; border-radius: 6px; padding: 8px; margin-bottom: 6px; font-size: 13px; }
 .cost-gm-title { margin-bottom: 6px; word-break: break-word; }

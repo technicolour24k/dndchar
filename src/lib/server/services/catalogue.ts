@@ -13,7 +13,7 @@ import { characterProfile, getTurnView, lockTurnState, resetTurnState } from '$l
 import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson, withCategory } from '$lib/rules/cost';
 import { inferCategory } from '$lib/rules/actionEconomy';
 import type { CostEntry } from '$lib/types/cost';
-import { payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
+import { loadActivationCost, payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { Activation } from '$lib/types/cost';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
@@ -359,11 +359,11 @@ export async function castCharacterSpell(userId:string,characterId:string,form:F
 }
 
 // Same cast, but also says which slot was spent (the VTT mirrors it onto the token).
-export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null;castAtLevel?:number}>{
+export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null;castAtLevel?:number;usedFollowup:boolean;followupCls:string|null}>{
   const requestedType=String(form.get('slotType')||'');
   const slotChoice={slotType:requestedType==='standard'||requestedType==='pact'?requestedType:undefined,slotLevel:Number(form.get('slotLevel'))||undefined,
     // An echo (a free repeat of a waiting follow-up) is chosen explicitly; a plain cast never spends one.
-    ...(form.get('followup')==='use'||form.get('followup')==='skip'?{followup:form.get('followup') as 'use'|'skip'}:{})} as const;
+    ...(['use','skip','require'].includes(String(form.get('followup')))?{followup:form.get('followup') as 'use'|'skip'|'require'}:{})} as const;
   return withTransaction(async(client)=>{await assertCanAct(client,userId,characterId);
     await lockTurnState(client,characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     const accessId=String(form.get('spellAccessId')||'');let spellId='';let activation:Activation;let context:{inventoryId?:string;instanceId?:string};
@@ -388,7 +388,9 @@ export async function castCharacterSpellDetailed(userId:string,characterId:strin
     const slot=paid.find((line)=>line.slot);
     // A spell echo (free follow-up) spends no slot; castAtLevel says which level it resolves at.
     const echo=paid.find((line)=>line.castAtLevel!==undefined);
-    return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null,...(echo?{castAtLevel:echo.castAtLevel}:{})};
+    // Which follow-up class this spell earns and spends (null unless it is Action-timed), so the VTT can offer the echo button.
+    const followupCls=(await loadActivationCost(client,characterId,activation)).followup?.cls??null;
+    return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null,...(echo?{castAtLevel:echo.castAtLevel}:{}),usedFollowup:paid.some((line)=>line.pool==='followup'),followupCls};
   });
 }
 

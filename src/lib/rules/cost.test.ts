@@ -434,9 +434,10 @@ describe('activationSignature', () => {
     expect(sig({ kind: 'weapon_attack', inventoryId: null })).toBe('weapon_attack|none||action|use');
   });
   it('the follow-up choice is part of the signature: weapons default to use, spells to skip', () => {
-    const w = (followup?: 'use' | 'skip') => activationSignature({ kind: 'weapon_attack', inventoryId: 'w1', ...(followup ? { followup } : {}) });
+    const w = (followup?: 'use' | 'skip' | 'require') => activationSignature({ kind: 'weapon_attack', inventoryId: 'w1', ...(followup ? { followup } : {}) });
     expect(w()).toBe(w('use'));
     expect(w('skip')).not.toBe(w('use'));
+    expect(w('require')).not.toBe(w('use')); // an approval for a free repeat never unlocks a paid attack
     const s = (followup?: 'use' | 'skip') => activationSignature({ kind: 'spell', instanceId: 'i1', slotType: 'standard', slotLevel: 3, ...(followup ? { followup } : {}) });
     expect(s()).toBe(s('skip'));
     expect(s('use')).not.toBe(s('skip'));

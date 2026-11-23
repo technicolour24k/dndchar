@@ -210,9 +210,9 @@ function slotChoiceOf(raw: any): { slotType?: SlotType; slotLevel?: number } {
 /** An activation descriptor from a request body, or null if it isn't well formed. */
 export function parseActivation(raw: any): Activation | null {
   if (!raw || typeof raw !== 'object') return null;
-  // An explicit follow-up choice ('use' | 'skip'); anything else is not a valid activation.
-  if (raw.followup !== undefined && raw.followup !== 'use' && raw.followup !== 'skip') return null;
-  const followup = raw.followup ? { followup: raw.followup as 'use' | 'skip' } : {};
+  // An explicit follow-up choice ('use' | 'skip' | 'require'); anything else is not a valid activation.
+  if (raw.followup !== undefined && raw.followup !== 'use' && raw.followup !== 'skip' && raw.followup !== 'require') return null;
+  const followup = raw.followup ? { followup: raw.followup as 'use' | 'skip' | 'require' } : {};
   if (raw.kind === 'spell' && isId(raw.instanceId)) return { kind: 'spell', instanceId: raw.instanceId, ...slotChoiceOf(raw), ...followup };
   if (raw.kind === 'spell_access' && isId(raw.spellAccessId) && isId(raw.inventoryItemId)) {
     return { kind: 'spell_access', spellAccessId: raw.spellAccessId, inventoryItemId: raw.inventoryItemId, ...slotChoiceOf(raw), ...followup };
@@ -241,7 +241,7 @@ const ATTACK_TIMINGS = ['action', 'bonus_action', 'reaction'];
 export function activationFromCastForm(form: FormData): Activation {
   const slot = slotChoiceOf({ slotType: String(form.get('slotType') || ''), slotLevel: form.get('slotLevel') });
   const choice = String(form.get('followup') || '');
-  const followup = choice === 'use' || choice === 'skip' ? { followup: choice as 'use' | 'skip' } : {};
+  const followup = choice === 'use' || choice === 'skip' || choice === 'require' ? { followup: choice as 'use' | 'skip' | 'require' } : {};
   const accessId = String(form.get('spellAccessId') || '');
   if (accessId) return { kind: 'spell_access', spellAccessId: accessId, inventoryItemId: String(form.get('inventoryItemId') || ''), ...slot, ...followup };
   return { kind: 'spell', instanceId: String(form.get('instanceId') || ''), ...slot, ...followup };
