@@ -22,7 +22,9 @@ export function participantRows(participants, speakingIds, localId) {
     const id = p.session_id;
     const isLocal = !!p.local || (localId != null && id === localId);
     const name = String(p.user_name || '').trim() || 'Guest';
-    return { id, name, isLocal, muted: !isAudioOn(p), speaking: speaking.has(id) };
+    // userId is the app user id (set by our token); the volume control keys its stored setting on it.
+    const userId = typeof p.user_id === 'string' && p.user_id ? p.user_id : null;
+    return { id, name, userId, isLocal, muted: !isAudioOn(p), speaking: speaking.has(id) };
   });
   rows.sort((a, b) => {
     if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;

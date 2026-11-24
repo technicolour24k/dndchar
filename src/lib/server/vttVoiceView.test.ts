@@ -33,6 +33,12 @@ describe('participantRows', () => {
   it('keeps markup in names as plain text (callers render via textContent)', () => {
     expect(participantRows([p('1', '<img src=x onerror=alert(1)>')], [], null)[0].name).toBe('<img src=x onerror=alert(1)>');
   });
+  it('passes the user id through, or null when missing or empty', () => {
+    const rows = participantRows([p('1', 'A', { user_id: 'u-1' }), p('2', 'B'), p('3', 'C', { user_id: '' })], [], null);
+    expect(rows.find((r: any) => r.id === '1').userId).toBe('u-1');
+    expect(rows.find((r: any) => r.id === '2').userId).toBeNull();
+    expect(rows.find((r: any) => r.id === '3').userId).toBeNull();
+  });
   it('handles empty input', () => {
     expect(participantRows(undefined as any, undefined as any, null)).toEqual([]);
   });

@@ -1187,6 +1187,12 @@ Plan: `~/.claude/plans/dndchar/vtt-forage/vtt-forage.md` (Rev 6). Migration `038
 - **Env.** `DAILY_API_KEY`, `DAILY_DOMAIN`, `DAILY_ROOM_PREFIX` (plus optional `DAILY_MAX_PARTICIPANTS`, `DAILY_SESSION_CAP_HOURS`); unset means voice is off. Details in `vtt/README.md` (Voice (Daily)).
 - **Known gaps.** The call does not survive navigating to a sheet or reloading (Rejoin voice is offered). No table-wide "in voice" presence before you join (optional Unit 5 of the plan). DMs have no mute/remove-others powers.
 
+### 2026-11-24 - Voice: per-person volume
+- **What.** Each listener can set any other person in the voice call to 0-200% from their "Who's in" row (slider, or -/+ on narrow screens). Local to that browser: nothing goes to the server, Daily or other people. Remembered in `localStorage` `vtt_voice_volumes`, keyed by app user id.
+- **How.** At 100% playback is unchanged. Other values mute that person's `<audio>` element and route the stream through a Web Audio gain node into a shared bus (played via one hidden `<audio>` when the speaker picker exists, so the picker still works). If Web Audio is missing or throws, it falls back to `el.volume` (no boost).
+- **Not affected.** Recordings always capture natural levels. The speaking ring still lights for someone at 0% (it measures before the gain).
+- **Open.** Echo cancellation with the gain path is unverified on laptop speakers; no limiter at 200%.
+
 ### 2026-11-23 - Token AC follows the sheet by delta (decks unit 5b)
 Changes the older "ac never follows the sheet" rule above (the 2026-09-26 AC entry and the character-resync clobber rule): token AC now follows the sheet's *changes*, never its absolute value. Accepted behaviour change: it follows ANY change to the sheet's resolved AC (deck effects, their expiry or undo, equipping armour or a shield, Shield the spell, rests, restores, a hard AC override).
 - **`token.sheetAc`** is the sheet AC a PC token last followed. Server-owned: token.js refuses it from `token:stat:update` and `token:update`, `token:add` drops any client copy and never seeds it from the token's own AC (a GM-typed AC would snap to the sheet on the first follow), and it is not in `PLAYER_EDITABLE_FIELDS`. Clients only display it.

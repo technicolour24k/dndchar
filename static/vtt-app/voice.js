@@ -19,6 +19,10 @@ import {
 import { createIdleTracker, idleTimings } from './shared/voiceIdle.js';
 import { applyRecordingMessage, badgeText, formatElapsed, pruneRecorders, recordingFileName, recordingMessage } from './shared/voiceRecord.js';
 import { createRecorder, downloadBlob } from './voiceRecorder.js';
+import {
+  VOLUME_BUTTON_STEP, VOLUME_DEFAULT, VOLUME_MAX, VOLUME_SLIDER_STEP,
+  clampVolume, elementVolume, gainFor, needsGain, parseVolumes, serialiseVolumes, stepVolume, volumeKey, volumeText, withVolume
+} from './shared/voiceVolume.js';
 
 // Daily retires old daily-js versions, so this needs bumping now and then (npm view
 // @daily-co/daily-js version). dist/daily.js is the UMD build and sets window.Daily. The integrity
@@ -28,10 +32,13 @@ const DAILY_JS_VERSION = '0.95.0';
 const DAILY_JS_URL = `https://unpkg.com/@daily-co/daily-js@${DAILY_JS_VERSION}/dist/daily.js`;
 const DAILY_JS_INTEGRITY = 'sha256-0hXNMDasaZMD8gJWdF0v85S6vDSEIOJPTSwpZY9opTU=';
 const LEVEL_INTERVAL_MS = 200;
+// How long a playback-context resume may take before we offer "Tap to enable sound".
+const SOUND_PROMPT_GRACE_MS = 1500;
 // Matches the server's default DAILY_SESSION_CAP_HOURS. Only used to word the eject message.
 const SESSION_CAP_MS = 6 * 3600 * 1000;
 const LS_INPUT = 'vtt_voice_input';
 const LS_OUTPUT = 'vtt_voice_output';
+const LS_VOLUMES = 'vtt_voice_volumes'; // { "<app user id>": pct }, only non-100 values
 
 let scriptPromise = null;
 function loadDailyScript() {
@@ -88,6 +95,9 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
   // ?voiceIdleTest=1 divides the idle timings by 60 so the rules can be tried by hand.
   const timings = idleTimings(new URLSearchParams(location.search).get('voiceIdleTest') === '1' ? 60 : 1);
   const canPickOutput = typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
+  // Per-person volume needs Web Audio to boost past 100%. Without it we can only attenuate via el.volume.
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const hasWebAudio = !!AC;
 
   let state = 'idle';
   let message = '';
@@ -101,7 +111,14 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
   let joinedAt = 0;
   let rejoinHint = false;
   let outputId = null;
-  const audioEls = new Map(); // session_id -> { el, trackId }
+  const audioEls = new Map(); // session_id -> { el, trackId, key, src, gain }
+  let volumes = parseVolumes(lsGet(LS_VOLUMES)); // app user id -> pct (non-100 only), read once
+  const sessionVolumes = new Map(); // session_id -> pct, for participants with no usable user id (not saved)
+  let playback = null; // { ctx, bus, busEl }, created lazily the first time someone is routed
+  let webAudioBroken = false; // creating the AudioContext threw: behave as if there is no Web Audio
+  let resuming = null; // pending playback.ctx.resume() chain, so we never stack them
+  let suspending = null; // pending playback.ctx.suspend() from the last call's cleanup
+  const rowEls = new Map(); // session_id -> { li, name, mark, key, ctl } for the "Who's in" list
   const lastLoudAt = {}; // session_id -> ms of last sample above SPEECH_LEVEL
   let speakTimer = null;
   let idleTimer = null;
@@ -183,25 +200,112 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
     dock.classList.toggle('voice-in-call', state === 'joined');
     if (local && local.session_id) localId = local.session_id;
 
-    // The list is small and rebuilt whole; names go in via textContent. Skipped while it's hidden
-    // (the speaking timer re-renders a few times a second); opening it renders again.
+    // Skipped while the list is hidden (the speaking timer re-renders a few times a second); opening it
+    // renders again. Rows are kept and updated in place (keyed by session_id), never rebuilt, so a
+    // volume slider that's being dragged survives the re-renders.
     if (listEl.hidden) return;
-    listEl.textContent = '';
-    for (const r of rows) {
-      const li = document.createElement('li');
-      li.className = 'voice-row' + (r.speaking ? ' speaking' : '') + (r.muted ? ' muted' : '');
-      const name = document.createElement('span');
-      name.className = 'voice-name';
-      name.textContent = r.name + (r.isLocal ? ' (you)' : '');
-      li.appendChild(name);
-      if (r.muted) {
-        const m = document.createElement('span');
-        m.className = 'voice-muted-mark';
-        m.textContent = 'muted';
-        li.appendChild(m);
-      }
-      listEl.appendChild(li);
+    const ids = new Set(rows.map((r) => r.id));
+    for (const [id, rec] of rowEls) {
+      if (!ids.has(id)) { rec.li.remove(); rowEls.delete(id); }
     }
+    rows.forEach((r, i) => {
+      let rec = rowEls.get(r.id);
+      if (!rec) { rec = createRow(r); rowEls.set(r.id, rec); }
+      updateRow(rec, r);
+      // Only move a row that's misplaced, so one already in the right place is never detached.
+      if (listEl.children[i] !== rec.li) listEl.insertBefore(rec.li, listEl.children[i] || null);
+    });
+  }
+
+  // ---- "Who's in" rows and per-person volume controls ------------------------------------------
+
+  const effectiveMax = () => (hasWebAudio && !webAudioBroken ? VOLUME_MAX : VOLUME_DEFAULT);
+
+  function createRow(r) {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'voice-name';
+    li.appendChild(name);
+    const mark = document.createElement('span');
+    mark.className = 'voice-muted-mark';
+    mark.textContent = 'muted';
+    li.appendChild(mark);
+    const rec = { li, name, mark, key: null, ctl: null };
+    if (r.isLocal) return rec; // no control on your own row
+    const id = r.id;
+    const wrap = document.createElement('div');
+    wrap.className = 'voice-vol';
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.className = 'voice-vol-slider';
+    slider.min = '0';
+    slider.max = String(effectiveMax());
+    slider.step = String(VOLUME_SLIDER_STEP);
+    const mkBtn = (cls, text, label) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = cls;
+      b.textContent = text;
+      if (label) b.setAttribute('aria-label', label);
+      return b;
+    };
+    const minus = mkBtn('voice-vol-btn', '-', 'Quieter');
+    const plus = mkBtn('voice-vol-btn', '+', 'Louder');
+    const pctEl = document.createElement('span');
+    pctEl.className = 'voice-vol-pct';
+    const reset = mkBtn('voice-vol-reset', 'Reset');
+    reset.title = 'Back to 100%';
+    wrap.append(slider, minus, pctEl, plus, reset);
+    li.appendChild(wrap);
+    const current = () => volumeOf(id, rec.key);
+    // Drag: apply live, save on release.
+    slider.addEventListener('input', () => setVolume(id, slider.valueAsNumber, false));
+    slider.addEventListener('change', () => setVolume(id, slider.valueAsNumber, true));
+    minus.addEventListener('click', () => setVolume(id, stepVolume(current(), -1, VOLUME_BUTTON_STEP, effectiveMax()), true));
+    plus.addEventListener('click', () => setVolume(id, stepVolume(current(), 1, VOLUME_BUTTON_STEP, effectiveMax()), true));
+    reset.addEventListener('click', () => setVolume(id, VOLUME_DEFAULT, true));
+    rec.ctl = { slider, minus, plus, pctEl, reset };
+    return rec;
+  }
+
+  function updateRow(rec, r) {
+    rec.li.className = 'voice-row' + (r.speaking ? ' speaking' : '') + (r.muted ? ' muted' : '');
+    const text = r.name + (r.isLocal ? ' (you)' : '');
+    if (rec.name.textContent !== text) rec.name.textContent = text;
+    rec.mark.hidden = !r.muted;
+    rec.key = volumeKey(r.userId, r.id);
+    const c = rec.ctl;
+    if (!c) return;
+    c.slider.setAttribute('aria-label', 'Volume for ' + r.name); // attribute, never parsed as HTML
+    const max = effectiveMax();
+    const pct = volumeOf(r.id, rec.key);
+    c.pctEl.textContent = volumeText(pct);
+    if (c.slider.max !== String(max)) c.slider.max = String(max);
+    // Never fight a slider that's being dragged.
+    if (c.slider !== document.activeElement && c.slider.value !== String(pct)) c.slider.value = String(pct);
+    c.minus.disabled = pct <= 0;
+    c.plus.disabled = pct >= max;
+    c.reset.hidden = pct === VOLUME_DEFAULT;
+  }
+
+  // A volume control was used (slider, -/+ or Reset). Those are user gestures, so this is also a
+  // good moment to start/resume the playback context.
+  function setVolume(sessionId, pct, persist) {
+    const rec = rowEls.get(sessionId);
+    const key = rec ? rec.key : null;
+    const v = clampVolume(pct, effectiveMax());
+    if (key) {
+      volumes = withVolume(volumes, key, v);
+      if (persist) lsSet(LS_VOLUMES, serialiseVolumes(volumes));
+    } else if (v === VOLUME_DEFAULT) {
+      sessionVolumes.delete(sessionId);
+    } else {
+      sessionVolumes.set(sessionId, v);
+    }
+    // Only bother with Web Audio if someone needs it (or it already exists and may need resuming).
+    if (needsGain(v) || playback) ensurePlayback(true);
+    applyVolumesFor(sessionId, key);
+    render();
   }
 
   // ---- remote audio ----------------------------------------------------------------------
@@ -209,6 +313,7 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
   function dropAudio(id) {
     const a = audioEls.get(id);
     if (!a) return;
+    unroute(a);
     a.el.srcObject = null;
     a.el.remove();
     audioEls.delete(id);
@@ -217,6 +322,11 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
   function clearAudio() {
     for (const id of [...audioEls.keys()]) dropAudio(id);
     soundBtn.hidden = true;
+    // Park the playback context between calls. Never closed: a new Join may have just made use of it.
+    // ensurePlayback() waits for `suspending` before resuming, so a quick rejoin isn't parked by it.
+    if (playback && playback.ctx.state === 'running' && !suspending) {
+      suspending = playback.ctx.suspend().catch(() => {}).finally(() => { suspending = null; });
+    }
   }
 
   function playEl(el) {
@@ -227,6 +337,141 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
   function applySink(el) {
     if (canPickOutput && outputId && el.setSinkId) el.setSinkId(outputId).catch(() => {});
   }
+
+  // ---- per-person volume (listener-side, this browser only) -----------------------------------
+  //
+  // 1. At exactly 100% a person plays as always: their own <audio> element, unmuted, volume 1.
+  // 2. At any other value the element stays attached but MUTED (Chromium only feeds a remote WebRTC
+  //    stream to Web Audio if it's also attached to an element), and a MediaStreamAudioSource ->
+  //    GainNode feeds a shared bus in one page-wide AudioContext. Gain is the only thing that can both
+  //    boost (el.volume caps at 1) and attenuate on iOS (which ignores el.volume).
+  // 3. The bus is a MediaStreamDestination played by one hidden <audio> (busEl) when the speaker picker
+  //    exists, so the picker moves routed and pass-through people alike. Otherwise it's ctx.destination.
+  // 4. RECORDINGS ARE UNAFFECTED: a.el.srcObject stays the raw stream and the gain output only goes to
+  //    the bus. The recorder has its own AudioContext. Don't share them or point srcObject at a
+  //    processed stream, or the DM's local volume choices would leak into the recording.
+  // Without Web Audio (or if it throws) we fall back to el.volume (no boost). Web Audio failures never
+  // silence anyone: the element path is used instead.
+
+  // Percentage for one participant: by app user id when we have one, else per session (not saved).
+  function volumeOf(sessionId, key) {
+    const v = key ? (volumes.get(key) ?? VOLUME_DEFAULT) : (sessionVolumes.get(sessionId) ?? VOLUME_DEFAULT);
+    return clampVolume(v, effectiveMax());
+  }
+
+  // Create the playback context on first need and resume it if it's suspended. Call it synchronously
+  // from a click where possible: Safari only honours resume() inside the gesture.
+  function ensurePlayback(fromGesture = false) {
+    if (!hasWebAudio || webAudioBroken) return null;
+    if (!playback) {
+      let busEl = null;
+      let ctx = null;
+      try {
+        ctx = new AC();
+        let bus = ctx.destination;
+        if (canPickOutput) {
+          const dest = ctx.createMediaStreamDestination();
+          bus = dest;
+          busEl = document.createElement('audio');
+          busEl.autoplay = true;
+          busEl.setAttribute('playsinline', '');
+          busEl.srcObject = dest.stream;
+          applySink(busEl);
+          audioHost.appendChild(busEl);
+        }
+        // Ignored while our own resume is in flight (e.g. the previous call's suspend landing just
+        // before it), so the prompt doesn't flash up for a context that's about to run again.
+        ctx.onstatechange = () => { if (!resuming) updateSoundPrompt(); };
+        playback = { ctx, bus, busEl };
+        if (busEl) playEl(busEl);
+      } catch (e) {
+        console.error('[voice] Web Audio unavailable, using plain volume', e);
+        if (busEl) busEl.remove();
+        if (ctx) ctx.close().catch(() => {});
+        webAudioBroken = true;
+        return null;
+      }
+    }
+    const { ctx } = playback;
+    if (fromGesture && ctx.state !== 'running') {
+      // Inside a click: always call resume() right now, even if an earlier one is still pending
+      // (Safari only honours it within the gesture, and a blocked one can stay pending forever).
+      ctx.resume().catch(() => {});
+    }
+    if (!resuming && (suspending || ctx.state !== 'running')) {
+      // One resume in flight at most. If the last call's suspend() hasn't landed yet, wait for it
+      // first, or it would land after us and park the new call's audio.
+      resuming = (suspending || Promise.resolve())
+        .then(() => ctx.resume())
+        .catch(() => {})
+        .finally(() => { resuming = null; updateSoundPrompt(); });
+      // A resume blocked by autoplay policy can stay pending with no statechange at all, so check
+      // once regardless: still not running with someone routed -> "Tap to enable sound".
+      setTimeout(updateSoundPrompt, SOUND_PROMPT_GRACE_MS);
+    }
+    return playback;
+  }
+
+  function unroute(a) {
+    try { if (a.src) a.src.disconnect(); } catch { /* already gone */ }
+    try { if (a.gain) a.gain.disconnect(); } catch { /* already gone */ }
+    a.src = null;
+    a.gain = null;
+  }
+
+  // The single place that decides how a participant is played (see the comment block above).
+  function applyVolume(id, a) {
+    try {
+      const pct = volumeOf(id, a.key);
+      if (!a.el.srcObject || !needsGain(pct)) {
+        unroute(a);
+        a.el.muted = false;
+        a.el.volume = 1;
+        return;
+      }
+      const pb = ensurePlayback();
+      if (!pb) {
+        unroute(a);
+        a.el.muted = false;
+        a.el.volume = elementVolume(pct);
+        return;
+      }
+      if (a.gain) {
+        a.gain.gain.setTargetAtTime(gainFor(pct), pb.ctx.currentTime, 0.015); // smooth, no clicks
+      } else {
+        a.src = pb.ctx.createMediaStreamSource(a.el.srcObject);
+        a.gain = pb.ctx.createGain();
+        a.gain.gain.value = gainFor(pct);
+        a.src.connect(a.gain);
+        a.gain.connect(pb.bus);
+      }
+      a.el.muted = true;
+    } catch (e) {
+      console.error('[voice] volume routing failed, playing normally', e);
+      unroute(a);
+      a.el.muted = false;
+      a.el.volume = 1;
+    }
+  }
+
+  // Re-apply for one person. With a user id that's every row of that user (two tabs of one person).
+  function applyVolumesFor(sessionId, key) {
+    for (const [id, a] of audioEls) {
+      if (key ? a.key === key : id === sessionId) applyVolume(id, a);
+    }
+  }
+
+  // If the context can't run (autoplay policy, or iOS suspended it) while someone is routed, they'd be
+  // silent: show the same "Tap to enable sound" button playEl uses. Never hides it (the click does).
+  function updateSoundPrompt() {
+    if (state !== 'joined' || !playback || playback.ctx.state === 'running') return;
+    for (const a of audioEls.values()) {
+      if (a.gain) { soundBtn.hidden = false; return; }
+    }
+  }
+
+  // Every element whose speaker should follow the picker: one per person, plus the shared bus element.
+  const outputEls = () => [...[...audioEls.values()].map((a) => a.el), ...(playback && playback.busEl ? [playback.busEl] : [])];
 
   function syncAudio() {
     const seen = new Set();
@@ -242,14 +487,17 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
         el.setAttribute('playsinline', '');
         applySink(el);
         audioHost.appendChild(el);
-        a = { el, trackId: null };
+        a = { el, trackId: null, key: null, src: null, gain: null };
         audioEls.set(p.session_id, a);
       }
+      a.key = volumeKey(p.user_id, p.session_id);
       if (a.trackId !== track.id) {
         a.trackId = track.id;
         a.el.srcObject = new MediaStream([track]);
+        unroute(a); // the old source node belonged to the old stream
         playEl(a.el);
       }
+      applyVolume(p.session_id, a); // idempotent, so it's fine to run on every pass
     }
     for (const id of [...audioEls.keys()]) if (!seen.has(id)) dropAudio(id);
     if (recorder.active) recorder.sync(buildSources());
@@ -259,6 +507,8 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
 
   // Everything audible to us: each remote participant's stream (the one already playing in its
   // <audio> element, which Chromium needs before Web Audio will hear it) plus our own mic.
+  // srcObject is the RAW stream; per-person volume lives only in the playback graph, so recordings
+  // are unaffected by what the DM has turned up or down locally.
   function buildSources() {
     const m = new Map();
     for (const [id, a] of audioEls) if (a.el.srcObject) m.set(id, { key: a.trackId, stream: a.el.srcObject });
@@ -316,6 +566,8 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
 
   soundBtn.addEventListener('click', () => {
     soundBtn.hidden = true;
+    ensurePlayback(true); // resumes the context if needed
+    if (playback && playback.busEl) playEl(playback.busEl);
     for (const { el } of audioEls.values()) playEl(el);
   });
 
@@ -407,7 +659,7 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
     }
     if (canPickOutput) {
       outputId = rememberedDevice(lsGet(LS_OUTPUT), pickDevices(all, 'audiooutput'));
-      for (const { el } of audioEls.values()) applySink(el);
+      for (const el of outputEls()) applySink(el);
     }
   }
 
@@ -418,7 +670,7 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
   outputSel.addEventListener('change', () => {
     outputId = outputSel.value || null;
     if (outputId) lsSet(LS_OUTPUT, outputId);
-    for (const { el } of audioEls.values()) applySink(el);
+    for (const el of outputEls()) applySink(el);
   });
   devicesBtn.addEventListener('click', () => {
     devicesOpen = !devicesOpen;
@@ -445,6 +697,9 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
     }
     stopTimers();
     localId = null;
+    sessionVolumes.clear();
+    rowEls.clear();
+    listEl.textContent = '';
   }
 
   function onCall(fn) {
@@ -606,8 +861,10 @@ export function createVoice({ getCampaignId, getCharacterId = () => null, getCam
     call.setLocalAudio(!call.localAudio());
   }
 
-  joinBtn.addEventListener('click', () => { join(false); });
-  listenBtn.addEventListener('click', () => { join(true); });
+  // ensurePlayback() runs first, synchronously, while we're still inside the click (Safari only allows
+  // resume() there). Only when someone has a saved non-100 volume, so we don't start audio for nothing.
+  joinBtn.addEventListener('click', () => { if (volumes.size > 0) ensurePlayback(true); join(false); });
+  listenBtn.addEventListener('click', () => { if (volumes.size > 0) ensurePlayback(true); join(true); });
   leaveBtn.addEventListener('click', () => { leave(); });
   muteBtn.addEventListener('click', toggleMute);
   listBtn.addEventListener('click', () => { listOpen = !listOpen; render(); });
