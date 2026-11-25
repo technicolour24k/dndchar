@@ -5,16 +5,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const pay = vi.fn();
 const gateFn = vi.fn();
+const consume = vi.fn();
 let access: any = { canAct: true };
 const view = { profileKey: 'attack_utility', pools: [{ key: 'attack', label: 'Attack', current: 2, max: 2 }], followups: [{ cls: 'melee', label: 'Extra Attack', remaining: 1 }] };
 
 class FakeShortfall extends Error { shortfalls = [{ label: 'Attack', needed: 1, available: 0 }]; }
+class FakeGone extends Error { constructor() { super('That free repeat is no longer available.'); } }
 
-vi.mock('$lib/server/db', () => ({ query: vi.fn() }));
+vi.mock('$lib/server/db', () => ({ query: vi.fn(), withTransaction: async (run: any) => run({}) }));
+vi.mock('$lib/server/services/effects', () => ({ consumeNextAttackEffects: (...args: unknown[]) => consume(...args) }));
 vi.mock('$lib/server/realtime', () => ({ emitRealtimeEvent: vi.fn() }));
 vi.mock('$lib/server/services/access', () => ({ getCharacterAccess: async () => access }));
 vi.mock('$lib/server/services/catalogue', () => ({ payTurnActivation: (...args: unknown[]) => pay(...args) }));
-vi.mock('$lib/server/services/cost-engine', () => ({ CostShortfallError: FakeShortfall }));
+vi.mock('$lib/server/services/cost-engine', () => ({ CostShortfallError: FakeShortfall, FollowupGoneError: FakeGone }));
 vi.mock('$lib/server/vttCostGate', () => ({
   openCostGate: (...args: unknown[]) => gateFn(...args),
   runWithGate: async (_gate: unknown, run: any) => run(null),
@@ -26,7 +29,7 @@ vi.mock('$lib/server/services/characters', () => ({
 vi.mock('$lib/rules/dnd5e', () => ({ abilityMap: () => ({}), equippedAttackItems: () => [{ id: '22222222-2222-4222-8222-222222222222', name: 'Longsword', attackAbility: 'str', damageRolls: '1d8' }] }));
 vi.mock('$lib/rules/characterStats', () => ({ characterStatsFor: () => ({ proficiency: { value: 2 } }) }));
 vi.mock('$lib/rules/attackRoll', () => ({
-  attackAgainstCandidatesFor: () => [], attackCandidatesFor: () => [], previewAdvantage: () => ({ sources: [] }), rollAttack: () => ({ title: 'Longsword', attackTotal: 15 })
+  attackAgainstCandidatesFor: () => [], attackCandidatesFor: () => [], previewAdvantage: () => ({ sources: [] }), rollAttack: () => ({ title: 'Longsword', attack: 'rolled', attackTotal: 15, advantageSources: [] }), appliedEffectRowIds: () => ['row-1']
 }));
 vi.mock('$lib/server/vttAttackAdvantage', () => ({
   gatherVttAdvantageSources: async () => ({ extraSources: [] }),
@@ -42,9 +45,31 @@ beforeEach(() => {
   pay.mockReset().mockResolvedValue({ paid: [{ label: 'Extra Attack', pool: 'followup', delta: -1 }], turn: { followups: [{ cls: 'melee', label: 'Extra Attack', remaining: 0 }] }, results: [] });
   gateFn.mockReset().mockImplementation(async (input: any) => ({ ok: true, mode: 'ask_dm', activation: input.activation, override: null }));
   access = { canAct: true };
+  consume.mockReset().mockResolvedValue([]);
 });
 
 describe('roll-attack and the action economy', () => {
+  it('uses up a counted next-attack effect after the paid roll and says so', async () => {
+    consume.mockResolvedValue(["King's Strike"]);
+    const body = await (await post({})).json();
+    expect(consume.mock.calls[0][1]).toBe(ID);
+    expect(consume.mock.calls[0][2]).toEqual(['row-1']);
+    expect(body).toMatchObject({ consumedEffects: ["King's Strike"], attack: "rolled - Advantage used up: King's Strike" });
+  });
+  it('a failing consume never turns a paid roll into an error', async () => {
+    consume.mockRejectedValue(new Error('db down'));
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const res = await post({});
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ attackTotal: 15 });
+    spy.mockRestore();
+  });
+  it('does not consume anything for a preview or an unpaid roll', async () => {
+    await post({ preview: true });
+    access = { canAct: false };
+    await post({});
+    expect(consume).not.toHaveBeenCalled();
+  });
   it('a preview never pays, and carries the live turn view for the confirm card', async () => {
     const res = await post({ preview: true });
     expect(await res.json()).toMatchObject({ usesAttackRoll: true, turn: view });
@@ -62,6 +87,18 @@ describe('roll-attack and the action economy', () => {
     expect(pay.mock.calls[0][2]).toEqual({ kind: 'weapon_attack', inventoryId: WEAPON, timing: 'bonus_action', followup: 'skip' });
     await post({ timing: 'sometime', followup: 'maybe' }); // junk falls back to the defaults
     expect(pay.mock.calls[1][2]).toEqual({ kind: 'weapon_attack', inventoryId: WEAPON, timing: 'action', followup: 'use' });
+  });
+  it("passes followup 'require' through, and says which follow-up class the attack uses", async () => {
+    const body = await (await post({ followup: 'require' })).json();
+    expect(pay.mock.calls[0][2]).toEqual({ kind: 'weapon_attack', inventoryId: WEAPON, timing: 'action', followup: 'require' });
+    expect(body.turn).toMatchObject({ usedFollowup: true, followupCls: 'melee' });
+    expect((await (await post({ timing: 'bonus_action' })).json()).turn.followupCls).toBeNull();
+  });
+  it("a 'require' with nothing waiting is a 409 followup_gone and returns no roll", async () => {
+    pay.mockRejectedValue(new FakeGone());
+    const res = await post({ followup: 'require' });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'followup_gone', message: 'That free repeat is no longer available.' });
   });
   it('someone who cannot act for the character rolls unpaid, with turn null', async () => {
     access = { canAct: false };

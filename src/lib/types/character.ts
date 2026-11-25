@@ -83,6 +83,10 @@ export type EffectDefinition = {
   isCondition: boolean;
   isSelectable: boolean;
   modifiers: EffectModifier[];
+  /** Library scope (homebrew library): used to filter what the sheet OFFERS, never what is already applied. */
+  scope?: 'global' | 'personal' | 'campaign';
+  ownerUserId?: string | null;
+  campaignId?: string | null;
 };
 
 export type ActiveCharacterEffect = {

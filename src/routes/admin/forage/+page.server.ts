@@ -9,7 +9,7 @@ import { announceUndo, publishFindChanged } from '$lib/server/vttForageRoll';
 // (requireAdmin); the actions re-check the role anyway, because they change inventory. Each find
 // shows the campaign it ran in and can be filtered by it ("none" = older finds made before
 // campaigns existed). Moving review and undo to campaign DMs is a later change (it would filter on
-// finds.campaign_id). Find TABLE authoring is a separate page at /forage/tables (campaign DMs + admins).
+// finds.campaign_id). Find TABLE authoring is on /campaigns/[id]/forage (campaign DMs + admins).
 //
 // Filters live in the URL (a GET form): ?campaign=<id|none>&session=<game session id>&character=<id>&status=<all|dm|self|...>.
 

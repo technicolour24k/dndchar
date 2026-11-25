@@ -84,6 +84,158 @@ describe.skipIf(!enabled)('active effects on containers', () => {
       await query(`DELETE FROM content_definitions WHERE content_key LIKE $1`, [`condition:${tag}%`]);
     }
   });
+  it('applies per-instance condition params ({name} placeholders), labels, source character and snapshots', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^\[|\]$/g, '')) || target.searchParams.has('host')) {
+      throw new Error('Refusing to run: database is not local.');
+    }
+    const { query, withTransaction } = await import('$lib/server/db');
+    const { applyCharacterEffect } = await import('./services/effects');
+    const { createCharacter, getCharacterForRoll, restoreCharacterVersion } = await import('./services/characters');
+    const { characterStatsFor } = await import('$lib/rules/characterStats');
+    const tag = `zzparam${crypto.randomBytes(4).toString('hex')}`;
+    const userId = (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Params', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    let modifierId = '';
+    try {
+      const characterId = await createCharacter(userId, 'Params');
+      const sourceId = await createCharacter(userId, 'Source');
+      const ac = async () => characterStatsFor((await getCharacterForRoll(characterId))!).armorClass.value;
+      const base = await ac();
+
+      modifierId = (await query<{ id: string }>(
+        `INSERT INTO modifier_definitions (target, modifier_type, label, default_value_expression)
+         VALUES ('ac', 'bonus', $1, '0') RETURNING id`, [tag])).rows[0].id;
+      const mkCondition = async (suffix: string, behaviour: string) => {
+        const id = (await query<{ id: string }>(
+          `INSERT INTO content_definitions (content_key, content_type, name, stack_behavior, duration_rounds)
+           VALUES ($1, 'condition', $2, $3, 10) RETURNING id`, [`condition:${tag}${suffix}`, `IT Param ${suffix}`, behaviour])).rows[0].id;
+        await query(`INSERT INTO content_modifier_links (content_id, modifier_id, activation_type, value_override_expression)
+          VALUES ($1, $2, 'manual', '{value}')`, [id, modifierId]);
+        return id;
+      };
+      const stackId = await mkCondition('stack', 'stack');
+      const refreshId = await mkCondition('refresh', 'refresh');
+      const apply = (id: string, options = {}) => withTransaction((client) => applyCharacterEffect(client, characterId, id, options));
+
+      const first = await apply(stackId, { params: { value: -3 }, sourceLabel: '3 of Clubs, failed', sourceCharacterId: sourceId, metadata: { deckDrawId: 'd1' } });
+      expect(first.rowId).toBeTruthy();
+      expect(await ac()).toBe(base - 3);
+      const row = (await query<any>(`SELECT * FROM active_character_effects WHERE id=$1`, [first.rowId])).rows[0];
+      expect(row.source_character_id).toBe(sourceId);
+      expect(row.metadata_json).toEqual({ deckDrawId: 'd1', params: { value: -3 }, sourceLabel: '3 of Clubs, failed' });
+      const { invalidateReferenceData } = await import('$lib/server/cache/referenceData');
+      invalidateReferenceData('test');
+      const detail = (await getCharacterForRoll(characterId))!;
+      expect(detail.modifierSources.some((s) => s.name === `IT Param stack (3 of Clubs, failed)`)).toBe(true);
+      expect(detail.activeEffects.find((e) => e.name.includes('3 of Clubs'))?.modifiers[0].valueOverrideExpression).toBe('-3');
+
+      // Two instances sum.
+      await apply(stackId, { params: { value: 2 }, sourceLabel: '2 of Clubs' });
+      expect(await ac()).toBe(base - 1);
+
+      // A snapshot round trip keeps the params.
+      const versions = async () => (await query<any>(`SELECT id, change_summary FROM character_versions WHERE character_id=$1 ORDER BY created_at`, [characterId])).rows;
+      const firstVersion = (await versions())[0];
+      await restoreCharacterVersion(userId, characterId, firstVersion.id);
+      expect(await ac()).toBe(base);
+      await restoreCharacterVersion(userId, characterId, (await versions()).find((v: any) => v.change_summary === 'Before restore').id);
+      expect(await ac()).toBe(base - 1);
+
+      // The refreshed path writes the new params (it used to blank metadata).
+      await apply(refreshId, { params: { value: 4 }, sourceLabel: 'one' });
+      expect((await apply(refreshId, { params: { value: 5 }, sourceLabel: 'two' })).status).toBe('refreshed');
+      expect(await ac()).toBe(base - 1 + 5);
+
+      // A {value} link on spell_slots.highest.max works per instance (catalogue slot sync).
+      const { syncCharacterSpellSlots, listSpellSlots } = await import('./services/catalogue');
+      await query('DELETE FROM character_classes WHERE character_id=$1', [characterId]);
+      await query("INSERT INTO character_classes (character_id, class_name, level, sort_order) VALUES ($1, 'Wizard', 5, 0)", [characterId]);
+      const topSlots = async () => { await syncCharacterSpellSlots(userId, characterId); const l = (await listSpellSlots(characterId)).filter((x) => x.type === 'standard'); return l[l.length - 1].max; };
+      const slotBase = await topSlots();
+      await query("DELETE FROM modifier_definitions WHERE label LIKE 'zzparam%slot'"); // leftovers from an aborted run
+      const slotModifier = (await query<{ id: string }>("INSERT INTO modifier_definitions (target, modifier_type, label, default_value_expression) VALUES ('spell_slots.highest.max', 'bonus', $1, '0') RETURNING id", [tag + 'slot'])).rows[0].id;
+      const slotCondition = (await query<{ id: string }>("INSERT INTO content_definitions (content_key, content_type, name, stack_behavior) VALUES ($1, 'condition', 'IT Param slots', 'stack') RETURNING id", ['condition:' + tag + 'slots'])).rows[0].id;
+      await query("INSERT INTO content_modifier_links (content_id, modifier_id, activation_type, value_override_expression) VALUES ($1, $2, 'manual', '{value}')", [slotCondition, slotModifier]);
+      await apply(slotCondition, { params: { value: 2 } });
+      await apply(slotCondition, { params: { value: 1 } });
+      expect(await topSlots()).toBe(slotBase + 3);
+
+      // A condition applied with no options still has empty metadata and its plain name.
+      const plain = await apply(await mkCondition('plain', 'refresh'));
+      const plainRow = (await query<any>(`SELECT metadata_json, source_character_id FROM active_character_effects WHERE id=$1`, [plain.rowId])).rows[0];
+      expect(plainRow).toEqual({ metadata_json: {}, source_character_id: null });
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE content_key LIKE $1`, [`condition:${tag}%`]);
+      if (modifierId) await query(`DELETE FROM modifier_definitions WHERE id = $1`, [modifierId]);
+      await query(`DELETE FROM modifier_definitions WHERE label = $1`, [tag + 'slot']);
+    }
+  });
+
+  it('uses up "until your next attack" effects only when the roll counted them, and caps them by rounds', async () => {
+    const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
+    if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^[|]$/g, '')) || target.searchParams.has('host')) {
+      throw new Error('Refusing to run: database is not local.');
+    }
+    const { query, withTransaction } = await import('$lib/server/db');
+    const { applyCharacterEffect, consumeNextAttackEffects } = await import('./services/effects');
+    const { createCharacter, getCharacterForRoll } = await import('./services/characters');
+    const { advanceCharacterRound } = await import('./services/catalogue');
+    const { rollWithModifiers, appliedEffectRowIds, spellAttackCandidates } = await import('$lib/rules/attackRoll');
+    const tag = `zznext${crypto.randomBytes(4).toString('hex')}`;
+    const userId = (await query<{ id: string }>(
+      `INSERT INTO users (email, display_name, password_hash) VALUES ($1, 'IT Next', 'x') RETURNING id`, [`${tag}@example.invalid`])).rows[0].id;
+    try {
+      const characterId = await createCharacter(userId, 'Next');
+      const otherId = await createCharacter(userId, 'Other');
+      const modifierId = (await query<{ id: string }>(
+        `SELECT id FROM modifier_definitions WHERE target='attack_roll.all' AND modifier_type='advantage' AND NOT is_archived LIMIT 1`)).rows[0]?.id;
+      expect(modifierId, 'needs the seeded attack_roll.all advantage modifier').toBeTruthy();
+      const conditionId = (await query<{ id: string }>(
+        `INSERT INTO content_definitions (content_key, content_type, name, stack_behavior, duration_rounds, expiry_boundary)
+         VALUES ($1, 'condition', 'IT Strike', 'stack', 10, 'next_attack') RETURNING id`, [`condition:${tag}`])).rows[0].id;
+      await query(`INSERT INTO content_modifier_links (content_id, modifier_id, activation_type) VALUES ($1, $2, 'manual')`, [conditionId, modifierId]);
+      const apply = (who: string) => withTransaction((client) => applyCharacterEffect(client, who, conditionId));
+      const row = (await apply(characterId)).rowId!;
+      const otherRow = (await apply(otherId)).rowId!;
+      expect((await query<any>(`SELECT expiry_boundary FROM active_character_effects WHERE id=$1`, [row])).rows[0].expiry_boundary).toBe('next_attack');
+
+      const roll = async (disabledSourceIds: string[] = []) => {
+        const character = (await getCharacterForRoll(characterId))!;
+        return rollWithModifiers(character.modifierSources, 0, spellAttackCandidates, [], undefined,
+          { context: { classes: character.classes, attackType: 'spell', ability: 'int' }, disabledSourceIds });
+      };
+      const first = await roll();
+      expect(first.pool.size).toBe(2); // advantage: two dice
+      expect(appliedEffectRowIds(first.advantageSources)).toEqual([row]);
+
+      // An unticked source is not applied, so nothing is consumed.
+      const unticked = await roll(first.advantageSources.map((s) => s.id));
+      expect(unticked.pool.size).toBe(1);
+      expect(appliedEffectRowIds(unticked.advantageSources)).toEqual([]);
+      expect(await withTransaction((client) => consumeNextAttackEffects(client, characterId, []))).toEqual([]);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [row])).rows).toHaveLength(1);
+
+      // Another character's row id, or a bad id, never consumes anything of that character.
+      expect(await withTransaction((client) => consumeNextAttackEffects(client, characterId, [otherRow, 'nope']))).toEqual([]);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [otherRow])).rows).toHaveLength(1);
+
+      // The counted source is used up, and a second roll has no advantage.
+      expect(await withTransaction((client) => consumeNextAttackEffects(client, characterId, appliedEffectRowIds(first.advantageSources)))).toEqual(['IT Strike']);
+      expect((await roll()).pool.size).toBe(1);
+
+      // Never attacking: ten round ticks cap it.
+      for (let i = 0; i < 9; i += 1) await advanceCharacterRound(userId, otherId);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [otherRow])).rows).toHaveLength(1);
+      await advanceCharacterRound(userId, otherId);
+      expect((await query(`SELECT 1 FROM active_character_effects WHERE id=$1`, [otherRow])).rows).toHaveLength(0);
+    } finally {
+      await query(`DELETE FROM users WHERE id = $1`, [userId]);
+      await query(`DELETE FROM content_definitions WHERE content_key = $1`, [`condition:${tag}`]);
+    }
+  });
+
   it('counts a condition once for the spell-slot bonus when it is both active and granted', async () => {
     const target = new URL(env.DATABASE_URL ?? 'postgres://none@none/none');
     if (!['localhost', '127.0.0.1', '::1'].includes(target.hostname.replace(/^[|]$/g, '')) || target.searchParams.has('host')) {

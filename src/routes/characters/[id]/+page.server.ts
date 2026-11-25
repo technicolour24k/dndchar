@@ -1,5 +1,4 @@
 import { error, fail } from '@sveltejs/kit';
-import { requireAdmin } from '$lib/server/auth/authorization';
 import { query } from '$lib/server/db';
 import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
 import { emitRealtimeEvent } from '$lib/server/realtime';
@@ -10,7 +9,8 @@ import { activationFromCastForm, parseActivation } from '$lib/server/vttCostAppr
 import { adjustCharacterPool } from '$lib/server/services/resource-pools';
 import { adjustTurnPool } from '$lib/server/services/turn-state';
 import { resetLiveTokenMovement } from '$lib/server/vttTurn';
-import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, payTurnActivation, createHomebrewContent, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { addContentToCharacter, advanceCharacterRound, advanceCharacterTurn, castCharacterSpell, payTurnActivation, newBattle, removeContentFromCharacter, restCharacter, setCharacterContentState, spendSpellSlot, triggerCharacterContentActions, useContentResource, useInventoryCatalogueItem, useInventoryResource } from '$lib/server/services/catalogue';
+import { ContentNotAvailableError } from '$lib/server/services/library';
 import { attempt } from '$lib/server/campaignAction';
 import { openCampaignRoomForMember, pruneDepartedCharacterTokens } from '$lib/server/services/campaignRooms';
 import { addCharacterToCampaign, getCampaignByRoomCode, listMyCampaignOptions, removeCharacterFromCampaign, setCharacterPartyActive } from '$lib/server/services/campaigns';
@@ -19,6 +19,8 @@ import { getUserVttSessionId, leaveRoom, logRoll } from '$lib/server/services/ro
 import { getRoomGameSessionId, logSessionNote } from '$lib/server/services/gameSessions';
 import { sessions } from '$vtt/store.js';
 import { poolSummary } from '$lib/rules/attackRoll';
+import { consumeNextAttackEffects } from '$lib/server/services/effects';
+import { withTransaction } from '$lib/server/db';
 
 // db-traffic-reduction Phase 4: load() only carries what the sheet renders on every
 // view - versions (VersionList.svelte) and the Activity Log's Past Encounters/Past
@@ -116,15 +118,13 @@ export const actions = {
   },
   addContent: async ({ request, params, locals }) => {
     const form = await request.formData();
-    await addContentToCharacter(locals.user!.id, params.id, String(form.get('contentId') || ''));
-    emitRealtimeEvent('character:updated', { characterId: params.id });
-    return { contentUpdated: true };
-  },
-  createHomebrew: async ({ request, params, locals }) => {
-    requireAdmin(locals.user);
-    const form = await request.formData();
-    const contentId = await createHomebrewContent(locals.user!.id, form);
-    await addContentToCharacter(locals.user!.id, params.id, contentId);
+    // A refused pick (not offered to this character, or the wrong type) is a plain 400; access failures still throw.
+    try {
+      await addContentToCharacter(locals.user!.id, params.id, String(form.get('contentId') || ''));
+    } catch (caught) {
+      if (caught instanceof ContentNotAvailableError) return fail(400, { error: caught.message });
+      throw caught;
+    }
     emitRealtimeEvent('character:updated', { characterId: params.id });
     return { contentUpdated: true };
   },
@@ -341,6 +341,17 @@ export const actions = {
     const breakdown = String(form.get('breakdown') || '');
     const natural = Number(form.get('natural'));
     if (!label || !Number.isFinite(total)) return fail(400, { logRollError: 'Invalid roll.' });
+
+    // Weapon/spell attack rolls send the applied "until your next attack" effect rows they counted.
+    // Used up here (before the room check: it does not need a VTT room). Only someone who can act.
+    const consumeIds = form.getAll('consumedEffectId').map(String).filter((id) => /^[0-9a-f-]{36}$/i.test(id)).slice(0, 20);
+    if (consumeIds.length) {
+      try {
+        await assertCanActForCharacter({ query }, locals.user!.id, params.id);
+        const used = await withTransaction((client) => consumeNextAttackEffects(client, params.id, consumeIds));
+        if (used.length) emitRealtimeEvent('resource:changed', { characterId: params.id });
+      } catch { /* not allowed or nothing to consume: the roll itself is unaffected */ }
+    }
 
     // Optional d20 pool fields (older clients don't send them, and get today's plain message).
     // Anything out of range is dropped rather than rejected: the pool only words the log line.

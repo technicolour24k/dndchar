@@ -8,8 +8,9 @@ import { drawDistanceGhost, drawDistanceLine, drawMovePath } from './render/move
 import { chebyshevFt, pathFt, snapToSquareCentre } from './shared/gridDistance.js';
 import { drawMarkers } from './render/markers.js';
 import { createForage } from './forage.js';
+import { createDeck } from './deck.js';
 import { createCostApproval } from './costApproval.js';
-import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, paidText, resetAllNote, turnChips } from './shared/actionEconomy.js';
+import { ATTACK_TIMINGS, attackCostText, attackFollowup, dashNeeded, dashPromptText, followupToSend, paidText, repeatOffer, resetAllNote, turnChips } from './shared/actionEconomy.js';
 import { approvalErrorText as costApprovalErrorText, isInsufficient as isCostInsufficient } from './shared/costApproval.js';
 import { createCampaignClient } from './campaign.js';
 import { createOverworld } from './overworld.js';
@@ -34,6 +35,7 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   'characterId',
   'ac',
   'knownAc',
+  'sheetAc',
   'saves',
   'actions',
   'spellSlots',
@@ -691,7 +693,9 @@ function handleMessage(msg) {
       // Forage: the GM's pending requests (or the player's own view and result) arrive in
       // session.forage / session.forageResults. Targeted updates only, no extra sidebar rebuild.
       forage.onStateFull();
+      deck.onStateFull();
       costApproval.onStateFull();
+      roundPendingOnStateFull();
       // db-traffic-reduction Phase 6: one catch-up sync on (re)join instead of
       // a periodic poll - anything that happens while connected arrives via
       // 'character:changed' below instead. See that case and
@@ -982,6 +986,20 @@ function handleMessage(msg) {
       forage.onClosed(msg);
       break;
 
+    // Decks (decks plan, unit 8). deck:drawn / deck:undone go to everyone at the table (the result is
+    // public); deck:tasks goes to the campaign's GM only. Toasts and a small sidebar block, no renderSidebar.
+    case 'deck:drawn':
+      deck.onDrawn(msg);
+      break;
+
+    case 'deck:undone':
+      deck.onUndone(msg);
+      break;
+
+    case 'deck:tasks':
+      deck.onTasks(msg);
+      break;
+
     // Cost-engine DM approval (cost-engine unit 6): the GM's queue, and a player's own request.
     case 'cost:update':
       costApproval.onUpdate(msg);
@@ -993,6 +1011,30 @@ function handleMessage(msg) {
 
     case 'cost:ping':
       costApproval.onPing();
+      break;
+
+    // Next round waits for Ready (unit 12). The GM hears the whole picture, a player only their own
+    // standing, and watchers nothing. round:next means the round has started (players only); round:done is
+    // the GM's copy, with the turn views to push onto the tokens.
+    case 'round:pending':
+    case 'round:pending:update':
+      onRoundPending(msg);
+      break;
+
+    case 'round:hold':
+      showMovePlanNotice(`${msg.name} wants to do something first`, 5000);
+      break;
+
+    case 'round:cancelled':
+      onRoundCancelled();
+      break;
+
+    case 'round:next':
+      onRoundNext();
+      break;
+
+    case 'round:done':
+      onRoundDone(msg);
       break;
 
     // A DM shared an overworld map (campaign tables only).
@@ -1648,6 +1690,7 @@ function closeAttackModal() {
     render();
   }
   pendingAttack = null;
+  lastAttack = null;
   dashHold = null;
 }
 
@@ -1877,12 +1920,13 @@ function attackRollExtras(sourceTokenId, targetId, options, preview) {
     advantage: { disabled: [...options.disabled], situationalAdvantage: options.adv, situationalDisadvantage: options.dis },
     manualDamageDice: options.damageDelta, // INTERIM
     // The action economy choices for a character's weapon attack (the server defaults match).
-    // A follow-up is only used when the card actually offered it (and it's still the choice);
-    // otherwise send 'skip', so a hidden/unknown follow-up is never spent silently.
-    ...(options.showTurn ? {
-      timing: options.timing,
-      followup: attackFollowup(options.turn, options.timing) && options.followup === 'use' ? 'use' : 'skip'
-    } : {}),
+    // followupToSend sends only a choice the player really made. With no turn view yet (the preview
+    // is still loading, or failed) it sends nothing, so the server's default ('use') applies and a
+    // waiting Extra Attack is spent rather than silently skipped. The server decides and pays.
+    ...(options.showTurn ? { timing: options.timing } : {}),
+    // A spell has no confirm-card choice, but the result button's repeat ('require') still goes through.
+    ...((options.showTurn || options.followup === 'require') && followupToSend(options.turn, options.timing, options.followup)
+      ? { followup: followupToSend(options.turn, options.timing, options.followup) } : {}),
   };
 }
 
@@ -1897,7 +1941,9 @@ async function loadAttackPreview(pending) {
     options.primaryDamageDice = preview.primaryDamageDice || '';
     if (preview.usesAttackRoll === false) options.showAdvantage = false;
     options.sources = (preview.sources || []).filter((src) => src.origin !== 'situational');
-    if (preview.turn) options.turn = preview.turn;
+    // roll-manual previews (Unarmed Strike, GM-added actions) carry no turn view, so fall back to the
+    // token's own display copy. It only decides whether the radio shows; the server decides what is paid.
+    options.turn = preview.turn ?? session.tokens[sourceTokenId]?.turn ?? null;
   } catch (err) {
     if (pendingAttack !== pending) return;
     console.warn('[VTT] advantage preview failed', err);
@@ -1974,6 +2020,12 @@ async function rollManualAction(action, extraBody = {}) {
 // The Error a roll route's non-OK answer becomes. A 409 'insufficient' keeps the whole body on
 // err.insufficient so resolveAttack can offer the ask-the-DM prompt instead of a dead end.
 function rollError(body, res) {
+  // A 'require' follow-up that was no longer there: nothing was spent.
+  if (body?.error === 'followup_gone') {
+    const gone = new Error(body.message || 'That free repeat is no longer available.');
+    gone.followupGone = true;
+    return gone;
+  }
   const refused = body?.error === 'approval_invalid' || body?.error === 'forbidden' || body?.error === 'wrong_room' || body?.error === 'not_in_room';
   const err = new Error(costShortfallText(body) || (refused ? costApprovalErrorText(body) : '') || body.error || ('roll request failed (' + res.status + ')'));
   if (isCostInsufficient(body)) err.insufficient = body;
@@ -2035,12 +2087,17 @@ async function rollPendingAction(action, source, extraBody = {}) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'pay', approvalId: extraBody.approvalId, override: extraBody.override, roomId: extraBody.roomId,
-          activation: { kind: 'weapon_attack', inventoryId: null, label: action.name, timing: extraBody.timing || 'action', followup: extraBody.followup === 'use' ? 'use' : 'skip' },
+          // followup is only sent when the player made a choice; otherwise the server default ('use') applies.
+          activation: { kind: 'weapon_attack', inventoryId: null, label: action.name, timing: extraBody.timing || 'action', ...(extraBody.followup ? { followup: extraBody.followup } : {}) },
         }),
       });
       const paidBody = await paid.json().catch(() => ({}));
       if (paid.status === 404) return rollManualAction(action, extraBody); // can't act for this character: rolls unpaid, as before
       if (!paid.ok) throw rollError(paidBody, paid);
+      // Keep what the turn route said was paid, so the result shows "Paid: 1 Attack" / "Extra Attack (N left)"
+      // and can offer the free repeat.
+      const manual = await rollManualAction(action, extraBody);
+      return { ...manual, turn: { paid: paidBody.paid, usedFollowup: paidBody.usedFollowup, followupCls: paidBody.followupCls, followupsLeft: paidBody.followupsLeft } };
     }
     return rollManualAction(action, extraBody);
   }
@@ -2096,6 +2153,11 @@ async function resolveAttack(costExtra = {}) {
       });
       return;
     }
+    if (err.followupGone && pendingAttack === pending) {
+      // The free repeat was used up or cleared (e.g. a new round) before the click: nothing was spent.
+      attackModalError(err.message);
+      return;
+    }
     console.error('[VTT] roll failed', err);
     attackModalError(`Couldn't ${isHeal ? 'use the heal' : isSpell ? 'cast the spell' : 'roll the attack'}: ${String(err.message || err)}`);
     return;
@@ -2112,9 +2174,13 @@ async function resolveAttack(costExtra = {}) {
   // no attack-roll concept in this simple model - both skip straight to the no-hidden-
   // value branch below, same as a save/auto spell already did.
   const usesAttackRoll = !isHeal && action.kind !== 'item' && (!isSpell || result.resolution === 'attack');
+  // The free repeat button (Extra Attack / a spell echo): only offered when the server says one is still
+  // waiting. A weapon repeats only as an Action-timed attack; a spell any intent.
+  const canRepeat = action.kind === 'item' || (!isSpell && (intent !== 'attack' || options.timing !== 'action')) ? null : repeatOffer(result.turn);
+  lastAttack = canRepeat ? { sourceTokenId, action, intent, targetId, targetName, options: cloneAttackOptions(options) } : null;
   renderAttackBreakdown(targetName, result, usesAttackRoll
     ? '<span class="attack-subtext">Resolving hit/miss…</span>'
-    : '<span class="attack-subtext">Loading…</span>');
+    : '<span class="attack-subtext">Loading…</span>', canRepeat);
   if (result.turn && paidText(result.turn)) {
     const paidEl = document.createElement('div');
     paidEl.className = 'attack-subtext';
@@ -2130,6 +2196,7 @@ async function resolveAttack(costExtra = {}) {
       if (awaitingAttackResult && awaitingAttackResult.targetId === targetId) {
         setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
         awaitingAttackResult = null;
+        enableRepeatButton();
       }
     }, 5000);
     awaitingAttackResult = { targetId, targetName, result, timeoutId };
@@ -2161,7 +2228,7 @@ async function resolveAttack(costExtra = {}) {
 // Renders the to-hit (if any) + damage breakdown (identical whichever roll
 // source), with a verdict slot filled once the server responds or (for
 // save/auto spells) once renderSpellResolutionControls wires its own prompt.
-function renderAttackBreakdown(targetName, result, verdictHtml) {
+function renderAttackBreakdown(targetName, result, verdictHtml, offer = null) {
   const hasAttackRoll = Boolean(result.attack);
   const saveLine = result.resolution === 'save'
     ? `<div class="attack-roll-block"><h4>Saving Throw</h4>DC ${result.saveDc} ${escapeHtml(String(result.saveAbility || '').toUpperCase())} — ${result.saveEffect === 'negate' ? 'no damage' : 'half damage'} on a success</div>`
@@ -2173,11 +2240,52 @@ function renderAttackBreakdown(targetName, result, verdictHtml) {
     ${saveLine}
     <div id="attackVerdict">${verdictHtml}</div>
     <div class="attack-roll-block"><h4>Damage${hasAttackRoll ? ' (on a hit)' : ''}</h4>${escapeHtml((result.damage || []).join('\n'))}</div>
+    <div class="attack-repeat-note attack-subtext" id="attackRepeatNote" role="status"></div>
     <div class="actions">
-      <button type="button" class="secondary" id="attackDoneBtn">Close</button>
+      ${offer ? `<button type="button" id="attackRepeatBtn" disabled>${escapeHtml(offer.label)} (${offer.remaining} left)</button>` : ''}
+      <button type="button" class="secondary" id="attackDoneBtn">Done</button>
     </div>
   `;
   document.getElementById('attackDoneBtn').addEventListener('click', closeAttackModal);
+  document.getElementById('attackRepeatBtn')?.addEventListener('click', repeatLastAttack);
+}
+
+// The free repeat (Extra Attack, a spell echo) stays disabled until this roll's verdict has landed, so the
+// next roll can't overlap the one still being applied.
+function enableRepeatButton() {
+  const button = document.getElementById('attackRepeatBtn');
+  if (button) button.disabled = false;
+}
+
+// A deep copy of the roll options, so the repeat reuses the same choices (unticked sources, situational
+// adv/dis, damage-dice delta) without sharing the Set the finished attack still holds.
+function cloneAttackOptions(options) {
+  return { ...options, sources: [...options.sources], disabled: new Set(options.disabled) };
+}
+
+// What the open result's repeat button runs: { sourceTokenId, action, intent, targetId, targetName, options }.
+let lastAttack = null;
+
+// The result's [Extra Attack] button: the same attack on the same target, straight away, with no confirm
+// card. It sends followup 'require', so the server either spends a waiting follow-up or answers
+// followup_gone with nothing spent. It never pays an action.
+function repeatLastAttack() {
+  const last = lastAttack;
+  if (!last) return;
+  const note = document.getElementById('attackRepeatNote');
+  if (!session.tokens[last.sourceTokenId] || !session.tokens[last.targetId]) {
+    if (note) note.textContent = 'That target is gone.';
+    return;
+  }
+  const options = cloneAttackOptions(last.options);
+  options.followup = 'require';
+  options.timing = 'action';
+  options.status = 'ready';
+  pendingAttack = { ...last, options, stage: 'confirm' };
+  send({ type: 'target:select', sourceTokenId: last.sourceTokenId, targetTokenIds: [last.targetId] });
+  currentTargetTokenIds = [last.targetId];
+  render();
+  resolveAttack();
 }
 
 function setAttackVerdict(html) {
@@ -2220,6 +2328,7 @@ function sendSpellResolve(sourceTokenId, targetId, result, saveSuccess, intent =
     if (awaitingSpellResult && awaitingSpellResult.targetId === targetId) {
       setAttackVerdict('<div class="attack-outcome unknown">No response from server — try again.</div>');
       awaitingSpellResult = null;
+      enableRepeatButton();
     }
   }, 5000);
   awaitingSpellResult = { targetId, timeoutId };
@@ -2256,6 +2365,7 @@ function handleSpellResult(msg) {
       : `${msg.damageApplied} damage dealt`;
   const cls = msg.resolution === 'heal' ? 'hit' : (msg.damageApplied > 0 ? 'hit' : 'miss');
   setAttackVerdict(`<div class="attack-outcome ${cls}">${label}${damageTakenNote(msg)}</div>`);
+  enableRepeatButton();
 }
 
 // The damage_taken audit trail the server adds when the target is a PC whose modifiers changed the
@@ -2283,6 +2393,7 @@ function handleAttackResult(msg) {
   } else { cls = 'miss'; label = 'Miss'; }
 
   setAttackVerdict(`<div class="attack-outcome ${cls}">${label}${damageTakenNote(msg)}</div>`);
+  enableRepeatButton();
 }
 
 // Yellow highlight ring around every valid target while an action is armed (step 1's visible
@@ -3534,6 +3645,110 @@ async function resetAllTurns() {
   } catch { /* movement was reset over the socket; actions follow on the next sync */ }
 }
 
+// GM "Next round" (unit 12): asks for the round. The server then waits for the players to press Ready
+// (or for Start now) before anything resets or ticks; the result comes back as round:done. A 409 too_soon
+// (a double click) is ignored quietly, and already_pending just shows the state that is there.
+let nextRoundBusy = false;
+async function postNextRound(action) {
+  if (!sessionId || nextRoundBusy) return;
+  nextRoundBusy = true;
+  refreshCombatControl();
+  try {
+    const res = await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/next-round', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok || body.error === 'already_pending') {
+      if (body.pending) { session.roundPending = body.pending; }
+      return;
+    }
+    if (body.error === 'no_pending') { session.roundPending = null; return; } // already processed or cancelled: clear a stale waiting line (finally redraws)
+    if (body.error === 'too_soon') return; // a double click
+    showMovePlanNotice("Couldn't do that for the next round.", 4000);
+  } catch {
+    showMovePlanNotice("Couldn't do that for the next round.", 4000);
+  } finally {
+    nextRoundBusy = false;
+    refreshCombatControl();
+  }
+}
+
+// The GM's copy of a processed round: the fresh turn copies go onto the tokens (like Reset all). It
+// arrives whoever completed the round (Start now, the last Ready, or a disconnect).
+function onRoundDone(msg) {
+  session.roundPending = null;
+  dropRepeatButton();
+  for (const token of Object.values(session.tokens)) {
+    const view = token.characterId && msg.views?.[token.characterId];
+    if (view) send({ type: 'token:stat:update', tokenId: token.id, stat: 'turn', value: view });
+  }
+  const count = Number(msg.advanced) || 0;
+  const skipped = Number(msg.skipped) || 0;
+  showMovePlanNotice(`Next round: ${count} ${count === 1 ? 'character' : 'characters'}${skipped ? `, ${skipped} skipped` : ''}`, 4000);
+  refreshCombatControl();
+}
+
+// GM: the pending state changed. Player: this player's own standing changed.
+function onRoundPending(msg) {
+  if (role === 'gm') { session.roundPending = msg.pending; refreshCombatControl(); }
+  else { session.roundPending = msg.view; showRoundCard(msg.view); }
+}
+
+function onRoundCancelled() {
+  session.roundPending = null;
+  if (role === 'gm') { showMovePlanNotice('Next round cancelled', 3000); refreshCombatControl(); }
+  else { showRoundCard(null); showMovePlanNotice('The DM cancelled the next round.', 4000); }
+}
+
+// A reload while a round is pending: state:full carries the pending view, so the card or the GM's
+// waiting line comes straight back (and a stale card goes if the round ended while we were away).
+function roundPendingOnStateFull() {
+  if (role === 'gm') refreshCombatControl();
+  else showRoundCard(session.roundPending ?? null);
+}
+
+// Players: the card. One at a time, fixed wording chosen by the player's own state ('waiting', 'holding'
+// or 'ready'), nothing from data. It never steals focus or blocks play.
+const roundCard = document.getElementById('roundCard');
+const ROUND_CARD_TEXT = {
+  waiting: 'The DM wants to start the next round. Anything to do first?',
+  holding: "The DM knows you want to act. Press Ready when you're done.",
+  ready: "You're ready. Waiting for the DM and the others."
+};
+function showRoundCard(view) {
+  if (!roundCard) return;
+  roundCard.hidden = !view;
+  if (!view) return;
+  document.getElementById('roundCardText').textContent = ROUND_CARD_TEXT[view.state] ?? ROUND_CARD_TEXT.waiting;
+  document.getElementById('roundReadyBtn').hidden = view.state === 'ready';
+  document.getElementById('roundHoldBtn').hidden = view.state === 'holding';
+}
+async function answerRound(action) {
+  if (!sessionId) return;
+  try {
+    // The server decides who we are; the card itself updates from the round:pending message that follows.
+    await fetch('/vtt/api/session/' + encodeURIComponent(sessionId) + '/next-round/ready', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, pendingId: session.roundPending?.id }),
+    });
+  } catch { showMovePlanNotice("Couldn't reach the DM, try again.", 3000); }
+}
+document.getElementById('roundReadyBtn')?.addEventListener('click', () => { void answerRound('ready'); });
+document.getElementById('roundHoldBtn')?.addEventListener('click', () => { void answerRound('hold'); });
+
+// Players: the round has started. A short note replaces the card.
+function onRoundNext() {
+  dropRepeatButton();
+  session.roundPending = null;
+  showRoundCard(null);
+  showMovePlanNotice('New round', 3000);
+}
+
+// A new round makes any waiting free repeat stale: take the button off an open attack result.
+function dropRepeatButton() {
+  lastAttack = null;
+  document.getElementById('attackRepeatBtn')?.remove();
+}
+
 // Sidebar Dash button: a dash with no move behind it (just adds speed to this turn's movement).
 function dashButtonClicked(tokenId) {
   const token = session?.tokens[tokenId];
@@ -3659,6 +3874,7 @@ function renderSidebar() {
   // Synchronously, before anything can paint: put the persistent voice dock back into its slot (the
   // innerHTML above detached it; the call and its audio elements are not affected).
   voice.mount(sidebarEl.querySelector('#voiceSlot'));
+  deck.afterSidebarRender(); // the GM's Deck block and the token-card Draw buttons
 
   // Restore BEFORE wiring: wireMarkerForm() reads the shape select at wire time
   // to show/hide the radius vs cone/cube fields.
@@ -3687,11 +3903,12 @@ function roomInfoHtml(roleLabel) {
   // Campaign tables get a slot at the top of the box for the voice controls (voice.mount moves the
   // one persistent dock node into it after every render). Quick rooms get none, so no voice there.
   const voiceSlot = campaignClient.active ? '<div id="voiceSlot"></div>' : '';
-  return `<div id="roomInfo">${voiceSlot}${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}<br/>Players: ${playerListHtml()}</div>
+  return `<div id="roomInfo">${voiceSlot}${campaignLine}<strong>${escapeHtml(sessionId)}</strong><br/>Role: ${roleLabel}${deck.roleLinkHtml()}<br/>Players: ${playerListHtml()}</div>
     <div class="field"><button type="button" id="openDiceRollerBtn" class="secondary">Roll Dice…</button></div>
     ${overworld.buttonHtml()}
     ${combatControlHtml()}
     ${forage.forageControlHtml()}
+    ${deck.deckControlHtml()}
     ${costApproval.queueHtml()}
     ${combatLogHtml()}
     ${rollLogHtml()}
@@ -3707,11 +3924,39 @@ function roomInfoHtml(roleLabel) {
 function combatControlHtml() {
   const active = !!session.encounterId;
   const statusLine = active ? `<div class="combat-encounter-id">Combat is active in this room.</div>` : '';
-  const gmButton = role !== 'gm' ? '' : active
+  const gmButton = role !== 'gm' ? '' : (active
     ? `<button type="button" id="stopCombatBtn" class="secondary">Stop Combat</button>`
-    : `<button type="button" id="startCombatBtn">Start Combat</button>`;
+    : `<button type="button" id="startCombatBtn">Start Combat</button>`) + nextRoundHtml();
   if (!gmButton && !statusLine) return '';
   return `<div class="field" id="combatControl">${gmButton}${statusLine}</div>`;
+}
+
+// The GM's Next round (every room; there is no initiative tracker). While a round is pending it becomes
+// who we are waiting on, with Start now and Cancel. Names are escaped; "wants to act" marks a Hold on.
+function nextRoundHtml() {
+  const pending = session.roundPending;
+  if (!pending) return `<button type="button" id="nextRoundBtn" class="secondary" ${nextRoundBusy ? 'disabled' : ''}>Next round</button>`;
+  const names = [...pending.waiting.map((p) => escapeHtml(p.name)), ...pending.holding.map((p) => `<span class="round-hold">${escapeHtml(p.name)} (wants to act)</span>`)];
+  const line = names.length ? `Next round: waiting on ${names.join(', ')}` : 'Next round: waiting for players to come back';
+  const ready = pending.ready.length ? ` <span style="color:#999;">(${pending.ready.length} ready)</span>` : '';
+  return `<div class="round-pending-line">${line}${ready}</div>`
+    + `<div class="round-pending-actions"><button type="button" id="startRoundNowBtn" ${nextRoundBusy ? 'disabled' : ''}>Start now</button>`
+    + `<button type="button" id="cancelRoundBtn" class="secondary" ${nextRoundBusy ? 'disabled' : ''}>Cancel</button></div>`;
+}
+
+// Redraws just the combat control from the server's state (no sidebar rebuild) and rewires its buttons.
+function refreshCombatControl() {
+  const el = document.getElementById('combatControl');
+  if (!el || role !== 'gm' || !session) return;
+  el.outerHTML = combatControlHtml();
+  wireCombatControl();
+}
+function wireCombatControl() {
+  document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
+  document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+  document.getElementById('nextRoundBtn')?.addEventListener('click', () => { void postNextRound('request'); });
+  document.getElementById('startRoundNowBtn')?.addEventListener('click', () => { void postNextRound('start'); });
+  document.getElementById('cancelRoundBtn')?.addEventListener('click', () => { void postNextRound('cancel'); });
 }
 
 function combatLogHtml() {
@@ -4228,8 +4473,7 @@ function markerListHtml(isGm) {
 }
 
 function wireGmSidebar() {
-  document.getElementById('startCombatBtn')?.addEventListener('click', startCombat);
-  document.getElementById('stopCombatBtn')?.addEventListener('click', stopCombat);
+  wireCombatControl();
   wireSessionNotesControls();
 
   document.getElementById('openDiceRollerBtn').addEventListener('click', openDiceRollerModal);
@@ -5093,6 +5337,7 @@ function ownTokenListHtml(tokens) {
             <button class="secondary changeImageBtn">Change Image…</button>
             ${isProp ? '' : '<button class="secondary conditionsBtn">Conditions…</button>'}
             ${forage.forageButtonHtml(t)}
+            ${deck.deckButtonHtml(t)}
             <button class="secondary recenterTokenBtn" title="Snap back to the middle of the map - use if your token ever gets dragged somewhere unreachable">Recenter on Map</button>
           </div>
           ${miniSheetHtml(t)}
@@ -5367,7 +5612,7 @@ function renderCombatActionsBody() {
     .join('');
   const turnFollowupsHtml = (token.turn?.followups || [])
     .filter((entry) => Number(entry.remaining) > 0)
-    .map((entry) => `<div class="mini-sheet-slot"><span class="mini-sheet-slot-label">${escapeHtml(entry.label)}: ${Number(entry.remaining) || 0} left</span></div>`)
+    .map((entry) => `<div class="mini-sheet-slot"><span class="mini-sheet-slot-label">${escapeHtml(entry.label)}: ${Number(entry.remaining) || 0} left - use it from the attack result</span></div>`)
     .join('');
 
   const itemsHtml = (token.items || []).length
@@ -5605,6 +5850,21 @@ const forage = createForage({
   advSourceLabel,
   advReadoutText,
   counterRowHtml,
+  bringModalToFront,
+  closeOnBackdropPress,
+});
+
+// Decks (decks plan, unit 8): the player's draw popup, the toasts and the GM's Deck block live in deck.js.
+// Like forage it only updates its own modal and small sidebar spots. Only campaign tables get a GM block
+// (campaignClient.campaignId is null in Quick rooms); the server decides who may draw.
+const deck = createDeck({
+  getSession: () => session,
+  getRole: () => role,
+  getSessionId: () => sessionId,
+  getCampaignId: () => campaignClient.campaignId,
+  isAccountLinked: () => !!accountPlayerId,
+  sidebarEl,
+  escapeHtml,
   bringModalToFront,
   closeOnBackdropPress,
 });

@@ -54,6 +54,19 @@ export type AdvantageSource = {
   applied: boolean;
 };
 
+// Ids of the applied-effect rows behind the attacker's own APPLIED advantage/disadvantage sources, i.e.
+// the effects whose modifiers this roll counted. Source ids look like "attacker|effect:<row uuid>|...";
+// target-side and situational sources never match. Used to consume "until your next attack" effects.
+export function appliedEffectRowIds(sources: AdvantageSource[]): string[] {
+  const ids = new Set<string>();
+  for (const source of sources) {
+    if (!source.applied || (source.origin !== 'attacker' && source.origin !== 'attacker_condition')) continue;
+    const match = source.id.split('|')[1]?.match(/^effect:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    if (match) ids.add(match[1].toLowerCase());
+  }
+  return [...ids];
+}
+
 // The result of the d20 pool, kept alongside the roll so logs can show every die and the kept one.
 export type AttackPool = {
   size: number;

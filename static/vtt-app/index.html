@@ -53,6 +53,13 @@
   </div>
   <!-- A passing message that doesn't block play (e.g. "The DM has taken the GM seat."). -->
   <div id="campaignBanner" hidden></div>
+  <!-- "Next round" card for players (vtt-feedback unit 12): the DM is waiting on Ready. Never blocks play.
+       The text and buttons are set from the player's own state in main.js; nothing from data. -->
+  <div id="roundCard" role="status" hidden>
+    <span id="roundCardText"></span>
+    <button type="button" id="roundReadyBtn">Ready</button>
+    <button type="button" id="roundHoldBtn" class="secondary">Hold on</button>
+  </div>
   <!-- "New map" banner when a DM shares an overworld map (campaign tables only). -->
   <div id="overworldBanner" hidden></div>
   <!-- Full-screen overworld (campaign tables only): an iframe is added on open and removed on close. -->
@@ -230,6 +237,14 @@
       <div id="foragePlayerBody"></div>
     </div>
   </div>
+
+  <!-- Decks (decks plan, unit 8). Player draw popup (closes freely) and the toast stack. Built by deck.js. -->
+  <div id="deckModal" class="modal-overlay">
+    <div class="modal deck-modal" role="dialog" aria-modal="true" aria-label="Decks">
+      <div id="deckModalBody"></div>
+    </div>
+  </div>
+  <div id="deckToasts" class="deck-toasts" aria-live="polite"></div>
 
   <!-- Forage GM popup. Deliberately no backdrop or Escape close: closing would cancel a player's request.
        The body is built by forage.js. -->

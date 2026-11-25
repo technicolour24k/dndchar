@@ -40,6 +40,17 @@ vi.mock('$lib/server/voice/voiceEject', () => ({
 const countActiveFindTables = vi.fn();
 vi.mock('$lib/server/services/resource-pools', () => ({ listUnreviewedOverrides: async () => [], reviewOverride: vi.fn() }));
 vi.mock('$lib/server/vttCostGate', () => ({ announceCostUndo: vi.fn() }));
+// The campaign page's Decks section (decks unit 9): the deck service and the table announcements are mocked.
+class MockDeckError extends Error { constructor(public code: string, message: string) { super(message); } }
+const deckSvc = {
+  DeckError: MockDeckError,
+  listCampaignDecks: vi.fn(async () => []), listAvailableDecks: vi.fn(async () => []), listDrawsForCampaign: vi.fn(async () => []),
+  listOpenDmTasks: vi.fn(async () => []), revertDraw: vi.fn(), setCampaignDeck: vi.fn(), setDrawTaskDone: vi.fn()
+};
+vi.mock('$lib/server/services/decks', () => deckSvc);
+const announceDeck = vi.fn(async () => {});
+const announceDmTasks = vi.fn(async () => {});
+vi.mock('$lib/server/vttDeckAnnounce', () => ({ announceDeck: (...a: unknown[]) => (announceDeck as any)(...a), announceDmTasks: (...a: unknown[]) => (announceDmTasks as any)(...a) }));
 vi.mock('$lib/server/services/forage', () => ({ countActiveFindTables: (...args: unknown[]) => countActiveFindTables(...args) }));
 
 const { CampaignError } = await import('$lib/server/campaignError');
@@ -71,6 +82,11 @@ async function redirected(promise: Promise<unknown>) {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // resetAllMocks drops the default implementations, so the deck list calls get theirs back.
+  deckSvc.listCampaignDecks.mockResolvedValue([]);
+  deckSvc.listAvailableDecks.mockResolvedValue([]);
+  deckSvc.listDrawsForCampaign.mockResolvedValue([]);
+  deckSvc.listOpenDmTasks.mockResolvedValue([]);
 });
 
 describe('/campaigns load', () => {
@@ -300,5 +316,41 @@ describe('campaign page character actions are tied to the URL campaign', () => {
     const toggled: any = await call(detail.actions.setActive, user, { characterId: 'c1', active: '0' });
     expect(svc.setCharacterPartyActive).toHaveBeenCalledWith(ME, 'c1', false, CAMPAIGN);
     expect(toggled.status).toBe(400);
+  });
+});
+
+describe('campaign page deck actions (decks unit 9)', () => {
+  it('setDeck forwards the signed-in user and the URL campaign, never a posted one', async () => {
+    deckSvc.setCampaignDeck.mockResolvedValue(undefined);
+    const out: any = await call(detail.actions.setDeck, user, { deckId: 'd1', enabled: '1', userId: 'someone-else' });
+    expect(deckSvc.setCampaignDeck).toHaveBeenCalledWith({ userId: ME, campaignId: CAMPAIGN, deckId: 'd1', enabled: true });
+    expect(out).toEqual({ saved: 'decks' });
+    await call(detail.actions.setDeck, user, { deckId: 'd1', enabled: '0' });
+    expect(deckSvc.setCampaignDeck).toHaveBeenLastCalledWith({ userId: ME, campaignId: CAMPAIGN, deckId: 'd1', enabled: false });
+  });
+  it('a player is refused (403) with the service message', async () => {
+    deckSvc.setCampaignDeck.mockRejectedValue(new MockDeckError('forbidden', 'Only the DM can change the campaign\'s decks.'));
+    const out: any = await call(detail.actions.setDeck, user, { deckId: 'd1', enabled: '1' });
+    expect(out.status).toBe(403);
+    expect(out.data.error).toMatch(/Only the DM/);
+  });
+  it('undoDraw announces an undo, but not a cancelled Ace', async () => {
+    deckSvc.revertDraw.mockResolvedValue({ id: 'x', status: 'reverted', revertNote: 'Restored.' });
+    const out: any = await call(detail.actions.undoDraw, user, { drawId: 'x' });
+    expect(deckSvc.revertDraw).toHaveBeenCalledWith({ userId: ME, drawId: 'x' });
+    expect(announceDeck).toHaveBeenCalledTimes(1);
+    expect(out).toEqual({ saved: 'draws', note: 'Restored.' });
+    deckSvc.revertDraw.mockResolvedValue({ id: 'y', status: 'cancelled', revertNote: '' });
+    await call(detail.actions.undoDraw, user, { drawId: 'y' });
+    expect(announceDeck).toHaveBeenCalledTimes(1);
+  });
+  it('load only asks for open tasks and disabled decks when the viewer can manage', async () => {
+    svc.getCampaignPage.mockResolvedValue({
+      campaign: { id: CAMPAIGN, isArchived: false }, members: [], characters: [], myCharacters: [], access: { canManage: false, role: 'player', isAdmin: false, isDm: false }
+    });
+    const out: any = await detail.load({ params: { id: CAMPAIGN }, locals: { user } } as any);
+    expect(deckSvc.listCampaignDecks).toHaveBeenCalledWith(CAMPAIGN, { includeDisabled: false });
+    expect(deckSvc.listOpenDmTasks).not.toHaveBeenCalled();
+    expect(out.deckTasks).toEqual([]);
   });
 });

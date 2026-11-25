@@ -13,6 +13,8 @@ export type FindTableEntry = {
   qtyDie: number;
   itemArchived: boolean;
   sortOrder: number;
+  /** Where a homebrew item came from (authoring view only; '' for core items). */
+  sourceLabel?: string;
 };
 
 export type FindTable = {

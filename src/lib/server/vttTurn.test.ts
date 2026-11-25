@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('$vtt/store.js', () => ({ sessions: new Map(), broadcast: vi.fn() }));
 
-import { resetLiveTokenMovement } from './vttTurn';
+import { resetLiveTokenMovement, resetSessionMovement } from './vttTurn';
 
 // A room with a PC token of the character (30 ft speed, 10 left), a hidden one, another
 // character's token and a token with no movement tracking.
@@ -52,5 +52,35 @@ describe('resetLiveTokenMovement', () => {
     const session = room({ tokens: { z: { id: 'z', characterId: 'c1', speedRemainingFt: 7 } } });
     run(session);
     expect(session.tokens.z.speedRemainingFt).toBe(0);
+  });
+});
+
+describe('resetSessionMovement (Next round)', () => {
+  function runAll(session: any) {
+    const sent: Record<string, any[]> = { gm: [], player: [] };
+    const broadcast = (_id: string, build: (recipient: any) => unknown) => {
+      for (const role of ['gm', 'player']) { const payload = build({ role }); if (payload) sent[role].push(payload); }
+    };
+    const count = resetSessionMovement(session, { sessions: new Map([[session.id, session]]), broadcast });
+    return { count, sent };
+  }
+  it('resets every token that tracks movement, whoever owns it, and tells the room once', () => {
+    const session = room();
+    const { count, sent } = runAll(session);
+    expect(count).toBe(3); // a, b, c (d tracks nothing)
+    expect(session.tokens.a.speedRemainingFt).toBe(30);
+    expect(session.tokens.c.speedRemainingFt).toBe(30);
+    expect(sent.gm).toHaveLength(1);
+    expect(sent.gm[0].updates.map((u: any) => u.tokenId).sort()).toEqual(['a', 'b', 'c']);
+  });
+  it('keeps hidden tokens and an unrevealed map away from players', () => {
+    const { sent } = runAll(room());
+    expect(sent.player[0].updates.map((u: any) => u.tokenId).sort()).toEqual(['a', 'c']);
+    expect(runAll(room({ map: { revealed: false } })).sent.player).toEqual([]);
+  });
+  it('sends nothing for a room with no moving tokens', () => {
+    const { count, sent } = runAll({ id: 'r2', tokens: { x: { id: 'x' } } });
+    expect(count).toBe(0);
+    expect(sent.gm).toEqual([]);
   });
 });

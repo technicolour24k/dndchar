@@ -1,16 +1,17 @@
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { query } from '$lib/server/db';
+import { query, withTransaction } from '$lib/server/db';
+import { consumeNextAttackEffects } from '$lib/server/services/effects';
 import { getCharacterForRoll } from '$lib/server/services/characters';
 import { getCharacterAccess } from '$lib/server/services/access';
 import { payTurnActivation } from '$lib/server/services/catalogue';
 import { emitRealtimeEvent } from '$lib/server/realtime';
-import { CostShortfallError } from '$lib/server/services/cost-engine';
+import { CostShortfallError, FollowupGoneError } from '$lib/server/services/cost-engine';
 import type { Activation } from '$lib/types/cost';
 import { costShortfallBody, openCostGate, runWithGate } from '$lib/server/vttCostGate';
 import { abilityMap, equippedAttackItems } from '$lib/rules/dnd5e';
 import { characterStatsFor } from '$lib/rules/characterStats';
-import { attackAgainstCandidatesFor, attackCandidatesFor, previewAdvantage, rollAttack } from '$lib/rules/attackRoll';
+import { appliedEffectRowIds, attackAgainstCandidatesFor, attackCandidatesFor, previewAdvantage, rollAttack } from '$lib/rules/attackRoll';
 import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAttackAdvantage';
 
 // Server-side attack roll for the VTT. The vanilla VTT client can't import $lib (no build step),
@@ -30,8 +31,9 @@ import { gatherVttAdvantageSources, parseAttackOptions } from '$lib/server/vttAt
 // the usual ask-the-DM flow on a shortfall. The roll is computed first and only returned once the
 // action was paid. If the actor can't act for the character (a Quick-room GM rolling someone else's
 // token), the attack rolls unpaid, as before, and the response says `turn: null`. A preview never pays.
-// Body extras: timing ('action' | 'bonus_action' | 'reaction', default action), followup ('use' | 'skip',
-// default use: Extra Attack is the default choice while follow-ups wait), approvalId / override / roomId.
+// Body extras: timing ('action' | 'bonus_action' | 'reaction', default action), followup ('use' | 'skip' | 'require',
+// default use: Extra Attack is the default choice while follow-ups wait; 'require' is the result button's free
+// repeat and answers 409 followup_gone, with nothing spent, if none is waiting), approvalId / override / roomId.
 export const POST: RequestHandler = async ({ params, request, locals }) => {
   const character = await getCharacterForRoll(params.id!);
   if (!character) return json({ error: 'not_found' }, { status: 404 });
@@ -81,7 +83,7 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
   });
 
   const timing = ['action', 'bonus_action', 'reaction'].includes(body?.timing) ? body.timing : 'action';
-  const followup = body?.followup === 'skip' ? 'skip' : 'use';
+  const followup = body?.followup === 'skip' ? 'skip' : body?.followup === 'require' ? 'require' : 'use';
   const characterId = params.id!;
   const access = locals.user ? await getCharacterAccess({ query }, locals.user.id, characterId) : null;
   if (!access?.canAct) return json({ ...result, turn: null });
@@ -91,14 +93,20 @@ export const POST: RequestHandler = async ({ params, request, locals }) => {
   if (!gate.ok) return json(gate.body, { status: gate.status });
   try {
     const paid = await runWithGate(gate, (override) => payTurnActivation(locals.user!.id, characterId, activation, override));
+    // "Until your next attack" effects this roll counted are used up (only for a paid, authorised roll).
+    // A failure here must never turn a paid roll into an error: log it and carry on.
+    const usedUp = await withTransaction((client) => consumeNextAttackEffects(client, characterId, appliedEffectRowIds(result.advantageSources)))
+      .catch((consumeError) => { console.error('roll-attack: could not use up next-attack effects', consumeError); return [] as string[]; });
     emitRealtimeEvent('resource:changed', { characterId });
     const used = paid.paid.find((line) => line.pool === 'followup');
     return json({
       ...result,
-      turn: { paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), usedFollowup: Boolean(used), followupsLeft: paid.turn.followups.map((f) => ({ cls: f.cls, label: f.label, remaining: f.remaining })), view: paid.turn }
+      ...(usedUp.length ? { attack: `${result.attack} - Advantage used up: ${usedUp.join(', ')}`, consumedEffects: usedUp } : {}),
+      turn: { paid: paid.paid.map((line) => ({ label: line.label, delta: line.delta })), usedFollowup: Boolean(used), followupCls: timing === 'action' ? 'melee' : null, followupsLeft: paid.turn.followups.map((f) => ({ cls: f.cls, label: f.label, remaining: f.remaining })), view: paid.turn }
     });
   } catch (error) {
     if (error instanceof CostShortfallError) return json(costShortfallBody(gate, error), { status: 409 });
+    if (error instanceof FollowupGoneError) return json({ error: 'followup_gone', message: error.message }, { status: 409 });
     return json({ error: error instanceof Error ? error.message : 'Could not pay for the attack.' }, { status: 400 });
   }
 };

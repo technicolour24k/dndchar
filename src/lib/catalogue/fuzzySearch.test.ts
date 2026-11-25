@@ -7,6 +7,12 @@ function entry(name: string, overrides: Partial<Omit<CatalogueIndexEntry, 'norma
     type: overrides.type ?? 'spell',
     name,
     sourceKind: overrides.sourceKind ?? 'srd',
+    scope: overrides.scope ?? 'global',
+    ownerUserId: overrides.ownerUserId ?? null,
+    ownerName: overrides.ownerName ?? null,
+    campaignId: overrides.campaignId ?? null,
+    hiddenFromPlayers: overrides.hiddenFromPlayers ?? false,
+    forkedFromOwnerName: overrides.forkedFromOwnerName ?? null,
     spellLevel: overrides.spellLevel ?? null
   });
 }
@@ -76,6 +82,13 @@ describe('searchCatalogue', () => {
     const itemResults = searchCatalogue(entries, 'fire', { type: 'item' });
     expect(spellResults.map((r) => r.id)).not.toContain('fire-sword');
     expect(itemResults.map((r) => r.id)).toEqual(['fire-sword']);
+  });
+
+  it('applies a visibility filter before the limit, so hidden entries never take a slot', () => {
+    const hidden = Array.from({ length: 5 }, (_, index) => entry(`Hidden Spell ${index}`, { id: `hidden-${index}`, scope: 'personal', ownerUserId: 'bob' }));
+    const shown = entry('Shown Spell', { id: 'shown' });
+    const results = searchCatalogue([...hidden, shown], 'spell', { limit: 1, visible: (candidate) => candidate.scope === 'global' });
+    expect(results.map((r) => r.id)).toEqual(['shown']);
   });
 
   it('caps results at the given limit (default 20)', () => {

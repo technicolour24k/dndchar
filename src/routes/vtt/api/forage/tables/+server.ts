@@ -41,6 +41,7 @@ export const GET: RequestHandler = async ({ locals, url }) => {
   const suggested = await listSuggestedChecks(session.campaignId);
   return json({
     skills: SKILL_CHECKS,
+    campaignId: session.campaignId, // lets the GM's "Set them up" link open this campaign's Forage page
     tables: tablesForCampaign(catalogue.tables, session.campaignId).map((table) => ({
       id: table.id,
       name: table.name,

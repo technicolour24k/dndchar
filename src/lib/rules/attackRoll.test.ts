@@ -3,6 +3,7 @@ import type { ActiveCharacterEffect, InventoryItem } from '$lib/types/character'
 import {
   adjustPrimaryDamageDice,
   applyDisabled,
+  appliedEffectRowIds,
   collectAdvantageSources,
   defaultRollChoices,
   poolSummary,
@@ -378,5 +379,21 @@ describe('homebrew crit rule: max of the primary dice added once', () => {
   it('does not crit a manual save/auto spell from its discarded d20', () => {
     const result = rollManualAttack({ name: 'Burst', toHitBonus: 0, damageRolls: '1d8', damageBonus: 0 }, scripted([20, 3]).rollDie, { allowCrit: false });
     expect(result.damageTotal).toBe(3);
+  });
+});
+
+describe('appliedEffectRowIds', () => {
+  const uuid = '3f2b8a52-1c4d-4e6f-9a7b-0123456789ab';
+  const src = (id: string, extra: Record<string, unknown> = {}) => ({ id, label: 'x', kind: 'advantage' as const, origin: 'attacker' as const, applied: true, ...extra });
+  it('returns the applied attacker-side effect row ids only', () => {
+    const ids = appliedEffectRowIds([
+      src(`attacker|effect:${uuid}|attack_roll.all|advantage|0`),
+      src(`attacker|effect:${uuid}|attack_roll.all|advantage|1`), // same row twice: once
+      src('attacker|effect:11111111-1111-4111-8111-111111111111|a|b|0', { applied: false }), // unticked
+      src('target|effect:22222222-2222-4222-8222-222222222222|a|b|0', { origin: 'target' }),
+      src('attacker|item:33333333-3333-4333-8333-333333333333|a|b|0'),
+      src('situational|advantage|1', { origin: 'situational' })
+    ]);
+    expect(ids).toEqual([uuid]);
   });
 });

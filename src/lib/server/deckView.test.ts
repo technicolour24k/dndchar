@@ -1,0 +1,90 @@
+import { describe, expect, it } from 'vitest';
+import { cardTitle, choiceOptions, drawnTitle, errorText, gmTaskLine, lastDrawLine, undoneTitle, recentLine, resultLines, rollLines, statusTag, successLabel, taskLine, taskLines, deckBlockHidden, hiddenState, waitingOnYouTitle } from '../../../static/vtt-app/shared/deckView.js';
+
+const draw: any = {
+  drawerName: 'Aria', success: false, chosenValue: null, status: 'resolved',
+  card: { label: '3 of Clubs', tags: { back: 'gold' }, valueOptions: undefined },
+  results: [{ text: 'Aria loses 3 AC for 10 rounds' }, { text: 'Brom loses 5 gp', note: 'Had 2 gp, lost 2, 3 short.' }],
+  dmTasks: [{ text: 'The party finds a cursed item', done: false }, { text: 'Old', done: true }],
+  outcome: { rolls: [{ name: 'party_roll', text: '4 + 7 = 11' }] }
+};
+
+describe('deckView', () => {
+  it('words the card, the result lines (with clamp notes), roll breakdowns and open DM tasks', () => {
+    expect(cardTitle(draw.card)).toBe('3 of Clubs - gold back');
+    expect(cardTitle({ label: 'Red Joker', tags: {} })).toBe('Red Joker');
+    expect(resultLines(draw)).toEqual(['Aria loses 3 AC for 10 rounds', 'Brom loses 5 gp (Had 2 gp, lost 2, 3 short.)']);
+    expect(rollLines(draw)).toEqual(['party roll: 4 + 7 = 11']);
+    expect(taskLines(draw)).toEqual(['Waiting on the DM: The party finds a cursed item']);
+    expect(taskLines(draw, true)).toHaveLength(2);
+  });
+  it('builds the Ace choices with their previews', () => {
+    const ace: any = { card: { valueOptions: [1, 11] }, previews: { 1: 'Aria gains 1 gp', 11: 'Aria gains 11 gp' } };
+    expect(choiceOptions(ace)).toEqual([
+      { value: 1, label: 'Count it as 1', preview: 'Aria gains 1 gp' },
+      { value: 11, label: 'Count it as 11', preview: 'Aria gains 11 gp' }
+    ]);
+    expect(choiceOptions({ card: {} })).toEqual([]);
+  });
+  it('words recent draws, status tags and errors', () => {
+    expect(recentLine(draw)).toBe('Aria drew the 3 of Clubs - gold back: Failure');
+    expect(recentLine({ ...draw, success: true, chosenValue: 11 })).toBe('Aria drew the 3 of Clubs - gold back (as 11): Success');
+    expect(statusTag({ status: 'reverted' })).toBe('Undone by the DM');
+    expect(statusTag(draw)).toBe('');
+    expect(errorText('choosing')).toMatch(/Finish the card/);
+    expect(errorText('mystery')).toBe('Something went wrong.');
+  });
+  it('words the VTT toasts and the GM block', () => {
+    const named = { ...draw, outcome: { name: "Defender's Aura" } };
+    expect(drawnTitle(named)).toBe("Aria drew the 3 of Clubs - gold back - failure: Defender's Aura");
+    expect(drawnTitle({ ...draw, success: true })).toBe('Aria drew the 3 of Clubs - gold back - success');
+    expect(undoneTitle(draw)).toBe("The DM undid Aria's draw of the 3 of Clubs");
+    expect(gmTaskLine({ cardLabel: 'Red Joker', text: 'The party gains a high-powered magic item' })).toBe('Red Joker: The party gains a high-powered magic item');
+    expect(lastDrawLine(draw)).toBe('Last draw: Aria drew the 3 of Clubs - gold back (failure)');
+  });
+  it('words a hidden result (success null) without giving anything away', () => {
+    const hidden = { ...draw, success: null, card: { label: 'Red Joker', tags: { back: 'black' } }, dmTasks: [{ text: '', done: false, hidden: true }, { text: '', done: false, hidden: true }] };
+    expect(successLabel(null)).toBe('Up to the DM');
+    expect(successLabel(true)).toBe('Success');
+    expect(recentLine(hidden)).toBe('Aria drew the Red Joker - black back');
+    expect(drawnTitle({ ...hidden, outcome: { name: 'Red Joker' } })).toBe('Aria drew the Red Joker - black back: Red Joker');
+    expect(lastDrawLine(hidden)).toBe('Last draw: Aria drew the Red Joker - black back');
+    for (const line of [recentLine(hidden), drawnTitle(hidden), lastDrawLine(hidden)]) expect(line).not.toMatch(/success|failure/i);
+  });
+  it('words hidden tasks as one "Waiting on the DM." line, and keeps the text of ordinary tasks', () => {
+    expect(taskLine({ text: '', done: false })).toBe('Waiting on the DM.');
+    expect(taskLine({ text: 'Pick one', done: false })).toBe('Waiting on the DM: Pick one');
+    const two = { dmTasks: [{ text: '' }, { text: '' }, { text: 'Pick one' }, { text: 'Pick one' }] };
+    expect(taskLines(two)).toEqual(['Waiting on the DM.', 'Waiting on the DM: Pick one']);
+  });
+  it('words the sticky GM toast from the open tasks only', () => {
+    const joker = { card: { label: 'Red Joker' }, dmTasks: [{ text: 'The party finds a cursed item', done: false }, { text: 'Old', done: true }] };
+    expect(waitingOnYouTitle(joker)).toBe('Waiting on you: Red Joker: The party finds a cursed item');
+    expect(waitingOnYouTitle({ card: { label: 'X' }, dmTasks: [] })).toBe('Waiting on you: X');
+  });
+  describe('deckBlockHidden', () => {
+    const stored = JSON.stringify({ lastDrawId: 'd1', taskIds: ['t1'] });
+    const tasks = [{ taskId: 't1' }];
+    it('stays hidden for the same draw and tasks', () => expect(deckBlockHidden(stored, { id: 'd1' }, tasks)).toBe(true));
+    it('shows again for a new draw', () => expect(deckBlockHidden(stored, { id: 'd2' }, tasks)).toBe(false));
+    it('shows again for a new task', () => expect(deckBlockHidden(stored, { id: 'd1' }, [...tasks, { taskId: 't2' }])).toBe(false));
+    it('a task ticked off keeps it hidden', () => expect(deckBlockHidden(stored, { id: 'd1' }, [])).toBe(true));
+    it('shows for nothing stored or bad JSON', () => {
+      expect(deckBlockHidden(null, { id: 'd1' }, tasks)).toBe(false);
+      expect(deckBlockHidden('{oops', { id: 'd1' }, tasks)).toBe(false);
+      expect(deckBlockHidden('"text"', { id: 'd1' }, tasks)).toBe(false);
+      expect(deckBlockHidden('{"lastDrawId":"d1"}', { id: 'd1' }, tasks)).toBe(false);
+    });
+    it('an undo that changes the last draw only re-shows the box if the GM re-dismisses it against the new state', () => {
+      // Dismissed against d2; the GM undoes d2, so the last draw is now d1 and the box would count as "new".
+      const before = JSON.stringify(hiddenState({ id: 'd2' }, []));
+      expect(deckBlockHidden(before, { id: 'd2' }, [])).toBe(true);
+      expect(deckBlockHidden(before, { id: 'd1' }, [])).toBe(false);
+      // Re-storing against the reloaded state (what loadGm(true) does) keeps it hidden.
+      const after = JSON.stringify(hiddenState({ id: 'd1' }, [{ taskId: 't9' }]));
+      expect(deckBlockHidden(after, { id: 'd1' }, [{ taskId: 't9' }])).toBe(true);
+      expect(hiddenState(null, undefined)).toEqual({ lastDrawId: null, taskIds: [] });
+    });
+    it('copes with no draws at all', () => expect(deckBlockHidden(JSON.stringify({ lastDrawId: null, taskIds: [] }), null, [])).toBe(true));
+  });
+});

@@ -1082,12 +1082,15 @@ export function createForage(deps) {
     gmInfo.at = Date.now();
     if (!res.ok || !Array.isArray(res.data.tables)) return;
     gmInfo.quick = res.data.unavailableReason === 'wrong_room';
+    gmInfo.campaignId = typeof res.data.campaignId === 'string' ? res.data.campaignId : '';
     gmInfo.pickable = pickableTables(res.data.tables).length;
     refreshSidebarLine();
   }
   function gmInfoHtml() {
+    // Deep-link to the campaign's forage page when we know the campaign; the old page redirects otherwise.
+    const setupHref = gmInfo.campaignId ? `/campaigns/${encodeURIComponent(gmInfo.campaignId)}/forage` : '/forage/tables';
     const text = gmInfo.quick ? "Foraging isn't available in Quick rooms."
-      : gmInfo.pickable === 0 ? 'No find tables for this campaign yet. <a href="/forage/tables" target="_blank" rel="noopener">Set them up</a>'
+      : gmInfo.pickable === 0 ? `No find tables for this campaign yet. <a href="${setupHref}" target="_blank" rel="noopener">Set them up</a>`
         : '';
     return text ? `<div class="forage-sidebar-line"><span class="attack-subtext">${text}</span></div>` : '';
   }

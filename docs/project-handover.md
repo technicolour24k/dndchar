@@ -851,6 +851,37 @@ Consequence
 
 Do not accidentally build the website around the experimental 2d6 system. It is relevant only as evidence that the user may want broader system support eventually and dislikes unnecessarily rigid 5e assumptions.
 
+2.36 Page structure: admin pages are global, campaign admin pages are campaign-specific
+
+Decision (Rev 4 of the decks plan, 2026-11-23)
+
+- Admin pages (/admin/...) are for global content only: things every campaign shares. The one deliberate extra is oversight: /admin/items, /admin/magic and /admin/feats list personal and campaign entries too (labelled, filterable by ?scope=), and an admin can promote a personal entry to global.
+- Campaign admin pages control things specific to one campaign. Built so far:
+  - /campaigns/[id]/decks: a DM or co-DM creates, edits, copies and archives that campaign's own decks, and enables library decks.
+  - /campaigns/[id]/library: which members' homebrew libraries are switched on (off by default), plus "Keep a campaign copy".
+  - /campaigns/[id]/homebrew: the campaign copies forked from former members' libraries (edit and archive, no create).
+  - /campaigns/[id]/forage: find table authoring. /forage/tables is now only a redirect to it. /admin/forage stays the global finds review and undo.
+- Access to a campaign admin page is campaign management (DM / co-DM, plus the existing site-admin override), checked server-side in both load and actions.
+
+Correction (homebrew library, 2026-11-23)
+
+- The earlier note that forage tables live under /admin/forage was wrong, and is now out of date anyway: authoring was at /forage/tables and has moved to /campaigns/[id]/forage. Only the finds review stays under /admin.
+
+Consequence
+
+Put new campaign-specific controls on a campaign admin page, not under /admin. Decks a DM creates are owned by the campaign; global decks are seeded and read-only (copy into the campaign to edit).
+
+Deploy note (decks and homebrew library)
+
+The user runs every prod step themselves. A session never touches .env.prod or Neon.
+
+1. Apply migrations 046-051 in order with npm run db:migrate:prod BEFORE deploying (046-049 are next-attack expiry, deck schema, the Deck of Mystical Fate seed and campaign-owned decks; 050 is the homebrew library; 051 is the joker player-facing text on the global Mystical Fate seed). Old code simply ignores 051's new fields, so the order is safe either way.
+2. Deploy library units D-G together (campaign library page, decks, personal conditions, fork on leave). Library content becomes usable in campaigns from D, so a member leaving before G is live would leave references to their library behind.
+3. Then repair anyone who left in between. Dry run first, then for real:
+   npx tsx --env-file=.env.prod scripts/fork-former-members.ts --dry-run --allow-remote
+   npx tsx --env-file=.env.prod scripts/fork-former-members.ts --allow-remote
+   scripts/sql/check-library.sql should then show no "unforked leavers" rows.
+
 ---
 
 3. DATA STRUCTURES / SCHEMAS (CONCEPTUAL ONLY)
@@ -1403,6 +1434,8 @@ Users are part of the domain, but the recorded discussions do not settle:
 Do not invent a restrictive access system based on normal SaaS assumptions. The trusted-group model should guide choices.
 
 4.12 Campaign/homebrew library scoping
+
+Decided in the homebrew library plan (2026-11-23), recorded in modifier-primacy-status.md §4a: global / personal / campaign scopes, libraries opt-in per campaign, referenced while the owner is a member, forked into the campaign on leave, no character-private copies. The list below is the original open list, kept for history.
 
 Open:
 

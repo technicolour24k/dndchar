@@ -1,8 +1,10 @@
 import type pg from 'pg';
-import { findOrCreateActionContainer, linkActionContainer } from '$lib/server/services/action-containers';
 import { query, withTransaction } from '$lib/server/db';
-import { assertCanActForCharacter, assertCanEditCharacter } from '$lib/server/services/access';
+import { assertCanActForCharacter, assertCanEditCharacter, isUuid } from '$lib/server/services/access';
+import { assertReferenceAllowed, assertVisibleForNewUse, resolveVisibleScope, visibleScopeSql } from '$lib/server/services/library';
+import type { VisibleScope } from '$lib/library/rules';
 import { cachedReference, invalidateReferenceData } from '$lib/server/cache/referenceData';
+import { readEffectMetadata, substituteParams } from '$lib/rules/effectParams';
 import { buildIndexEntry, type CatalogueIndexEntry } from '$lib/catalogue/fuzzySearch';
 import { abilityModifier, abilityMap, resolveResourceMaximum, standardSpellSlotMaximums, pactMagicSlots, totalLevel } from '$lib/rules/dnd5e';
 import { effectiveProficiencyBonus, readStatOverrides } from '$lib/rules/characterStats';
@@ -11,36 +13,39 @@ import { characterProfile, getTurnView, lockTurnState, resetTurnState } from '$l
 import { applySpellAccessCost, costSummary, defaultCostFor, effectiveCost, parseCostJson, withCategory } from '$lib/rules/cost';
 import { inferCategory } from '$lib/rules/actionEconomy';
 import type { CostEntry } from '$lib/types/cost';
-import { payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
+import { loadActivationCost, payActivationCost, type CostOverride, type PaidLine } from '$lib/server/services/cost-engine';
 import { executeContentActions, type ActionResult } from '$lib/server/services/action-engine';
 import type { Activation } from '$lib/types/cost';
 import type { AbilityKey, CharacterAbility, CharacterClass } from '$lib/types/character';
 import type { CharacterContentInstance, ContentDefinition, ContentType, RechargePeriod, SpellSlot } from '$lib/types/content';
 
-const contentTypes = new Set<ContentType>(['item', 'spell', 'feat', 'class_feature', 'condition', 'action']);
 const rechargePeriods = new Set<RechargePeriod>(['short_rest', 'long_rest', 'dawn', 'round', 'encounter', 'manual']);
 
-function slug(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'content';
-}
-
-export async function listCatalogue(userId: string, type?: ContentType, search = ''): Promise<ContentDefinition[]> {
+// Read-only browse list. Limited to what `scope` may be offered (default: global plus the viewer's own library), so
+// another user's private homebrew never shows here.
+// `ownerUserId` narrows to one member's personal entries in SQL, so the row cap below can't cut them off.
+export async function listCatalogue(userId: string, type?: ContentType, search = '', scope?: VisibleScope, ownerUserId?: string): Promise<ContentDefinition[]> {
+  const visible = visibleScopeSql('c', scope ?? await resolveVisibleScope({ query }, userId), 3);
   const result = await query<any>(
     `
       SELECT c.*, s.spell_level, s.school, s.casting_time, s.spell_range, s.components, s.duration,
         s.ritual, s.concentration, s.classes, s.higher_level,
         s.resolution_type, s.damage_type, s.base_dice, s.save_ability, s.save_effect, s.scaling_json,
         i.category, i.equipment_type, i.requires_attunement, i.ac_bonus, i.to_hit_bonus,
-        i.damage_bonus, i.attack_ability, i.damage_rolls
+        i.damage_bonus, i.attack_ability, i.damage_rolls,
+        u.display_name AS owner_name
       FROM content_definitions c
       LEFT JOIN spell_definitions s ON s.content_id = c.id
       LEFT JOIN item_definitions i ON i.content_id = c.id
-      WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1)
+      LEFT JOIN users u ON u.id = c.owner_user_id
+      WHERE c.is_archived=false AND ($1::text IS NULL OR c.content_type = $1) AND c.content_type <> 'deck'
         AND ($2 = '' OR c.name ILIKE '%' || $2 || '%')
-      ORDER BY c.source_kind = 'srd' DESC, c.name ASC
+        AND ${visible.sql}
+        AND ($${visible.params.length + 3}::uuid IS NULL OR (c.scope = 'personal' AND c.owner_user_id = $${visible.params.length + 3}::uuid))
+      ORDER BY (c.source_kind = 'srd') ASC, c.name ASC
       LIMIT 300
     `,
-    [type || null, search.trim()]
+    [type || null, search.trim(), ...visible.params, ownerUserId ?? null]
   );
 
   const ids = result.rows.map((row: any) => row.id);
@@ -63,6 +68,11 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
     sourceKind: row.source_kind,
     sourceRef: row.source_ref || '',
     ownerUserId: row.owner_user_id,
+    scope: row.scope,
+    ownerName: row.owner_name ?? null,
+    campaignId: row.campaign_id ?? null,
+    hiddenFromPlayers: row.hidden_from_players ?? false,
+    forkedFromOwnerName: row.metadata_json?.fork?.fromOwnerName ?? null,
     isArchived: row.is_archived,
     isSystem: row.is_system ?? false,
     metadata: row.metadata_json || {},
@@ -105,9 +115,12 @@ export async function listCatalogue(userId: string, type?: ContentType, search =
 // the admin "Reload catalogue" button - see admin/settings/+page.server.ts).
 async function loadCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
   const result = await query<any>(`
-    SELECT c.id, c.content_type, c.name, c.source_kind, s.spell_level
+    SELECT c.id, c.content_type, c.name, c.source_kind, s.spell_level,
+      c.scope, c.owner_user_id, c.campaign_id, c.hidden_from_players,
+      u.display_name AS owner_name, c.metadata_json->'fork'->>'fromOwnerName' AS forked_from_owner_name
     FROM content_definitions c
     LEFT JOIN spell_definitions s ON s.content_id = c.id
+    LEFT JOIN users u ON u.id = c.owner_user_id
     WHERE c.is_archived = false AND c.content_type IN ('spell', 'item', 'feat', 'class_feature')
   `);
   return result.rows.map((row: any) => buildIndexEntry({
@@ -115,6 +128,12 @@ async function loadCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
     type: row.content_type,
     name: row.name,
     sourceKind: row.source_kind,
+    scope: row.scope,
+    ownerUserId: row.owner_user_id ?? null,
+    ownerName: row.owner_name ?? null,
+    campaignId: row.campaign_id ?? null,
+    hiddenFromPlayers: row.hidden_from_players,
+    forkedFromOwnerName: row.forked_from_owner_name ?? null,
     spellLevel: row.spell_level ?? null
   }));
 }
@@ -123,98 +142,10 @@ export async function getCatalogueIndex(): Promise<CatalogueIndexEntry[]> {
   return cachedReference('catalogue-index', loadCatalogueIndex, { ttlMs: 24 * 60 * 60 * 1000 });
 }
 
-export async function createHomebrewContent(userId: string, form: FormData): Promise<string> {
-  const type = String(form.get('contentType') || '') as ContentType;
-  const name = String(form.get('name') || '').trim();
-  if (!contentTypes.has(type) || !name) throw new Error('A valid content type and name are required.');
 
-  const id = await withTransaction(async (client) => {
-    const key = `custom:${userId}:${type}:${slug(name)}:${Date.now()}`;
-    const created = await client.query<{ id: string }>(
-      `INSERT INTO content_definitions
-       (content_key, content_type, name, description, source_kind, owner_user_id, metadata_json)
-       VALUES ($1, $2, $3, $4, 'homebrew', $5, $6) RETURNING id`,
-      [key, type, name, String(form.get('description') || ''), userId, JSON.stringify({})]
-    );
-    const id = created.rows[0].id;
-    if (type === 'spell') {
-      await client.query(
-        `INSERT INTO spell_definitions
-         (content_id, spell_level, school, casting_time, spell_range, components, duration, ritual, concentration, classes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [id, Math.min(9, Math.max(0, Number(form.get('spellLevel')) || 0)), String(form.get('school') || ''),
-          String(form.get('castingTime') || ''), String(form.get('range') || ''), String(form.get('components') || ''),
-          String(form.get('duration') || ''), form.get('ritual') === 'on', form.get('concentration') === 'on',
-          String(form.get('classes') || '').split(',').map((value) => value.trim()).filter(Boolean)]
-      );
-    }
-    if (type === 'item') {
-      await client.query(
-        `INSERT INTO item_definitions
-         (content_id, category, equipment_type, requires_attunement, ac_bonus, to_hit_bonus, damage_bonus, attack_ability, damage_rolls)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [id, String(form.get('category') || 'gear'), String(form.get('equipmentType') || 'item'),
-          form.get('requiresAttunement') === 'on', Number(form.get('acBonus')) || 0, Number(form.get('toHitBonus')) || 0,
-          Number(form.get('damageBonus')) || 0, String(form.get('attackAbility') || 'str'), String(form.get('damageRolls') || '')]
-      );
-    }
-    return id;
-  });
-  invalidateReferenceData('createHomebrewContent');
-  return id;
-}
 
-export async function setContentArchived(userId:string,contentId:string,isAdmin=false):Promise<void>{
-  const result=await query(`UPDATE content_definitions SET is_archived=NOT is_archived,updated_at=now()
-    WHERE id=$1 AND ($2::boolean OR owner_user_id=$3) RETURNING id`,[contentId,isAdmin,userId]);
-  if(!result.rowCount)throw new Error('Catalogue entry not found or not editable.');
-  invalidateReferenceData('setContentArchived');
-}
 
-export async function updateOwnedContent(userId:string,form:FormData):Promise<void>{
-  const result=await query(`UPDATE content_definitions SET name=$3,description=$4,updated_at=now()
-    WHERE id=$1 AND owner_user_id=$2 AND source_kind='homebrew'`,[String(form.get('contentId')||''),userId,
-    String(form.get('name')||'').trim(),String(form.get('description')||'').trim()]);
-  if(!result.rowCount)throw new Error('Homebrew entry not found or not editable.');
-  invalidateReferenceData('updateOwnedContent');
-}
 
-export async function attachEffectToContent(form: FormData): Promise<void> {
-  const contentId = String(form.get('contentId') || '');
-  const effectId = String(form.get('effectId') || '');
-  const activationType = String(form.get('activationType') || 'manual');
-  // effectId is the condition container id. content_grants is the only write.
-  await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
-    SELECT $1, cd.id, $3 FROM content_definitions cd WHERE cd.id=$2 AND cd.content_type='condition'
-    ON CONFLICT DO NOTHING`,
-    [contentId, effectId, activationType]);
-  invalidateReferenceData('attachEffectToContent');
-}
-
-export async function attachEffectToOwnedContent(userId: string, form: FormData): Promise<void> {
-  const contentId = String(form.get('contentId') || '');
-  const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
-  if (!owned.rowCount) throw new Error('Private homebrew content not found.');
-  if (String(form.get('activationType') || 'manual') === 'on_use') {
-    await withTransaction(async (client) => {
-      const content = await client.query<any>('SELECT name, owner_user_id FROM content_definitions WHERE id=$1', [contentId]);
-      const actionContainerId = await findOrCreateActionContainer(client, contentId, 'on_use', `Use ${content.rows[0].name}`,
-        `Actions for ${content.rows[0].name}`, content.rows[0].owner_user_id);
-      await linkActionContainer(client, contentId, actionContainerId, 'on_use');
-      const effectId = String(form.get('effectId') || '');
-      // effectId is the condition container id; the step carries it as effect_container_id.
-      await client.query(`INSERT INTO action_steps(container_id,step_type,operation,effect_container_id,label,sort_order)
-        SELECT $1,'apply_effect','apply',effect.id,effect.name,
-          COALESCE((SELECT max(sort_order)+1 FROM action_steps WHERE container_id=$1),0)
-        FROM content_definitions effect WHERE effect.id=$2 AND effect.content_type='condition'
-          AND NOT EXISTS(SELECT 1 FROM action_steps WHERE container_id=$1 AND step_type='apply_effect' AND effect_container_id=$2)`,
-        [actionContainerId, effectId]);
-    });
-    invalidateReferenceData('attachEffectToOwnedContent');
-    return;
-  }
-  await attachEffectToContent(form);
-}
 
 export async function addContentResourceDefinition(form: FormData): Promise<void> {
   const contentId = String(form.get('contentId') || '');
@@ -238,24 +169,15 @@ export async function addContentResourceDefinition(form: FormData): Promise<void
 }
 
 export async function grantContentFromContent(form: FormData): Promise<void> {
+  // Homebrew library: a global entry can't grant a personal one, and so on (see canReference).
+  await assertReferenceAllowed({ query }, String(form.get('sourceContentId') || ''), String(form.get('grantedContentId') || ''));
   await query(`INSERT INTO content_grants (source_content_id, granted_content_id, activation_type)
     VALUES ($1,$2,$3) ON CONFLICT (source_content_id, granted_content_id, activation_type) DO NOTHING`,
     [String(form.get('sourceContentId') || ''), String(form.get('grantedContentId') || ''), String(form.get('activationType') || 'equipped')]);
   invalidateReferenceData('grantContentFromContent');
 }
 
-export async function addOwnedContentResourceDefinition(userId: string, form: FormData): Promise<void> {
-  const contentId = String(form.get('contentId') || '');
-  const owned = await query('SELECT id FROM content_definitions WHERE id=$1 AND owner_user_id=$2', [contentId, userId]);
-  if (!owned.rowCount) throw new Error('Private homebrew content not found.');
-  await addContentResourceDefinition(form);
-}
 
-export async function listEffectsForLinking(userId?: string): Promise<Array<{ id: string; name: string }>> {
-  const result = await query<{ id: string; name: string }>(`SELECT id, name FROM content_definitions
-    WHERE content_type='condition' AND is_archived=false ORDER BY name`);
-  return result.rows;
-}
 
 // Inserts one new inventory row for an item Container (copying its item fields) and starts its
 // resources. Shared by the sheet's catalogue add (quantity 1) and forage's finds (stacking falls
@@ -280,8 +202,13 @@ export async function insertCatalogueItem(client: pg.PoolClient, characterId: st
 export async function addContentToCharacter(userId: string, characterId: string, contentId: string): Promise<void> {
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
-    const visible = await client.query('SELECT id FROM content_definitions WHERE id=$1 AND is_archived=false', [contentId]);
-    if (!visible.rowCount) throw new Error('Catalogue entry not found.');
+    // Decks are shared campaign items (drawn via the deck service), never character content.
+    const kind = isUuid(contentId) ? await client.query<{ content_type: string }>('SELECT content_type FROM content_definitions WHERE id=$1', [contentId]) : { rows: [] };
+    if (kind.rows[0]?.content_type === 'deck') throw new Error('Decks cannot be added to a character.');
+    // Homebrew library: only entries this character may be OFFERED (global, its campaign's enabled libraries and
+    // copies, or its owner's library when it has no campaign), live, and of a character-content type. Uncached.
+    const scope = await resolveVisibleScope(client, userId, { characterId });
+    await assertVisibleForNewUse(client, contentId, scope, ['item', 'spell', 'feat', 'class_feature']);
     const definition = await client.query<any>(`SELECT c.content_type, c.name, i.* FROM content_definitions c
       LEFT JOIN item_definitions i ON i.content_id = c.id WHERE c.id = $1`, [contentId]);
     if (definition.rows[0]?.content_type === 'item') {
@@ -432,11 +359,11 @@ export async function castCharacterSpell(userId:string,characterId:string,form:F
 }
 
 // Same cast, but also says which slot was spent (the VTT mirrors it onto the token).
-export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null;castAtLevel?:number}>{
+export async function castCharacterSpellDetailed(userId:string,characterId:string,form:FormData,costOverride?:CostOverride|null):Promise<{results:ActionResult[];spent:{slotType:'standard'|'pact';slotLevel:number}|null;castAtLevel?:number;usedFollowup:boolean;followupCls:string|null}>{
   const requestedType=String(form.get('slotType')||'');
   const slotChoice={slotType:requestedType==='standard'||requestedType==='pact'?requestedType:undefined,slotLevel:Number(form.get('slotLevel'))||undefined,
     // An echo (a free repeat of a waiting follow-up) is chosen explicitly; a plain cast never spends one.
-    ...(form.get('followup')==='use'||form.get('followup')==='skip'?{followup:form.get('followup') as 'use'|'skip'}:{})} as const;
+    ...(['use','skip','require'].includes(String(form.get('followup')))?{followup:form.get('followup') as 'use'|'skip'|'require'}:{})} as const;
   return withTransaction(async(client)=>{await assertCanAct(client,userId,characterId);
     await lockTurnState(client,characterId); // the turn row is the FIRST lock (see cost-engine.ts)
     const accessId=String(form.get('spellAccessId')||'');let spellId='';let activation:Activation;let context:{inventoryId?:string;instanceId?:string};
@@ -461,7 +388,9 @@ export async function castCharacterSpellDetailed(userId:string,characterId:strin
     const slot=paid.find((line)=>line.slot);
     // A spell echo (free follow-up) spends no slot; castAtLevel says which level it resolves at.
     const echo=paid.find((line)=>line.castAtLevel!==undefined);
-    return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null,...(echo?{castAtLevel:echo.castAtLevel}:{})};
+    // Which follow-up class this spell earns and spends (null unless it is Action-timed), so the VTT can offer the echo button.
+    const followupCls=(await loadActivationCost(client,characterId,activation)).followup?.cls??null;
+    return {results:[...paidToResults(paid),...effects],spent:slot?.slot??null,...(echo?{castAtLevel:echo.castAtLevel}:{}),usedFollowup:paid.some((line)=>line.pool==='followup'),followupCls};
   });
 }
 
@@ -603,7 +532,10 @@ export async function getCombatClock(characterId: string): Promise<{ roundNumber
   return { roundNumber: result.rows[0].round_number, turnNumber: result.rows[0].turn_number };
 }
 
-export async function advanceCharacterRound(userId: string, characterId: string): Promise<void> {
+// tickTurnEffects: the VTT GM's Next round has no initiative tracker, so it also counts down the
+// turn_start / turn_end effects by one. The sheet's own Next Round passes nothing and is unchanged.
+export async function advanceCharacterRound(userId: string, characterId: string, options: { tickTurnEffects?: boolean } = {}): Promise<void> {
+  const boundaries = options.tickTurnEffects ? ['round_end', 'next_attack', 'turn_start', 'turn_end'] : ['round_end', 'next_attack'];
   await withTransaction(async (client) => {
     await assertCanEdit(client, userId, characterId);
     await lockTurnState(client, characterId); // the turn row is the FIRST lock (see cost-engine.ts)
@@ -611,7 +543,7 @@ export async function advanceCharacterRound(userId: string, characterId: string)
       ON CONFLICT (character_id) DO UPDATE SET round_number = character_combat_clocks.round_number + 1,
         turn_number = 1, updated_at = now()`, [characterId]);
     await client.query(`UPDATE active_character_effects SET remaining_rounds = GREATEST(0, remaining_rounds - 1)
-      WHERE character_id = $1 AND remaining_rounds IS NOT NULL AND expiry_boundary = 'round_end'`, [characterId]);
+      WHERE character_id = $1 AND remaining_rounds IS NOT NULL AND expiry_boundary = ANY($2::text[])`, [characterId, boundaries]);
     await client.query(`DELETE FROM active_character_effects WHERE character_id = $1 AND remaining_rounds = 0`, [characterId]);
     await client.query(`UPDATE character_content_resources r SET current_value = max_value
       FROM content_resource_definitions d, character_content_instances i WHERE r.resource_definition_id = d.id
@@ -749,8 +681,21 @@ async function syncSpellSlotsWithClient(client: pg.PoolClient, characterId: stri
           OR (l.activation_type='attuned' AND inventory.attuned))
     ) SELECT COALESCE(sum(CASE WHEN value_expression ~ '^-?[0-9]+$' THEN value_expression::integer ELSE 0 END),0)::text AS bonus
     FROM modifier_values WHERE target='spell_slots.highest.max' AND modifier_type='bonus'`, [characterId]);
+  // Applied effects whose link expression has {name} placeholders: the query above skips them (not an integer),
+  // so each instance is substituted from its own metadata params and added here.
+  const parameterised = await client.query<{ value_expression: string; metadata_json: unknown }>(
+    `SELECT l.value_override_expression AS value_expression, a.metadata_json
+     FROM active_character_effects a JOIN content_definitions cd ON cd.id=a.container_id AND cd.content_type='condition'
+     JOIN content_modifier_links l ON l.content_id=a.container_id JOIN modifier_definitions m ON m.id=l.modifier_id
+     WHERE a.character_id=$1 AND m.target='spell_slots.highest.max' AND m.modifier_type='bonus'
+       AND l.value_override_expression LIKE '%{%'`, [characterId]);
+  let paramBonus = 0;
+  for (const row of parameterised.rows) {
+    const text = substituteParams(row.value_expression, readEffectMetadata(row.metadata_json).params).trim();
+    if (/^-?\d+$/.test(text)) paramBonus += Number(text);
+  }
   const highestIndex = standard.findLastIndex((maximum) => maximum > 0);
-  if (highestIndex >= 0) standard[highestIndex] = Math.max(0, standard[highestIndex] + (Number(bonusResult.rows[0]?.bonus) || 0));
+  if (highestIndex >= 0) standard[highestIndex] = Math.max(0, standard[highestIndex] + (Number(bonusResult.rows[0]?.bonus) || 0) + paramBonus);
   await client.query(`DELETE FROM character_spell_slots WHERE character_id = $1 AND slot_type = 'standard'
     AND NOT (slot_level = ANY($2::int[]))`, [characterId, standard.map((value, index) => value ? index + 1 : 0).filter(Boolean)]);
   for (let index = 0; index < standard.length; index += 1) {

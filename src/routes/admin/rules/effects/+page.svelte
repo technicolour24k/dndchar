@@ -109,6 +109,7 @@
           <option value="turn_start" selected={editing?.expiryBoundary==='turn_start'}>Start of Turn</option>
           <option value="turn_end"   selected={editing?.expiryBoundary==='turn_end'}>End of Turn</option>
           <option value="manual"     selected={editing?.expiryBoundary==='manual'}>Manual</option>
+          <option value="next_attack" selected={editing?.expiryBoundary==='next_attack'}>Until next attack</option>
         </select></label>
       </div>
       <label class="inline"><input type="checkbox" name="requiresConcentration" checked={editing?.requiresConcentration}/> Concentration</label>

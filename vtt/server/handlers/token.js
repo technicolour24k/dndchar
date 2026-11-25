@@ -31,6 +31,21 @@ function logCombatLine(context, session, message, details) {
   }).catch((err) => console.error('[VTT] combat log write failed', err));
 }
 
+// Asks the SvelteKit side to record a new PC token's real sheet AC as its sheetAc baseline (no token.ac change).
+// Fire-and-forget: errors are logged and never block token:add. The route also checks the character belongs at
+// this table, which is why a forged characterId on a PC token simply never gets a baseline (the VTT server has
+// no database to check it here).
+function primeTokenAc(context, sessionId, token) {
+  if (token.type !== 'pc' || typeof token.characterId !== 'string' || !token.characterId) return;
+  if (typeof context.internalApiBaseUrl !== 'function') return;
+  fetch(`${context.internalApiBaseUrl()}/vtt/api/token-ac-prime`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-vtt-internal-secret': INTERNAL_API_SECRET },
+    body: JSON.stringify({ roomId: sessionId, tokenId: token.id }),
+    signal: AbortSignal.timeout(5000),
+  }).catch((err) => console.error('[VTT] token AC prime failed', err));
+}
+
 // The client sends back the d20 pool the server rolled (attackPool from the roll endpoints). It is
 // only used to word the logs, so it is validated hard: anything odd and it is dropped, and the log
 // falls back to the plain to-hit text. Never trusted for anything mechanical.
@@ -219,6 +234,10 @@ const TOKEN_LEVEL_STAT_FIELDS = new Set([
   // survives filterTokenForPlayer (unlike the real `ac`, which is stripped for
   // enemy/npc) - it's the deliberately-revealed upper bound players discover.
   'knownAc',
+  // The sheet AC this PC token last followed (decks plan, unit 5b). Written ONLY by the SvelteKit side
+  // (src/lib/server/vttTokenAc.ts); every client write is refused below, and it is sanitised on token:add.
+  // Display only on the clients.
+  'sheetAc',
 ]);
 
 // Top-level fields that are still secret from players on enemy/npc tokens even
@@ -435,8 +454,13 @@ async function handleTokenEvent(meta, msg, context) {
         const cleanTurn = sanitizeTurn(token.turn);
         if (cleanTurn) token.turn = cleanTurn; else delete token.turn;
       }
+      // sheetAc is server-owned: never trust the client's copy, and never seed it from the token's own ac (a
+      // GM-typed AC would then snap to the sheet on the first follow). The real sheet AC is recorded as the
+      // baseline a moment later by primeTokenAc, without moving token.ac.
+      delete token.sheetAc;
       session.tokens[token.id] = token;
       broadcastToken(context, session, meta.sessionId, 'token:add', token);
+      primeTokenAc(context, meta.sessionId, token);
       break;
     }
 
@@ -585,6 +609,7 @@ async function handleTokenEvent(meta, msg, context) {
     case 'token:stat:update': {
       const token = session.tokens[msg.tokenId];
       if (!token) return;
+      if (msg.stat === 'sheetAc') return; // server-owned, see TOKEN_LEVEL_STAT_FIELDS
       // isValidHpTarget (Section 3b) is a deliberate OR-branch, not a
       // narrowing of canEditToken - it exists specifically to allow a write
       // on a token the sender does NOT own (an enemy they've targeted), so it
@@ -793,6 +818,7 @@ async function handleTokenEvent(meta, msg, context) {
       if (!token) return;
       const patch = { ...(msg.patch || {}) };
       delete patch.hidden;
+      delete patch.sheetAc; // server-owned
       delete patch.id;
       delete patch.x;
       delete patch.y;
