@@ -3,7 +3,7 @@
 // can be unit tested. voice.js does the actual audio routing.
 
 export const VOLUME_MIN = 0;
-export const VOLUME_MAX = 200;
+export const VOLUME_MAX = 300;
 export const VOLUME_DEFAULT = 100;
 export const VOLUME_SLIDER_STEP = 5;
 export const VOLUME_BUTTON_STEP = 10;
